@@ -41,8 +41,7 @@ Run as Admin (UAC) so everything just works the first time.
 - Stop Windows Update From Restarting  Mid-game
 
 **Games** 
-one-click cache cleanup for Steam, Epic, EA, GOG, Battle.net,
-Riot, Ubisoft, Discord, and the Xbox app.
+- one-click cache cleanup for Steam, Epic, EA, GOG, Battle.net, Riot, Ubisoft, Discord, and the Xbox app.
 
 All tweaks can be undone from the same screen. There's also a Preview Mode
 that shows you exactly what would happen without changing anything.

@@ -3,8 +3,7 @@
 A simple 1-click Windows cleaner, repair, and tweak app for gamers. Pick what
 you want, hit Run, done — no need to babysit it.
 
-Opens with an admin prompt (UAC) so everything just works the first time —
-you won't have to restart the app to unlock repairs or tweaks.
+Run as Admin (UAC) so everything just works the first time.
 
 
 <p align="center">
@@ -13,25 +12,36 @@ you won't have to restart the app to unlock repairs or tweaks.
 
 ## What it does
 
-**Clean** — shader caches (NVIDIA/AMD/Intel), Steam/Epic/EA/Discord/Riot/GOG/
-Battle.net/Ubisoft caches, temp files, old driver leftovers, Recycle Bin,
-crash dumps, browser cache, thumbnail cache, DNS cache, and more.
+**Clean**
+- Shader Caches (NVIDIA/AMD/Intel) 
+- Game Launcher Caches
+- Temp Files 
+- Old Driver Leftovers 
+- Recycle Bin
+- Crash Dumps 
+- Browser Cache 
+- Thumbnail Cache 
+- DNS Cache
 
-**Repair** — System File Checker, DISM image repair (fixes corrupted Windows
-files by downloading clean copies — no reinstall needed), network reset,
-Windows Update fixes, broken Start Menu/search fixes, and a one-click restore
-point before anything runs.
+**Repair**
+- System File Checker  
+- DISM Image Repair
+- Network Reset
+- Windows Update Fixes 
+- Broken Start Menu & Search Fixes
+- 1-click restore
 
-**Tweak** (all reversible with one click) — Ultimate Performance power plan,
-Game Mode, disable Xbox background recording, 1:1 mouse aim, HAGS, exclude
-game folders from antivirus scanning, stop Windows Update from restarting
-mid-game, and more.
+**Tweak**
+- Ultimate Performance Power Plan 
+- Game Mode 
+- Disable Xbox Background Recording 
+- 1:1 Mouse Aim 
+- Hardware Accelerated GPU Scheduling 
+- Exclude Game Folders From Antivirus Scanning
+- Stop Windows Update From Restarting  Mid-game
 
-**Games** — one-click cache cleanup for Steam, Epic, EA, GOG, Battle.net,
-Riot, Ubisoft, Discord, and the Xbox app.
-
-Every tweak can be undone from the same screen. There's also a Preview Mode
-that shows you exactly what would happen without changing anything.
+**Games** 
+- one-click cache cleanup for Steam, Epic, EA, GOG, Battle.net, Riot, Ubisoft, Discord, and the Xbox app.
 
 ## Requirements
 
@@ -49,7 +59,3 @@ python main.py
 ```powershell
 pyinstaller --onefile --windowed --name "CleanerTool" --icon "app/assets/icon.ico" --add-data "app/assets;app/assets" --manifest "app/assets/admin_manifest.xml" app/__main__.py
 ```
-
-Or just push to GitHub — `.github/workflows/build.yml` builds it for you on
-every push, and tagging a release (e.g. `v2.1.0`) publishes the .exe as a
-GitHub Release automatically.

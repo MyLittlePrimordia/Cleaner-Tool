@@ -43,9 +43,6 @@ Run as Admin (UAC) so everything just works the first time.
 **Games** 
 - one-click cache cleanup for Steam, Epic, EA, GOG, Battle.net, Riot, Ubisoft, Discord, and the Xbox app.
 
-All tweaks can be undone from the same screen. There's also a Preview Mode
-that shows you exactly what would happen without changing anything.
-
 ## Requirements
 
 Windows 10 or 11. No install needed — just run the .exe.

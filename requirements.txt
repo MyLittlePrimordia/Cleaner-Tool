@@ -1,0 +1,5 @@
+# Runtime: this app is intentionally stdlib-only (tkinter, ctypes, winreg,
+# subprocess) so it has zero third-party runtime dependencies.
+#
+# Build-time only:
+pyinstaller>=6.10

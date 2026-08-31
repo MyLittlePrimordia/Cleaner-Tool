@@ -29,22 +29,31 @@ def _get_elevation_cookie_path() -> str:
     return os.path.join(tempfile.gettempdir(), "CleanerTool_elevation_cookie")
 
 
-def _write_elevation_cookie(pid: int) -> None:
-    """Write the elevated process PID to the cookie file."""
+def _get_elevation_token_path() -> str:
+    """Path storing the expected random token for the pending elevation."""
+    return os.path.join(tempfile.gettempdir(), "CleanerTool_elevation_token")
+
+
+def _write_elevation_cookie(pid: int, token: str = "") -> None:
+    """Write the elevated process PID and token to the cookie file."""
     try:
         with open(_get_elevation_cookie_path(), "w") as f:
-            f.write(str(pid))
+            f.write(f"{pid}:{token}" if token else str(pid))
     except Exception:
         pass
 
 
-def _read_elevation_cookie() -> int | None:
-    """Read the elevated process PID from the cookie file."""
+def _read_elevation_cookie() -> tuple[int | None, str]:
+    """Read the elevated process PID and token from the cookie file."""
     try:
         with open(_get_elevation_cookie_path(), "r") as f:
-            return int(f.read().strip())
+            raw = f.read().strip()
+            if ":" in raw:
+                pid_s, token = raw.split(":", 1)
+                return int(pid_s.strip()), token.strip()
+            return int(raw), ""
     except Exception:
-        return None
+        return None, ""
 
 
 def _clear_elevation_cookie() -> None:
@@ -55,15 +64,44 @@ def _clear_elevation_cookie() -> None:
         pass
 
 
+def _write_pending_token(token: str) -> None:
+    try:
+        with open(_get_elevation_token_path(), "w") as f:
+            f.write(token)
+    except Exception:
+        pass
+
+
+def _read_pending_token() -> str | None:
+    try:
+        with open(_get_elevation_token_path(), "r") as f:
+            return f.read().strip()
+    except Exception:
+        return None
+
+
+def _clear_pending_token() -> None:
+    try:
+        os.remove(_get_elevation_token_path())
+    except Exception:
+        pass
+
+
 def _wait_for_elevated_process(timeout: float = 10.0) -> bool:
     """
     Wait for the elevated process to signal it has started.
     Returns True if the elevated process started successfully.
+    Verifies token to prevent spoofing via pre-created cookie.
     """
+    expected_token = _read_pending_token()
     start_time = time.time()
     while time.time() - start_time < timeout:
-        pid = _read_elevation_cookie()
+        pid, token = _read_elevation_cookie()
         if pid is not None:
+            # If a token was issued, the cookie must match it
+            if expected_token and token != expected_token:
+                time.sleep(0.2)
+                continue
             # Verify the process is still alive
             try:
                 import ctypes.wintypes
@@ -77,6 +115,7 @@ def _wait_for_elevated_process(timeout: float = 10.0) -> bool:
                         ctypes.windll.kernel32.CloseHandle(handle)
                         if exit_code.value == 259:  # STILL_ACTIVE
                             _clear_elevation_cookie()
+                            _clear_pending_token()
                             return True
                     ctypes.windll.kernel32.CloseHandle(handle)
             except Exception:
@@ -95,18 +134,22 @@ def relaunch_as_admin() -> bool:
     to ensure the elevated process actually started before exiting.
     """
     try:
+        import secrets
         _clear_elevation_cookie()  # Clear any stale cookie
-        
+        _clear_pending_token()
+        token = secrets.token_hex(16)
+        _write_pending_token(token)
+
         if getattr(sys, "frozen", False):
             # Running as a PyInstaller-built .exe
             executable = sys.executable
-            argv = list(sys.argv[1:])
+            argv = list(sys.argv[1:]) + [f"--elevation-token={token}"]
         else:
             # Running as a normal python script: relaunch python.exe with the
             # script path as the first argument.
             executable = sys.executable
             script = os.path.abspath(sys.argv[0])
-            argv = [script] + list(sys.argv[1:])
+            argv = [script] + list(sys.argv[1:]) + [f"--elevation-token={token}"]
 
         # subprocess.list2cmdline applies correct Windows argument quoting and
         # escapes any embedded quotes, preventing argument injection.
@@ -116,8 +159,15 @@ def relaunch_as_admin() -> bool:
             None, "runas", executable, params, None, 1
         )
         # ShellExecuteW returns a value > 32 on success
-        return int(rc) > 32
+        if int(rc) <= 32:
+            _clear_pending_token()
+            return False
+        return True
     except Exception:
+        try:
+            _clear_pending_token()
+        except Exception:
+            pass
         return False
 
 
@@ -133,6 +183,22 @@ def wait_for_elevated_process(timeout: float = 10.0) -> bool:
 def signal_elevated_startup() -> None:
     """
     Called by the elevated process on startup to signal the original process
-    that it has started successfully.
+    that it has started successfully. If --elevation-token was passed, it is
+    echoed back in the cookie for verification.
     """
-    _write_elevation_cookie(os.getpid())
+    token = ""
+    # Extract token from argv if present
+    for arg in sys.argv:
+        if arg.startswith("--elevation-token="):
+            token = arg.split("=", 1)[1]
+            break
+    # Only signal if we're actually admin and have a token (or legacy pid-only)
+    # Don't write cookie on non-Windows test runs without token to avoid litter
+    if not token:
+        # No token — legacy / direct launch without elevation. Only write if
+        # a pending token file exists (means we were launched via relaunch)
+        pending = _read_pending_token()
+        if pending is None:
+            return
+        token = pending
+    _write_elevation_cookie(os.getpid(), token)

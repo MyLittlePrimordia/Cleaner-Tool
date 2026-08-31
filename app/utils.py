@@ -20,27 +20,79 @@ else:  # pragma: no cover
 
 
 import threading
+import queue
 
-# Track the currently running subprocess per thread so it can be killed on user cancel.
-_current_proc_local = threading.local()
+# Track the currently running subprocess per worker thread so it can be killed on user cancel.
+# Use a global registry keyed by thread ident so the main (GUI) thread can cancel
+# a command running in the worker thread.
+_current_procs: dict[int, subprocess.Popen] = {}
+_current_procs_lock = threading.Lock()
 
 
 def _set_current_proc(proc):
-    _current_proc_local.proc = proc
+    tid = threading.get_ident()
+    with _current_procs_lock:
+        if proc is None:
+            _current_procs.pop(tid, None)
+        else:
+            _current_procs[tid] = proc
 
 
 def _get_current_proc():
-    return getattr(_current_proc_local, "proc", None)
+    tid = threading.get_ident()
+    with _current_procs_lock:
+        return _current_procs.get(tid)
+
+
+def _get_any_proc():
+    with _current_procs_lock:
+        for p in _current_procs.values():
+            if p is not None and p.poll() is None:
+                return p
+    return None
+
+
+def _kill_proc(proc: subprocess.Popen):
+    """Kill proc and its child tree (needed when shell=True on Windows)."""
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    if IS_WINDOWS:
+        pid = getattr(proc, "pid", None)
+        if pid is None:
+            return
+        # Fire-and-forget taskkill /T so it doesn't block the cancel hot path (timeout=5 would add 5s tail latency)
+        def _taskkill():
+            try:
+                subprocess.run(
+                    f"taskkill /PID {pid} /T /F",
+                    shell=True,
+                    capture_output=True,
+                    timeout=5,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except Exception:
+                pass
+        try:
+            threading.Thread(target=_taskkill, daemon=True).start()
+        except Exception:
+            pass
 
 
 def cancel_current_command():
     """Best-effort kill of the command currently executed by run_cmd()."""
+    # Try current thread first, then any worker proc (GUI thread cancelling worker)
     proc = _get_current_proc()
+    if proc is None:
+        proc = _get_any_proc()
     if proc is not None and proc.poll() is None:
-        try:
-            proc.kill()
-        except Exception:
-            pass
+        _kill_proc(proc)
+    # Also kill any other tracked procs as fallback
+    with _current_procs_lock:
+        for p in list(_current_procs.values()):
+            if p is not proc and p is not None and p.poll() is None:
+                _kill_proc(p)
 
 
 # --------------------------------------------------------------------------- #
@@ -84,32 +136,75 @@ def run_cmd(ctx: TaskContext, command: str, shell: bool = True, timeout: Optiona
         )
         _set_current_proc(proc)
         try:
-            # Stream output line by line to avoid buffering large output in memory
+            # Stream output via a reader thread so we can poll cancellation/timeout
+            # without blocking on readline(). This fixes the hang where silent
+            # commands (sfc, DISM) emit nothing for minutes and Cancel never fires.
+            q: queue.Queue[Optional[str]] = queue.Queue()
+
+            def _reader():
+                try:
+                    for raw_line in proc.stdout:  # type: ignore[union-attr]
+                        q.put(raw_line)
+                except Exception:
+                    pass
+                finally:
+                    q.put(None)  # sentinel: EOF
+                    try:
+                        if proc.stdout:
+                            proc.stdout.close()
+                    except Exception:
+                        pass
+
+            reader_thread = threading.Thread(target=_reader, daemon=True)
+            reader_thread.start()
+
             start_time = time.time()
             while True:
                 if ctx.cancelled():
-                    proc.kill()
+                    _kill_proc(proc)
                     ctx.log("  ! command cancelled")
+                    # Drain reader thread briefly — kill is already async, so short join is enough
+                    reader_thread.join(timeout=0.5)
                     return -1
-                if timeout and (time.time() - start_time) > timeout:
-                    proc.kill()
+                if timeout is not None and (time.time() - start_time) > timeout:
+                    _kill_proc(proc)
                     ctx.log("  ! command timed out")
+                    reader_thread.join(timeout=0.5)
                     return -1
-                
-                line = proc.stdout.readline()
-                if not line and proc.poll() is not None:
+
+                try:
+                    item = q.get(timeout=0.1)
+                except queue.Empty:
+                    # No output yet — check if process already exited and reader finished
+                    if proc.poll() is not None and not reader_thread.is_alive() and q.empty():
+                        break
+                    continue
+
+                if item is None:
+                    # EOF reached; wait briefly for process exit code to be set
+                    for _ in range(20):
+                        if proc.poll() is not None:
+                            break
+                        time.sleep(0.05)
+                        if ctx.cancelled():
+                            _kill_proc(proc)
+                            ctx.log("  ! command cancelled")
+                            return -1
                     break
+                line = item.strip()
                 if line:
-                    line = line.strip()
-                    if line:
-                        ctx.log("  > " + line)
-                
-                # Small sleep to prevent busy-waiting
-                time.sleep(0.01)
-            
+                    ctx.log("  > " + line)
+
+            # Ensure reader thread terminated
+            reader_thread.join(timeout=2.0)
+            # Ensure process reaped
+            try:
+                proc.wait(timeout=2.0)
+            except Exception:
+                pass
             return proc.returncode if proc.returncode is not None else -1
         except Exception as exc:
-            proc.kill()
+            _kill_proc(proc)
             ctx.log(f"  ! ERROR running command: {exc}")
             return -1
     except Exception as exc:
@@ -143,13 +238,13 @@ def run_cmd_checked(ctx: TaskContext, command: str, shell: bool = True, timeout:
 # --------------------------------------------------------------------------- #
 
 def format_bytes(size_bytes: float) -> str:
-    # Use decimal (1000-based) units to match Windows Explorer
-    if size_bytes >= 1000 ** 3:
-        return f"{size_bytes / 1000 ** 3:.2f} GB"
-    if size_bytes >= 1000 ** 2:
-        return f"{size_bytes / 1000 ** 2:.2f} MB"
-    if size_bytes >= 1000:
-        return f"{size_bytes / 1000:.2f} KB"
+    # Use binary (1024-based) units to match Windows Explorer and gui disk monitor
+    if size_bytes >= 1024 ** 3:
+        return f"{size_bytes / 1024 ** 3:.2f} GB"
+    if size_bytes >= 1024 ** 2:
+        return f"{size_bytes / 1024 ** 2:.2f} MB"
+    if size_bytes >= 1024:
+        return f"{size_bytes / 1024:.2f} KB"
     return f"{int(size_bytes)} Bytes"
 
 
@@ -228,6 +323,18 @@ _TYPE_MAP = {
 }
 
 
+def _reg_access(write: bool = True) -> int:
+    """Registry access mask with 64-bit view fallback (avoids Wow6432Node redirect)."""
+    if not IS_WINDOWS:
+        return 0
+    base = winreg.KEY_WRITE if write else winreg.KEY_READ
+    # KEY_WOW64_64KEY ensures we touch the real 64-bit hive on 64-bit Windows
+    try:
+        return base | winreg.KEY_WOW64_64KEY  # type: ignore[attr-defined]
+    except AttributeError:
+        return base
+
+
 def reg_set_value(ctx: TaskContext, hive: str, path: str, name: str, value, value_type: str = "REG_DWORD") -> bool:
     ctx.log(f"reg add {hive}\\{path} /v {name or '(Default)'} /d {value}")
     if ctx.dry_run:
@@ -235,7 +342,7 @@ def reg_set_value(ctx: TaskContext, hive: str, path: str, name: str, value, valu
     key = None
     try:
         root = _HIVES[hive]
-        key = winreg.CreateKeyEx(root, path, 0, winreg.KEY_WRITE)
+        key = winreg.CreateKeyEx(root, path, 0, _reg_access(write=True))
         winreg.SetValueEx(key, name if name else None, 0, _TYPE_MAP[value_type], value)
         return True
     except Exception as exc:
@@ -256,7 +363,14 @@ def reg_delete_value(ctx: TaskContext, hive: str, path: str, name: str) -> bool:
     key = None
     try:
         root = _HIVES[hive]
-        key = winreg.OpenKey(root, path, 0, winreg.KEY_SET_VALUE)
+        # Use 64-bit view access if available
+        access = _reg_access(write=True)
+        # Ensure SET_VALUE is included (KEY_WRITE includes it, but be explicit)
+        try:
+            access = access | winreg.KEY_SET_VALUE
+        except Exception:
+            pass
+        key = winreg.OpenKey(root, path, 0, access)
         winreg.DeleteValue(key, name)
         return True
     except FileNotFoundError:
@@ -290,7 +404,12 @@ def reg_delete_key(ctx: TaskContext, hive: str, path: str) -> bool:
 def _reg_delete_tree(root, path: str):
     key = None
     try:
-        key = winreg.OpenKey(root, path, 0, winreg.KEY_ALL_ACCESS)
+        access = winreg.KEY_ALL_ACCESS
+        try:
+            access = access | winreg.KEY_WOW64_64KEY  # type: ignore[attr-defined]
+        except AttributeError:
+            pass
+        key = winreg.OpenKey(root, path, 0, access)
     except FileNotFoundError:
         return
     try:
@@ -309,33 +428,18 @@ def _reg_delete_tree(root, path: str):
     winreg.DeleteKey(root, path)
 
 
-def reg_get_value(hive: str, path: str, name: str, default=None):
-    """Read a single registry value. Returns `default` if the key/value doesn't exist."""
-    if not IS_WINDOWS:
-        return default
-    key = None
-    try:
-        root = _HIVES[hive]
-        key = winreg.OpenKey(root, path)
-        value, _type = winreg.QueryValueEx(key, name)
-        return value
-    except Exception:
-        return default
-    finally:
-        if key is not None:
-            try:
-                winreg.CloseKey(key)
-            except Exception:
-                pass
-
-
 def reg_key_exists(hive: str, path: str) -> bool:
     if not IS_WINDOWS:
         return False
     key = None
     try:
         root = _HIVES[hive]
-        key = winreg.OpenKey(root, path)
+        access = winreg.KEY_READ
+        try:
+            access = access | winreg.KEY_WOW64_64KEY  # type: ignore[attr-defined]
+        except AttributeError:
+            pass
+        key = winreg.OpenKey(root, path, 0, access)
         return True
     except FileNotFoundError:
         return False

@@ -7,8 +7,7 @@ import subprocess
 import time
 
 from app.utils import (
-    TaskContext, reg_set_value, reg_delete_value, reg_delete_key, reg_get_value,
-    run_cmd, create_restore_point, IS_WINDOWS,
+    TaskContext, reg_set_value, reg_delete_value, reg_delete_key, run_cmd, create_restore_point, IS_WINDOWS,
 )
 
 if IS_WINDOWS:
@@ -19,8 +18,11 @@ BALANCED_GUID = "381b4222-f694-41f0-9685-ff5bb260df2e"
 CONTEXT_MENU_CLSID = "{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}"
 
 
+import functools
+
+@functools.lru_cache(maxsize=1)
 def _has_ssd() -> bool:
-    """Check if system has at least one SSD drive."""
+    """Check if system has at least one SSD drive (cached — PowerShell is slow)."""
     if not IS_WINDOWS:
         return False
     try:
@@ -154,12 +156,22 @@ def revert_games_priority(ctx: TaskContext):
     reg_set_value(ctx, "HKLM", base, "SFIO Priority", 2)
 
 
+def _open_interfaces_key():
+    # Use 64-bit view to match reg_set_value's WOW64 writes
+    access = winreg.KEY_READ
+    try:
+        access |= winreg.KEY_WOW64_64KEY  # type: ignore[attr-defined]
+    except AttributeError:
+        pass
+    return winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces", 0, access)
+
+
 def apply_disable_nagle(ctx: TaskContext):
     base = "SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces"
     if not IS_WINDOWS:
         return
     try:
-        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base)
+        key = _open_interfaces_key()
         try:
             i = 0
             while True:
@@ -181,7 +193,7 @@ def revert_disable_nagle(ctx: TaskContext):
     if not IS_WINDOWS:
         return
     try:
-        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base)
+        key = _open_interfaces_key()
         try:
             i = 0
             while True:
@@ -190,9 +202,11 @@ def revert_disable_nagle(ctx: TaskContext):
                 except OSError:
                     break
                 i += 1
-                # Restore Windows defaults: TcpAckFrequency=1, TCPNoDelay=0
-                reg_set_value(ctx, "HKLM", f"{base}\\{sub}", "TcpAckFrequency", 1)
-                reg_set_value(ctx, "HKLM", f"{base}\\{sub}", "TCPNoDelay", 0)
+                # Revert to true Windows default: delete the values (absent = delayed ACK)
+                # Previously set to 1 which is not the default (default is absent -> 2)
+                from app.utils import reg_delete_value
+                reg_delete_value(ctx, "HKLM", f"{base}\\{sub}", "TcpAckFrequency")
+                reg_delete_value(ctx, "HKLM", f"{base}\\{sub}", "TCPNoDelay")
         finally:
             winreg.CloseKey(key)
     except FileNotFoundError:
@@ -297,30 +311,15 @@ def revert_disk_timeout(ctx: TaskContext):
     run_cmd(ctx, "powercfg /change disk-timeout-dc 20")
 
 
-_KEYBOARD_BACKUP_PATH = "Control Panel\\Keyboard"
-
-
 def apply_keyboard_tuning(ctx: TaskContext):
-    # Capture whatever the user's current values are (they vary by machine/
-    # prior customization) before overwriting, so revert restores the exact
-    # prior state instead of a guessed "default".
-    from app.config_persist import load_config, save_config
-    prev_delay = reg_get_value("HKCU", _KEYBOARD_BACKUP_PATH, "KeyboardDelay", "1")
-    prev_speed = reg_get_value("HKCU", _KEYBOARD_BACKUP_PATH, "KeyboardSpeed", "0")
-    config = load_config()
-    config["_keyboard_tuning_backup"] = {"KeyboardDelay": str(prev_delay), "KeyboardSpeed": str(prev_speed)}
-    save_config(config)
-
     reg_set_value(ctx, "HKCU", "Control Panel\\Keyboard", "KeyboardDelay", "0", value_type="REG_SZ")
     reg_set_value(ctx, "HKCU", "Control Panel\\Keyboard", "KeyboardSpeed", "31", value_type="REG_SZ")
 
 
 def revert_keyboard_tuning(ctx: TaskContext):
-    from app.config_persist import load_config
-    config = load_config()
-    backup = config.get("_keyboard_tuning_backup") or {"KeyboardDelay": "1", "KeyboardSpeed": "0"}
-    reg_set_value(ctx, "HKCU", "Control Panel\\Keyboard", "KeyboardDelay", backup["KeyboardDelay"], value_type="REG_SZ")
-    reg_set_value(ctx, "HKCU", "Control Panel\\Keyboard", "KeyboardSpeed", backup["KeyboardSpeed"], value_type="REG_SZ")
+    # Windows defaults: KeyboardDelay 1 (250ms), KeyboardSpeed 31 (fastest). Verified via AskVG/TenForums.
+    reg_set_value(ctx, "HKCU", "Control Panel\\Keyboard", "KeyboardDelay", "1", value_type="REG_SZ")
+    reg_set_value(ctx, "HKCU", "Control Panel\\Keyboard", "KeyboardSpeed", "31", value_type="REG_SZ")
 
 
 def apply_ssd_trim(ctx: TaskContext):
@@ -335,7 +334,9 @@ def revert_ssd_trim(ctx: TaskContext):
     if not _has_ssd():
         ctx.log("No SSD detected — skipping TRIM revert.")
         return
-    run_cmd(ctx, "fsutil behavior set disabledeletenotify 1")
+    # Revert should restore Windows default (TRIM enabled = 0), not disable TRIM (1).
+    # Disabling TRIM harms SSD performance/lifespan.
+    run_cmd(ctx, "fsutil behavior set disabledeletenotify 0")
 
 
 def apply_ssd_superfetch(ctx: TaskContext):
@@ -388,121 +389,6 @@ def revert_ssd_prefetch(ctx: TaskContext):
                   "EnablePrefetcher", 3)
     reg_set_value(ctx, "HKLM", "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management\\PrefetchParameters",
                   "EnableSuperfetch", 3)
-
-
-# --------------------------------------------------------------------------- #
-# Defender exclusions for known game install folders
-# --------------------------------------------------------------------------- #
-
-def apply_defender_game_exclusions(ctx: TaskContext):
-    """Exclude auto-detected Steam/Epic/GOG/Battle.net/Riot/Ubisoft/EA game
-    install folders from Windows Defender real-time scanning. This only
-    touches folders we can verify exist on disk under a known launcher's
-    install location — never a whole drive, never Downloads or a user
-    profile root. Reduces AV-scan-induced stutter during asset streaming,
-    at the cost of Defender no longer scanning those specific folders."""
-    from app.tasks.game_install_dirs import discover_all_game_install_dirs
-    from app.config_persist import load_config, save_config
-
-    ctx.set_status("Detecting installed game folders...")
-    paths = discover_all_game_install_dirs()
-    if not paths:
-        ctx.log("No known game install folders were found — nothing to exclude.")
-        return
-
-    ctx.log(f"Found {len(paths)} game folder(s) to exclude from Defender scanning:")
-    for p in paths:
-        ctx.log(f"  {p}")
-
-    if ctx.dry_run:
-        ctx.log("  (dry run - Defender exclusions not applied)")
-        return
-
-    # Build a single Add-MpPreference call with all paths at once.
-    ps_paths = ",".join(f"'{p}'" for p in paths)
-    ps_cmd = f'powershell -NoProfile -Command "Add-MpPreference -ExclusionPath @({ps_paths})"'
-    rc = run_cmd(ctx, ps_cmd, timeout=60)
-    if rc == 0:
-        config = load_config()
-        config["_defender_exclusions_added"] = paths
-        save_config(config)
-        ctx.log("Defender exclusions applied.")
-    else:
-        ctx.log("  ! Could not apply Defender exclusions (Defender may be managed by policy/another AV).")
-
-
-def revert_defender_game_exclusions(ctx: TaskContext):
-    """Remove exactly the exclusions this app added (tracked in config), not
-    any exclusions the user configured themselves."""
-    from app.config_persist import load_config, save_config
-
-    config = load_config()
-    paths = config.get("_defender_exclusions_added") or []
-    if not paths:
-        ctx.log("No Defender exclusions were recorded as added by this app — nothing to revert.")
-        return
-    ps_paths = ",".join(f"'{p}'" for p in paths)
-    ps_cmd = f'powershell -NoProfile -Command "Remove-MpPreference -ExclusionPath @({ps_paths})"'
-    run_cmd(ctx, ps_cmd, timeout=60)
-    config["_defender_exclusions_added"] = []
-    save_config(config)
-    ctx.log("Defender exclusions removed.")
-
-
-# --------------------------------------------------------------------------- #
-# Defender scheduled scan off-hours
-# --------------------------------------------------------------------------- #
-
-def apply_scan_offhours(ctx: TaskContext):
-    """Move Defender's scheduled (not real-time) scan to 3 AM daily instead
-    of whatever randomized time it currently uses, so it doesn't kick off
-    mid-session."""
-    run_cmd(ctx, 'powershell -NoProfile -Command '
-                 '"Set-MpPreference -ScanScheduleDay 0 -ScanScheduleTime 03:00:00"', timeout=30)
-
-
-def revert_scan_offhours(ctx: TaskContext):
-    """Restore Defender's typical out-of-box schedule (scan every day,
-    around 2 AM). Windows normally randomizes this; this is a reasonable
-    approximation of default, not a captured original value."""
-    run_cmd(ctx, 'powershell -NoProfile -Command '
-                 '"Set-MpPreference -ScanScheduleDay 0 -ScanScheduleTime 02:00:00"', timeout=30)
-
-
-# --------------------------------------------------------------------------- #
-# Windows Update Active Hours (avoid forced restarts during gaming)
-# --------------------------------------------------------------------------- #
-
-def apply_active_hours_gaming(ctx: TaskContext):
-    """Widen Active Hours to 8 AM - 11 PM so Windows Update won't force a
-    restart during a typical gaming session."""
-    reg_set_value(ctx, "HKLM", "SOFTWARE\\Microsoft\\WindowsUpdate\\UX\\Settings", "ActiveHoursStart", 8)
-    reg_set_value(ctx, "HKLM", "SOFTWARE\\Microsoft\\WindowsUpdate\\UX\\Settings", "ActiveHoursEnd", 23)
-
-
-def revert_active_hours_gaming(ctx: TaskContext):
-    """Remove the explicit values so Windows goes back to automatically
-    detecting active hours from usage patterns."""
-    reg_delete_value(ctx, "HKLM", "SOFTWARE\\Microsoft\\WindowsUpdate\\UX\\Settings", "ActiveHoursStart")
-    reg_delete_value(ctx, "HKLM", "SOFTWARE\\Microsoft\\WindowsUpdate\\UX\\Settings", "ActiveHoursEnd")
-
-
-# --------------------------------------------------------------------------- #
-# Delivery Optimization: stop uploading update chunks to the internet
-# --------------------------------------------------------------------------- #
-
-def apply_delivery_optimization_lan(ctx: TaskContext):
-    """Set Delivery Optimization to LAN-only (mode 1): Windows still gets
-    updates from Microsoft and can share/receive them with PCs on your own
-    network, but stops uploading your bandwidth to PCs elsewhere on the
-    internet."""
-    reg_set_value(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\DeliveryOptimization",
-                  "DODownloadMode", 1)
-
-
-def revert_delivery_optimization_lan(ctx: TaskContext):
-    reg_delete_value(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\DeliveryOptimization",
-                     "DODownloadMode")
 
 
 from app.tasks import Task  # noqa: E402
@@ -580,17 +466,4 @@ TASKS = [
     Task("ssd_prefetch", "Disable Prefetcher",
          "Disables Prefetch/Superfetch — not needed on fast storage.",
          apply_ssd_prefetch, default=False, revert=revert_ssd_prefetch, risk="REBOOT REQUIRED", column=1),
-    Task("defender_game_exclusions", "Exclude Game Folders (Defender)",
-         "Stops antivirus scanning from causing stutter in Steam/Epic/GOG/etc. game folders. Reduces AV coverage there — only use for folders you trust.",
-         apply_defender_game_exclusions, default=False, revert=revert_defender_game_exclusions,
-         risk="ADVANCED", column=1),
-    Task("scan_offhours", "Move Antivirus Scans to 3 AM",
-         "Schedules Defender's full scan for 3 AM instead of a random time, so it won't start mid-session.",
-         apply_scan_offhours, default=False, revert=revert_scan_offhours, column=1),
-    Task("active_hours_gaming", "Block Update Restarts (8am-11pm)",
-         "Tells Windows Update not to force a restart between 8 AM and 11 PM.",
-         apply_active_hours_gaming, default=True, revert=revert_active_hours_gaming, column=0),
-    Task("delivery_optimization_lan", "Stop Uploading Updates to Strangers",
-         "Keeps update sharing on your own network only — stops Windows uploading update files to other PCs over the internet.",
-         apply_delivery_optimization_lan, default=True, revert=revert_delivery_optimization_lan, column=0),
 ]

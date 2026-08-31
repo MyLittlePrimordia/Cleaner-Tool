@@ -24,7 +24,11 @@ def _get_executable_and_args():
 
 
 def _build_schtasks_cmd(frequency, time_str):
-    """Build schtasks command to create the scheduled task."""
+    """Build schtasks command to create the scheduled task.
+
+    Returns a list suitable for subprocess.run(shell=False) to avoid quoting issues
+    when the executable path contains spaces (e.g. C:\\Program Files\\...).
+    """
     exe, args = _get_executable_and_args()
     schedule_map = {
         "daily": "DAILY",
@@ -32,11 +36,19 @@ def _build_schtasks_cmd(frequency, time_str):
         "monthly": "MONTHLY",
     }
     sched = schedule_map.get(frequency, "WEEKLY")
-    
-    # Build command with proper quoting using subprocess.list2cmdline
     task_run = subprocess.list2cmdline([exe] + args)
-    cmd = f'schtasks /Create /TN "{TASK_NAME}" /TR {task_run} /SC {sched} /ST {time_str} /F /RL HIGHEST /IT'
+    cmd = [
+        "schtasks", "/Create", "/TN", TASK_NAME,
+        "/TR", task_run,
+        "/SC", sched, "/ST", time_str,
+        "/F", "/RL", "HIGHEST", "/IT",
+    ]
     return cmd
+
+
+def _build_schtasks_cmd_str(frequency, time_str) -> str:
+    """Legacy string form for display / debugging (properly quoted)."""
+    return subprocess.list2cmdline(_build_schtasks_cmd(frequency, time_str))
 
 
 def enable_schedule(frequency="weekly", time_str="03:00"):
@@ -46,10 +58,11 @@ def enable_schedule(frequency="weekly", time_str="03:00"):
     config["schedule_frequency"] = frequency
     config["schedule_time"] = time_str
     save_config(config)
-    
+
     cmd = _build_schtasks_cmd(frequency, time_str)
     try:
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+        # Use list form with shell=False to handle spaces in paths correctly
+        result = subprocess.run(cmd, shell=False, capture_output=True, text=True, timeout=30)
         return result.returncode == 0, result.stdout or result.stderr
     except Exception as e:
         return False, str(e)
@@ -61,9 +74,9 @@ def disable_schedule():
     config["schedule_enabled"] = False
     save_config(config)
     
-    cmd = f'schtasks /Delete /TN "{TASK_NAME}" /F'
+    cmd = ["schtasks", "/Delete", "/TN", TASK_NAME, "/F"]
     try:
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(cmd, shell=False, capture_output=True, text=True, timeout=30)
         return result.returncode == 0, result.stdout or result.stderr
     except Exception as e:
         return False, str(e)
@@ -71,9 +84,9 @@ def disable_schedule():
 
 def get_schedule_status():
     """Check if the scheduled task exists and get its details."""
-    cmd = f'schtasks /Query /TN "{TASK_NAME}" /V /FO LIST'
+    cmd = ["schtasks", "/Query", "/TN", TASK_NAME, "/V", "/FO", "LIST"]
     try:
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(cmd, shell=False, capture_output=True, text=True, timeout=30)
         return result.returncode == 0, result.stdout
     except Exception:
         return False, ""
@@ -106,21 +119,29 @@ def run_auto_clean(selected_tasks_by_tab):
     if not tasks_to_run:
         return False, "No tasks selected for auto-clean"
     
-    # Run synchronously (this is called from the scheduled task, not GUI).
-    # Must satisfy the same interface as TaskContext (dry_run / cancelled) —
-    # every task function and helper (run_cmd, clean_folder_contents,
-    # reg_set_value, ...) reads ctx.dry_run / ctx.cancelled() directly, so a
-    # bare log/set_status-only stand-in raises AttributeError on every task.
-    logs = []
+    # Run synchronously (this is called from the scheduled task, not GUI)
+    # Must satisfy TaskContext contract (log, set_status, dry_run, cancelled)
+    class AutoCtx(TaskContext):
+        def __init__(self):
+            self.logs = []
+            super().__init__(
+                log=self._log,
+                set_status=self._set_status,
+                dry_run=False,
+                cancelled=lambda: False,
+            )
+        def _log(self, msg):
+            self.logs.append(msg)
+            print(f"[AUTO] {msg}")
+        def _set_status(self, msg):
+            print(f"[AUTO STATUS] {msg}")
+        # Keep public aliases for callers that reference .log/.set_status directly
+        def log(self, msg):  # type: ignore[override]
+            self._log(msg)
+        def set_status(self, msg):  # type: ignore[override]
+            self._set_status(msg)
 
-    def _log(msg):
-        logs.append(msg)
-        print(f"[AUTO] {msg}")
-
-    def _set_status(msg):
-        print(f"[AUTO STATUS] {msg}")
-
-    ctx = TaskContext(log=_log, set_status=_set_status, dry_run=False, cancelled=lambda: False)
+    ctx = AutoCtx()
     total_bytes = 0
     completed, failed = 0, 0
     

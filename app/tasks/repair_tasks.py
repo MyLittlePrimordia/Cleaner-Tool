@@ -39,7 +39,12 @@ def repair_dism_resetbase(ctx: TaskContext):
 
 def repair_chkdsk_scan(ctx: TaskContext):
     ctx.set_status("Scanning the system drive for filesystem errors (read-only)...")
-    run_cmd(ctx, f"chkdsk {os.environ.get('SYSTEMDRIVE', 'C:')} /scan", timeout=900)
+    _sd = os.environ.get("SYSTEMDRIVE", "C:")
+    if len(_sd) == 2 and _sd[1] == ":":
+        _sd_root = _sd + "\\"
+    else:
+        _sd_root = _sd if _sd.endswith("\\") else _sd + "\\"
+    run_cmd(ctx, f"chkdsk {_sd_root} /scan", timeout=900)
 
 
 def repair_windows_update_reset(ctx: TaskContext):
@@ -63,15 +68,21 @@ def repair_windows_update_reset(ctx: TaskContext):
                 backup = folder + ".bak"
                 try:
                     if os.path.exists(backup):
-                        shutil.rmtree(backup, ignore_errors=True)
-                    if not ctx.dry_run:
+                        if ctx.dry_run:
+                            ctx.log(f"Would remove existing backup {backup} (dry run)")
+                        else:
+                            shutil.rmtree(backup, ignore_errors=True)
+                    if ctx.dry_run:
+                        ctx.log(f"Would rename {folder} -> {backup} (dry run)")
+                        # Don't append to renamed in dry-run — not actually renamed
+                    else:
                         os.rename(folder, backup)
-                    renamed.append((folder, backup))
-                    ctx.log(f"Renamed {folder} -> {backup}")
+                        renamed.append((folder, backup))
+                        ctx.log(f"Renamed {folder} -> {backup}")
                 except Exception as exc:
                     ctx.log(f"  ! could not rename {folder}: {exc}")
                     # Rollback any previously renamed folders
-                    for orig, bak in reversed(renamed[:-1]):
+                    for orig, bak in reversed(renamed):
                         try:
                             if os.path.exists(bak):
                                 if os.path.exists(orig):
@@ -83,7 +94,22 @@ def repair_windows_update_reset(ctx: TaskContext):
                     raise
     finally:
         for svc in reversed(stopped_services):
-            run_cmd(ctx, f"net start {svc}", timeout=30)
+            rc = run_cmd(ctx, f"net start {svc}", timeout=30)
+            if rc != 0:
+                ctx.log(f"  ! Warning: could not start {svc} (code {rc}) — may need reboot")
+        # If rename succeeded and Windows recreated the folders, clean up .bak to reclaim space
+        # (otherwise leave .bak for next run's rmtree). Don't block on deletion.
+        if not ctx.dry_run and renamed:
+            import time as _time
+            _time.sleep(2.0)
+            for orig, bak in renamed:
+                if os.path.exists(orig) and os.path.exists(bak):
+                    try:
+                        shutil.rmtree(bak, ignore_errors=True)
+                        if not os.path.exists(bak):
+                            ctx.log(f"Cleaned up backup {bak}")
+                    except Exception:
+                        pass
 
 
 def repair_network_reset(ctx: TaskContext):
@@ -98,21 +124,31 @@ def repair_network_reset(ctx: TaskContext):
 
 def repair_search_index(ctx: TaskContext):
     ctx.set_status("Rebuilding the Windows Search index...")
-    run_cmd(ctx, "net stop WSearch", timeout=30)
-    # Fixed path: ProgramData is at system drive root, not inside Windows
-    program_data = os.environ.get("ProgramData", os.path.join(os.environ.get("SYSTEMDRIVE", "C:"), "ProgramData"))
+    rc_stop = run_cmd(ctx, "net stop WSearch", timeout=30)
+    # ProgramData is at drive root; handle bare "C:" correctly
+    _sd = os.environ.get("SYSTEMDRIVE", "C:")
+    if len(_sd) == 2 and _sd[1] == ":":
+        _sd_root = _sd + "\\"
+    else:
+        _sd_root = _sd if _sd.endswith("\\") else _sd + "\\"
+    program_data = os.environ.get("ProgramData", os.path.join(_sd_root, "ProgramData"))
     index_db = os.path.join(program_data, "Microsoft\\Search\\Data\\Applications\\Windows")
     if os.path.exists(index_db) and not ctx.dry_run:
-        try:
-            shutil.rmtree(index_db, ignore_errors=False)
-            ctx.log(f"Cleared search index database at {index_db}")
-        except Exception as exc:
-            ctx.log(f"  ! could not clear search index: {exc}")
+        if rc_stop != 0:
+            ctx.log(f"  ! WSearch stop failed (code {rc_stop}) — skipping delete to avoid partial lock")
+        else:
+            try:
+                shutil.rmtree(index_db, ignore_errors=False)
+                ctx.log(f"Cleared search index database at {index_db}")
+            except Exception as exc:
+                ctx.log(f"  ! could not clear search index: {exc}")
     elif os.path.exists(index_db):
         ctx.log(f"Would clear search index at {index_db} (dry run)")
     else:
         ctx.log(f"Search index path not found: {index_db}")
-    run_cmd(ctx, "net start WSearch", timeout=30)
+    rc_start = run_cmd(ctx, "net start WSearch", timeout=30)
+    if rc_start != 0:
+        ctx.log(f"  ! Warning: could not start WSearch (code {rc_start})")
     ctx.log("Search index will rebuild automatically in the background.")
 
 
@@ -199,16 +235,19 @@ def repair_enable_virtual_machine_platform(ctx: TaskContext):
 
 
 def repair_disable_storage_sense_active_hours(ctx: TaskContext):
-    """Prevent Storage Sense from running cleanup during active hours (prevents gaming stutters)."""
-    ctx.set_status("Configuring Storage Sense to avoid active hours...")
-    run_cmd(ctx, "reg add HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\StorageSense\\Parameters\\StoragePolicy /v 01 /t REG_DWORD /d 1 /f", timeout=30)
-    ctx.log("Storage Sense configured to run only during free disk space cleanup.")
+    """Configure Storage Sense master switch (HKCU). Value 01 = on/off."""
+    ctx.set_status("Configuring Storage Sense...")
+    # Correct hive is HKCU, not HKLM — StoragePolicy lives under HKCU\SOFTWARE\...
+    from app.utils import reg_set_value
+    reg_set_value(ctx, "HKCU", "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\StorageSense\\Parameters\\StoragePolicy", "01", 1)
+    ctx.log("Storage Sense configured.")
 
 
 def repair_enable_storage_sense_active_hours(ctx: TaskContext):
-    """Restore Storage Sense default behavior."""
+    """Restore Storage Sense default behavior (HKCU)."""
     ctx.set_status("Restoring Storage Sense default behavior...")
-    run_cmd(ctx, "reg delete HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\StorageSense\\Parameters\\StoragePolicy /v 01 /f", timeout=30)
+    from app.utils import reg_delete_value
+    reg_delete_value(ctx, "HKCU", "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\StorageSense\\Parameters\\StoragePolicy", "01")
     ctx.log("Storage Sense restored to default.")
 
 
@@ -240,8 +279,7 @@ TASKS = [
          "Clears stuck background downloads that block updates.",
          repair_bits_reset, default=False, column=1),
     Task("disable_memory_integrity", "Disable Memory Integrity (HVCI)",
-         "SECURITY TRADE-OFF, not just a tweak: can gain 5-25% FPS in CPU-bound games, but removes "
-         "Windows' protection against kernel-level exploits. Most users should leave this on.",
+         "Disables HVCI for 5-25% FPS gain in CPU-bound games. Reduces kernel exploit protection.",
          repair_disable_memory_integrity, default=False, revert=repair_enable_memory_integrity, risk="ADVANCED", column=0),
     Task("disable_vm_platform", "Disable Virtual Machine Platform",
          "Disables Hyper-V/Virtual Machine Platform if not using WSL2. Reduces CPU overhead.",

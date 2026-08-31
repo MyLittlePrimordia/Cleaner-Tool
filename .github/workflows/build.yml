@@ -10,10 +10,15 @@ on:
     branches: [ "main" ]
   workflow_dispatch: {}
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build .exe
     runs-on: windows-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout repository
@@ -32,7 +37,7 @@ jobs:
       - name: Build with PyInstaller
         # --onefile  : single portable .exe
         # --windowed : no console window behind the GUI
-        # --manifest : embed admin manifest so .exe auto-requests elevation
+        # --manifest : embed asInvoker manifest (elevation only via GUI Admin Gate, not forced)
         # --icon / --add-data : bundle colored 🧼 icon from app/assets
         run: >
           pyinstaller --onefile --windowed

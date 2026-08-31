@@ -12,7 +12,7 @@ import time
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 
-from app.config import APP_NAME, APP_SHORT_NAME, APP_VERSION, WINDOW_SIZE, WINDOW_MIN_SIZE, COLORS, FONT_FAMILY, MONO_FONT_FAMILY
+from app.config import APP_NAME, WINDOW_SIZE, WINDOW_MIN_SIZE, COLORS, FONT_FAMILY, MONO_FONT_FAMILY
 from app.elevation import is_admin, relaunch_as_admin
 from app.utils import TaskContext, format_bytes
 from app.tasks import clean_tasks, repair_tasks, tweak_tasks, game_tasks
@@ -163,18 +163,70 @@ class AdminGateFrame(tk.Frame):
 
     def _restart_elevated(self):
         if relaunch_as_admin():
-            self.root.after(100, lambda: self.root.destroy())
-            # Wait for elevated process to signal it started
-            from app.elevation import wait_for_elevated_process
-            if wait_for_elevated_process(timeout=15.0):
-                sys.exit(0)
-            else:
-                # Elevated process didn't start in time (user cancelled UAC)
-                # Re-show the admin gate
-                messagebox.showwarning("Elevation Cancelled", "Administrator elevation was cancelled or timed out. Continuing in limited mode.")
-                self._continue_limited()
+            # Disable buttons and show waiting state without blocking the main thread
+            for child in self.winfo_children():
+                try:
+                    for btn in child.winfo_children():
+                        for sub in btn.winfo_children():
+                            if isinstance(sub, tk.Button):
+                                sub.config(state="disabled")
+                except Exception:
+                    pass
+            # Also disable direct buttons in btn_row if found
+            self._set_elevate_buttons_state("disabled")
+            self._wait_status = tk.Label(self, text="Waiting for elevation (UAC)...", font=(FONT_FAMILY, 8),
+                                         bg=COLORS["bg"], fg=COLORS["accent_blue"])
+            self._wait_status.pack(pady=(8, 0))
+
+            def _wait_thread():
+                from app.elevation import wait_for_elevated_process
+                success = wait_for_elevated_process(timeout=15.0)
+                # All UI work must happen on main thread via after
+                def _on_done():
+                    if success:
+                        try:
+                            self.root.destroy()
+                        except Exception:
+                            pass
+                        sys.exit(0)
+                    else:
+                        # Elevated process didn't start in time (user cancelled UAC)
+                        try:
+                            if hasattr(self, "_wait_status") and self._wait_status.winfo_exists():
+                                self._wait_status.destroy()
+                        except Exception:
+                            pass
+                        self._set_elevate_buttons_state("normal")
+                        try:
+                            messagebox.showwarning("Elevation Cancelled", "Administrator elevation was cancelled or timed out. Continuing in limited mode.")
+                        except Exception:
+                            pass
+                        self._continue_limited()
+                # Schedule on Tk main loop (after may fail if root destroyed)
+                try:
+                    self.root.after(0, _on_done)
+                except Exception:
+                    # Root already destroyed
+                    pass
+
+            threading.Thread(target=_wait_thread, daemon=True).start()
         else:
             messagebox.showerror("Elevation Failed", "Could not request administrator rights. You can still continue in limited mode.")
+
+    def _set_elevate_buttons_state(self, state: str):
+        # Find buttons in this frame and set state
+        try:
+            for wrapper in self.winfo_children():
+                for child in wrapper.winfo_children():
+                    if isinstance(child, tk.Frame):
+                        for btn in child.winfo_children():
+                            if isinstance(btn, tk.Button):
+                                try:
+                                    btn.config(state=state)
+                                except Exception:
+                                    pass
+        except Exception:
+            pass
 
     def _continue_limited(self):
         self.destroy()
@@ -234,9 +286,14 @@ class TaskTab(tk.Frame):
         }
 
         # distribute tasks round-robin across 3 columns to eliminate vertical scroll
+        # Note: Task.column is legacy/deprecated — layout is auto-balanced via round-robin
         col_rows = {0: 0, 1: 0, 2: 0}
         for idx, task in enumerate(self.tasks):
-            col = idx % 3
+            # Honor explicit column if it was intentionally set to 2, otherwise round-robin for balance
+            if hasattr(task, "column") and task.column == 2 and len(self.tasks) > 6:
+                col = 2
+            else:
+                col = idx % 3
             row = col_rows[col]
             col_rows[col] += 1
             var = tk.BooleanVar(value=task.default)
@@ -320,7 +377,7 @@ class TaskTab(tk.Frame):
 class Application:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title(APP_SHORT_NAME)  # show as "Cleaner Tool" with 🧼 icon next to it
+        self.root.title("Cleaner")  # show as Cleaner with 🧼 icon next to it
         self.root.geometry(WINDOW_SIZE)
         self.root.minsize(*WINDOW_MIN_SIZE)
         
@@ -358,6 +415,30 @@ class Application:
         style.configure("TProgressbar", thickness=10, troughcolor=COLORS["surface"],
                         background=COLORS["accent_green"])
         style.configure("TCheckbutton", background=COLORS["bg"], foreground=COLORS["text"])
+        # Combobox dark theme — fixes white-on-white popup reported in Auto Maintenance dialog
+        style.configure("TCombobox",
+                        fieldbackground=COLORS["surface"],
+                        background=COLORS["surface"],
+                        foreground=COLORS["text"],
+                        arrowcolor=COLORS["text"],
+                        selectbackground=COLORS["surface_hover"],
+                        selectforeground=COLORS["text"],
+                        bordercolor=COLORS["surface"],
+                        lightcolor=COLORS["surface"],
+                        darkcolor=COLORS["surface"])
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", COLORS["surface"]), ("disabled", COLORS["surface"])],
+                  background=[("readonly", COLORS["surface"])],
+                  foreground=[("readonly", COLORS["text"]), ("disabled", COLORS["subtext"])],
+                  selectbackground=[("readonly", COLORS["surface_hover"])],
+                  selectforeground=[("readonly", COLORS["text"])],
+                  arrowcolor=[("readonly", COLORS["text"])])
+        # Listbox popup for Combobox (the dropdown) — default is white
+        self.root.option_add("*TCombobox*Listbox.background", COLORS["surface"])
+        self.root.option_add("*TCombobox*Listbox.foreground", COLORS["text"])
+        self.root.option_add("*TCombobox*Listbox.selectBackground", COLORS["surface_hover"])
+        self.root.option_add("*TCombobox*Listbox.selectForeground", COLORS["text"])
+        self.root.option_add("*TCombobox*Listbox.font", (FONT_FAMILY, 9))
 
 
 
@@ -388,7 +469,7 @@ class Application:
                 self._header_soap_img = hdr_img  # keep ref
         except Exception:
             pass
-        tk.Label(header_row, text=APP_SHORT_NAME, font=(FONT_FAMILY, 12, "bold"),
+        tk.Label(header_row, text="Cleaner", font=(FONT_FAMILY, 12, "bold"),
                  bg=COLORS["bg"], fg=COLORS["accent_blue"]).pack(side="left")
         
         mode = "Administrator Mode" if is_admin() else "Limited Mode — Clean only"
@@ -499,19 +580,34 @@ class Application:
                 return
             try:
                 free_bytes = ctypes.c_ulonglong(0)
-                ctypes.windll.kernel32.GetDiskFreeSpaceExW(
-                    ctypes.c_wchar_p("C:\\"), None, None, ctypes.byref(free_bytes)
+                total_bytes = ctypes.c_ulonglong(0)
+                avail_bytes = ctypes.c_ulonglong(0)
+                res = ctypes.windll.kernel32.GetDiskFreeSpaceExW(
+                    ctypes.c_wchar_p("C:\\"),
+                    ctypes.byref(avail_bytes),
+                    ctypes.byref(total_bytes),
+                    ctypes.byref(free_bytes),
                 )
-                gb = free_bytes.value / (1024 ** 3)
-                self.disk_space_var.set(f"C: {gb:.1f} GB free")
+                if res != 0:
+                    gb = free_bytes.value / (1024 ** 3)
+                    try:
+                        self.disk_space_var.set(f"C: {gb:.1f} GB free")
+                    except Exception:
+                        pass
             except Exception:
                 pass
             # Schedule next update (30 seconds)
-            if getattr(self, "_disk_monitor_running", False):
-                self.root.after(30000, update_disk)
+            try:
+                if getattr(self, "_disk_monitor_running", False) and self.root.winfo_exists():
+                    self.root.after(30000, update_disk)
+            except Exception:
+                pass
 
         # Start the first update
-        self.root.after(0, update_disk)
+        try:
+            self.root.after(0, update_disk)
+        except Exception:
+            pass
 
     def _stop_disk_monitor(self):
         self._disk_monitor_running = False
@@ -535,7 +631,6 @@ class Application:
         menubar = tk.Menu(self.root)
         tools_menu = tk.Menu(menubar, tearoff=0)
         tools_menu.add_command(label="Task Manager (Startup tab)", command=lambda: self._launch("taskmgr"))
-        tools_menu.add_command(label="Startup Apps (enable/disable)", command=lambda: self._launch("start ms-settings:startupapps"))
         tools_menu.add_command(label="Disk Cleanup", command=lambda: self._launch("cleanmgr"))
         tools_menu.add_command(label="Reliability Monitor", command=lambda: self._launch("perfmon /rel"))
         tools_menu.add_command(label="Event Viewer", command=lambda: self._launch("eventvwr"))
@@ -556,7 +651,7 @@ class Application:
             messagebox.showerror("Could Not Launch", str(exc))
 
     def _show_about(self):
-        messagebox.showinfo("About", f"{APP_NAME} v{APP_VERSION}\n\nSafe, reversible Windows cleaning & tuning.")
+        messagebox.showinfo("About", f"{APP_NAME}\n\nSafe, reversible Windows cleaning & tuning.")
 
     def _show_schedule_dialog(self):
         from app.config_persist import load_config, save_config
@@ -591,15 +686,26 @@ class Application:
         )
         cb.pack(anchor="w", padx=16, pady=(16, 8))
 
-        # Frequency
+        # Frequency — use tk.OptionMenu with explicit dark styling (ttk.Combobox is white-on-white on Windows dark theme)
         freq_frame = tk.Frame(dlg, bg=COLORS["bg"])
         freq_frame.pack(fill="x", padx=16, pady=4)
         tk.Label(freq_frame, text="Frequency:", bg=COLORS["bg"], fg=COLORS["text"],
                  font=(FONT_FAMILY, 9)).pack(side="left")
         freq_var = tk.StringVar(value=freq)
-        freq_combo = ttk.Combobox(freq_frame, textvariable=freq_var,
-                                   values=["daily", "weekly", "monthly"],
-                                   state="readonly", width=12, font=(FONT_FAMILY, 9))
+        # Dark OptionMenu to replace ttk.Combobox white popup bug
+        freq_combo = tk.OptionMenu(freq_frame, freq_var, "daily", "weekly", "monthly")
+        freq_combo.config(bg=COLORS["surface"], fg=COLORS["text"],
+                          activebackground=COLORS["surface_hover"], activeforeground=COLORS["text"],
+                          highlightthickness=0, bd=0, relief="flat",
+                          font=(FONT_FAMILY, 9), width=12, indicatoron=True)
+        # Style the dropdown Menu itself (otherwise it stays white)
+        try:
+            menu = freq_combo["menu"]
+            menu.config(bg=COLORS["surface"], fg=COLORS["text"],
+                        activebackground=COLORS["surface_hover"], activeforeground=COLORS["text"],
+                        bd=0, relief="flat", font=(FONT_FAMILY, 9))
+        except Exception:
+            pass
         freq_combo.pack(side="right")
 
         # Time
@@ -676,37 +782,64 @@ class Application:
 
     def log(self, text):
         def _do():
-            self.log_area.config(state="normal")
-            self.log_area.insert(tk.END, f"[{time.strftime('%H:%M:%S')}] {text}\n")
-            self.log_area.see(tk.END)
-            self.log_area.config(state="disabled")
-        if threading.current_thread() is threading.main_thread():
-            _do()
-        else:
-            self.root.after(0, _do)
+            try:
+                if not self.log_area.winfo_exists():
+                    return
+                self.log_area.config(state="normal")
+                self.log_area.insert(tk.END, f"[{time.strftime('%H:%M:%S')}] {text}\n")
+                self.log_area.see(tk.END)
+                self.log_area.config(state="disabled")
+            except Exception:
+                pass
+        try:
+            if threading.current_thread() is threading.main_thread():
+                _do()
+            else:
+                self.root.after(0, _do)
+        except Exception:
+            pass
 
     def set_status(self, text):
         def _do():
-            self.lbl_status.config(text=f"Status: {text}")
-        if threading.current_thread() is threading.main_thread():
-            _do()
-        else:
-            self.root.after(0, _do)
+            try:
+                if hasattr(self, "lbl_status") and self.lbl_status.winfo_exists():
+                    self.lbl_status.config(text=f"Status: {text}")
+            except Exception:
+                pass
+        try:
+            if threading.current_thread() is threading.main_thread():
+                _do()
+            else:
+                self.root.after(0, _do)
+        except Exception:
+            pass
 
     def _set_progress(self, value, maximum=None):
         def _do():
-            if maximum is not None:
-                self.progress["maximum"] = maximum
-            self.progress["value"] = value
-        self.root.after(0, _do)
+            try:
+                if maximum is not None:
+                    self.progress["maximum"] = maximum
+                self.progress["value"] = value
+            except Exception:
+                pass
+        try:
+            self.root.after(0, _do)
+        except Exception:
+            pass
 
     def _set_buttons_enabled(self, enabled: bool):
         def _do():
-            for tab in self.tabs.values():
-                tab.set_buttons_enabled(enabled)
-            if getattr(self, "cancel_btn", None) is not None:
-                self.cancel_btn.config(state="normal" if not enabled else "disabled")
-        self.root.after(0, _do)
+            try:
+                for tab in self.tabs.values():
+                    tab.set_buttons_enabled(enabled)
+                if getattr(self, "cancel_btn", None) is not None:
+                    self.cancel_btn.config(state="normal" if not enabled else "disabled")
+            except Exception:
+                pass
+        try:
+            self.root.after(0, _do)
+        except Exception:
+            pass
 
     # -- task execution ----------------------------------------------------- #
 
@@ -737,9 +870,26 @@ class Application:
                 return
             self._busy = True
 
-        # Check for dangerous task combinations
-        warnings = check_dangerous_combos(tasks)
+        # Check for dangerous task combinations — include cross-tab selections for scheduler relevance
+        # Aggregate all tabs' currently checked tasks (not just the tab being run) so cross-tab rules like network_reset+disable_nagle can fire
+        try:
+            all_selected = []
+            for tab in self.tabs.values():
+                all_selected.extend(tab._selected_tasks())
+            # Deduplicate by key in case current tab tasks overlap
+            seen = set()
+            uniq_all = []
+            for t in all_selected:
+                if t.key not in seen:
+                    seen.add(t.key)
+                    uniq_all.append(t)
+            # Also include the explicitly requested tasks (same objects, but ensure)
+            warnings = check_dangerous_combos(uniq_all if len(uniq_all) > len(tasks) else tasks)
+        except Exception:
+            warnings = check_dangerous_combos(tasks)
         if warnings:
+            # Deduplicate identical warnings (reboot bundle overlaps)
+            warnings = list(dict.fromkeys(warnings))
             msg = "⚠️ Potentially problematic task combinations detected:\n\n" + "\n\n".join(warnings)
             msg += "\n\nDo you want to continue?"
             if not messagebox.askyesno("Confirm Task Combination", msg, icon="warning"):
@@ -832,9 +982,12 @@ class Application:
         self._cancel_requested = False
         self._set_buttons_enabled(True)
         self.root.after(0, lambda: messagebox.showinfo("Done", summary))
-        # Toast notification (non-blocking)
+        # Toast notification — must not block Tk thread (PowerShell can cold-start ~2s)
         if total_bytes > 0 or completed > 0:
-            self.root.after(100, lambda: notify_clean_complete(total_bytes, completed))
+            try:
+                threading.Thread(target=notify_clean_complete, args=(total_bytes, completed), daemon=True).start()
+            except Exception:
+                pass
 
 
 def launch():

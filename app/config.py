@@ -4,7 +4,7 @@ Central place for app metadata, window sizing, and the color theme.
 
 APP_NAME = "Cleaner Tool"
 APP_SHORT_NAME = "Cleaner Tool"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.0.0"
 WINDOW_SIZE = "800x620"
 WINDOW_MIN_SIZE = (780, 560)
 

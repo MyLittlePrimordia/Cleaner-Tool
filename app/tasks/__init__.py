@@ -23,4 +23,4 @@ class Task:
     admin_required: bool = True
     risk: str = "SAFE"             # SAFE / ADVANCED / REBOOT REQUIRED (see config.py)
     revert: Optional[Callable[[TaskContext], None]] = None  # tweaks only
-    column: int = 0                # which UI column to place the checkbox in
+    column: int = 0                # deprecated: layout is auto-balanced round-robin in gui.py (kept for backward compat)

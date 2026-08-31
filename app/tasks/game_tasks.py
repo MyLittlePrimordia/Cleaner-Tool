@@ -25,7 +25,9 @@ from app.tasks.launcher_paths import (
 def _clean_many(ctx: TaskContext, folders, label):
     total = 0
     for folder in folders:
-        if folder and os.path.exists(folder):
+        if not folder or not os.path.isabs(folder):
+            continue
+        if os.path.exists(folder):
             ctx.log(f"Cleaning {label}: {folder}")
             total += clean_folder_contents(ctx, folder)
     return total

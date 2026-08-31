@@ -18,28 +18,36 @@ def show_toast(title: str, message: str, duration: str = "short"):
     if not sys.platform.startswith("win"):
         return False
     
-    # Escape for PowerShell
-    title_esc = title.replace("'", "''").replace('"', '""')
-    msg_esc = message.replace("'", "''").replace('"', '""')
+    if duration not in ("short", "long"):
+        duration = "short"
+    
+    # Escape for PowerShell single-quoted strings: '' is escaped '
+    # Use single quotes so $ ` ; not expanded
+    def _esc(s: str) -> str:
+        return s.replace("'", "''")
+    title_esc = _esc(title)
+    msg_esc = _esc(message)
     
     ps_script = f'''
 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
 $template = [Windows.UI.Notifications.ToastTemplateType]::ToastText02
 $xml = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent($template)
 $text = $xml.GetElementsByTagName("text")
-$text[0].AppendChild($xml.CreateTextNode("{title_esc}")) | Out-Null
-$text[1].AppendChild($xml.CreateTextNode("{msg_esc}")) | Out-Null
+$text[0].AppendChild($xml.CreateTextNode('{title_esc}')) | Out-Null
+$text[1].AppendChild($xml.CreateTextNode('{msg_esc}')) | Out-Null
 $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
 $toast.ExpirationTime = [DateTimeOffset]::Now.AddSeconds($({"7" if duration == "short" else "25"}))
 $notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("CleanerTool")
 $notifier.Show($toast)
 '''
     try:
-        subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps_script],
-            capture_output=True, timeout=10, creationflags=subprocess.CREATE_NO_WINDOW
+        # Use -ExecutionPolicy Bypass for restrictive policies; handle missing CREATE_NO_WINDOW on non-Windows
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
+            capture_output=True, timeout=10, creationflags=creationflags
         )
-        return True
+        return result.returncode == 0
     except Exception:
         return False
 

@@ -17,13 +17,18 @@ import pathlib
 if __package__ in (None, ""):
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-# Signal elevated startup early (for elevation coordination)
-from app.elevation import signal_elevated_startup
-signal_elevated_startup()
-
 from app.gui import launch  # noqa: E402
 from app.config_persist import load_config  # noqa: E402
 from app.scheduler import run_auto_clean  # noqa: E402
+
+# Signal elevated startup early (for elevation coordination), but only on Windows
+# and after imports so --elevation-token is already in sys.argv.
+if sys.platform.startswith("win"):
+    try:
+        from app.elevation import signal_elevated_startup
+        signal_elevated_startup()
+    except Exception:
+        pass
 
 
 def main():

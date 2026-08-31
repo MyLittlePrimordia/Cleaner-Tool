@@ -12,7 +12,7 @@ identity = ET.SubElement(root, "assemblyIdentity", {
 })
 
 desc = ET.SubElement(root, "description")
-desc.text = "Cleaner Tool"
+desc.text = "Windows Gamer Maintenance & Optimizer Suite"
 
 trust = ET.SubElement(root, "trustInfo", {
     "xmlns": "urn:schemas-microsoft-com:asm.v2"
@@ -20,7 +20,7 @@ trust = ET.SubElement(root, "trustInfo", {
 security = ET.SubElement(trust, "security")
 priv = ET.SubElement(security, "requestedPrivileges")
 ET.SubElement(priv, "requestedExecutionLevel", {
-    "level": "requireAdministrator",
+    "level": "asInvoker",
     "uiAccess": "false"
 })
 
@@ -47,9 +47,12 @@ dpi2.text = "PerMonitorV2"
 tree = ET.ElementTree(root)
 # Add XML declaration manually since standalone isn't supported
 import io
+import pathlib
 buf = io.BytesIO()
 tree.write(buf, encoding="UTF-8", xml_declaration=True)
 content = buf.getvalue().replace(b'?>', b' standalone="yes"?>')
-with open("app/assets/admin_manifest.xml", "wb") as f:
+out_path = pathlib.Path(__file__).resolve().parent / "app" / "assets" / "admin_manifest.xml"
+out_path.parent.mkdir(parents=True, exist_ok=True)
+with open(out_path, "wb") as f:
     f.write(content)
-print("Written valid manifest")
+print(f"Written valid manifest to {out_path}")

@@ -39,9 +39,9 @@ DANGEROUS_COMBOS = [
         "You only need ONE reboot after all changes. The app will remind you at the end."
     ),
     
-    # Clean Prefetch + other cleaning (prefetch is rarely needed)
+    # Prefetch is rarely needed — warn whenever it is selected
     (
-        ["prefetch", "temp_files", "win_update_cache"],
+        ["prefetch"],
         "⚠️ Clearing Prefetch is rarely needed and may slow down next app launches. "
         "Windows manages this automatically. Consider leaving it unchecked unless troubleshooting."
     ),
@@ -59,32 +59,26 @@ DANGEROUS_COMBOS = [
         "ℹ️ Browser cache cleaning requires browsers to be closed. "
         "Make sure Chrome/Edge/Firefox are not running for best results."
     ),
-
-    # Defender exclusions reduce AV coverage — always surface this, not just on combo
-    (
-        ["defender_game_exclusions"],
-        "⚠️ Excluding game folders stops Windows Defender from scanning them at all. "
-        "Only do this if you trust everything in your game install folders — mods and "
-        "cracked/pirated content are the most common way malware ends up hiding in an "
-        "excluded folder."
-    ),
-
-    # Memory Integrity (HVCI) is a security feature, not just a performance knob
-    (
-        ["disable_memory_integrity"],
-        "⚠️ Memory Integrity (HVCI) is a Windows security feature, not just a performance "
-        "setting — disabling it removes protection against kernel-level exploits. Most "
-        "users should leave this on; only disable it if you understand and accept that trade-off."
-    ),
 ]
 
 
 def check_dangerous_combos(selected_tasks: List[Task]) -> List[str]:
     """Check selected tasks for dangerous combinations.
     
+    Accepts List[Task] or List[str] (keys) for scheduler use.
     Returns list of warning messages.
     """
-    selected_keys = {t.key for t in selected_tasks}
+    # Support both Task objects and raw key strings
+    selected_keys = set()
+    for t in selected_tasks:
+        if isinstance(t, str):
+            selected_keys.add(t)
+        else:
+            try:
+                selected_keys.add(t.key)
+            except AttributeError:
+                # Fallback: treat as string
+                selected_keys.add(str(t))
     warnings = []
     
     for combo_keys, message in DANGEROUS_COMBOS:

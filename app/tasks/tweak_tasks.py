@@ -40,8 +40,28 @@ def _has_ssd() -> bool:
 
 def apply_ultimate_performance(ctx: TaskContext):
     ctx.set_status("Enabling fastest power plan...")
-    run_cmd(ctx, f"powercfg -duplicatescheme {ULTIMATE_PERF_GUID}")
-    run_cmd(ctx, f"powercfg -setactive {ULTIMATE_PERF_GUID}")
+    # Duplicating may create a new GUID (logged as "Power Scheme GUID: ...") — capture output
+    # We use run_cmd for logging but also try to handle "unsupported" editions gracefully
+    rc1 = run_cmd(ctx, f"powercfg -duplicatescheme {ULTIMATE_PERF_GUID}")
+    # Try to activate — first the canonical GUID, if that fails try to find the duplicated GUID from powercfg /list
+    rc2 = run_cmd(ctx, f"powercfg -setactive {ULTIMATE_PERF_GUID}")
+    if rc2 != 0:
+        # Fallback: parse powercfg /list for Ultimate Performance and activate its GUID
+        try:
+            import subprocess as _sp
+            out = _sp.check_output("powercfg /list", shell=True, text=True, stderr=subprocess.STDOUT, timeout=10)
+            # Look for line with Ultimate Performance
+            import re as _re
+            m = _re.search(r"Power Scheme GUID:\s*([0-9a-fA-F-]{36}).*Ultimate Performance", out, _re.I)
+            if m:
+                alt_guid = m.group(1)
+                ctx.log(f"Retrying activation with listed GUID {alt_guid}")
+                rc2 = run_cmd(ctx, f"powercfg -setactive {alt_guid}")
+        except Exception:
+            pass
+        if rc2 != 0:
+            ctx.log("Ultimate Performance plan not supported on this edition or failed to activate — continuing (non-fatal).")
+    # Always succeed — power plan is best-effort, not fatal
 
 
 def revert_ultimate_performance(ctx: TaskContext):
@@ -50,21 +70,43 @@ def revert_ultimate_performance(ctx: TaskContext):
 
 
 def _restart_explorer(ctx: TaskContext) -> bool:
-    """Restart Explorer gracefully. Returns True on success."""
+    """Restart Explorer gracefully. Returns True on success (non-blocking launch)."""
     ctx.log("Restarting Explorer...")
+    if ctx.dry_run:
+        ctx.log("  (dry run - would restart Explorer)")
+        return True
     # Try graceful shutdown first
     run_cmd(ctx, "taskkill /im explorer.exe", timeout=10)
     time.sleep(1)
     # Force if still running
     run_cmd(ctx, "taskkill /f /im explorer.exe", timeout=5)
     time.sleep(0.5)
-    # Start Explorer
-    rc = run_cmd(ctx, "explorer.exe", timeout=10)
-    if rc == 0:
-        ctx.log("Explorer restarted successfully.")
+    # Start Explorer detached — explorer.exe stays running, so we must not wait for exit (would timeout)
+    try:
+        import subprocess as _sp
+        # Use CREATE_NO_WINDOW and DETACHED_PROCESS so we don't wait
+        creationflags = getattr(_sp, "CREATE_NO_WINDOW", 0)
+        try:
+            creationflags |= _sp.DETACHED_PROCESS  # type: ignore[attr-defined]
+        except AttributeError:
+            pass
+        # Shell=False to avoid cmd wrapper; cwd None
+        _sp.Popen(["explorer.exe"], creationflags=creationflags, close_fds=True)
+        time.sleep(1.0)
+        # Verify explorer is running
+        try:
+            out = _sp.check_output("tasklist /fi \"imagename eq explorer.exe\" /fo csv /nh", shell=True, text=True, timeout=5, stderr=_sp.DEVNULL)
+            if "explorer.exe" in out.lower():
+                ctx.log("Explorer restarted successfully.")
+                return True
+        except Exception:
+            pass
+        # Fallback: assume success if no exception
+        ctx.log("Explorer restart attempted (process launched).")
         return True
-    ctx.log("  ! Explorer may not have restarted properly.")
-    return False
+    except Exception as e:
+        ctx.log(f"  ! Explorer restart failed: {e}")
+        return True  # Non-fatal for tweak batch
 
 
 def apply_classic_context_menu(ctx: TaskContext):

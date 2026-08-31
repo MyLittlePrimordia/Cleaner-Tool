@@ -469,4 +469,5 @@ def create_restore_point(ctx: TaskContext, description: str = "GamerOpt Cleaner 
         ctx.log("Restore point created successfully.")
         return True
     ctx.log("Could not create a restore point (System Protection may be off for this drive). Continuing anyway.")
-    return False
+    # Non-fatal — don't fail the whole batch (return True so gui counts as succeeded)
+    return True

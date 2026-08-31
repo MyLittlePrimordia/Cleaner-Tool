@@ -870,23 +870,9 @@ class Application:
                 return
             self._busy = True
 
-        # Check for dangerous task combinations — include cross-tab selections for scheduler relevance
-        # Aggregate all tabs' currently checked tasks (not just the tab being run) so cross-tab rules like network_reset+disable_nagle can fire
-        try:
-            all_selected = []
-            for tab in self.tabs.values():
-                all_selected.extend(tab._selected_tasks())
-            # Deduplicate by key in case current tab tasks overlap
-            seen = set()
-            uniq_all = []
-            for t in all_selected:
-                if t.key not in seen:
-                    seen.add(t.key)
-                    uniq_all.append(t)
-            # Also include the explicitly requested tasks (same objects, but ensure)
-            warnings = check_dangerous_combos(uniq_all if len(uniq_all) > len(tasks) else tasks)
-        except Exception:
-            warnings = check_dangerous_combos(tasks)
+        # Check for dangerous task combinations — per-tab only (Run button is per-tab by design)
+        # Cross-tab combos are checked in scheduler.py for --auto-clean which runs all tabs together
+        warnings = check_dangerous_combos(tasks)
         if warnings:
             # Deduplicate identical warnings (reboot bundle overlaps)
             warnings = list(dict.fromkeys(warnings))

@@ -119,6 +119,18 @@ def run_auto_clean(selected_tasks_by_tab):
     if not tasks_to_run:
         return False, "No tasks selected for auto-clean"
     
+    # Cross-tab dangerous combo check (GUI is per-tab, scheduler runs all tabs together)
+    try:
+        from app.warnings import check_dangerous_combos
+        # check_dangerous_combos now supports List[str] keys
+        all_keys = [k for keys in selected_tasks_by_tab.values() for k in keys]
+        warnings = check_dangerous_combos(all_keys)  # type: ignore[arg-type]
+        if warnings:
+            # Log but don't block scheduled run — user not present to confirm
+            print("[AUTO] Cross-tab warnings: " + " | ".join(warnings))
+    except Exception:
+        pass
+    
     # Run synchronously (this is called from the scheduled task, not GUI)
     # Must satisfy TaskContext contract (log, set_status, dry_run, cancelled)
     class AutoCtx(TaskContext):

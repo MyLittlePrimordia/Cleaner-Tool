@@ -6,7 +6,15 @@ from typing import List
 
 
 # Define dangerous combinations: (task_keys, warning_message)
-# These are combos that could cause issues when run together
+# Split into two tiers (user feedback: curated presets like Deep Clean /
+# Recommended Tweak always popped a white warning box, which felt like the
+# preset itself was broken):
+#   * DANGEROUS_COMBOS — true ordering hazards that need a Yes/No confirm.
+#     These never all appear together in a shipped preset, so a preset run
+#     stays silent unless the user ADDS a conflicting Custom task.
+#   * INFO_NOTICES — FYI notes (reversible, safe-together, "close your
+#     browser first"). These are logged to the run log, never a modal
+#     popup, so presets don't nag.
 DANGEROUS_COMBOS = [
     # Network reset + other network tweaks — network_reset is the ANCHOR
     # (it wipes the adapters); the other two are its victims.
@@ -23,7 +31,10 @@ DANGEROUS_COMBOS = [
         "⚠️ Both 'Fix Boot Issues' (disable Fast Startup) and 'Faster Graphics (HAGS)' require a reboot. "
         "You'll need to reboot twice to apply both. Consider enabling one, rebooting, then the other."
     ),
+]
 
+# FYI only — safe to run together, shown in the run log, never a popup.
+INFO_NOTICES = [
     # Multiple reboot-required tweaks — any 2 of these together means the
     # "one reboot covers all" note matters. No single anchor: any pair.
     # Phase 2 #13: adv_vmp / adv_memory_integrity removed from the app, so
@@ -32,7 +43,7 @@ DANGEROUS_COMBOS = [
     # tasks.txt: MPO fix also requires a reboot.
     (
         ["hags", "priority_separation", "disable_fast_startup", "ssd_trim", "ssd_superfetch", "ssd_last_access", "ssd_prefetch", "mpo_fix"],
-        "⚠️ Multiple selected tweaks require a reboot (HAGS, Priority Separation, Fast Startup, SSD tweaks, MPO). "
+        "ℹ️ Multiple selected tweaks require a reboot (HAGS, Priority Separation, Fast Startup, SSD tweaks, MPO). "
         "You only need ONE reboot after all changes. The app will remind you at the end."
     ),
 
@@ -46,7 +57,7 @@ DANGEROUS_COMBOS = [
     # Prefetch is rarely needed — warn whenever it is selected
     (
         ["prefetch"],
-        "⚠️ Clearing Prefetch is rarely needed and may slow down next app launches. "
+        "ℹ️ Clearing Prefetch is rarely needed and may slow down next app launches. "
         "Windows manages this automatically. Consider leaving it unchecked unless troubleshooting."
     ),
 
@@ -70,14 +81,14 @@ DANGEROUS_COMBOS = [
     # second member.
     (
         ["vss_repair", "restore_point", "restore_point_tweak"],
-        "⚠️ Restore point creation is limited by Windows to once per 24 hours. "
+        "ℹ️ Restore point creation is limited by Windows to once per 24 hours. "
         "If a checkpoint was made today, extra restore-point tasks will be skipped by Windows (shown as info, not failure)."
     ),
 
     # Several telemetry reducers — any 2 of the 3 (no anchor: pure overlap FYI)
     (
         ["stop_telemetry", "privacy_baseline", "nvidia_telemetry"],
-        "⚠️ Several telemetry-reduction tweaks are selected (Stop Telemetry, Privacy Baseline, NVIDIA Opt-Out). "
+        "ℹ️ Several telemetry-reduction tweaks are selected (Stop Telemetry, Privacy Baseline, NVIDIA Opt-Out). "
         "They overlap somewhat but are safe together — just know some switches do the same thing."
     ),
 
@@ -86,20 +97,15 @@ DANGEROUS_COMBOS = [
     # the other tweak's badge still reads applied). Warn when both are on.
     (
         ["limit_telemetry", "privacy_baseline"],
-        "⚠️ 'Limit Tracking' and 'Privacy Baseline' both write the same AllowTelemetry value. "
+        "ℹ️ 'Limit Tracking' and 'Privacy Baseline' both write the same AllowTelemetry value. "
         "They're safe to run together, but if you later undo just one of them, "
         "the tracking limit is removed for both — re-apply the other if you still want it."
     ),
 ]
 
 
-def check_dangerous_combos(selected_tasks) -> List[str]:
-    """Check selected tasks for dangerous combinations.
-
-    Accepts List[Task] or List[str] (keys) for scheduler use.
-    Returns list of warning messages.
-    """
-    # Support both Task objects and raw key strings
+def _selected_keys(selected_tasks) -> set:
+    """Normalize List[Task] | List[str] to a set of task keys."""
     selected_keys = set()
     for t in selected_tasks:
         if isinstance(t, str):
@@ -110,21 +116,47 @@ def check_dangerous_combos(selected_tasks) -> List[str]:
             except AttributeError:
                 # Fallback: treat as string
                 selected_keys.add(str(t))
-    warnings = []
+    return selected_keys
 
-    for combo_keys, message in DANGEROUS_COMBOS:
+
+def _match_combos(selected_keys: set, combos) -> List[str]:
+    """Shared anchor matcher for both tiers.
+
+    Audit fix (probe-confirmed false positive): the old rule fired for
+    ANY 2 members of a multi-key combo — e.g. Nagle + Throttling
+    warned about "Network Reset will undo them" when Network Reset
+    wasn't even selected. The first key in each multi-key combo is the
+    ANCHOR (the act that causes the harm); the rest are the victims.
+    A combo fires only when the anchor is present AND at least one
+    other member is too. Single-key combos fire on that key alone.
+    """
+    warnings = []
+    for combo_keys, message in combos:
         present = [k for k in combo_keys if k in selected_keys]
-        # Audit fix (probe-confirmed false positive): the old rule fired for
-        # ANY 2 members of a multi-key combo — e.g. Nagle + Throttling
-        # warned about "Network Reset will undo them" when Network Reset
-        # wasn't even selected. The first key in each multi-key combo is the
-        # ANCHOR (the act that causes the harm); the rest are the victims.
-        # A combo fires only when the anchor is present AND at least one
-        # other member is too. Single-key combos fire on that key alone.
         if len(combo_keys) == 1:
             if present:
                 warnings.append(message)
         elif present and combo_keys[0] in present and len(present) >= 2:
             warnings.append(message)
-
     return warnings
+
+
+def check_dangerous_combos(selected_tasks) -> List[str]:
+    """Check selected tasks for dangerous combinations.
+
+    BLOCKING tier only — callers show these in a confirm dialog.
+    Accepts List[Task] or List[str] (keys) for scheduler use.
+    Returns list of warning messages.
+    """
+    return _match_combos(_selected_keys(selected_tasks), DANGEROUS_COMBOS)
+
+
+def check_info_notices(selected_tasks) -> List[str]:
+    """FYI notes — safe/reversible, logged to the run log, never a popup.
+
+    Same key-matching contract as check_dangerous_combos. Shipped presets
+    (Deep Clean's prefetch/browser_cache, Recommended's telemetry overlap +
+    ad-blocker note, Deep Repair's 24h restore-point note) live here, which
+    is why a preset run no longer pops a warning box.
+    """
+    return _match_combos(_selected_keys(selected_tasks), INFO_NOTICES)

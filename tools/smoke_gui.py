@@ -115,6 +115,31 @@ def main():
     assert list(app.tabs.keys()) == ["Clean", "Repair", "Tweak", "Install"], \
         f"expected 4 tabs, got {list(app.tabs.keys())}"
 
+    # --- branding: name only on the window title bar, never in-app ---
+    from app.config import APP_NAME
+    assert root.title() == APP_NAME == "Cleaner Tool", f"window title wrong: {root.title()!r}"
+    def _all_labels(widget, acc):
+        for w in widget.winfo_children():
+            if isinstance(w, tk.Label):
+                acc.append(w)
+            _all_labels(w, acc)
+    _labels = []
+    _all_labels(root, _labels)
+    assert not any((lbl.cget("text") or "") in ("Cleaner", "Cleaner Tool") for lbl in _labels), \
+        "redundant in-app name header still present"
+
+    # --- per-tab icon above the pill: one loaded asset per tab, swaps on switch ---
+    assert set(getattr(app, "_tab_icons", {})) == {"Clean", "Repair", "Tweak", "Install"}, \
+        f"tab icons missing: {sorted(getattr(app, '_tab_icons', {}))}"
+    for tab_name in ("Clean", "Repair", "Tweak"):
+        app._switch_to(tab_name)
+        root.update()
+        shown = str(app._tab_icon_lbl.cget("image"))
+        assert shown and shown == str(app._tab_icons[tab_name]), \
+            f"{tab_name}: icon label not showing that tab's asset ({shown!r})"
+    app._switch_to("Clean")
+    root.update()
+
     # --- drive every tab + preset + custom + undo ---
     for tab_name in ("Clean", "Repair", "Tweak"):
         app._switch_to(tab_name)
@@ -253,18 +278,13 @@ def main():
     # is the widget-CREATION command, so querying that way tries to create
     # an existing window ("window name already exists"). Use the Menu
     # widget's own python methods instead.
-    menubar = None
-    for w in root.winfo_children():
-        if isinstance(w, tk.Menu):
-            menubar = w
-            break
-    assert menubar is not None, "no menubar found on root"
-    mb_end = int(menubar.index("end"))
-    cascades = [menubar.entrycget(i, "label")
-                for i in range(0, mb_end + 1)
-                if menubar.type(i) == "cascade"]
-    assert cascades == ["Quick Tools"], f"expected only Quick Tools, got {cascades}"
-    tools_menu = root.nametowidget(menubar.entrycget(menubar.index("Quick Tools"), "menu"))
+    # Quick Tools is a dark in-app dropdown now (no native menubar — the
+    # native strip rendered white and Tk cannot theme it).
+    assert not str(app.root.cget("menu")), "native menubar must stay detached (white strip)"
+    assert hasattr(app, "_tools_btn"), "Quick Tools toolbar button missing"
+    assert hasattr(app, "_tools_menu"), "Quick Tools dropdown menu missing"
+    tools_menu = app._tools_menu
+    assert isinstance(tools_menu, tk.Menu), "Quick Tools menu is not a tk.Menu"
     idx_end = int(tools_menu.index("end"))
     item_labels = [tools_menu.entrycget(i, "label") if tools_menu.type(i) != "separator" else "—"
                    for i in range(0, idx_end + 1)]

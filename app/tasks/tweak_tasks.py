@@ -556,15 +556,33 @@ def apply_usb_suspend(ctx: TaskContext):
     H4 fix: 'powercfg /change usb-selective-suspend-setting' is NOT a valid
     /change alias (verified: 'Invalid Parameters'). Only the GUID form works,
     and it must be applied to both AC and DC values.
+
+    LTSC/user-reported fix: on some PCs (Win10 IoT LTSC, VMs, stripped
+    power plans) this subgroup/setting does not exist — powercfg prints
+    'The power scheme, subgroup or setting specified does not exist' and
+    exits non-zero. The old code ignored the return code, so the log showed
+    the error while the tweak still counted as success. Now: both sides
+    failing honestly SKIPS (nothing to change on this PC); one side failing
+    logs a warning but still applies the side that worked.
     """
-    run_cmd(ctx, "powercfg /setacvalueindex scheme_current 2a737441-1930-4402-8d77-b2bbe5a308a3 48e6b7a6-50f5-4782-a5d4-53bb8fcc84df 0")
-    run_cmd(ctx, "powercfg /setdcvalueindex scheme_current 2a737441-1930-4402-8d77-b2bbe5a308a3 48e6b7a6-50f5-4782-a5d4-53bb8fcc84df 0")
+    rc_ac = run_cmd(ctx, "powercfg /setacvalueindex scheme_current 2a737441-1930-4402-8d77-b2bbe5a308a3 48e6b7a6-50f5-4782-a5d4-53bb8fcc84df 0")
+    rc_dc = run_cmd(ctx, "powercfg /setdcvalueindex scheme_current 2a737441-1930-4402-8d77-b2bbe5a308a3 48e6b7a6-50f5-4782-a5d4-53bb8fcc84df 0")
+    if rc_ac != 0 and rc_dc != 0:
+        raise TaskSkipped(
+            "USB selective suspend setting not present in this power plan — "
+            "skipping (nothing to change on this PC)."
+        )
+    if rc_ac != 0 or rc_dc != 0:
+        ctx.log("  (one power side accepted the change, the other is not present — applied what exists)")
     run_cmd(ctx, "powercfg /setactive scheme_current")
 
 
 def revert_usb_suspend(ctx: TaskContext):
-    run_cmd(ctx, "powercfg /setacvalueindex scheme_current 2a737441-1930-4402-8d77-b2bbe5a308a3 48e6b7a6-50f5-4782-a5d4-53bb8fcc84df 1")
-    run_cmd(ctx, "powercfg /setdcvalueindex scheme_current 2a737441-1930-4402-8d77-b2bbe5a308a3 48e6b7a6-50f5-4782-a5d4-53bb8fcc84df 1")
+    rc_ac = run_cmd(ctx, "powercfg /setacvalueindex scheme_current 2a737441-1930-4402-8d77-b2bbe5a308a3 48e6b7a6-50f5-4782-a5d4-53bb8fcc84df 1")
+    rc_dc = run_cmd(ctx, "powercfg /setdcvalueindex scheme_current 2a737441-1930-4402-8d77-b2bbe5a308a3 48e6b7a6-50f5-4782-a5d4-53bb8fcc84df 1")
+    if rc_ac != 0 and rc_dc != 0:
+        ctx.log("  (USB selective suspend setting not present — nothing to restore)")
+        return
     run_cmd(ctx, "powercfg /setactive scheme_current")
 
 
@@ -839,24 +857,91 @@ def revert_max_cpu_power(ctx: TaskContext):
     ctx.log("CPU power settings restored to their prior values.")
 
 
+def _is_win11_or_newer() -> bool:
+    """True on Windows 11+ (build 22000+). Win10 (incl. IoT LTSC 2021) has
+    no Widgets/Chat/search-highlights keys — attempting them there creates
+    junk values at best, Access-denied noise at worst."""
+    try:
+        import sys as _sys
+        if not _sys.platform.startswith("win"):
+            return False
+        import platform as _pf
+        ver = _pf.version()  # e.g. '10.0.22631'
+        parts = ver.split(".")
+        if len(parts) >= 3 and parts[0] == "10" and parts[1] == "0":
+            return int(parts[2]) >= 22000
+    except Exception:
+        pass
+    return False
+
+
 def apply_taskbar_cleanup(ctx: TaskContext):
     """Win11: remove Widgets, Chat/Teams icon, Meet Now, search highlights,
-    and OneDrive ads in File Explorer — all background CPU/RAM consumers."""
+    and OneDrive ads in File Explorer — all background CPU/RAM consumers.
+
+    LTSC/user-reported fix: the old code used reg_set_value_checked for all
+    5 values, so ONE denied/missing value (observed: TaskbarDa -> WinError 5
+    on Win10 IoT LTSC 2021, where the Win11-only Widgets key doesn't exist)
+    failed the WHOLE tweak. Now each value is best-effort: Win11-only keys
+    are skipped with a log line on Win10, other failures are logged, and the
+    tweak only fails when NOTHING could be applied.
+    """
+    from app.utils import reg_set_value as _set
     adv = "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced"
-    reg_set_value_checked(ctx, "HKCU", adv, "TaskbarDa", 0)       # Widgets
-    reg_set_value_checked(ctx, "HKCU", adv, "TaskbarMn", 0)       # Chat / Teams icon
-    reg_set_value_checked(ctx, "HKCU", adv, "ShowSyncProviderNotifications", 0)  # Explorer ads
-    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\SearchSettings", "IsDynamicSearchBoxEnabled", 0)  # search highlights
-    reg_set_value_checked(ctx, "HKLM", "Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer", "HideSCAMeetNow", 1)
+    is_win11 = _is_win11_or_newer()
+    if not is_win11:
+        ctx.log("  (Win10 detected — Widgets/Chat/search-highlights are Win11-only; applying what exists here)")
+    # (hive, path, name, value, win11_only)
+    writes = [
+        ("HKCU", adv, "TaskbarDa", 0, True),        # Widgets
+        ("HKCU", adv, "TaskbarMn", 0, True),        # Chat / Teams icon
+        ("HKCU", adv, "ShowSyncProviderNotifications", 0, False),  # Explorer ads
+        ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\SearchSettings", "IsDynamicSearchBoxEnabled", 0, True),
+        ("HKLM", "Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer", "HideSCAMeetNow", 1, False),
+    ]
+    ok, skipped = 0, []
+    for hive, path, name, value, win11_only in writes:
+        if win11_only and not is_win11:
+            skipped.append(f"{name} (Win11-only — not present on Win10)")
+            ctx.log(f"  (skipped) {hive}\\{path}\\{name}: Win11-only key on Win10 — nothing to change.")
+            continue
+        if _set(ctx, hive, path, name, value):
+            ok += 1
+        else:
+            skipped.append(f"{name} (blocked — policy or permissions)")
+    if ok == 0:
+        raise RuntimeError(
+            "Could not apply any taskbar setting "
+            f"({'; '.join(skipped) or 'all writes blocked'}). "
+            "Nothing was marked as applied."
+        )
+    if skipped:
+        ctx.log(f"  (applied {ok} of {len(writes)}; skipped: {'; '.join(skipped)})")
     ctx.log("Widgets, Chat icon, search highlights and Explorer ads disabled. Restart Explorer to see changes.")
 
 def revert_taskbar_cleanup(ctx: TaskContext):
+    """Best-effort mirror of apply: Win11-only restores are skipped on Win10,
+    failures are logged, and the revert only reports failure when nothing
+    could be restored."""
+    from app.utils import reg_set_value as _set
     adv = "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced"
-    reg_set_value_checked(ctx, "HKCU", adv, "TaskbarDa", 1)
-    reg_set_value_checked(ctx, "HKCU", adv, "TaskbarMn", 1)
-    reg_set_value_checked(ctx, "HKCU", adv, "ShowSyncProviderNotifications", 1)
-    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\SearchSettings", "IsDynamicSearchBoxEnabled", 1)
+    is_win11 = _is_win11_or_newer()
+    writes = [
+        ("HKCU", adv, "TaskbarDa", 1, True),
+        ("HKCU", adv, "TaskbarMn", 1, True),
+        ("HKCU", adv, "ShowSyncProviderNotifications", 1, False),
+        ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\SearchSettings", "IsDynamicSearchBoxEnabled", 1, True),
+    ]
+    ok = 0
+    for hive, path, name, value, win11_only in writes:
+        if win11_only and not is_win11:
+            ctx.log(f"  (skipped) {hive}\\{path}\\{name}: Win11-only key on Win10 — nothing to restore.")
+            continue
+        if _set(ctx, hive, path, name, value):
+            ok += 1
     reg_delete_value(ctx, "HKLM", "Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer", "HideSCAMeetNow")
+    if ok == 0 and is_win11:
+        ctx.log("  (no taskbar values could be restored — they may already be at defaults)")
     ctx.log("Taskbar items restored. Restart Explorer to see changes.")
 
 

@@ -41,12 +41,247 @@ from app.elevation import is_admin, relaunch_as_admin
 from app.utils import TaskContext, TaskSkipped, TaskCancelled, format_bytes
 from app.tab_presets import TABS, PRESETS, TAB_NAMES
 from app.toast import notify_clean_complete
-from app.warnings import check_dangerous_combos
+from app.warnings import check_dangerous_combos, check_info_notices
 from app.config_persist import get_tweak_state, mark_tweak_applied, mark_tweak_reverted
 
 
+def _themed_askyesno(parent, title: str, message: str, accent: str = None,
+                     yes_text: str = "Continue", no_text: str = "Go Back") -> bool:
+    """Dark-themed Yes/No confirm dialog (replaces white native messagebox).
+
+    User feedback: the conflict/pre-flight popups were plain white OS boxes
+    that didn't match the navy app theme. This Toplevel uses the app
+    palette + AnimatedButton pills, is modal (grab_set + wait_window), and
+    returns True on Yes, False on No / X / Escape.
+    Falls back to tkinter.messagebox only if the themed window itself fails.
+    """
+    try:
+        import tkinter as _tk
+        try:
+            from app.config import COLORS as _C, FONT_FAMILY as _F
+        except Exception:
+            return messagebox.askyesno(title, message)
+        try:
+            root = parent.winfo_toplevel() if parent is not None and hasattr(parent, "winfo_toplevel") else parent
+        except Exception:
+            root = parent
+        dlg = _tk.Toplevel(root)
+        dlg.title(title)
+        dlg.configure(bg=_C["bg"])
+        dlg.resizable(False, False)
+        try:
+            _enable_dark_titlebar(dlg)
+        except Exception:
+            pass
+        # keep import late (AnimatedButton is defined below in this module,
+        # so resolve it at call time, not import time)
+        try:
+            _AB = globals().get("AnimatedButton")
+        except Exception:
+            _AB = None
+        result = {"ok": False}
+
+        def _close(val: bool):
+            result["ok"] = val
+            try:
+                dlg.grab_release()
+            except Exception:
+                pass
+            try:
+                dlg.destroy()
+            except Exception:
+                pass
+
+        # card
+        card = _tk.Frame(dlg, bg=_C["bg_alt"], padx=2, pady=2)
+        # title row
+        trow = _tk.Frame(dlg, bg=_C["bg"])
+        trow.pack(fill="x", padx=18, pady=(16, 0))
+        dot = _tk.Canvas(trow, width=10, height=10, bg=_C["bg"],
+                         highlightthickness=0, bd=0)
+        try:
+            dot.create_oval(1, 1, 9, 9, fill=accent or _C["accent_yellow"], outline="")
+        except Exception:
+            pass
+        dot.pack(side="left", padx=(0, 8))
+        _tk.Label(trow, text=title, font=(_F, 11, "bold"),
+                  bg=_C["bg"], fg=_C["text"]).pack(side="left")
+        _tk.Label(dlg, text=message, font=(_F, 9), bg=_C["bg"],
+                  fg=_C["text"], wraplength=440, justify="left").pack(
+                      fill="x", padx=18, pady=(10, 14))
+        brow = _tk.Frame(dlg, bg=_C["bg"])
+        brow.pack(fill="x", padx=18, pady=(0, 16))
+        if _AB is not None:
+            _AB(brow, text=no_text, command=lambda: _close(False),
+                bg=_C["surface"], fg=_C["text"], font=(_F, 9, "bold"),
+                padx=18, pady=7).pack(side="right", padx=(8, 0))
+            _AB(brow, text=yes_text, command=lambda: _close(True),
+                bg=accent or _C["accent_yellow"], fg=_C["black"], font=(_F, 9, "bold"),
+                padx=18, pady=7).pack(side="right")
+        else:
+            _tk.Button(brow, text=no_text, command=lambda: _close(False)).pack(side="right", padx=4)
+            _tk.Button(brow, text=yes_text, command=lambda: _close(True)).pack(side="right", padx=4)
+        dlg.bind("<Escape>", lambda _e: _close(False))
+        dlg.bind("<Return>", lambda _e: _close(True))
+        try:
+            dlg.transient(root)
+        except Exception:
+            pass
+        # center over parent
+        try:
+            dlg.update_idletasks()
+            px, py = root.winfo_rootx(), root.winfo_rooty()
+            pw, ph = root.winfo_width(), root.winfo_height()
+            dw, dh = dlg.winfo_reqwidth(), dlg.winfo_reqheight()
+            dlg.geometry(f"+{px + max(0, (pw - dw) // 2)}+{py + max(0, (ph - dh) // 2)}")
+        except Exception:
+            pass
+        try:
+            dlg.grab_set()
+        except Exception:
+            pass
+        try:
+            dlg.wait_window()
+        except Exception:
+            pass
+        return bool(result["ok"])
+    except Exception:
+        try:
+            return bool(messagebox.askyesno(title, message))
+        except Exception:
+            return False
+
+
+def _themed_showinfo(parent, title: str, message: str, accent: str = None,
+                     ok_text: str = "OK") -> None:
+    """Dark-themed info dialog (themed twin of messagebox.showinfo)."""
+    try:
+        import tkinter as _tk
+        try:
+            from app.config import COLORS as _C, FONT_FAMILY as _F
+        except Exception:
+            messagebox.showinfo(title, message)
+            return
+        try:
+            root = parent.winfo_toplevel() if parent is not None and hasattr(parent, "winfo_toplevel") else parent
+        except Exception:
+            root = parent
+        dlg = _tk.Toplevel(root)
+        dlg.title(title)
+        dlg.configure(bg=_C["bg"])
+        dlg.resizable(False, False)
+        try:
+            _enable_dark_titlebar(dlg)
+        except Exception:
+            pass
+        try:
+            _AB = globals().get("AnimatedButton")
+        except Exception:
+            _AB = None
+
+        def _close():
+            try:
+                dlg.grab_release()
+            except Exception:
+                pass
+            try:
+                dlg.destroy()
+            except Exception:
+                pass
+
+        trow = _tk.Frame(dlg, bg=_C["bg"])
+        trow.pack(fill="x", padx=18, pady=(16, 0))
+        dot = _tk.Canvas(trow, width=10, height=10, bg=_C["bg"],
+                         highlightthickness=0, bd=0)
+        try:
+            dot.create_oval(1, 1, 9, 9, fill=accent or _C["accent_green"], outline="")
+        except Exception:
+            pass
+        dot.pack(side="left", padx=(0, 8))
+        _tk.Label(trow, text=title, font=(_F, 11, "bold"),
+                  bg=_C["bg"], fg=_C["text"]).pack(side="left")
+        _tk.Label(dlg, text=message, font=(_F, 9), bg=_C["bg"],
+                  fg=_C["text"], wraplength=440, justify="left").pack(
+                      fill="x", padx=18, pady=(10, 14))
+        brow = _tk.Frame(dlg, bg=_C["bg"])
+        brow.pack(fill="x", padx=18, pady=(0, 16))
+        if _AB is not None:
+            _AB(brow, text=ok_text, command=_close,
+                bg=accent or _C["accent_green"], fg=_C["black"], font=(_F, 9, "bold"),
+                padx=22, pady=7).pack(side="right")
+        else:
+            _tk.Button(brow, text=ok_text, command=_close).pack(side="right")
+        dlg.bind("<Escape>", lambda _e: _close())
+        dlg.bind("<Return>", lambda _e: _close())
+        try:
+            dlg.transient(root)
+        except Exception:
+            pass
+        try:
+            dlg.update_idletasks()
+            px, py = root.winfo_rootx(), root.winfo_rooty()
+            pw, ph = root.winfo_width(), root.winfo_height()
+            dw, dh = dlg.winfo_reqwidth(), dlg.winfo_reqheight()
+            dlg.geometry(f"+{px + max(0, (pw - dw) // 2)}+{py + max(0, (ph - dh) // 2)}")
+        except Exception:
+            pass
+        try:
+            dlg.grab_set()
+        except Exception:
+            pass
+        try:
+            dlg.wait_window()
+        except Exception:
+            pass
+    except Exception:
+        try:
+            messagebox.showinfo(title, message)
+        except Exception:
+            pass
+
+
+def _enable_dark_titlebar(window):
+    """Ask Windows to draw this window's title bar dark (DWM immersive mode).
+
+    User feedback: the white title strip clashed with the dark UI. Tkinter
+    uses the native window chrome, whose color is owned by Windows — the
+    only supported override is DWMWA_USE_IMMERSIVE_DARK_MODE (Win10 1809+;
+    attribute 20 on 20H1+, 19 before). Best-effort: any failure just keeps
+    the system default. Safe on non-Windows (no-op).
+    """
+    try:
+        import ctypes
+        import sys as _sys
+        if not _sys.platform.startswith("win"):
+            return
+        try:
+            hwnd = window.winfo_id()
+        except Exception:
+            return
+        # Tk's winfo_id is the inner child window — the DWM attribute wants
+        # the real top-level, i.e. its parent. Try both.
+        candidates = []
+        try:
+            candidates.append(ctypes.windll.user32.GetParent(hwnd))
+        except Exception:
+            pass
+        candidates.append(hwnd)
+        for attr in (20, 19):
+            for h in candidates:
+                try:
+                    if not h:
+                        continue
+                    val = ctypes.c_int(1)
+                    ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                        h, attr, ctypes.byref(val), ctypes.sizeof(val))
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+
 def _set_window_icon(root: tk.Tk):
-    """Set colored 🧼 window icon next to title Cleaner — no black square."""
+    """Set colored 🧼 window icon next to the title — no black square."""
     try:
         candidates = []
         if getattr(sys, "_MEIPASS", None):
@@ -3042,12 +3277,13 @@ class InstallTab(tk.Frame):
 class Application:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Cleaner")
+        self.root.title(APP_NAME)
         self.root.geometry(WINDOW_SIZE)
         self.root.minsize(*WINDOW_MIN_SIZE)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.configure(bg=COLORS["bg"])
         _set_window_icon(self.root)
+        _enable_dark_titlebar(self.root)
 
         self._busy = False
         self._busy_lock = threading.Lock()
@@ -3065,12 +3301,15 @@ class Application:
 
     def _on_close(self):
         if self._busy:
-            proceed = messagebox.askyesno(
+            proceed = _themed_askyesno(
+                self.root,
                 "Task Still Running",
                 "A task is still running. Closing now may leave a Windows "
                 "service stopped until you restart it manually.\n\n"
                 "Stop the task and close anyway?",
-                icon="warning",
+                accent=COLORS["accent_red"],
+                yes_text="Stop & Close",
+                no_text="Keep Running",
             )
             if not proceed:
                 return
@@ -3113,30 +3352,45 @@ class Application:
 
         self._build_menu()
 
-        # Header: soap image + Cleaner + mode
-        header = tk.Frame(self.root, bg=COLORS["bg"])
-        header.pack(fill="x", padx=26, pady=(10, 0))
-        hdr_img = None
-        try:
-            for p in self._asset_candidates("soap_header.png"):
-                if p.is_file():
-                    hdr_img = tk.PhotoImage(file=str(p))
-                    break
-        except Exception:
-            hdr_img = None
-        if hdr_img is not None:
-            lbl_img = tk.Label(header, image=hdr_img, bg=COLORS["bg"])
-            lbl_img.image = hdr_img
-            lbl_img.pack(side="left", padx=(0, 8))
-        tk.Label(header, text="Cleaner", font=(F, 16, "bold"), bg=COLORS["bg"],
-                 fg=COLORS["text"]).pack(side="left")
+        # Toolbar row: dark Quick Tools dropdown button (left) + privilege
+        # mode (right). The app name lives only on the window title bar now
+        # (user feedback: the in-app "Cleaner" header under it was redundant).
+        toolbar = tk.Frame(self.root, bg=COLORS["bg"])
+        toolbar.pack(fill="x", padx=26, pady=(8, 0))
+        self._tools_btn = AnimatedButton(
+            toolbar, text="☰  Quick Tools", command=self._popup_tools_menu,
+            bg=COLORS["surface"], fg=COLORS["text"], font=(F, 9),
+            padx=12, pady=5,
+        )
+        self._tools_btn.pack(side="left")
         mode = "Administrator" if is_admin() else "Limited — cleaning only"
-        mk = tk.Label(header, text=mode, font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"])
-        mk.pack(side="right", anchor="se", pady=(0, 2))
+        tk.Label(toolbar, text=mode, font=(F, 9), bg=COLORS["bg"],
+                 fg=COLORS["subtext"]).pack(side="right", anchor="se")
+
+        # Per-tab icon, centered above the pill switcher (user request).
+        # The image swaps on every tab switch; PhotoImages are kept on self
+        # so Tk never garbage-collects the currently shown one.
+        self._tab_icons: dict = {}
+        for _tab, _fname in (("Clean", "clean.png"), ("Repair", "repair.png"),
+                             ("Tweak", "tweak.png"), ("Install", "install.png")):
+            for _p in self._asset_candidates(_fname):
+                if not _p.is_file():
+                    continue
+                try:
+                    _img = tk.PhotoImage(file=str(_p))
+                    if _img.width() > 96 or _img.height() > 96:
+                        _img = _img.subsample(4, 4)  # install.png is 256px -> 64px
+                    self._tab_icons[_tab] = _img
+                    break
+                except Exception:
+                    continue
+        self._tab_icon_lbl = tk.Label(self.root, bg=COLORS["bg"])
+        self._tab_icon_lbl.pack(pady=(6, 8))
 
         # Pill switcher (Phase 2 #12: 5 tabs -> one sliding 3-way pill).
         # active_tab must exist before _build_tab_switch draws the thumb.
         self.active_tab = "Clean"
+        self._update_tab_icon()
         self._build_tab_switch()
 
         # Tab pages (Install gets the catalog browser, others the preset UI)
@@ -3354,6 +3608,7 @@ class Application:
             return
         from_accent = TAB_ACCENTS[self.active_tab]
         self.active_tab = name
+        self._update_tab_icon()
         # cancel any in-flight animation so a fast re-click retargets cleanly
         if self._switch_anim_after is not None:
             try:
@@ -3431,6 +3686,20 @@ class Application:
             x0, y1, x0, y1 - r, x0, y0 + r, x0, y0,
         ]
 
+    def _update_tab_icon(self):
+        """Swap the icon above the pill to the active tab's asset image."""
+        try:
+            lbl = getattr(self, "_tab_icon_lbl", None)
+            if lbl is None or not lbl.winfo_exists():
+                return
+            img = getattr(self, "_tab_icons", {}).get(getattr(self, "active_tab", ""))
+            if img is not None:
+                lbl.config(image=img)
+            else:
+                lbl.config(image="")
+        except Exception:
+            pass
+
     def _show_tab(self, name):
         # -------------------------------------------------------------
         # PROTO (user-approved experiment, 2026-09): always-mapped STACKED
@@ -3504,13 +3773,23 @@ class Application:
     # ---------------- menu ---------------- #
 
     def _build_menu(self):
-        menubar = tk.Menu(self.root)
-        tools_menu = tk.Menu(menubar, tearoff=0)
+        # No native menubar: on Windows it renders as a white strip that Tk
+        # cannot theme. Quick Tools instead lives as a dark dropdown posted
+        # from the toolbar button in the header (same commands, dark popup
+        # like the drive-overflow menu).
+        tools_menu = tk.Menu(
+            self.root, tearoff=0,
+            bg=COLORS["surface"], fg=COLORS["text"],
+            activebackground=COLORS["surface_hover"], activeforeground=COLORS["text"],
+            relief="flat", bd=0, font=(F, 9),
+        )
         tools_menu.add_command(label="Task Manager", command=lambda: self._launch("taskmgr"))
         tools_menu.add_command(label="Disk Cleanup", command=lambda: self._launch("cleanmgr"))
         tools_menu.add_command(label="Reliability Monitor", command=lambda: self._launch("perfmon /rel"))
         tools_menu.add_command(label="System Restore", command=lambda: self._launch("rstrui"))
         tools_menu.add_command(label="Power Options", command=lambda: self._launch("powercfg.cpl"))
+        tools_menu.add_command(label="Device Manager", command=lambda: self._launch("devmgmt.msc"))
+        tools_menu.add_command(label="System Information", command=lambda: self._launch("msinfo32"))
         tools_menu.add_separator()
         # Windows Settings deep-links (ms-settings: URIs — must go through
         # the shell, not Popen: the URI scheme isn't an executable)
@@ -3519,17 +3798,38 @@ class Application:
         tools_menu.add_command(label="Storage Sense", command=lambda: self._launch_settings("ms-settings:storagesense"))
         tools_menu.add_command(label="Windows Update", command=lambda: self._launch_settings("ms-settings:windowsupdate"))
         tools_menu.add_command(label="Network Settings", command=lambda: self._launch_settings("ms-settings:network-status"))
+        tools_menu.add_command(label="Bluetooth & Devices", command=lambda: self._launch_settings("ms-settings:bluetooth"))
         tools_menu.add_command(label="Sound Settings", command=lambda: self._launch_settings("ms-settings:sound"))
         tools_menu.add_command(label="App Volume & Devices", command=lambda: self._launch_settings("ms-settings:apps-volume"))
+        tools_menu.add_command(label="Display Settings", command=lambda: self._launch_settings("ms-settings:display"))
         tools_menu.add_command(label="Graphics Settings", command=lambda: self._launch_settings("ms-settings:display-advancedgraphics"))
         tools_menu.add_separator()
         tools_menu.add_command(label="Auto Maintenance...", command=self._show_schedule_dialog)
         tools_menu.add_command(label="Export Logs", command=self.export_logs)
-        menubar.add_cascade(label="Quick Tools", menu=tools_menu)
         # no Help menu (user request); About lives in Quick Tools now
         tools_menu.add_separator()
         tools_menu.add_command(label="About", command=self._show_about)
-        self.root.config(menu=menubar)
+        self._tools_menu = tools_menu
+        # a native menu must never be attached (it would bring back the
+        # white strip) — belt and suspenders in case one lingered
+        try:
+            self.root.config(menu="")
+        except Exception:
+            pass
+
+    def _popup_tools_menu(self):
+        """Post the dark Quick Tools dropdown under the toolbar button."""
+        try:
+            x = self._tools_btn.winfo_rootx()
+            y = self._tools_btn.winfo_rooty() + self._tools_btn.winfo_height() + 4
+            self._tools_menu.tk_popup(x, y)
+        except Exception:
+            pass
+        finally:
+            try:
+                self._tools_menu.grab_release()
+            except Exception:
+                pass
 
     def _launch(self, command):
         try:
@@ -3565,6 +3865,7 @@ class Application:
         dlg.geometry("420x420")
         dlg.resizable(False, False)
         dlg.configure(bg=COLORS["bg"])
+        _enable_dark_titlebar(dlg)
         dlg.transient(self.root)
         dlg.grab_set()
         dlg.update_idletasks()
@@ -4263,21 +4564,26 @@ class Application:
                 names = ", ".join(t.label for t in admin_tasks)
                 self.log(f"Limited mode: skipping {len(admin_tasks)} admin-only task(s): {names}")
                 tasks = [t for t in tasks if not t.admin_required]
-                messagebox.showwarning(
+                _themed_showinfo(
+                    self.root,
                     "Administrator Required",
                     f"Skipped {len(admin_tasks)} admin-only task(s):\n{names}\n\n"
                     "Running the rest in limited mode.",
+                    accent=COLORS["accent_yellow"],
                 )
             if not tasks:
-                messagebox.showinfo(
+                _themed_showinfo(
+                    self.root,
                     "Nothing to Run",
                     "All selected tasks require Administrator rights. Restart as Administrator to run them.",
+                    accent=COLORS["accent_yellow"],
                 )
                 return
 
         with self._busy_lock:
             if self._busy:
-                messagebox.showinfo("Busy", "Please wait for the current operation to finish.")
+                _themed_showinfo(self.root, "Busy", "Please wait for the current operation to finish.",
+                                 accent=COLORS["accent_yellow"])
                 return
             self._busy = True
 
@@ -4290,18 +4596,31 @@ class Application:
             preflight = []
         if preflight:
             msg = "Before we start:\n\n" + "\n".join(f"  • {p}" for p in preflight)
-            if not messagebox.askyesno("Pre-flight Check", msg + "\n\nStart anyway?", icon="warning"):
+            if not _themed_askyesno(self.root, "Pre-flight Check", msg + "\n\nStart anyway?",
+                                    accent=COLORS["accent_yellow"]):
                 with self._busy_lock:
                     self._busy = False
                 return
             self.log("Pre-flight notices: " + " | ".join(preflight))
 
+        # Blocking hazards only — FYI notes are logged, never a popup
+        # (curated presets like Deep Clean / Recommended are safe by
+        # design, so they run silent; Custom combos that truly conflict
+        # still ask here).
+        try:
+            info_notes = check_info_notices(tasks)
+        except Exception:
+            info_notes = []
+        if info_notes:
+            for _note in dict.fromkeys(info_notes):
+                self.log(_note)
         warnings = check_dangerous_combos(tasks)
         if warnings:
             warnings = list(dict.fromkeys(warnings))
-            msg = "⚠️ Potentially problematic task combinations detected:\n\n" + "\n\n".join(warnings)
+            msg = "Potentially problematic task combinations detected:\n\n" + "\n\n".join(warnings)
             msg += "\n\nDo you want to continue?"
-            if not messagebox.askyesno("Confirm Task Combination", msg, icon="warning"):
+            if not _themed_askyesno(self.root, "Confirm Task Combination", msg,
+                                    accent=COLORS["accent_red"]):
                 with self._busy_lock:
                     self._busy = False
                 return
@@ -4440,9 +4759,11 @@ class Application:
 
         def _done_popup():
             if cancelled:
-                messagebox.showinfo("Stopped", summary)
+                _themed_showinfo(self.root, "Stopped", summary,
+                                 accent=COLORS["accent_yellow"])
             else:
-                messagebox.showinfo("Done", summary)
+                _themed_showinfo(self.root, "Done", summary,
+                                 accent=COLORS["accent_green"])
         self.root.after(0, _done_popup)
 
         # audit fix (A3-M1): the "Clean Complete — freed X" toast fired for

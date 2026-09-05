@@ -49,24 +49,28 @@ jobs:
         # --icon / --add-data : bundle colored 🧼 icon from app/assets
         run: >
           pyinstaller --onefile --windowed
-          --name "CleanerTool"
+          --name "Cleaner-Tool"
           --icon "app/assets/icon.ico"
           --add-data "app/assets;app/assets"
           --manifest "app/assets/app_manifest.xml"
           app/__main__.py
 
+      - name: Create zip archive
+        # Bundle the exe as Cleaner-Tool.exe inside a zip for artifact/release
+        run: Compress-Archive -Path "dist/Cleaner-Tool.exe" -DestinationPath "dist/Cleaner-Tool-windows.zip" -Force
+
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: CleanerTool-windows-exe
-          path: dist/CleanerTool.exe
+          name: Cleaner-Tool-windows-zip
+          path: dist/Cleaner-Tool-windows.zip
           if-no-files-found: error
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/CleanerTool.exe
+          files: dist/Cleaner-Tool-windows.zip
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

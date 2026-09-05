@@ -1,7 +1,8 @@
 name: Build Windows Executable
 
-# Build a standalone .exe on every push/PR to main, on demand, and produce a
-# GitHub Release automatically when you push a version tag (e.g. v2.0.0).
+# Build a standalone .exe on every push to main / PR / manual run, and
+# continuously overwrite a rolling "latest" release with the raw .exe
+# (no zip). Version tags (e.g. v2.0.0) still create their own release too.
 on:
   push:
     branches: [ "main" ]
@@ -55,22 +56,42 @@ jobs:
           --manifest "app/assets/app_manifest.xml"
           app/__main__.py
 
-      - name: Create zip archive
-        # Bundle the exe as Cleaner-Tool.exe inside a zip for artifact/release
-        run: Compress-Archive -Path "dist/Cleaner-Tool.exe" -DestinationPath "dist/Cleaner-Tool-windows.zip" -Force
-
-      - name: Upload build artifact
+      - name: Upload build artifact (raw .exe, no zip)
         uses: actions/upload-artifact@v4
         with:
-          name: Cleaner-Tool-windows-zip
-          path: dist/Cleaner-Tool-windows.zip
+          name: Cleaner-Tool-windows-exe
+          path: dist/Cleaner-Tool.exe
           if-no-files-found: error
 
-      - name: Create GitHub Release
+      - name: Update rolling latest release (overwrite every build)
+        # Only on pushes to main — PRs from forks can't write releases,
+        # and we don't want feature branches clobbering "latest".
+        # This creates/overwrites the `latest` tag and replaces the
+        # attached Cleaner-Tool.exe with the freshly built one.
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest Build
+          body: |
+            Rolling build of Cleaner-Tool.exe from the latest `main` commit.
+
+            - Commit: ${{ github.sha }}
+            - Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            Download `Cleaner-Tool.exe` below (raw .exe, not zipped). This asset is overwritten on every push to `main`.
+          files: dist/Cleaner-Tool.exe
+          make_latest: "true"
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create versioned GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/Cleaner-Tool-windows.zip
+          files: dist/Cleaner-Tool.exe
           generate_release_notes: true
+          make_latest: "true"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

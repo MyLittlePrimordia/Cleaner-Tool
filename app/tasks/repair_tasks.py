@@ -577,6 +577,88 @@ def repair_teredo(ctx: TaskContext):
     ctx.log("Teredo reset to defaults — retry the Xbox party/game invite.")
 
 
+_HOSTS_PATH = os.path.join(
+    os.environ.get("WINDIR", "C:\\Windows"), "System32", "drivers", "etc", "hosts"
+)
+# NOTE: deliberately NOT hosts.cleanertool_bak — that name belongs to the
+# Tweak tab's Ad Blocker backup (the pre-block original). Overwriting it
+# would destroy the Ad Blocker's undo. This repair keeps its own backup.
+_HOSTS_REPAIR_BACKUP = _HOSTS_PATH + ".cleanertool_repair_bak"
+
+_STOCK_HOSTS_LINES = [
+    "# Copyright (c) 1993-2009 Microsoft Corp.",
+    "#",
+    "# This is a sample HOSTS file used by Microsoft TCP/IP for Windows.",
+    "#",
+    "# This file contains the mappings of IP addresses to host names. Each",
+    "# entry should be kept on an individual line. The IP address should",
+    "# be placed in the first column followed by the corresponding host name.",
+    "# The IP address and the host name should be separated by at least one",
+    "# space.",
+    "#",
+    "# Additionally, comments (such as these) may be inserted on individual",
+    "# lines or following the machine name denoted by a '#' symbol.",
+    "#",
+    "# For example:",
+    "#",
+    "#      102.54.94.97     rhino.acme.com          # source server",
+    "#       38.25.63.10     x.acme.com              # x client host",
+    "",
+    "# localhost name resolution is handled within DNS itself.",
+    "#\t127.0.0.1       localhost",
+    "#\t::1             localhost",
+    "",
+]
+
+
+def repair_hosts_file(ctx: TaskContext):
+    """Restore the stock Windows hosts file (fixes damage from other
+    ad-blockers/optimizers that left stale redirects behind — a common
+    cause of 'site won't load' and Game Pass sign-in failures).
+
+    Backs up the current file once (separate name from the Ad Blocker's
+    backup, so its undo is never harmed). If our own Ad Blocker tweak is
+    currently applied, its badge is cleared too since the block is gone
+    with the old file (re-running the tweak re-applies a fresh block)."""
+    ctx.set_status("Restoring the default Windows hosts file...")
+    if not os.path.isfile(_HOSTS_PATH):
+        raise RuntimeError(f"Hosts file not found at {_HOSTS_PATH}.")
+    try:
+        with open(_HOSTS_PATH, "r", encoding="utf-8", errors="ignore") as f:
+            current = f.read()
+    except Exception as exc:
+        raise RuntimeError(f"Could not read hosts file: {exc}")
+    had_block = "Cleaner Tool AdBlock" in current
+    if current.strip() == "\r\n".join(_STOCK_HOSTS_LINES).strip() or \
+            current.strip() == "\n".join(_STOCK_HOSTS_LINES).strip():
+        ctx.log("Hosts file is already stock — nothing to fix.")
+        return
+    if not os.path.isfile(_HOSTS_REPAIR_BACKUP):
+        try:
+            with open(_HOSTS_REPAIR_BACKUP, "w", encoding="utf-8") as f:
+                f.write(current)
+            ctx.log(f"Backed up current hosts file to {_HOSTS_REPAIR_BACKUP}")
+        except Exception as exc:
+            raise RuntimeError(f"Could not back up hosts file, aborting for safety: {exc}")
+    try:
+        with open(_HOSTS_PATH, "w", encoding="utf-8", newline="") as f:
+            f.write("\r\n".join(_STOCK_HOSTS_LINES))
+    except Exception as exc:
+        raise RuntimeError(f"Could not write hosts file (need admin rights?): {exc}")
+    run_cmd(ctx, "ipconfig /flushdns", timeout=30)
+    if had_block:
+        # Our own Ad Blocker's block went out with the old file — keep the
+        # tweak badge honest so it no longer shows Active.
+        try:
+            from app.config_persist import mark_tweak_reverted, clear_tweak_snapshot
+            mark_tweak_reverted("ad_blocker")
+            clear_tweak_snapshot("ad_blocker")
+            ctx.log("Cleared the Ad Blocker tweak badge (re-run that tweak to re-block).")
+        except Exception:
+            ctx.log("Note: re-run Undo on the Ad Blocker tweak to clear its badge.")
+    ctx.log("Hosts file restored to Windows defaults.")
+
+
 # --------------------------------------------------------------------------- #
 # Installer tasks MOVED to app/tasks/install_tasks.py (Install tab) — every
 # internet-required task lives there now, per the user's 4th-tab request.
@@ -617,4 +699,5 @@ TASKS = [
     Task("enable_restore", "Turn On System Protection", "Re-enables restore points on C: if something turned them off", repair_enable_system_restore, default=False, admin_required=True, column=0),
     Task("power_plans", "Reset Power Plans", "Restores Microsoft's default power plans when optimizers break them", repair_power_plans, default=False, admin_required=True, column=0),
     Task("teredo_fix", "Fix Xbox Multiplayer (Teredo)", "Resets Teredo tunneling to fix Xbox party and matchmaking errors", repair_teredo, default=False, admin_required=True, column=1),
+    Task("hosts_restore", "Restore Hosts File", "Restores the stock hosts file when blockers break sites or logins", repair_hosts_file, default=False, admin_required=True, column=1),
 ]

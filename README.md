@@ -4,6 +4,33 @@ A lightweight, modular Windows 10/11 utility for disk cleaning, system repairs, 
 
 ---
 
+## 📸 Screenshots
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <b>Clean Tab</b><br/><br/>
+      <img src="screenshots/clean.png" alt="Clean Tab" width="100%" />
+    </td>
+    <td align="center" width="50%">
+      <b>Repair Tab</b><br/><br/>
+      <img src="screenshots/repair.png" alt="Repair Tab" width="100%" />
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="50%">
+      <b>Tweak Tab</b><br/><br/>
+      <img src="screenshots/tweak.png" alt="Tweak Tab" width="100%" />
+    </td>
+    <td align="center" width="50%">
+      <b>Install Tab</b><br/><br/>
+      <img src="screenshots/install.png" alt="Install Tab" width="100%" />
+    </td>
+  </tr>
+</table>
+
+---
+
 ## Features
 
 - **Safe by Default**: Optional System Restore point creation before making changes, plus warning checks on risky task combinations.

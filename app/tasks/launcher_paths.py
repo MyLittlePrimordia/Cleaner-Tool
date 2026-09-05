@@ -235,7 +235,9 @@ def _minecraft_bedrock_paths() -> list[str]:
 MINECRAFT_BEDROCK_CACHE_PATHS = _minecraft_bedrock_paths()
 
 # --------------------------------------------------------------------------- #
-# Top-game junk paths (Steam Most-Played Top 100, PCGamingWiki-verified)
+# Verified per-title junk paths (PCGamingWiki-checked) plus a generalized
+# Unity-engine log sweep (see UNITY_PLAYER_LOGS below) that covers the
+# indie long tail with no per-game entries.
 #
 # SAFETY RULES (from PCGW data):
 #   - Only Logs / Crashes / CrashDumps / shader-cache / webcache subfolders.
@@ -332,6 +334,57 @@ def _build_low_game_player_logs() -> list[str]:
     return files
 
 LOW_GAME_PLAYER_LOGS = _build_low_game_player_logs()
+
+# --------------------------------------------------------------------------- #
+# Generalized Unity-engine log sweep (the indie long tail, no per-game rows).
+#
+# Every Unity game writes its stdout log to AppData\LocalLow\<Company>\
+# <Game>\Player.log (plus Player-prev.log for the previous session). That
+# filename is engine-defined and is NEVER a save — saves live in
+# game-specific files/subfolders — so sweeping the exact filename under
+# LocalLow covers dozens of indie titles (the bulk of Steam ranks 50-250)
+# with one rule instead of ~150 hand-verified table rows.
+#
+# Bounds that keep it safe:
+#   - Exact filenames only (Player.log / Player-prev.log), never folders.
+#   - LocalLow only, max depth 4 (Company\Game[\Sub]) — no deep descent.
+#   - Symlinks/junctions never followed; unreadable folders skipped.
+#   - Only existing files are listed (same pattern as the Minecraft logs
+#     above); game_tasks re-checks each file at clean time.
+# --------------------------------------------------------------------------- #
+
+_UNITY_PLAYER_LOG_NAMES = ("Player.log", "Player-prev.log")
+_UNITY_PLAYER_LOG_MAX_DEPTH = 4
+
+
+def _build_unity_player_logs() -> list[str]:
+    low = LOCALLOW
+    if not low or not os.path.isdir(low):
+        return []
+    found: list[str] = []
+    stack = [(low, 0)]
+    while stack:
+        directory, depth = stack.pop()
+        if depth > _UNITY_PLAYER_LOG_MAX_DEPTH:
+            continue
+        try:
+            with os.scandir(directory) as it:
+                entries = list(it)
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append((entry.path, depth + 1))
+                elif (entry.is_file(follow_symlinks=False)
+                        and entry.name in _UNITY_PLAYER_LOG_NAMES):
+                    found.append(entry.path)
+            except OSError:
+                continue
+    return found
+
+
+UNITY_PLAYER_LOGS = _build_unity_player_logs()
 
 _TOP_GAME_CACHE_PATHS = _build_top_game_paths()
 

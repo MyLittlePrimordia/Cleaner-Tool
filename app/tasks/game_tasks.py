@@ -3,8 +3,9 @@ Games tab — merged mega-tasks: one checkbox per concern, giant verified path l
 
 Tasks:
   * Clean Gamer Launchers — every launcher store + chat clients (web caches, logs)
-  * Clean Game Files — the giant per-game junk table (logs/crashes/shader caches
-    for the Steam Most-Played Top 100, Minecraft, CurseForge, OBS, peripherals)
+   * Clean Game Files — verified per-game junk paths (logs/crashes/shader caches
+     for top titles, Minecraft, CurseForge, OBS, peripherals) plus a generalized
+     Unity Player.log sweep covering the indie long tail
   * Clean GPU Shader Caches — DirectX/NVIDIA/AMD/Intel/Steam shader caches
   * Clean Game Captures — Game DVR clip folder
 """
@@ -19,6 +20,7 @@ from app.tasks.launcher_paths import (
     GAME_CAPTURES_PATHS,
     MINECRAFT_LAUNCHER_LOGS,
     LOW_GAME_PLAYER_LOGS,
+    UNITY_PLAYER_LOGS,
 )
 
 
@@ -142,12 +144,14 @@ def clean_gamer_launchers(ctx: TaskContext):
 
 
 def clean_game_files(ctx: TaskContext):
-    """The mega task: junk from 100+ top games + Minecraft + CurseForge + OBS + peripherals.
+    """The mega task: junk from verified top titles + Minecraft + CurseForge
+    + OBS + peripherals + a generalized Unity-engine log sweep.
 
     Only touches logs, crash dumps, web caches and shader caches — never saves.
     """
-    ctx.log("Cleaning game files (Steam Top-100 titles, Minecraft, CurseForge, OBS,")
-    ctx.log("Streamlabs, Logitech G Hub, Razer, Roblox, Unreal/Unity engine caches)")
+    ctx.log("Cleaning game files (verified top titles, Minecraft, CurseForge, OBS,")
+    ctx.log("Streamlabs, Logitech G Hub, Razer, Roblox, Unreal/Unity engine caches,")
+    ctx.log("Unity Player.log sweep)")
     total = _clean_many(ctx, GAME_FILES_ALL, "game files")
     # Minecraft launcher logs are loose files in the .minecraft root
     total += _clean_files(ctx, MINECRAFT_LAUNCHER_LOGS, "Minecraft launcher log")
@@ -157,6 +161,11 @@ def clean_game_files(ctx: TaskContext):
     # path matched nothing and the log claimed cleaning anyway. Route them
     # through the file-based cleaner like the Minecraft launcher logs.
     total += _clean_files(ctx, LOW_GAME_PLAYER_LOGS, "game Player.log")
+    # Generalized Unity sweep (launcher_paths.UNITY_PLAYER_LOGS): every
+    # Player.log / Player-prev.log under LocalLow — the indie long tail
+    # with no per-game table rows. Overlaps LOW_GAME_PLAYER_LOGS for the
+    # three titles above; _clean_files skips already-removed files quietly.
+    total += _clean_files(ctx, UNITY_PLAYER_LOGS, "Unity Player.log")
     return total
 
 
@@ -222,7 +231,7 @@ from app.tasks import Task  # noqa: E402
 
 TASKS = [
     Task("gamer_launchers", "Clean Launchers & Chat", "Clears every game store + Discord, Slack, Teams, Spotify web junk; keeps logins", clean_gamer_launchers, default=True, admin_required=False, column=0),
-    Task("game_files", "Clean Game Files", "Removes logs, crashes and junk from 100+ top games like Fortnite, PUBG, BG3; keeps saves", clean_game_files, default=True, admin_required=False, column=1),
+    Task("game_files", "Clean Game Files", "Removes logs, crashes and junk from top games like Fortnite, PUBG, BG3 plus a Unity log sweep for indies; keeps saves", clean_game_files, default=True, admin_required=False, column=1),
     Task("steam_stuck", "Clear Stuck Steam Downloads", "Removes huge leftover files from failed Steam updates; frees lots of space", clean_steam_stuck_downloads, default=False, admin_required=False, column=1),
     Task("gpu_shader_caches", "Clean Shader Caches", "Rebuilds DirectX/NVIDIA/AMD/Intel shader caches to fix game stutter", clean_gpu_shader_caches, default=False, admin_required=False, column=0),
     Task("game_captures", "Clean Game Captures", "Removes old Xbox Game Bar clips to free disk space", clean_game_captures, default=False, admin_required=False, column=1),

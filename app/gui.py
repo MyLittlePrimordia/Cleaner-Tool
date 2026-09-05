@@ -838,13 +838,13 @@ class AdminGateFrame(tk.Frame):
     def _restart_elevated(self):
         if relaunch_as_admin():
             self._set_elevate_buttons_state("disabled")
-            self._wait_status = tk.Label(self, text="Waiting for elevation (UAC)...", font=(F, 9),
+            self._wait_status = tk.Label(self, text="Waiting for elevation — click Yes on the UAC prompt, then wait...", font=(F, 9),
                                          bg=COLORS["bg"], fg=COLORS["accent_blue"])
             self._wait_status.pack(pady=(10, 0))
 
             def _wait_thread():
                 from app.elevation import wait_for_elevated_process
-                success = wait_for_elevated_process(timeout=15.0)
+                success = wait_for_elevated_process(timeout=60.0)
 
                 def _on_done():
                     if success:
@@ -860,12 +860,16 @@ class AdminGateFrame(tk.Frame):
                         except Exception:
                             pass
                         self._set_elevate_buttons_state("normal")
+                        # Don't auto-open limited mode here: the elevated
+                        # window is often already running (old bug created
+                        # two main windows). Let the user decide.
                         try:
                             messagebox.showwarning("Elevation Cancelled",
-                                                   "Administrator elevation was cancelled or timed out. Continuing in limited mode.")
+                                                   "Administrator elevation was cancelled or timed out.\n\n"
+                                                   "If an elevated window opened, use that one and close this.\n"
+                                                   "Otherwise click 'Continue Without Admin' to proceed in limited mode.")
                         except Exception:
                             pass
-                        self._continue_limited()
 
                 try:
                     self.root.after(0, _on_done)

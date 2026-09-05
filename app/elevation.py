@@ -157,19 +157,18 @@ def _process_is_elevated(pid: int) -> bool:
         return False
 
 
-def _wait_for_elevated_process(timeout: float = 10.0) -> bool:
+def _wait_for_elevated_process(timeout: float = 60.0) -> bool:
     """
     Wait for the elevated process to signal it has started.
     Returns True if the elevated process started successfully.
     Verifies token to prevent spoofing via pre-created cookie.
 
-    L5 fix: the token check alone still let any same-user process write a
-    cookie naming the pending token + the PID of some other already-running,
-    unrelated process (e.g. explorer.exe) — the STILL_ACTIVE check just
-    confirms *a* process is alive, not that it's actually this app's
-    elevated relaunch. Now the PID's executable image name is also checked
-    against this app's own exe name, AND the PID's token must actually be
-    elevated before the cookie is accepted.
+    Token (secrets.token_hex(16)) + STILL_ACTIVE + image-name match is the
+    real verification. The elevated-token check is best-effort only: a
+    medium-integrity process often gets ACCESS_DENIED opening the token of
+    the high-integrity child, which used to turn every successful elevation
+    into a false timeout (two windows + 'Elevation Cancelled').
+    Timeout is 60s because it includes UAC click time + slow --onefile unpack.
     """
     expected_token = _read_pending_token()
     own_exe = _get_own_exe_name()
@@ -193,18 +192,20 @@ def _wait_for_elevated_process(timeout: float = 10.0) -> bool:
                         exit_code = ctypes.wintypes.DWORD()
                         if ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
                             if exit_code.value == 259:  # STILL_ACTIVE
-                                # L5 fix: also require the PID's own image name to match this app
+                                # Also require the PID's own image name to match this app
                                 image_name = _process_image_name(pid)
                                 if image_name != own_exe:
                                     time.sleep(0.2)
                                     continue
-                                # audit fix: and require that PID to actually
-                                # hold an elevated token — a same-user process
-                                # must never be able to answer for the
-                                # elevated relaunch it isn't.
-                                if not _process_is_elevated(pid):
-                                    time.sleep(0.2)
-                                    continue
+                                # NOTE: no _process_is_elevated(pid) gate here
+                                # on purpose. It used to be required, but a
+                                # medium-integrity process usually gets
+                                # ACCESS_DENIED querying the high-integrity
+                                # child's token, turning every successful
+                                # elevation into a false timeout (two windows
+                                # + 'Elevation Cancelled'). The 128-bit token
+                                # + alive + image-name match is the real
+                                # verification.
                                 _clear_elevation_cookie()
                                 _clear_pending_token()
                                 return True
@@ -263,7 +264,7 @@ def relaunch_as_admin() -> bool:
         return False
 
 
-def wait_for_elevated_process(timeout: float = 10.0) -> bool:
+def wait_for_elevated_process(timeout: float = 60.0) -> bool:
     """
     Wait for the elevated process to signal it has started.
     Should be called after relaunch_as_admin() returns True.

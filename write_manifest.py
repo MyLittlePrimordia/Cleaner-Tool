@@ -19,10 +19,10 @@ trust = ET.SubElement(root, "trustInfo", {
 })
 security = ET.SubElement(trust, "security")
 priv = ET.SubElement(security, "requestedPrivileges")
-# asInvoker: the app launches without a UAC prompt and offers elevation
-# itself via the in-app Admin Gate (matches elevation.py's design).
+# requireAdministrator: the frozen .exe always elevates at launch via
+# Windows UAC (no in-app Admin Gate / restart handshake needed).
 ET.SubElement(priv, "requestedExecutionLevel", {
-    "level": "asInvoker",
+    "level": "requireAdministrator",
     "uiAccess": "false"
 })
 

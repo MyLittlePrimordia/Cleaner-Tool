@@ -556,6 +556,27 @@ def repair_enable_system_restore(ctx: TaskContext):
     ctx.log("System Protection is on for C: — Safety Checkpoints will work again.")
 
 
+def repair_power_plans(ctx: TaskContext):
+    """Restore Microsoft's default power plans (fixes plans broken or
+    deleted by other optimizers — Balanced/High performance come back;
+    your active plan resets to Balanced, reselect after if you like)."""
+    ctx.set_status("Restoring default Windows power plans...")
+    run_cmd_checked(ctx, "powercfg -restoredefaultschemes", timeout=120,
+                    success_codes=(0,))
+    ctx.log("Default power plans restored (active plan is now Balanced).")
+
+
+def repair_teredo(ctx: TaskContext):
+    """Fix Xbox-multiplayer 'Teredo unable to qualify' NAT errors by
+    resetting the Teredo tunnel to Microsoft defaults (enterpriseclient +
+    default server). No firewall or router changes; harmless on PCs
+    without Xbox networking."""
+    ctx.set_status("Resetting Teredo for Xbox multiplayer networking...")
+    run_cmd(ctx, "netsh interface teredo set state enterpriseclient", timeout=60)
+    run_cmd(ctx, "netsh interface teredo set state servername=default", timeout=60)
+    ctx.log("Teredo reset to defaults — retry the Xbox party/game invite.")
+
+
 # --------------------------------------------------------------------------- #
 # Installer tasks MOVED to app/tasks/install_tasks.py (Install tab) — every
 # internet-required task lives there now, per the user's 4th-tab request.
@@ -594,4 +615,6 @@ TASKS = [
     Task("icon_cache", "Fix Blank Icons", "Rebuilds the icon cache that causes blank or white desktop icons", repair_icon_cache, default=False, admin_required=False, column=1),
     Task("wsreset_store", "Reset Store Downloads", "Resets the Store cache when app downloads fail or hang", repair_store_cache_reset, default=False, admin_required=False, column=1),
     Task("enable_restore", "Turn On System Protection", "Re-enables restore points on C: if something turned them off", repair_enable_system_restore, default=False, admin_required=True, column=0),
+    Task("power_plans", "Reset Power Plans", "Restores Microsoft's default power plans when optimizers break them", repair_power_plans, default=False, admin_required=True, column=0),
+    Task("teredo_fix", "Fix Xbox Multiplayer (Teredo)", "Resets Teredo tunneling to fix Xbox party and matchmaking errors", repair_teredo, default=False, admin_required=True, column=1),
 ]

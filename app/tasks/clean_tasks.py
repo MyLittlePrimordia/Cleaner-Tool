@@ -666,6 +666,50 @@ def clean_dev_caches(ctx: TaskContext):
     return _clean_many(ctx, folders, "dev caches")
 
 
+def clean_package_manager_caches(ctx: TaskContext):
+    """Clean NuGet / Cargo / Gradle download caches (regenerable blobs;
+    installed packages, toolchains and projects untouched — the next build
+    just re-downloads what it needs)."""
+    userprofile = os.environ.get("USERPROFILE", "")
+    folders = [
+        # NuGet HTTP caches (NOT ~/.nuget/packages — that is the package
+        # store itself; only the throwaway HTTP layers go here)
+        os.path.join(_LOCALAPPDATA, "NuGet\\v3-cache"),
+        os.path.join(_LOCALAPPDATA, "NuGet\\http-cache"),
+        os.path.join(_LOCALAPPDATA, "NuGet\\plugins-cache"),
+        # Cargo registry download cache (extracted sources under
+        # registry/src stay, so builds keep working offline)
+        os.path.join(userprofile, ".cargo\\registry\\cache") if userprofile else "",
+        os.path.join(userprofile, ".cargo\\registry\\index") if userprofile else "",
+        # Gradle build cache + transform cache (project files untouched)
+        os.path.join(userprofile, ".gradle\\caches\\build-cache-1") if userprofile else "",
+        os.path.join(userprofile, ".gradle\\caches\\transforms-4") if userprofile else "",
+    ]
+    return _clean_many(ctx, [f for f in folders if f], "package manager caches")
+
+
+def clean_terminal_history(ctx: TaskContext):
+    """Clear PowerShell / Terminal command history (privacy hygiene only —
+    no settings, profiles or scripts touched)."""
+    files = [
+        os.path.join(_APPDATA, "Microsoft\\Windows\\PowerShell\\PSReadLine\\ConsoleHost_history.txt"),
+        # Legacy per-host history + VS Code's integrated-terminal history
+        os.path.join(_APPDATA, "Microsoft\\Windows\\PowerShell\\PSReadLine\\Visual Studio Code Host_history.txt"),
+    ]
+    total = 0
+    for path in files:
+        try:
+            if os.path.isfile(path):
+                total += os.path.getsize(path)
+                os.remove(path)
+                ctx.log(f"Removed terminal history: {path}")
+        except OSError as exc:
+            ctx.log(f"  (kept history file: {exc})")
+    if not total:
+        ctx.log("No terminal history found.")
+    return total
+
+
 from app.tasks import Task  # noqa: E402
 
 TASKS = [
@@ -701,4 +745,6 @@ TASKS = [
     Task("defender_history", "Clear Defender History", "Removes stale protection-history entries that haunt the Security app", clean_defender_history, default=False, admin_required=True, column=1),
     Task("steam_depot", "Clean Steam Download Cache", "Clears Steam's manifest cache that causes phantom update states", clean_steam_download_cache, default=False, admin_required=False, column=0),
     Task("dev_caches", "Clean Dev Caches", "Clears VS Code, npm and pip caches for modders and AI tinkerers", clean_dev_caches, default=False, admin_required=False, column=1),
+    Task("pkg_caches", "Clean Package Caches", "Clears NuGet, Cargo and Gradle download caches; projects untouched", clean_package_manager_caches, default=False, admin_required=False, column=1),
+    Task("terminal_history", "Clear Terminal History", "Clears PowerShell command history for privacy; settings untouched", clean_terminal_history, default=False, admin_required=False, column=0),
 ]

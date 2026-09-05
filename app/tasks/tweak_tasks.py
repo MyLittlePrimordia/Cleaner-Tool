@@ -1928,6 +1928,49 @@ def revert_location_tracking_off(ctx: TaskContext):
     ctx.log("Location setting restored.")
 
 
+def apply_widgets_board_off(ctx: TaskContext):
+    """Policy-level Widgets board off (goes further than hiding the taskbar
+    icon: the board, news feed and its background activity stop entirely)."""
+    _snap_reg_values(ctx, "widgets_board_off",
+                     [("HKLM", "SOFTWARE\\Policies\\Microsoft\\Dsh", "AllowNewsAndInterests"),
+                      ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Feeds", "ShellFeedsTaskbarViewMode")])
+    reg_set_value_checked(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Dsh", "AllowNewsAndInterests", 0)
+    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Feeds", "ShellFeedsTaskbarViewMode", 2)
+    ctx.log("Widgets board disabled (icon hide + news feed off).")
+
+def revert_widgets_board_off(ctx: TaskContext):
+    _restore_reg_values(ctx, "widgets_board_off")
+    ctx.log("Widgets board restored.")
+
+
+def apply_autoplay_off(ctx: TaskContext):
+    """Disable AutoPlay/AutoRun for USB sticks and discs (plugging in a
+    drive never auto-launches anything — classic USB-malware vector)."""
+    _snap_reg_values(ctx, "autoplay_off",
+                     [("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\AutoplayHandlers", "DisableAutoplay"),
+                      ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer", "NoDriveTypeAutoRun")])
+    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\AutoplayHandlers", "DisableAutoplay", 1)
+    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer", "NoDriveTypeAutoRun", 255)
+    ctx.log("AutoPlay disabled for all drives.")
+
+def revert_autoplay_off(ctx: TaskContext):
+    _restore_reg_values(ctx, "autoplay_off")
+    ctx.log("AutoPlay restored.")
+
+
+def apply_snap_flyout_off(ctx: TaskContext):
+    """Disable the Snap-layouts flyout that pops when hovering a window's
+    maximize button mid-game (Win+arrows snapping keeps working)."""
+    _snap_reg_values(ctx, "snap_flyout_off",
+                     [("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", "EnableSnapAssistFlyout")])
+    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", "EnableSnapAssistFlyout", 0)
+    ctx.log("Snap flyout off — maximize-hover no longer pops layouts.")
+
+def revert_snap_flyout_off(ctx: TaskContext):
+    _restore_reg_values(ctx, "snap_flyout_off")
+    ctx.log("Snap flyout restored.")
+
+
 from app.tasks import Task  # noqa: E402
 
 TASKS = [
@@ -2000,4 +2043,7 @@ TASKS = [
     Task("remote_assist", "Disable Remote Assistance", "Closes the inbound-remote-help vector most gamers never use", apply_remote_assist_off, default=False, revert=revert_remote_assist_off, admin_required=True, column=0),
     Task("verbose_boot", "Verbose Boot Messages", "Shows what Windows is doing at boot and shutdown instead of the spinner", apply_verbose_boot, default=False, revert=revert_verbose_boot, admin_required=True, column=0),
     Task("location_tracking", "Disable Location Tracking", "Turns off the location sensor (breaks Find My Device and auto time-zone)", apply_location_tracking_off, default=False, revert=revert_location_tracking_off, admin_required=True, column=0),
+    Task("widgets_board_off", "Disable Widgets Board", "Kills the Widgets news board entirely, not just its taskbar icon", apply_widgets_board_off, default=False, revert=revert_widgets_board_off, admin_required=True, column=0),
+    Task("autoplay_off", "Disable USB AutoPlay", "Stops USB sticks auto-launching apps when plugged in", apply_autoplay_off, default=False, revert=revert_autoplay_off, admin_required=False, column=0),
+    Task("snap_flyout_off", "No Snap Popups", "Stops layout popups when hovering maximize mid-game", apply_snap_flyout_off, default=False, revert=revert_snap_flyout_off, admin_required=False, column=0),
 ]

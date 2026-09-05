@@ -6,7 +6,7 @@ Fixed: search index path, return-code checking, added safe new tasks.
 import os
 import shutil
 
-from app.utils import TaskContext, run_cmd, run_cmd_checked, create_restore_point
+from app.utils import TaskContext, run_cmd, run_cmd_checked, create_restore_point, clean_folder_contents, restart_explorer
 
 _WINDIR = os.environ.get("WINDIR", "C:\\Windows")
 
@@ -28,13 +28,14 @@ def repair_dism_component_cleanup(ctx: TaskContext):
                     success_codes=(0, 3010))
 
 
-def repair_dism_resetbase(ctx: TaskContext):
-    ctx.set_status("Running DISM /ResetBase (permanently trims WinSxS — removes update rollback)...")
-    run_cmd_checked(ctx, "DISM /Online /Cleanup-Image /StartComponentCleanup /ResetBase", timeout=900,
-                    success_codes=(0, 3010))
+def repair_dism_scanhealth(ctx: TaskContext):
+    ctx.set_status("Scanning Windows image for corruption (DISM ScanHealth)...")
+    run_cmd_checked(ctx, "DISM /Online /Cleanup-Image /ScanHealth", timeout=900, success_codes=(0, 3010))
 
 
-
+def repair_dism_checkhealth(ctx: TaskContext):
+    ctx.set_status("Checking Windows image health (DISM CheckHealth)...")
+    run_cmd_checked(ctx, "DISM /Online /Cleanup-Image /CheckHealth", timeout=600, success_codes=(0, 3010))
 
 
 def repair_chkdsk_scan(ctx: TaskContext):
@@ -66,19 +67,30 @@ def repair_windows_update_reset(ctx: TaskContext):
         for folder in (sw_dist, catroot2):
             if os.path.exists(folder):
                 backup = folder + ".bak"
+                # M4 fix: Windows recreates SoftwareDistribution as an EMPTY
+                # folder within seconds of the services above restarting.
+                # The old code unconditionally did rmtree(backup) then
+                # rename(folder, backup) on every run — so running this task
+                # twice in a short window would delete the only complete
+                # backup (from run #1) and replace it with an empty folder
+                # (Windows' just-recreated stub from run #1), wiping the WU
+                # download store. Fix: only replace the backup if the LIVE
+                # folder actually has content worth backing up; an empty
+                # live folder means a backup already exists from a prior
+                # run and should be left alone.
+                try:
+                    has_content = any(os.scandir(folder))
+                except Exception:
+                    has_content = True  # can't tell — be safe, don't skip
+                if not has_content and os.path.exists(backup):
+                    ctx.log(f"  {folder} is already empty — keeping existing backup at {backup} untouched.")
+                    continue
                 try:
                     if os.path.exists(backup):
-                        if ctx.dry_run:
-                            ctx.log(f"Would remove existing backup {backup} (dry run)")
-                        else:
-                            shutil.rmtree(backup, ignore_errors=True)
-                    if ctx.dry_run:
-                        ctx.log(f"Would rename {folder} -> {backup} (dry run)")
-                        # Don't append to renamed in dry-run — not actually renamed
-                    else:
-                        os.rename(folder, backup)
-                        renamed.append((folder, backup))
-                        ctx.log(f"Renamed {folder} -> {backup}")
+                        shutil.rmtree(backup, ignore_errors=True)
+                    os.rename(folder, backup)
+                    renamed.append((folder, backup))
+                    ctx.log(f"Renamed {folder} -> {backup}")
                 except Exception as exc:
                     ctx.log(f"  ! could not rename {folder}: {exc}")
                     # Rollback any previously renamed folders
@@ -97,29 +109,13 @@ def repair_windows_update_reset(ctx: TaskContext):
             rc = run_cmd(ctx, f"net start {svc}", timeout=30)
             if rc != 0:
                 ctx.log(f"  ! Warning: could not start {svc} (code {rc}) — may need reboot")
-        # If rename succeeded and Windows recreated the folders, clean up .bak to reclaim space
-        # (otherwise leave .bak for next run's rmtree). Don't block on deletion.
-        if not ctx.dry_run and renamed:
-            import time as _time
-            _time.sleep(2.0)
-            for orig, bak in renamed:
-                if os.path.exists(orig) and os.path.exists(bak):
-                    try:
-                        shutil.rmtree(bak, ignore_errors=True)
-                        if not os.path.exists(bak):
-                            ctx.log(f"Cleaned up backup {bak}")
-                    except Exception:
-                        pass
-
-
-def repair_network_reset(ctx: TaskContext):
-    ctx.set_status("Resetting the network stack (Winsock + TCP/IP)...")
-    run_cmd(ctx, "netsh winsock reset", timeout=60)
-    run_cmd(ctx, "netsh int ip reset", timeout=60)
-    run_cmd(ctx, "ipconfig /release", timeout=60)
-    run_cmd(ctx, "ipconfig /renew", timeout=60)
-    run_cmd(ctx, "ipconfig /flushdns", timeout=30)
-    ctx.log("A reboot is recommended for the network reset to fully apply.")
+        # M10 fix: do NOT rmtree the .bak here — Windows may not have recreated
+        # the original folder yet, and deleting the only copy would destroy the
+        # user's entire WU download store. Leave the .bak for the next run to
+        # clean up (the rename-backup at the top of the next run handles it).
+        if renamed:
+            ctx.log("Backups kept as .bak (Windows rebuilds folders on next update check).")
+            ctx.log("They will be cleaned automatically on the next run of this task.")
 
 
 def repair_search_index(ctx: TaskContext):
@@ -133,7 +129,7 @@ def repair_search_index(ctx: TaskContext):
         _sd_root = _sd if _sd.endswith("\\") else _sd + "\\"
     program_data = os.environ.get("ProgramData", os.path.join(_sd_root, "ProgramData"))
     index_db = os.path.join(program_data, "Microsoft\\Search\\Data\\Applications\\Windows")
-    if os.path.exists(index_db) and not ctx.dry_run:
+    if os.path.exists(index_db):
         if rc_stop != 0:
             ctx.log(f"  ! WSearch stop failed (code {rc_stop}) — skipping delete to avoid partial lock")
         else:
@@ -142,8 +138,6 @@ def repair_search_index(ctx: TaskContext):
                 ctx.log(f"Cleared search index database at {index_db}")
             except Exception as exc:
                 ctx.log(f"  ! could not clear search index: {exc}")
-    elif os.path.exists(index_db):
-        ctx.log(f"Would clear search index at {index_db} (dry run)")
     else:
         ctx.log(f"Search index path not found: {index_db}")
     rc_start = run_cmd(ctx, "net start WSearch", timeout=30)
@@ -156,12 +150,8 @@ def repair_print_spooler(ctx: TaskContext):
     ctx.set_status("Clearing stuck print jobs and restarting the Print Spooler...")
     run_cmd(ctx, "net stop spooler", timeout=30)
     spool_dir = f"{_WINDIR}\\System32\\spool\\PRINTERS"
-    if os.path.exists(spool_dir) and not ctx.dry_run:
-        for f in os.listdir(spool_dir):
-            try:
-                os.remove(os.path.join(spool_dir, f))
-            except OSError:
-                pass
+    if os.path.exists(spool_dir):
+        clean_folder_contents(ctx, spool_dir)
     run_cmd(ctx, "net start spooler", timeout=30)
 
 
@@ -203,109 +193,405 @@ def repair_bits_reset(ctx: TaskContext):
     run_cmd(ctx, "bitsadmin /reset /allusers", timeout=60)
 
 
-def repair_disable_memory_integrity(ctx: TaskContext):
-    """Disable Memory Integrity (HVCI) — improves CPU-bound gaming performance.
-    WARNING: Reduces protection against kernel-level exploits."""
-    ctx.set_status("Disabling Memory Integrity (HVCI)...")
-    run_cmd(ctx, "reg add HKLM\\SYSTEM\\CurrentControlSet\\Control\\DeviceGuard /v EnableVirtualizationBasedSecurity /t REG_DWORD /d 0 /f", timeout=30)
-    run_cmd(ctx, "reg add HKLM\\SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios\\HypervisorEnforcedCodeIntegrity /v Enabled /t REG_DWORD /d 0 /f", timeout=30)
-    ctx.log("Memory Integrity disabled. Reboot required.")
+def repair_xbox_game_apps(ctx: TaskContext):
+    """Re-register Xbox / Gaming Services apps — fixes broken Game Pass,
+    Xbox app not launching, and 'we couldn't sign you in' errors.
+    Keeps all packages installed; just repairs their registration."""
+    ctx.set_status("Repairing Xbox / Game Pass apps (GamingServices, Xbox app)...")
+    packages = [
+        "Microsoft.GamingApp",        # Xbox app
+        "Microsoft.GamingServices",   # Game Pass / install services
+        "Microsoft.XboxIdentityProvider",
+        "Microsoft.XboxGamingOverlay",
+    ]
+    for pkg in packages:
+        run_cmd(
+            ctx,
+            f'powershell -NoProfile -Command "Get-AppxPackage -Name \\"{pkg}\\" | '
+            f'ForEach-Object {{ Add-AppxPackage -DisableDevelopmentMode -Register '
+            f'($_.InstallLocation + \'\\AppXManifest.xml\') -ErrorAction SilentlyContinue }}"',
+            timeout=120,
+        )
+        ctx.log(f"  Re-registered {pkg}")
+    # GamingServices also installs a Win32 service pair; re-register its appx explicitly
+    run_cmd(
+        ctx,
+        'powershell -NoProfile -Command "Get-AppxPackage -Name \\"Microsoft.GamingServices\\" -AllUsers | '
+        'ForEach-Object { Add-AppxPackage -DisableDevelopmentMode -Register ($_.InstallLocation + \'\\AppXManifest.xml\') -ErrorAction SilentlyContinue }"',
+        timeout=120,
+    )
+    ctx.log("Xbox / Game Pass apps repaired. Reboot if the Xbox app still misbehaves.")
 
 
-def repair_enable_memory_integrity(ctx: TaskContext):
-    """Re-enable Memory Integrity (HVCI) — restores kernel exploit protection."""
-    ctx.set_status("Enabling Memory Integrity (HVCI)...")
-    run_cmd(ctx, "reg add HKLM\\SYSTEM\\CurrentControlSet\\Control\\DeviceGuard /v EnableVirtualizationBasedSecurity /t REG_DWORD /d 1 /f", timeout=30)
-    run_cmd(ctx, "reg add HKLM\\SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios\\HypervisorEnforcedCodeIntegrity /v Enabled /t REG_DWORD /d 1 /f", timeout=30)
-    ctx.log("Memory Integrity enabled. Reboot required.")
+def repair_ssd_maintenance(ctx: TaskContext):
+    """SSD maintenance: retrim all SSDs (defrag /L) + SMART health report."""
+    ctx.set_status("Running SSD retrim and reporting drive health...")
+    run_cmd(ctx, "defrag /C /L /U /V", timeout=1800)
+    run_cmd(
+        ctx,
+        'powershell -NoProfile -Command "Get-PhysicalDisk | Select-Object FriendlyName, MediaType, HealthStatus | Format-Table -AutoSize"',
+        timeout=60,
+    )
+    ctx.log("Retrim complete. Any drive above shows OK health or needs attention.")
 
 
-def repair_disable_virtual_machine_platform(ctx: TaskContext):
-    """Disable Virtual Machine Platform (Hyper-V) — reduces overhead if not using WSL2/Hyper-V."""
-    ctx.set_status("Disabling Virtual Machine Platform...")
-    run_cmd_checked(ctx, "dism /Online /Disable-Feature /FeatureName:VirtualMachinePlatform /NoRestart", timeout=120, success_codes=(0, 3010))
-    ctx.log("Virtual Machine Platform disabled. Reboot required.")
+def repair_vss_restore_points(ctx: TaskContext):
+    """Restart the Volume Shadow Copy service and list writers — fixes
+    failing System Restore point creation (complements the Safety Checkpoint task)."""
+    ctx.set_status("Restarting Volume Shadow Copy (VSS) service...")
+    run_cmd(ctx, "net stop VSS", timeout=60)
+    run_cmd(ctx, "net start VSS", timeout=60)
+    run_cmd(ctx, "vssadmin list writers", timeout=120)
+    ctx.log("VSS restarted and writers listed above (look for [x] Stable).")
 
 
-def repair_enable_virtual_machine_platform(ctx: TaskContext):
-    """Re-enable Virtual Machine Platform (needed for WSL2/Hyper-V)."""
-    ctx.set_status("Enabling Virtual Machine Platform...")
-    run_cmd_checked(ctx, "dism /Online /Enable-Feature /FeatureName:VirtualMachinePlatform /All /NoRestart", timeout=120, success_codes=(0, 3010))
-    ctx.log("Virtual Machine Platform enabled. Reboot required.")
+def repair_network_stack_defaults(ctx: TaskContext):
+    """Reset network stack to Microsoft defaults + normalize TCP autotuning/RSS.
+    Fixes damage left by other 'optimizers' (autotuning disabled causes slow
+    downloads on Steam/Epic)."""
+    ctx.set_status("Resetting network stack to Windows defaults...")
+    run_cmd(ctx, "netsh winsock reset", timeout=60)
+    run_cmd(ctx, "netsh int ip reset", timeout=60)
+    run_cmd(ctx, "netsh int tcp set global autotuninglevel=normal", timeout=60)
+    run_cmd(ctx, "netsh int tcp set global rss=enabled", timeout=60)
+    run_cmd(ctx, "ipconfig /release", timeout=60)
+    run_cmd(ctx, "ipconfig /renew", timeout=60)
+    run_cmd(ctx, "ipconfig /flushdns", timeout=30)
+    ctx.log("Network stack reset to defaults. A reboot is recommended.")
 
 
-def repair_disable_storage_sense_active_hours(ctx: TaskContext):
-    """Configure Storage Sense master switch (HKCU). Value 01 = on/off."""
-    ctx.set_status("Configuring Storage Sense...")
-    # Correct hive is HKCU, not HKLM — StoragePolicy lives under HKCU\SOFTWARE\...
-    from app.utils import reg_set_value
-    reg_set_value(ctx, "HKCU", "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\StorageSense\\Parameters\\StoragePolicy", "01", 1)
-    ctx.log("Storage Sense configured.")
+# --------------------------------------------------------------------------- #
+# Round 2 checks (user request) — report-only, plain-language verdicts
+# --------------------------------------------------------------------------- #
+
+def repair_smart_verdict(ctx: TaskContext):
+    """SMART verdict: read the system drive's health via PowerShell's
+    Get-PhysicalDisk (same data CrystalDiskInfo shows) and translate it
+    into a plain-language verdict. Report-only — never 'fixes' a dying
+    drive, just tells the user the truth."""
+    ctx.set_status("Checking drive health (SMART)...")
+    import subprocess as _sp
+    try:
+        out = _sp.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-PhysicalDisk | Select-Object FriendlyName, MediaType, HealthStatus, "
+             "@{n='Size';e={[math]::Round($_.Size/1GB)}} | ConvertTo-Csv -NoTypeInformation"],
+            capture_output=True, text=True, timeout=60,
+            creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Could not query drive health: {exc}")
+    lines = [l.strip() for l in (out.stdout or "").splitlines() if l.strip() and not l.startswith("#")]
+    if len(lines) < 2:
+        raise RuntimeError("No drives reported — SMART data unavailable (or storage service disabled).")
+    bad = []
+    ok_n = 0
+    for row in lines[1:]:
+        parts = [p.strip('"') for p in row.split(",")]
+        if len(parts) < 3:
+            continue
+        name, media, health = parts[0], parts[1], parts[2]
+        ctx.log(f"  {name} ({media}): {health}")
+        if health and health.lower() != "healthy":
+            bad.append(name)
+        else:
+            ok_n += 1
+    if bad:
+        raise RuntimeError(
+            f"Drive health WARNING: {', '.join(bad)} — back up your game library "
+            "and saves NOW; a failing drive is the one thing this app can't repair."
+        )
+    ctx.log(f"VERDICT: all {ok_n} drive(s) Healthy — no action needed.")
 
 
-def repair_enable_storage_sense_active_hours(ctx: TaskContext):
-    """Restore Storage Sense default behavior (HKCU)."""
-    ctx.set_status("Restoring Storage Sense default behavior...")
-    from app.utils import reg_delete_value
-    reg_delete_value(ctx, "HKCU", "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\StorageSense\\Parameters\\StoragePolicy", "01")
-    ctx.log("Storage Sense restored to default.")
+def repair_gpu_driver_age(ctx: TaskContext):
+    """Driver-age nudge: read the installed GPU driver's date from WMI
+    (Win32_VideoController.DriverDate) and flag anything older than a
+    year, or older than 6 months with a gentle note. Report-only."""
+    ctx.set_status("Checking GPU driver age...")
+    import subprocess as _sp
+    from datetime import datetime, timezone
+    try:
+        # A1 fix: PowerShell's ConvertTo-Csv serializes DateTime in the
+        # current culture's SHORT-DATE format (on en-US: "7/23/2026 7:00:00
+        # PM"), which the parser below cannot read — every row was skipped
+        # and healthy drivers were reported as unparsable. Format the
+        # timestamp with an invariant culture FIRST, so the CSV always
+        # carries "yyyy-MM-dd HH:mm:ss" regardless of regional settings.
+        out = _sp.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_VideoController | "
+             "Where-Object DriverDate | Select-Object Name, DriverDate | "
+             "ForEach-Object { [PSCustomObject]@{ Name = $_.Name; "
+             "DriverDate = $_.DriverDate.ToString('yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture) } } | "
+             "ConvertTo-Csv -NoTypeInformation"],
+            capture_output=True, text=True, timeout=60,
+            creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Could not query GPU driver info: {exc}")
+    lines = [l.strip() for l in (out.stdout or "").splitlines() if l.strip() and not l.startswith("#")]
+    if len(lines) < 2:
+        raise RuntimeError("No GPU driver info available from WMI.")
+    stale, seen_any = [], False
+    for row in lines[1:]:
+        parts = [p.strip('"') for p in row.split(",", 1)]
+        if len(parts) < 2 or not parts[1]:
+            continue
+        name, date_raw = parts[0], parts[1]
+        try:
+            # A1 fix: the pipeline above emits an invariant timestamp
+            # ("yyyy-MM-dd HH:mm:ss", no culture-dependent short-date
+            # format), so a single strict parse covers every machine.
+            d = datetime.strptime(date_raw.strip(), "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue  # genuinely unparsable row — skip it, don't abort
+        seen_any = True
+        age_days = (datetime.now(timezone.utc).replace(tzinfo=None) - d).days
+        ctx.log(f"  {name}: driver dated {d.date()} ({age_days} days old)")
+        if age_days > 365:
+            stale.append(f"{name} ({age_days // 30} months old)")
+    if not seen_any:
+        raise RuntimeError("Could not parse any driver dates — check the log.")
+    if stale:
+        raise RuntimeError(
+            f"GPU driver outdated: {', '.join(stale)}. Update it from the "
+            "Install tab (NVIDIA App / Intel DSA / AMD) for the latest game "
+            "fixes and performance."
+        )
+    ctx.log("VERDICT: GPU drivers reasonably current — no nudge needed.")
 
 
 from app.tasks import Task  # noqa: E402
 
+# --------------------------------------------------------------------------- #
+# Service quick-fixers (tasks.txt additions)
+# --------------------------------------------------------------------------- #
+
+def restart_audio_engine(ctx: TaskContext):
+    """Restart the Windows audio stack (AudioSrv + AudioEndpointBuilder).
+    Fixes most dead-audio / dead-mic situations (USB swap, app freeze)
+    without a reboot. Best-effort per-service: AudioEndpointBuilder is a
+    dependency of AudioSrv, so stopping AudioSrv /y stops both; we then
+    start Builder first and AudioSrv second, as Windows expects."""
+    ctx.set_status("Restarting Windows audio...")
+    run_cmd_checked(ctx, "net stop AudioSrv /y", timeout=60, success_codes=(0, 1, 2))
+    # 1 = service not stopped (wasn't running) — fine for a restart
+    # 2 = service not installed (rare) — still try to start the stack
+    run_cmd_checked(ctx, "net start AudioEndpointBuilder", timeout=60, success_codes=(0, 2))
+    run_cmd_checked(ctx, "net start AudioSrv", timeout=60, success_codes=(0, 2))
+    ctx.log("Audio engine restarted. If your device was muted, replug it or check Sound Settings.")
+
+
+def repair_firewall_reset(ctx: TaskContext):
+    """Reset Windows Firewall to factory defaults. Fixes multiplayer /
+    anti-cheat matchmaking failures caused by corrupted or third-party
+    mangled rules. ADVANCED: also removes every per-app allow/block rule
+    (Windows re-prompts on next launch) — that's the point of a reset."""
+    ctx.set_status("Resetting Windows Firewall rules...")
+    run_cmd_checked(ctx, "netsh advfirewall reset", timeout=120)
+    ctx.log("Firewall reset to stock defaults. Games will re-ask for network permission on first launch.")
+
+
+def restart_bluetooth_stack(ctx: TaskContext):
+    """Restart Bluetooth services (bthserv + bthHFSrv) — fixes wireless
+    controller/headset disconnects without a reboot. Same shape as
+    restart_audio_engine: dependency order matters (handsfree depends on
+    the support service — stop dependents first, start support first).
+    Exit codes: 1 = wasn't running (fine for stop), 2 = not installed
+    (desktop PCs without Bluetooth)."""
+    ctx.set_status("Restarting Bluetooth...")
+    started = []
+    for svc in ("bthHFSrv", "bthserv"):
+        rc = run_cmd(ctx, f"net stop {svc} /y", timeout=60)
+        if rc == 2:
+            ctx.log(f"  {svc} not installed on this PC — skipped.")
+    for svc in ("bthserv", "bthHFSrv"):
+        rc = run_cmd(ctx, f"net start {svc}", timeout=60)
+        if rc == 0:
+            started.append(svc)
+        elif rc == 2:
+            ctx.log(f"  {svc} not installed — nothing to start.")
+        else:
+            ctx.log(f"  ! could not start {svc} (code {rc})")
+    if not started:
+        # honest failure (repair_smart_verdict pattern): a Bluetooth-less
+        # PC must not report "restarted successfully"
+        raise RuntimeError(
+            "No Bluetooth services found — this PC may not have Bluetooth."
+        )
+    ctx.log(f"Bluetooth restarted ({', '.join(started)}). Reconnect your controller/headset if needed.")
+
+
+def flush_arp_cache(ctx: TaskContext):
+    """Clear the ARP table — fixes IP-conflict and router-communication
+    issues. Pairs with dns_flush; netsh over `arp -d *` because it's one
+    clean command with rc 0 on success."""
+    ctx.set_status("Flushing ARP cache...")
+    run_cmd_checked(ctx, "netsh interface ip delete arpcache", timeout=30)
+    ctx.log("ARP cache cleared. Windows rebuilds it as you use the network.")
+
+
+def reset_graphics_driver(ctx: TaskContext):
+    """Soft-restart the display driver stack — the scripted version of
+    Win+Ctrl+Shift+B. Screen flashes once; open windows stay open; no
+    admin needed. There is no public API for this, so it synthesizes the
+    global hotkey via keybd_event (the same technique dedicated 'fix black
+    screen' utilities use).
+
+    Honesty note: keybd_event gives no return code to verify — this is
+    fire-and-forget by nature. The log states exactly what was sent and
+    what the user should see (one screen flash). The heavier alternative
+    (disable/enable the display device via PnP) was rejected: it needs
+    admin, black-screens longer, and rearranges windows — worse for a
+    layman-facing tool."""
+    import ctypes
+    import time
+    ctx.set_status("Restarting graphics driver (screen will flash)...")
+    user32 = ctypes.windll.user32
+    keys = [(0x5B, 0), (0x11, 0), (0x10, 0), (0x42, 0),   # LWin, Ctrl, Shift, B down
+            (0x42, 2), (0x10, 2), (0x11, 2), (0x5B, 2)]   # ...up, in reverse
+    for vk, flags in keys:
+        user32.keybd_event(vk, 0, flags, 0)
+        time.sleep(0.05)
+    ctx.log("Display driver restart sent (same as pressing Win+Ctrl+Shift+B).")
+    ctx.log("Your screen should flash once. If it didn't, the hotkey can be pressed manually.")
+
+
+_ANTICHEAT_SERVICES = ("EasyAntiCheat", "EasyAntiCheat_EOS", "BEService", "BEDaisy")
+
+
+def repair_anticheat_services(ctx: TaskContext):
+    """Reset EAC / BattlEye services to on-demand and bounce them — fixes
+    'Error 30005: anti-cheat service creation failed' launch errors.
+
+    The safe, real fix: games start these services themselves with their
+    own arguments; third-party 'optimizers' often leave them disabled or
+    broken, which is what 30005 reports. Set back to demand-start (checked
+    via run_cmd_checked) and bounce once. NEVER delete services — the game
+    recreates them and SDDL permission templates vary per install, so
+    sc sdset is out of scope."""
+    ctx.set_status("Repairing anti-cheat services (EasyAntiCheat, BattlEye)...")
+    found = 0
+    for svc in _ANTICHEAT_SERVICES:
+        rc = run_cmd(ctx, f"sc query {svc}", timeout=30)
+        if rc != 0:
+            ctx.log(f"  {svc}: not installed — skipped.")
+            continue
+        found += 1
+        run_cmd_checked(ctx, f"sc config {svc} start= demand", timeout=30)
+        run_cmd(ctx, f"net stop {svc} /y", timeout=60)   # best-effort; usually idle
+        rc2 = run_cmd(ctx, f"net start {svc}", timeout=60)
+        if rc2 == 0:
+            ctx.log(f"  {svc}: reset to on-demand and verified it starts.")
+        else:
+            ctx.log(f"  {svc}: reset to on-demand. (Could not start it standalone — "
+                    "normal; your game starts it with its own arguments.)")
+    if not found:
+        raise RuntimeError(
+            "No EasyAntiCheat or BattlEye services found — this only helps if "
+            "you have an EAC/BattlEye game installed."
+        )
+    ctx.log("Tip: if a game still fails, run 'EasyAntiCheat_EOS_Setup.exe' "
+            "(in the game's EasyAntiCheat folder) and choose Repair.")
+
+
+# --------------------------------------------------------------------------- #
+# Missing Gaming Components installers (LTSC / stripped Windows support)
+# --------------------------------------------------------------------------- #
+# Design rules distilled from the add.txt review:
+#   * never guess from the Windows edition — detect the component itself
+#     (app/capabilities.py) so this works on LTSC, N, and debloated Pro
+#   * skip honestly when already present ("already installed" is a
+#     success, not a failure)
+#   * install order respects the chicken-and-egg: Store FIRST (it brings
+#     winget), then everything else via winget
+#   * verify presence AFTER install and raise if it didn't take — no
+#     silent fake successes (the Ultimate Performance lesson)
+#   * every winget ID below was verified to exist on a real machine
+#     before being hardcoded (Xbox 9MV0B5HZVK9Z, Game Bar 9NZKPSTSNW4P,
+#     VP9 9N4D0MSMP0PT, AV1 9MVZQVXJBQ9V, WebMedia 9N5TDP8VCMHS)
+
+def repair_icon_cache(ctx: TaskContext):
+    """Fix blank/white desktop icons: stop Explorer, delete the icon cache
+    databases, restart Explorer (verified back — never left without a shell)."""
+    ctx.set_status("Rebuilding the icon cache...")
+    run_cmd(ctx, "taskkill /f /im explorer.exe", timeout=15)
+    local = os.environ.get("LOCALAPPDATA", "")
+    removed = 0
+    if local and os.path.isabs(local):
+        import glob as _glob
+        for path in [os.path.join(local, "IconCache.db")] + \
+                _glob.glob(os.path.join(local, "iconcache_*.db")):
+            try:
+                if os.path.isfile(path):
+                    os.remove(path)
+                    removed += 1
+                    ctx.log(f"Removed stale icon cache: {path}")
+            except OSError as exc:
+                ctx.log(f"  (kept {path}: {exc})")
+    if not restart_explorer(ctx):
+        ctx.log("  ! Explorer did not come back on its own — press Ctrl+Shift+Esc, File > Run, type explorer.exe")
+    else:
+        ctx.log(f"Icon cache rebuilt ({removed} database(s) cleared).")
+
+
+def repair_store_cache_reset(ctx: TaskContext):
+    """Reset the Microsoft Store download cache (wsreset): fixes Store and
+    Xbox-app downloads that fail, hang, or loop."""
+    ctx.set_status("Resetting the Store download cache (wsreset)...")
+    run_cmd_checked(ctx, "wsreset.exe", timeout=600, success_codes=(0,))
+    ctx.log("Store cache reset — reopen the Store and retry the download.")
+
+
+def repair_enable_system_restore(ctx: TaskContext):
+    """Re-enable System Protection on C: when something (or some debloat
+    guide) turned it off — without it, Safety Checkpoints cannot save you."""
+    ctx.set_status("Turning System Protection back on for C:...")
+    run_cmd_checked(
+        ctx,
+        'powershell -NoProfile -Command "Enable-ComputerRestore -Drive \'C:\\\'"',
+        timeout=300, success_codes=(0,),
+    )
+    ctx.log("System Protection is on for C: — Safety Checkpoints will work again.")
+
+
+# --------------------------------------------------------------------------- #
+# Installer tasks MOVED to app/tasks/install_tasks.py (Install tab) — every
+# internet-required task lives there now, per the user's 4th-tab request.
+# Repair keeps the repair-only identity: fix what exists, don't install
+# what doesn't.
+# --------------------------------------------------------------------------- #
+
 TASKS = [
-    Task("restore_point", "Safety Checkpoint",
-         "Creates an undo point so you can roll back before repairs.",
-         create_restore_point, default=True, column=0),
-    Task("sfc_scan", "Fix System Files",
-         "Scans and repairs broken or missing Windows system files.",
-         repair_sfc_scan, default=True, column=0),
-    Task("dism_restorehealth", "Repair Windows Image",
-         "Fixes broken system files by downloading clean copies from Windows Update.",
-         repair_dism_restorehealth, default=True, column=0),
-    Task("dism_cleanup", "Cleanup Update Storage",
-         "Frees disk space safely — keeps ability to uninstall recent updates.",
-         repair_dism_component_cleanup, default=False, column=0),
-    Task("dism_resetbase", "Deep Cleanup (Advanced)",
-         "Maximum space savings but you can no longer uninstall current updates. Only if you won't roll back.",
-         repair_dism_resetbase, default=False, risk="ADVANCED", column=0),
-    Task("chkdsk_scan", "Check Disk for Errors (Read-Only)",
-         "Scans your drive for file errors without locking it or needing a reboot.",
-         repair_chkdsk_scan, default=False, column=1),
-    Task("wu_reset", "Fix Stuck Updates",
-         "The standard Microsoft fix when updates are stuck or failing.",
-         repair_windows_update_reset, default=False, column=1),
-    Task("bits_reset", "Fix Download Queue",
-         "Clears stuck background downloads that block updates.",
-         repair_bits_reset, default=False, column=1),
-    Task("disable_memory_integrity", "Disable Memory Integrity (HVCI)",
-         "Disables HVCI for 5-25% FPS gain in CPU-bound games. Reduces kernel exploit protection.",
-         repair_disable_memory_integrity, default=False, revert=repair_enable_memory_integrity, risk="ADVANCED", column=0),
-    Task("disable_vm_platform", "Disable Virtual Machine Platform",
-         "Disables Hyper-V/Virtual Machine Platform if not using WSL2. Reduces CPU overhead.",
-         repair_disable_virtual_machine_platform, default=False, revert=repair_enable_virtual_machine_platform, risk="REBOOT REQUIRED", column=0),
-    Task("storage_sense_active_hours", "Storage Sense: Avoid Active Hours",
-         "Prevents Storage Sense cleanup from running during gaming (prevents stutters).",
-         repair_disable_storage_sense_active_hours, default=False, revert=repair_enable_storage_sense_active_hours, column=0),
-    Task("network_reset", "Fix Internet Connection",
-         "Resets network adapter to fix no-internet or DNS issues.",
-         repair_network_reset, default=False, risk="REBOOT REQUIRED", column=1),
-    Task("time_sync", "Fix Clock Sync",
-         "Syncs your clock — fixes update and certificate errors.",
-         repair_time_sync, default=False, column=1),
-    Task("gpupdate", "Fix Blocked Settings",
-         "Refreshes system policies that may block updates or Game Mode.",
-         repair_gpupdate, default=False, column=1),
-    Task("search_index", "Fix Search Not Working",
-         "Rebuilds Start menu and File Explorer search.",
-         repair_search_index, default=False, column=1),
-    Task("print_spooler", "Fix Stuck Printing",
-         "Clears stuck print jobs and restarts printing.",
-         repair_print_spooler, default=False, column=1),
-    Task("wmi_repair", "Fix Game Services (WMI)",
-         "Checks the database many games and tools use — repairs if broken.",
-         repair_wmi_repository, default=False, column=1),
-    Task("store_apps_reregister", "Fix Missing Apps / Start Menu",
-         "Fixes broken Start menu or missing built-in apps without reinstalling Windows.",
-         repair_reregister_store_apps, default=False, column=1),
+    Task("restore_point", "Safety Checkpoint", "Saves a restore point you can go back to", create_restore_point, default=True, column=0),
+    Task("xbox_apps", "Fix Xbox / Game Pass Apps", "Repairs the Xbox app and Game Pass sign-in without reinstalling", repair_xbox_game_apps, default=False, column=0),
+    Task("ssd_maintenance", "SSD Maintenance", "Retrims your SSD and checks drive health", repair_ssd_maintenance, default=False, column=0),
+    Task("vss_repair", "Fix Restore Points (VSS)", "Restarts the shadow-copy service so checkpoints work again", repair_vss_restore_points, default=False, column=0),
+    Task("network_reset", "Fix Internet Connection", "Resets internet settings to defaults, repairs bad tweaks", repair_network_stack_defaults, default=False, risk="REBOOT REQUIRED", column=1),
+    Task("sfc_scan", "Fix System Files", "Scans and fixes broken Windows files that crash games", repair_sfc_scan, default=False, column=0),
+    Task("dism_restorehealth", "Repair Windows Image", "Downloads fresh Windows files to fix a broken image", repair_dism_restorehealth, default=False, column=0),
+    Task("dism_cleanup", "Cleanup Update Storage", "Cleans old update leftovers but keeps uninstall option", repair_dism_component_cleanup, default=False, column=0),
+    Task("dism_scanhealth", "Scan Image Health", "Scans Windows image for corruption", repair_dism_scanhealth, default=False, column=0),
+    Task("dism_checkhealth", "Check Image Health", "Quick check if image needs repair", repair_dism_checkhealth, default=False, column=0),
+    Task("chkdsk_scan", "Check Disk (Read-Only)", "Checks your drive for errors without restarting", repair_chkdsk_scan, default=False, column=1),
+    Task("wu_reset", "Fix Stuck Updates", "Fixes Windows Update when it’s stuck or failing", repair_windows_update_reset, default=False, column=1),
+    Task("bits_reset", "Fix Download Queue", "Clears stuck download jobs that block updates", repair_bits_reset, default=False, column=1),
+    Task("time_sync", "Fix Clock Sync", "Fixes wrong clock that breaks updates and logins", repair_time_sync, default=False, column=1),
+    Task("gpupdate", "Fix Blocked Settings", "Refreshes Windows rules that may block Game Mode", repair_gpupdate, default=False, column=1),
+    Task("search_index", "Fix Search Not Working", "Rebuilds Windows search that finds files and apps", repair_search_index, default=False, column=1),
+    Task("print_spooler", "Fix Stuck Printing", "Clears stuck print jobs and restarts printer", repair_print_spooler, default=False, column=1),
+    Task("wmi_repair", "Fix Game Services (WMI)", "Fixes system database many games rely on", repair_wmi_repository, default=False, column=1),
+    Task("store_apps_reregister", "Fix Missing Apps / Start Menu", "Fixes missing apps or Start menu without reinstall", repair_reregister_store_apps, default=False, column=1),
+    Task("restart_audio", "Restart Sound / Mic", "Fixes dead audio or mic instantly without a reboot", restart_audio_engine, default=False, admin_required=True, column=1),
+    Task("firewall_reset", "Reset Firewall", "Fixes multiplayer/anti-cheat connection errors by resetting firewall rules", repair_firewall_reset, default=False, admin_required=True, risk="ADVANCED", column=1),
+    Task("smart_verdict", "Drive Health Verdict (SMART)", "Plain-language check: is your SSD/HDD healthy, or time to back up?", repair_smart_verdict, default=False, admin_required=False, column=1),
+    Task("gpu_driver_age", "GPU Driver Freshness", "Checks your graphics driver's age and nudges you to update if it's stale", repair_gpu_driver_age, default=False, admin_required=False, column=1),
+    Task("restart_bluetooth", "Restart Bluetooth", "Fixes wireless controller and headset drops without rebooting", restart_bluetooth_stack, default=False, admin_required=True, column=1),
+    Task("arp_flush", "Fix IP Conflicts (ARP)", "Clears stuck network address entries that break router talk", flush_arp_cache, default=False, admin_required=True, column=1),
+    Task("gpu_reset", "Restart Graphics Driver", "Fixes black screens and resolution bugs instantly, no reboot", reset_graphics_driver, default=False, admin_required=False, column=1),
+    Task("anticheat_repair", "Fix Anti-Cheat Errors", "Resets EasyAntiCheat and BattlEye to fix launch errors like 30005", repair_anticheat_services, default=False, admin_required=True, column=1),
+    Task("icon_cache", "Fix Blank Icons", "Rebuilds the icon cache that causes blank or white desktop icons", repair_icon_cache, default=False, admin_required=False, column=1),
+    Task("wsreset_store", "Reset Store Downloads", "Resets the Store cache when app downloads fail or hang", repair_store_cache_reset, default=False, admin_required=False, column=1),
+    Task("enable_restore", "Turn On System Protection", "Re-enables restore points on C: if something turned them off", repair_enable_system_restore, default=False, admin_required=True, column=0),
 ]

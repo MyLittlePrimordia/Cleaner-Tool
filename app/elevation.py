@@ -9,6 +9,7 @@ read-only / limited mode if they decline.
 """
 
 import ctypes
+import ctypes.wintypes
 import os
 import subprocess
 import sys
@@ -87,13 +88,91 @@ def _clear_pending_token() -> None:
         pass
 
 
+def _get_own_exe_name() -> str:
+    """Basename of the executable this process was started from (frozen exe
+    or the python interpreter running main.py). Used to verify a PID found
+    in the elevation cookie is actually an instance of this app."""
+    return os.path.basename(sys.executable).lower()
+
+
+def _process_image_name(pid: int) -> str | None:
+    """Return the basename of the executable running under `pid`, or None
+    if it can't be determined (process gone, access denied, etc.)."""
+    try:
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return None
+        try:
+            buf = ctypes.create_unicode_buffer(260)
+            size = ctypes.wintypes.DWORD(260)
+            ok = ctypes.windll.kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size))
+            if ok:
+                return os.path.basename(buf.value).lower()
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    except Exception:
+        pass
+    return None
+
+
+def _process_is_elevated(pid: int) -> bool:
+    """True if the process under `pid` runs with an elevated (admin) token.
+
+    Closes the last spoof gap in the elevation handshake: token match +
+    STILL_ACTIVE + image-name match proved only that *some* same-user
+    process with our exe name was alive — not that it was the elevated
+    relaunch. A same-user process could write a cookie naming any
+    already-running copy of this exe, and the old check accepted it,
+    making the original window exit with a false 'elevation succeeded'.
+    """
+    try:
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+        )
+        if not handle:
+            return False
+        try:
+            # 1 = TokenElevation class
+            token = ctypes.wintypes.HANDLE()
+            if not ctypes.windll.kernel32.OpenProcessToken(
+                handle, 0x0008, ctypes.byref(token)  # TOKEN_QUERY
+            ):
+                return False
+            try:
+                elevation = ctypes.wintypes.DWORD()
+                ret_len = ctypes.wintypes.DWORD()
+                if not ctypes.windll.advapi32.GetTokenInformation(
+                    token, 1, ctypes.byref(elevation),
+                    ctypes.sizeof(elevation), ctypes.byref(ret_len)
+                ):
+                    return False
+                return bool(elevation.value)
+            finally:
+                ctypes.windll.kernel32.CloseHandle(token)
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    except Exception:
+        return False
+
+
 def _wait_for_elevated_process(timeout: float = 10.0) -> bool:
     """
     Wait for the elevated process to signal it has started.
     Returns True if the elevated process started successfully.
     Verifies token to prevent spoofing via pre-created cookie.
+
+    L5 fix: the token check alone still let any same-user process write a
+    cookie naming the pending token + the PID of some other already-running,
+    unrelated process (e.g. explorer.exe) — the STILL_ACTIVE check just
+    confirms *a* process is alive, not that it's actually this app's
+    elevated relaunch. Now the PID's executable image name is also checked
+    against this app's own exe name, AND the PID's token must actually be
+    elevated before the cookie is accepted.
     """
     expected_token = _read_pending_token()
+    own_exe = _get_own_exe_name()
     start_time = time.time()
     while time.time() - start_time < timeout:
         pid, token = _read_elevation_cookie()
@@ -110,14 +189,27 @@ def _wait_for_elevated_process(timeout: float = 10.0) -> bool:
                     PROCESS_QUERY_LIMITED_INFORMATION, False, pid
                 )
                 if handle:
-                    exit_code = ctypes.wintypes.DWORD()
-                    if ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                    try:
+                        exit_code = ctypes.wintypes.DWORD()
+                        if ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                            if exit_code.value == 259:  # STILL_ACTIVE
+                                # L5 fix: also require the PID's own image name to match this app
+                                image_name = _process_image_name(pid)
+                                if image_name != own_exe:
+                                    time.sleep(0.2)
+                                    continue
+                                # audit fix: and require that PID to actually
+                                # hold an elevated token — a same-user process
+                                # must never be able to answer for the
+                                # elevated relaunch it isn't.
+                                if not _process_is_elevated(pid):
+                                    time.sleep(0.2)
+                                    continue
+                                _clear_elevation_cookie()
+                                _clear_pending_token()
+                                return True
+                    finally:
                         ctypes.windll.kernel32.CloseHandle(handle)
-                        if exit_code.value == 259:  # STILL_ACTIVE
-                            _clear_elevation_cookie()
-                            _clear_pending_token()
-                            return True
-                    ctypes.windll.kernel32.CloseHandle(handle)
             except Exception:
                 pass
         time.sleep(0.2)
@@ -192,13 +284,19 @@ def signal_elevated_startup() -> None:
         if arg.startswith("--elevation-token="):
             token = arg.split("=", 1)[1]
             break
-    # Only signal if we're actually admin and have a token (or legacy pid-only)
-    # Don't write cookie on non-Windows test runs without token to avoid litter
     if not token:
         # No token — legacy / direct launch without elevation. Only write if
-        # a pending token file exists (means we were launched via relaunch)
+        # a pending token file exists (means we were launched via relaunch).
         pending = _read_pending_token()
         if pending is None:
             return
         token = pending
+    # Only signal if we're actually admin — a non-elevated process must never
+    # claim to be the elevated relaunch (prevents stale-token races where a
+    # later, unrelated process start answers the original app's wait loop).
+    try:
+        if not is_admin():
+            return
+    except Exception:
+        return
     _write_elevation_cookie(os.getpid(), token)

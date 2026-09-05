@@ -1,29 +1,39 @@
 """
 Central place for app metadata, window sizing, and the color theme.
+
+Phase 2: single dark-navy theme (user asked for dark only). Accent colors
+identify tabs: blue = Clean, amber = Repair, purple = Tweak, green = Install,
+red = Undo. All keys from the old palette are kept so existing modules
+(task dialogs, admin gate, scheduler UI) keep working unchanged.
 """
 
 APP_NAME = "Cleaner Tool"
 APP_SHORT_NAME = "Cleaner Tool"
 APP_VERSION = "2.0.0"
-WINDOW_SIZE = "800x620"
-WINDOW_MIN_SIZE = (780, 560)
+WINDOW_SIZE = "980x720"
+WINDOW_MIN_SIZE = (920, 660)
 
-# Windows 11 dark theme — professional, neutral, higher contrast
 COLORS = {
-    "bg": "#202020",
-    "bg_alt": "#272727",
-    "bg_widget": "#1a1a1a",
-    "surface": "#2d2d2d",
-    "surface_hover": "#353535",
-    "text": "#f0f0f0",
-    "subtext": "#9d9d9d",
-    "accent_green": "#4cc2a0",
-    "accent_teal": "#60cdff",
-    "accent_blue": "#60cdff",
-    "accent_yellow": "#ffb86a",
-    "accent_red": "#ff7b7b",
-    "accent_mauve": "#cba6f7",
-    "black": "#111111",
+    # Base surfaces (dark navy)
+    "bg": "#0D1117",            # window base
+    "bg_alt": "#151B24",        # cards / panels
+    "bg_widget": "#10141C",     # log well / progress track
+    "surface": "#1C2430",       # buttons / controls
+    "surface_hover": "#263041",
+    "hairline": "#232B38",      # 1px borders
+    # Text
+    "text": "#EAEFF5",
+    "subtext": "#7C8797",
+    # Accents — tab identity + statuses
+    "accent_green": "#3ED598",  # Clean (mint)
+    "accent_teal": "#2EE6A8",   # bright mint (hover variant)
+    "accent_yellow": "#F2B84B", # Repair (amber)
+    "accent_sky": "#38BDF8",    # Install alt (sky blue — downloads/cloud feel)
+    "accent_pink": "#F472B6",   # spare accent (tried for Install, unused)
+    "accent_blue": "#7C6CF0",   # Tweak (violet)
+    "accent_mauve": "#B48CFF",
+    "accent_red": "#F2555F",    # Undo / danger / reboot badge
+    "black": "#0B0E13",         # text on bright accent fills
 }
 
 FONT_FAMILY = "Segoe UI"

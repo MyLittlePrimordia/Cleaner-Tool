@@ -34,17 +34,25 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Run smoke tests
+        # audit fix: the build never ran any test — regressions (like the
+        # ToggleSwitch duplicate-def bug) shipped silently. The harness
+        # checks run headless-safe; Tk is present on windows-latest runners.
+        run: python -X utf8 -m tools.smoke_gui
+
       - name: Build with PyInstaller
         # --onefile  : single portable .exe
         # --windowed : no console window behind the GUI
-        # --manifest : embed asInvoker manifest (elevation only via GUI Admin Gate, not forced)
+        # --manifest : embed asInvoker manifest — the app asks for elevation
+        #              itself via the Admin Gate screen (opt-in UAC), so the
+        #              exe must NOT force a UAC prompt on every launch
         # --icon / --add-data : bundle colored 🧼 icon from app/assets
         run: >
           pyinstaller --onefile --windowed
           --name "CleanerTool"
           --icon "app/assets/icon.ico"
           --add-data "app/assets;app/assets"
-          --manifest "app/assets/admin_manifest.xml"
+          --manifest "app/assets/app_manifest.xml"
           app/__main__.py
 
       - name: Upload build artifact

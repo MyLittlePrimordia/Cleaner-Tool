@@ -19,6 +19,8 @@ trust = ET.SubElement(root, "trustInfo", {
 })
 security = ET.SubElement(trust, "security")
 priv = ET.SubElement(security, "requestedPrivileges")
+# asInvoker: the app launches without a UAC prompt and offers elevation
+# itself via the in-app Admin Gate (matches elevation.py's design).
 ET.SubElement(priv, "requestedExecutionLevel", {
     "level": "asInvoker",
     "uiAccess": "false"
@@ -51,7 +53,7 @@ import pathlib
 buf = io.BytesIO()
 tree.write(buf, encoding="UTF-8", xml_declaration=True)
 content = buf.getvalue().replace(b'?>', b' standalone="yes"?>')
-out_path = pathlib.Path(__file__).resolve().parent / "app" / "assets" / "admin_manifest.xml"
+out_path = pathlib.Path(__file__).resolve().parent / "app" / "assets" / "app_manifest.xml"
 out_path.parent.mkdir(parents=True, exist_ok=True)
 with open(out_path, "wb") as f:
     f.write(content)

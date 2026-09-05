@@ -5,9 +5,10 @@ Laymen short labels + hover tooltips; compact symmetrical grid.
 
 import glob as globmod
 import os
+import subprocess
 
-from app.utils import TaskContext, clean_folder_contents, run_cmd
-from app.tasks.launcher_paths import ALL_LAUNCHER_CACHE_PATHS
+from app.utils import TaskContext, clean_folder_contents, run_cmd, restart_explorer
+from app.tasks.launcher_paths import ALL_LAUNCHER_CACHE_PATHS, GPU_SHADER_CACHE_ALL
 
 _LOCALAPPDATA = os.environ.get("LOCALAPPDATA", "")
 _APPDATA = os.environ.get("APPDATA", "")
@@ -37,20 +38,12 @@ def _clean_many(ctx: TaskContext, folders, label):
 
 
 def clean_shader_cache(ctx: TaskContext):
-    folders = [
-        os.path.join(_LOCALAPPDATA, "NVIDIA\\DXCache"),
-        os.path.join(_LOCALAPPDATA, "NVIDIA\\GLCache"),
-        os.path.join(_APPDATA, "NVIDIA\\ComputeCache"),
-        os.path.join(_PROGRAMDATA, "NVIDIA Corporation\\NV_Cache"),
-        os.path.join(_LOCALAPPDATA, "AMD\\DxCache"),
-        os.path.join(_LOCALAPPDATA, "AMD\\DxcCache"),
-        os.path.join(_LOCALAPPDATA, "AMD\\VkCache"),
-        os.path.join(_LOCALAPPDATA, "AMD\\CN"),
-        os.path.join(_LOCALAPPDATA, "Intel\\ShaderCache"),
-        os.path.join(_LOCALAPPDATA, "Microsoft\\DirectX Shader Cache"),
-        os.path.join(_LOCALAPPDATA, "D3DSCache"),
-    ]
-    return _clean_many(ctx, folders, "shader cache")
+    # M2 fix: now sourced from launcher_paths.GPU_SHADER_CACHE_ALL — the
+    # single shared list also used by game_tasks.clean_gpu_shader_caches —
+    # instead of a separate hardcoded copy that pointed at the wrong
+    # NVIDIA ComputeCache location (APPDATA instead of LOCALAPPDATA) and was
+    # missing the PerDriverVersion\ cache paths.
+    return _clean_many(ctx, GPU_SHADER_CACHE_ALL, "shader cache")
 
 
 def clean_launcher_cache(ctx: TaskContext):
@@ -106,176 +99,6 @@ def clean_driver_junk(ctx: TaskContext):
         elif os.path.exists(folder):
             ctx.log(f"Skipping {folder} (may contain active drivers)")
     return _clean_many(ctx, verified_folders, "driver leftover")
-
-
-def clean_driver_store(ctx: TaskContext):
-    """Remove old/inactive driver packages from Driver Store using pnputil.
-    Only removes drivers not currently in use AND older than 30 days (safe).
-
-    Parses pnputil output block-wise to avoid deleting in-use packages.
-    Never uses /force — pnputil will fail if the package is still needed.
-    """
-    ctx.set_status("Scanning Driver Store for old packages...")
-    ctx.log("$ pnputil /enum-drivers")
-    if ctx.dry_run:
-        ctx.log("  (dry run - would scan Driver Store, no packages deleted)")
-        return 0
-
-    import subprocess
-    import datetime
-    import re
-
-    # Use shell=False to avoid injection; handle missing STARTUPINFO on non-Windows
-    try:
-        startupinfo = None
-        creationflags = 0
-        if os.name == "nt":
-            try:
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                creationflags = subprocess.CREATE_NO_WINDOW
-            except Exception:
-                startupinfo = None
-        proc = subprocess.Popen(
-            ["pnputil", "/enum-drivers"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, shell=False,
-            startupinfo=startupinfo,
-            creationflags=creationflags,
-        )
-        stdout, _ = proc.communicate(timeout=60)
-    except Exception as e:
-        ctx.log(f"  ! ERROR enumerating drivers: {e}")
-        return 0
-
-    if not stdout:
-        return 0
-
-    # Parse output block-wise: pnputil emits blank-line separated blocks
-    # We track per-block published name, date, and in-use indicators.
-    # Indicators that mean 'do NOT delete': Device Instance(s), 'In Use' patterns,
-    # or locale variants. If we cannot determine, we conservatively skip.
-    blocks = re.split(r"\n\s*\n", stdout)
-    candidates: list[tuple[str, str, bool]] = []  # (published, date_str, maybe_in_use)
-    for block in blocks:
-        pub = None
-        date_str = None
-        maybe_in_use = False
-        for line in block.splitlines():
-            stripped = line.strip()
-            low = stripped.lower()
-            if low.startswith("published name"):
-                parts = stripped.split(":", 1)
-                if len(parts) == 2:
-                    pub = parts[1].strip()
-            elif low.startswith("driver date"):
-                parts = stripped.split(":", 1)
-                if len(parts) == 2:
-                    date_str = parts[1].strip()
-            # Heuristics for in-use: device instance, present, in use, etc.
-            if any(k in low for k in ("device instance", "device id", "present", "in use", "is present")):
-                # If value after colon suggests active, mark in-use; otherwise ignore
-                if ":" in stripped:
-                    val = stripped.split(":", 1)[1].strip().lower()
-                    if val not in ("", "no", "false", "0", "not present"):
-                        # Check for affirmative values
-                        if any(v in val for v in ("yes", "true", "1")) or "device instance" in low:
-                            maybe_in_use = True
-                        # Non-empty device instance line itself means in-use
-                        if "device instance" in low and val:
-                            maybe_in_use = True
-                elif "device instance" in low:
-                    maybe_in_use = True
-        if pub and date_str:
-            candidates.append((pub, date_str, maybe_in_use))
-
-    # Fallback to old line-wise parsing if block parsing found nothing
-    if not candidates:
-        lines = stdout.splitlines()
-        current_published = None
-        for line in lines:
-            s = line.strip()
-            if s.lower().startswith("published name"):
-                current_published = s.split(":", 1)[1].strip() if ":" in s else None
-            elif s.lower().startswith("driver date") and current_published:
-                ds = s.split(":", 1)[1].strip() if ":" in s else ""
-                candidates.append((current_published, ds, False))
-                current_published = None
-    # Locale fallback: non-English Windows uses different labels; try regex for oem*.inf + date
-    if not candidates:
-        oem_re = re.compile(r'\b(oem\d+\.inf)\b', re.I)
-        date_re = re.compile(r'\b(\d{1,2}[\.\/\-]\d{1,2}[\.\/\-]\d{2,4})\b')
-        for block in blocks:
-            m_oem = oem_re.search(block)
-            m_date = date_re.search(block)
-            if m_oem and m_date:
-                # Conservative: without English in-use markers, assume maybe_in_use if block mentions device-like id
-                maybe = bool(re.search(r'(device|present|in\s*use)', block, re.I))
-                candidates.append((m_oem.group(1), m_date.group(1), maybe))
-
-    if not candidates:
-        ctx.log("No driver packages found in store.")
-        return 0
-
-    # Filter: older than 30 days AND not maybe_in_use
-    cutoff_date = datetime.datetime.now() - datetime.timedelta(days=30)
-    old_drivers: list[str] = []
-    skipped_in_use = 0
-    for pub_name, date_str, maybe_in_use in candidates:
-        if maybe_in_use:
-            skipped_in_use += 1
-            ctx.log(f"  Skipping in-use package: {pub_name}")
-            continue
-        try:
-            # Extract date part before any time suffix (e.g., '01/15/2023 31.0.15' or '15.01.2023')
-            date_part = date_str.split()[0] if date_str else ""
-            # Normalize German dd.MM.yyyy -> try dot format
-            driver_date = None
-            for fmt in ("%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d", "%Y/%m/%d", "%d.%m.%Y", "%Y.%m.%d", "%d-%m-%Y", "%m-%d-%Y"):
-                try:
-                    driver_date = datetime.datetime.strptime(date_part, fmt)
-                    break
-                except ValueError:
-                    continue
-            if driver_date is None:
-                ctx.log(f"  Skipping {pub_name}: unparsable date '{date_str}'")
-                continue
-            if driver_date < cutoff_date:
-                old_drivers.append(pub_name)
-        except Exception:
-            continue
-
-    if skipped_in_use:
-        ctx.log(f"  Skipped {skipped_in_use} in-use package(s).")
-    if not old_drivers:
-        ctx.log("No removable driver packages older than 30 days found (or all are in-use).")
-        return 0
-
-    ctx.log(f"Found {len(old_drivers)} removable driver package(s) older than 30 days (not in-use).")
-
-    # Delete old drivers WITHOUT /force
-    deleted = 0
-    for pub_name in old_drivers:
-        if ctx.cancelled():
-            break
-        # Use shell=False list form via run_cmd: build command string but run_cmd uses shell=True
-        # so we shell-quote via subprocess.list2cmdline for safety
-        import subprocess as sp_mod
-        cmd = sp_mod.list2cmdline(["pnputil", "/delete-driver", pub_name, "/uninstall"])
-        ctx.log(f"$ {cmd}  (without /force — will fail if still needed)")
-        try:
-            # Pass as string with shell=True is what run_cmd expects, but we have safe quoting
-            rc = run_cmd(ctx, cmd, timeout=60)
-            if rc == 0:
-                ctx.log(f"  Deleted: {pub_name}")
-                deleted += 1
-            else:
-                ctx.log(f"  ! Skipped {pub_name} (still needed or delete failed, code {rc})")
-        except Exception as e:
-            ctx.log(f"  ! Error deleting {pub_name}: {e}")
-
-    ctx.log(f"Removed {deleted} old driver package(s) from Driver Store.")
-    return 0
 
 
 def _get_uwp_package_folders() -> list[str]:
@@ -334,7 +157,7 @@ def clean_windows_update_cache(ctx: TaskContext):
     stopped = []
     for svc in ("wuauserv", "bits"):
         rc = run_cmd(ctx, f"net stop {svc}", timeout=30)
-        if rc == 0 and not ctx.dry_run:
+        if rc == 0:
             stopped.append(svc)
     try:
         total = clean_folder_contents(ctx, f"{_WINDIR}\\SoftwareDistribution\\Download")
@@ -351,7 +174,13 @@ def clean_delivery_optimization(ctx: TaskContext):
 def clean_recycle_bin_and_dumps(ctx: TaskContext):
     dump_folders = [
         os.path.join(_LOCALAPPDATA, "CrashDumps"),
-        os.path.join(_PROGRAMDATA, "Microsoft\\Windows\\WER"),
+        # L4 fix: removed ProgramData\Microsoft\Windows\WER here — it's the
+        # parent of WER\ReportQueue and WER\ReportArchive, which the
+        # separate (also default-on) clean_error_reports() already walks.
+        # Both tasks run by default in Quick Clean, so this was walking +
+        # deleting the same report files twice on every run. Crash dumps
+        # specifically live under CrashDumps/Minidump, not loose in WER
+        # root, so nothing is lost by dropping this entry.
         f"{_WINDIR}\\Minidump",
     ]
     total = _clean_many(ctx, [f for f in dump_folders if os.path.isdir(f)], "crash dump")
@@ -360,27 +189,21 @@ def clean_recycle_bin_and_dumps(ctx: TaskContext):
     memory_dump = f"{_WINDIR}\\Memory.dmp"
     if os.path.isfile(memory_dump):
         try:
-            # Use stat to get size atomically before remove to avoid TOCTOU
             st = os.stat(memory_dump)
             size = st.st_size
-            skip = False
-            if not ctx.dry_run:
-                try:
-                    os.remove(memory_dump)
-                except FileNotFoundError:
-                    # Race: file deleted between stat and remove
-                    size = 0
-                except OSError:
-                    ctx.log(f"  (skipped locked dump: {memory_dump})")
-                    size = 0
-                    skip = True
-            if size and not skip:
+            try:
+                os.remove(memory_dump)
+            except FileNotFoundError:
+                # Race: file deleted between stat and remove
+                size = 0
+            except OSError:
+                ctx.log(f"  (skipped locked dump: {memory_dump})")
+                size = 0
+            if size:
                 total += size
                 ctx.log(f"Cleaning crash dump: {memory_dump} ({size} bytes)")
         except OSError:
-            # Stat failed or other OSError
-            if 'size' not in locals() or size != 0:
-                ctx.log(f"  (skipped locked dump: {memory_dump})")
+            ctx.log(f"  (skipped locked dump: {memory_dump})")
     ctx.log("Emptying Recycle Bin (silent)...")
     run_cmd(ctx, 'powershell -NoProfile -Command "Clear-RecycleBin -Force -ErrorAction SilentlyContinue"')
     return total
@@ -411,14 +234,6 @@ def clean_office_cache(ctx: TaskContext):
     return _clean_many(ctx, folders, "Office cache")
 
 
-def clean_spotify_cache(ctx: TaskContext):
-    folders = [
-        os.path.join(_APPDATA, "Spotify\\Storage"),
-        os.path.join(_LOCALAPPDATA, "Spotify\\Storage"),
-    ]
-    return _clean_many(ctx, folders, "Spotify cache")
-
-
 def clean_chk_fragments(ctx: TaskContext):
     # .CHK fragments from chkdsk — must use drive root (C:\), not bare "C:"
     total = 0
@@ -430,9 +245,17 @@ def clean_chk_fragments(ctx: TaskContext):
         for path in globmod.glob(pattern):
             try:
                 if os.path.isfile(path):
-                    total += os.path.getsize(path)
-                    if not ctx.dry_run:
-                        os.remove(path)
+                    # L2 fix: size must be added to `total` only AFTER
+                    # os.remove() succeeds. The old order added it first —
+                    # if remove() then raised (e.g. a locked file), the
+                    # except below still swallowed it, but the size had
+                    # already been counted, inflating the "space freed"
+                    # total for files that were never actually deleted.
+                    # (Matches the correct order already used in
+                    # game_tasks._clean_files and utils.clean_folder_contents.)
+                    size = os.path.getsize(path)
+                    os.remove(path)
+                    total += size
                 elif os.path.isdir(path):
                     # Only clean Found.XXX directories (chkdsk fragment directories)
                     dirname = os.path.basename(path)
@@ -444,12 +267,29 @@ def clean_chk_fragments(ctx: TaskContext):
 
 
 def clean_thumbnail_icon_cache(ctx: TaskContext):
+    """Clear thumbcache/iconcache .db files. They are locked while Explorer
+    runs, so Explorer is restarted around the clean.
+
+    C3 fix: this used to kill Explorer, clean, then call
+    run_cmd(ctx, "explorer.exe", timeout=10) to bring it back. run_cmd waits
+    for the process to exit — but explorer.exe is meant to stay running as
+    the shell, so it never exits, the call blocks for the full 10s, times
+    out, and run_cmd's timeout-cleanup kills the process tree — which kills
+    the Explorer we just relaunched. Net effect: this default-on task could
+    leave the user with no taskbar/desktop about 10 seconds after "fixing"
+    their icons. Fix: use the shared restart_explorer() helper, which
+    launches Explorer detached and never waits on it.
+    """
     explorer_dir = os.path.join(_LOCALAPPDATA, "Microsoft\\Windows\\Explorer")
-    return clean_folder_contents(ctx, explorer_dir, extensions=[".db"])
+    run_cmd(ctx, "taskkill /f /im explorer.exe", timeout=10)
+    total = clean_folder_contents(ctx, explorer_dir, extensions=[".db"])
+    # Always bring Explorer back — detached, non-blocking (see docstring above)
+    restart_explorer(ctx)
+    return total
 
 
 def _check_browser_running(ctx: TaskContext) -> list[str]:
-    """Check for running browser processes. Timeout + no hang, respects dry_run/cancel."""
+    """Check for running browser processes. Timeout + no hang, respects cancel."""
     import subprocess
     browsers = {
         "chrome.exe": "Chrome",
@@ -490,7 +330,7 @@ def clean_browser_caches(ctx: TaskContext):
         ctx.log(f"Warning: The following browsers appear to be running: {', '.join(running)}")
         ctx.log("  Cache cleaning may be incomplete or cause issues. Close browsers for best results.")
     
-    # All profiles, not just Default — plus Opera/Vivaldi
+    # All profiles, not just Default — plus root-level GPU shader caches
     total = 0
     base_patterns = [
         os.path.join(_LOCALAPPDATA, "Google\\Chrome\\User Data"),
@@ -506,6 +346,12 @@ def clean_browser_caches(ctx: TaskContext):
         except OSError as e:
             ctx.log(f"  (skipped {base}: {e})")
             continue
+        # Root-level GPU caches (shared across profiles)
+        for sub in ("ShaderCache", "GrShaderCache", "GraphiteDawnCache"):
+            p = os.path.join(base, sub)
+            if os.path.isdir(p):
+                ctx.log(f"Cleaning browser cache: {p}")
+                total += clean_folder_contents(ctx, p)
         for profile in profiles:
             if ctx.cancelled():
                 break
@@ -560,12 +406,47 @@ def flush_dns(ctx: TaskContext):
 
 
 def purge_ram_working_sets(ctx: TaskContext):
-    ps_ram = (
-        'powershell -NoProfile -Command '
-        '"[System.GC]::Collect(); [System.GC]::WaitForPendingFinalizers()"'
+    """Trim working sets of running processes so Windows frees unused RAM.
+
+    Uses SetProcessWorkingSetSize(-1, -1) via P/Invoke — the same trim Windows
+    does under memory pressure. Safe: trimmed pages just get paged back in on
+    next use. Excludes system-critical pseudo processes.
+
+    C2 fix history: the original hand-escaped the script into a shell=True
+    string, and cmd.exe's quote-stripping broke on the mid-script `|` —
+    it ran 'Idle' as a program and failed with rc=255, unchecked, while
+    logging success.
+
+    C2b fix (user-reported from a real run log): the shell=False rewrite
+    still embedded literal `\\"` sequences in the PS SOURCE. PowerShell
+    does not use backslash escapes — `\\"` ends the string early and the
+    script dies with a ParserError (exit 1) on every run, which the
+    rc check dutifully logged but the task still returned 0 and reported
+    success. Fix: write the P/Invoke signature with PowerShell SINGLE
+    quotes (no escaping needed at all), keep shell=False, and return
+    None on failure so the runner counts it as an honest failure instead
+    of a fake success.
+    """
+    ps_script = (
+        "$sig = '[DllImport(\"kernel32.dll\")] public static extern bool "
+        "SetProcessWorkingSetSize(IntPtr h, int min, int max);';"
+        "$t = Add-Type -MemberDefinition $sig -Name Trim -Namespace Cleaner -PassThru;"
+        "Get-Process | Where-Object { $_.ProcessName -notmatch "
+        "'^(powershell|Idle|Registry|Memory Compression|csrss|dwm|explorer)$' } |"
+        "ForEach-Object { try { $h = $_.Handle; $t::SetProcessWorkingSetSize($h, -1, -1) } catch {} }"
     )
-    run_cmd(ctx, ps_ram)
-    return 0
+    ctx.log("Trimming working sets of running processes (releases unused RAM)...")
+    rc = run_cmd(
+        ctx,
+        ["powershell", "-NoProfile", "-Command", ps_script],
+        shell=False,
+        timeout=120,
+    )
+    if rc == 0:
+        ctx.log("Memory trim complete — Windows will reclaim pages as needed.")
+        return 0
+    ctx.log(f"  ! Memory trim failed (exit code {rc}) — reporting as a failed task.")
+    raise RuntimeError(f"Memory trim command failed (exit code {rc}).")
 
 
 def clean_old_logs(ctx: TaskContext):
@@ -578,79 +459,246 @@ def clean_prefetch(ctx: TaskContext):
     return clean_folder_contents(ctx, f"{_WINDIR}\\Prefetch")
 
 
+def clean_windows_update_leftovers(ctx: TaskContext):
+    """Remove Windows Update / upgrade leftovers (Sophia Script's list).
+
+    Targets: Windows.old, $Windows.~BT, $WinREAgent, $GetCurrent, $SysReset,
+    $Windows.~WS, ESD, C:\\Intel, C:\\PerfLogs. These are installer debris and
+    safe to delete AFTER an upgrade completed (Windows itself offers to remove
+    most of them via Storage Sense after 10 days).
+    """
+    folders = [
+        os.path.join(_SYSTEMDRIVE_ROOT, "Windows.old"),
+        os.path.join(_SYSTEMDRIVE_ROOT, "$Windows.~BT"),
+        os.path.join(_SYSTEMDRIVE_ROOT, "$Windows.~WS"),
+        os.path.join(_SYSTEMDRIVE_ROOT, "$WinREAgent"),
+        os.path.join(_SYSTEMDRIVE_ROOT, "$GetCurrent"),
+        os.path.join(_SYSTEMDRIVE_ROOT, "$SysReset"),
+        os.path.join(_SYSTEMDRIVE_ROOT, "ESD"),
+        os.path.join(_SYSTEMDRIVE_ROOT, "Intel"),
+        os.path.join(_SYSTEMDRIVE_ROOT, "PerfLogs"),
+    ]
+    total = 0
+    for folder in folders:
+        if not folder or not os.path.isabs(folder):
+            continue
+        if os.path.exists(folder):
+            ctx.log(f"Cleaning update leftover: {folder}")
+            total += clean_folder_contents(ctx, folder, remove_root=True)
+    if total > 0:
+        ctx.log(f"Removed {total / 1024 / 1024:.0f} MB of Windows Update leftovers.")
+    else:
+        ctx.log("No update leftovers found.")
+    return total
+
+
+def clean_activity_traces(ctx: TaskContext):
+    """Clear user activity traces (Privacy.sexy-style cleanup).
+
+    Removes jump lists (recent files), Run-dialog MRU, typed paths, and recent
+    docs. Purely local privacy hygiene — no functionality lost beyond history.
+    """
+    import subprocess
+    total = 0
+    # Jump lists (AutomaticDestinations / CustomDestinations)
+    recent = os.path.join(_APPDATA, "Microsoft\\Windows\\Recent")
+    for sub in ("AutomaticDestinations", "CustomDestinations"):
+        d = os.path.join(recent, sub)
+        if os.path.isdir(d):
+            ctx.log(f"Clearing jump lists: {d}")
+            total += clean_folder_contents(ctx, d)
+    # Run-dialog MRU + typed paths + recent docs (registry)
+    from app.utils import reg_delete_key
+    reg_delete_key(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RunMRU")
+    reg_delete_key(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\TypedPaths")
+    # Recent items shortcuts
+    if os.path.isdir(recent):
+        ctx.log(f"Clearing recent items: {recent}")
+        total += clean_folder_contents(ctx, recent, extensions=[".lnk"])
+    ctx.log("Activity traces cleared.")
+    return total
+
+
+def clean_winget_cache(ctx: TaskContext):
+    """winget's own log + temp dirs — they grow forever on update-heavy
+    machines. (New task: 'Clear WinGet Cache'.) Only touches the App
+    Installer package's TempState/diag logs and %TEMP%\\WinGet — never
+    C:\\Windows\\Installer (deleting from there breaks MSI uninstall/repair;
+    even $PatchCache$ is deliberately left alone in a layman tool)."""
+    pkg = os.path.join(_LOCALAPPDATA, "Packages", "Microsoft.DesktopAppInstaller_8wekyb3d8bbwe")
+    folders = [
+        os.path.join(pkg, "TempState"),
+        os.path.join(pkg, "LocalState", "DiagOutputDir"),   # winget's ever-growing text logs
+        os.path.join(_TEMP, "WinGet"),
+    ]
+    return _clean_many(ctx, folders, "winget cache")
+
+
+# Cleans disk via cleanmgr (no ResetBase — keeps your ability to roll back updates) #
+def run_disk_cleanup(ctx: TaskContext):
+    ctx.log("[Clean] Disk Cleanup - Run")
+    _sd = os.environ.get("SYSTEMDRIVE", "C:")
+    if len(_sd) == 2 and _sd[1] == ":":
+        _sd_root = _sd + "\\"
+    else:
+        _sd_root = _sd if _sd.endswith("\\") else _sd + "\\"
+    ctx.log(f"$ cleanmgr.exe /d {_sd_root[:-1]} /VERYLOWDISK")
+    run_cmd(ctx, f"cleanmgr.exe /d {_sd_root[:-1]} /VERYLOWDISK", timeout=120)
+    ctx.log("Disk Cleanup complete.")
+    return 0
+
+# Removes temp files via PowerShell #
+def remove_temp_files_deep(ctx: TaskContext):
+    ctx.log("[Clean] Temporary Files - Remove")
+    ps_cmd1 = 'powershell -NoProfile -Command "Remove-Item -Path \\"$Env:Temp\\*\\" -Recurse -Force -ErrorAction SilentlyContinue"'
+    ps_cmd2 = 'powershell -NoProfile -Command "Remove-Item -Path \\"$Env:SystemRoot\\Temp\\*\\" -Recurse -Force -ErrorAction SilentlyContinue"'
+    ctx.log("$ Remove-Item -Path \"$Env:Temp\\*\" -Recurse -Force")
+    run_cmd(ctx, ps_cmd1)
+    ctx.log("$ Remove-Item -Path \"$Env:SystemRoot\\Temp\\*\" -Recurse -Force")
+    run_cmd(ctx, ps_cmd2)
+    # audit fix: both _clean_many return values were discarded and the task
+    # reported 0 bytes freed. The fallback walkers do the real accounting
+    # (they stat+remove and count) — the PS pass above only catches what
+    # escaped between runs.
+    total = _clean_many(ctx, [_TEMP], "user temp folder (fallback)")
+    total += _clean_many(ctx, [f"{_WINDIR}\\Temp"], "system temp folder (fallback)")
+    return total
+
+# Removes Windows bloat #
+def remove_windows_bloat(ctx: TaskContext):
+    """Remove common preinstalled bloat. Gamer-safe: keeps all Xbox/GamingServices
+    packages (Game Pass) and codec/media extensions (video playback).
+    Package names verified: Clipchamp family is 'Clipchamp.Clipchamp' (store id 9P1J8S7CCWWT)."""
+    ctx.log("[Clean] Remove Windows Bloat")
+    bloat = [
+        "Clipchamp.Clipchamp",             # Clipchamp (verified real name — old 'Microsoft.Clipchamp' matched nothing)
+        "Clipchamp.Clipchamp.ShellExtension",
+        "Microsoft.BingWeather",           # MSN Weather
+        "Microsoft.BingNews",              # MSN News
+        "Microsoft.Microsoft3DViewer",     # 3D Viewer
+        "Microsoft.MicrosoftSolitaireCollection",
+        "Microsoft.MixedReality.Portal",
+        "Microsoft.Todos",
+        "Microsoft.People",
+        "Microsoft.Getstarted",            # Microsoft Tips
+        "Microsoft.WindowsFeedbackHub",   # (only app users report issues with)
+    ]
+    for pkg in bloat:
+        run_cmd(ctx, f'powershell -NoProfile -Command "Get-AppxPackage -Name \\"{pkg}\\" -AllUsers | Remove-AppxPackage -ErrorAction SilentlyContinue"')
+        ctx.log(f"  Checked {pkg}")
+    # TikTok registers under different publisher names; catch-all fallback
+    run_cmd(ctx, 'powershell -NoProfile -Command "Get-AppxPackage -AllUsers | Where-Object {$_.Name -like \\"*TikTok*\\"} | Remove-AppxPackage -ErrorAction SilentlyContinue"')
+    # Note: blocking auto-reinstall of consumer suggestions (DisableWindowsConsumerFeatures)
+    # lives in the Tweak tab's "Stop Windows Ads & Tips" task instead, since that task has
+    # a working revert. This Clean-tab task only removes apps (Store-reinstallable, no
+    # one-way registry writes left behind).
+    ctx.log("Bloat removal complete.")
+    return 0
+
+
+def clean_event_logs(ctx: TaskContext):
+    """Clear Windows Event Viewer logs (diagnostic history only — the logs
+    start fresh; fixes bloated evtx files, admin)."""
+    collected: "list[str]" = []
+    run_cmd(ctx, 'wevtutil el', shell=True, timeout=120, collect=collected)
+    cleared = 0
+    for name in collected:
+        name = name.strip()
+        if not name:
+            continue
+        rc = run_cmd(ctx, f'wevtutil cl "{name}"', shell=True, timeout=120)
+        if rc == 0:
+            cleared += 1
+        else:
+            ctx.log(f"  (skipped in-use log: {name})")
+    ctx.log(f"Cleared {cleared} event logs.")
+    return 0
+
+
+def clean_defender_history(ctx: TaskContext):
+    """Clear Defender's protection-history leftovers (stale threat entries
+    that haunt the Security UI; the engine rescans cleanly, admin)."""
+    folders = [
+        os.path.join(_PROGRAMDATA, "Microsoft\\Windows Defender\\Scans\\History\\Service"),
+    ]
+    return _clean_many(ctx, folders, "Defender history")
+
+
+def _steam_root() -> str:
+    """Steam install dir: registry first, default path as fallback."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as k:
+            path, _ = winreg.QueryValueEx(k, "SteamPath")
+            if path and os.path.isdir(path):
+                return path
+    except Exception:
+        pass
+    return os.path.join(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"), "Steam")
+
+
+def clean_steam_download_cache(ctx: TaskContext):
+    """Clear Steam's depot manifest cache + stale appinfo (fixes phantom
+    'update required' states; Steam re-downloads them on launch)."""
+    root = _steam_root()
+    total = _clean_many(ctx, [os.path.join(root, "depotcache")], "Steam depot cache")
+    appinfo = os.path.join(root, "appcache", "appinfo.vdf")
+    try:
+        if os.path.isfile(appinfo):
+            total += os.path.getsize(appinfo)
+            os.remove(appinfo)
+            ctx.log(f"Removed stale app manifest: {appinfo}")
+    except OSError as exc:
+        ctx.log(f"  (kept appinfo.vdf: {exc})")
+    return total
+
+
+def clean_dev_caches(ctx: TaskContext):
+    """Clean VS Code / npm / pip caches (regenerable blobs for the
+    modding-and-AI crowd; extensions and packages untouched)."""
+    folders = [
+        os.path.join(_APPDATA, "Code\\Cache"),
+        os.path.join(_APPDATA, "Code\\CachedData"),
+        os.path.join(_APPDATA, "Code\\GPUCache"),
+        os.path.join(_LOCALAPPDATA, "npm-cache\\_cacache"),
+        os.path.join(_LOCALAPPDATA, "pip\\Cache"),
+    ]
+    return _clean_many(ctx, folders, "dev caches")
+
+
 from app.tasks import Task  # noqa: E402
 
 TASKS = [
-    Task("shader_cache", "Clear Shader Cache",
-         "Deletes temp graphics files games rebuild next launch — fixes stutter after driver updates.",
-         clean_shader_cache, default=True, admin_required=False, column=0),
-    Task("launcher_cache", "Clean Game Launchers",
-         "Clears Steam/Epic/Discord web cache — fixes blank launchers.",
-         clean_launcher_cache, default=True, admin_required=False, column=0),
-    Task("engine_cache", "Clean Engine Cache",
-         "Removes Unreal/Unity build files — safe, rebuilds on next use.",
-         clean_engine_cache, default=True, admin_required=False, column=0),
-    Task("driver_junk", "Remove Old Drivers",
-         "Deletes C:\\NVIDIA / C:\\AMD leftovers after driver installs.",
-         clean_driver_junk, default=True, admin_required=False, column=0),
-    Task("driver_store", "Clean Driver Store",
-         "Removes old/inactive driver packages (pnputil) — frees 1-5 GB.",
-         clean_driver_store, default=False, admin_required=True, risk="ADVANCED", column=0),
-    Task("user_temp_files", "Empty User Temp Files",
-         "Clears your user temp folder.",
-         clean_user_temp_files, default=True, admin_required=False, column=0),
-    Task("system_temp_files", "Empty System Temp Files",
-         "Clears Windows system temp folder (requires admin).",
-         clean_system_temp_files, default=True, admin_required=True, column=0),
-    Task("win_update_cache", "Fix Update Cache",
-         "Clears stuck update downloads — restarts the update service.",
-         clean_windows_update_cache, default=True, admin_required=True, column=0),
-    Task("delivery_optimization", "Clear Update Share Cache",
-         "Removes shared update chunks Windows keeps for other PCs.",
-         clean_delivery_optimization, default=True, admin_required=True, column=0),
-    Task("inet_cache", "Clear Internet Cache",
-         "Clears old Temporary Internet Files and WebCache.",
-         clean_inet_cache, default=True, admin_required=False, column=0),
-    Task("recycle_bin", "Empty Bin & Crash Reports",
-         "Empties trash and deletes old crash reports.",
-         clean_recycle_bin_and_dumps, default=True, admin_required=False, column=1),
-    Task("error_reports", "Clear Error Reports",
-         "Deletes old Windows error report queues and archives.",
-         clean_error_reports, default=True, admin_required=False, column=1),
-    Task("thumbnail_cache", "Fix Blurry Icons",
-         "Clears and rebuilds thumbnail previews — fixes missing icons.",
-         clean_thumbnail_icon_cache, default=True, admin_required=False, column=1),
-    Task("browser_cache", "Clear Browser Cache",
-         "Clears Chrome/Edge/Firefox/Brave/Opera cache — keeps passwords and history.",
-         clean_browser_caches, default=False, admin_required=False, column=1),
-    Task("office_cache", "Clear Office Cache",
-         "Clears Microsoft Office temp file cache.",
-         clean_office_cache, default=False, admin_required=False, column=1),
-    Task("spotify_cache", "Clear Spotify Cache",
-         "Clears Spotify offline cache — music re-downloads as needed.",
-         clean_spotify_cache, default=False, admin_required=False, column=1),
-    Task("uwp_cache", "Clear UWP App Caches",
-         "Clears Photos, Maps, Xbox, Edge, Feedback Hub caches.",
-         clean_uwp_cache, default=False, admin_required=False, column=1),
-    Task("chk_fragments", "Remove Disk Fragments",
-         "Deletes leftover .CHK files from disk checks.",
-         clean_chk_fragments, default=True, admin_required=False, column=1),
-    Task("font_cache", "Fix Broken Fonts",
-         "Rebuilds font cache — fixes garbled text.",
-         clean_font_cache, default=False, admin_required=True, column=1),
-    Task("store_cache", "Fix Store",
-         "Resets Store when apps won't download.",
-         clean_store_cache, default=False, admin_required=False, column=1),
-    Task("old_logs", "Clear System Logs",
-         "Deletes old CBS/DISM/WindowsUpdate logs.",
-         clean_old_logs, default=True, admin_required=False, column=1),
-    Task("dns_flush", "Fix Internet (DNS)",
-         "Clears address cache — fixes some sites not loading.",
-         flush_dns, default=True, admin_required=False, column=1),
-    Task("ram_purge", "Free Up RAM",
-         "Asks Windows to release unused memory.",
-         purge_ram_working_sets, default=True, admin_required=False, column=1),
-    Task("prefetch", "Clear Prefetch (Rarely Needed)",
-         "Windows manages this itself — clearing may slow next app start.",
-         clean_prefetch, default=False, admin_required=True, risk="ADVANCED", column=1),
+    Task("shader_cache", "Clear Shader Cache", "Removes temp graphics files that help fix stutter", clean_shader_cache, default=True, admin_required=False, column=0),
+    Task("launcher_cache", "Clean Launchers & Chat", "Clears every game store plus Discord, Slack, Teams, Spotify junk", clean_launcher_cache, default=True, admin_required=False, column=0),
+    Task("engine_cache", "Clean Engine Cache", "Removes leftover Unreal/Unity build files", clean_engine_cache, default=True, admin_required=False, column=0),
+    Task("driver_junk", "Remove Old Drivers", "Deletes old NVIDIA/AMD installer leftovers", clean_driver_junk, default=True, admin_required=True, column=0),
+    Task("user_temp_files", "Empty User Temp Files", "Deletes leftover temp files Windows left behind", clean_user_temp_files, default=True, admin_required=False, column=0),
+    Task("system_temp_files", "Empty System Temp Files", "Cleans system temp files no longer needed", clean_system_temp_files, default=True, admin_required=True, column=0),
+    Task("win_update_cache", "Fix Update Cache", "Fixes Windows Update when downloads get stuck", clean_windows_update_cache, default=True, admin_required=True, column=0),
+    Task("delivery_optimization", "Clear Update Share Cache", "Removes update copies kept to share with other PCs", clean_delivery_optimization, default=True, admin_required=True, column=0),
+    Task("inet_cache", "Clear Internet Cache", "Clears old internet temp files", clean_inet_cache, default=True, admin_required=False, column=0),
+    Task("recycle_bin", "Empty Bin & Crash Reports", "Empties trash and removes old crash dumps", clean_recycle_bin_and_dumps, default=True, admin_required=True, column=1),
+    Task("error_reports", "Clear Error Reports", "Deletes old Windows error reports", clean_error_reports, default=True, admin_required=False, column=1),
+    Task("thumbnail_cache", "Fix Blurry Icons", "Rebuilds icons, fixes missing thumbnails", clean_thumbnail_icon_cache, default=True, admin_required=False, column=1),
+    Task("chk_fragments", "Remove Disk Fragments", "Deletes leftover files from disk checks", clean_chk_fragments, default=True, admin_required=True, column=1),
+    Task("old_logs", "Clear System Logs", "Removes old Windows logs", clean_old_logs, default=True, admin_required=True, column=1),
+    Task("dns_flush", "Fix Internet (DNS)", "Clears internet cache to fix sites not loading", flush_dns, default=True, admin_required=False, column=1),
+    Task("ram_purge", "Free Up RAM", "Asks Windows to free unused memory", purge_ram_working_sets, default=False, admin_required=False, column=1),
+    Task("update_leftovers", "Clear Update Leftovers", "Run this only once your PC has been running fine for a few days after a big Windows update", clean_windows_update_leftovers, default=False, admin_required=True, risk="ADVANCED", column=0),
+    Task("activity_traces", "Clear Activity Traces", "Clears recent-files and jump-list history for privacy", clean_activity_traces, default=False, admin_required=False, column=0),
+    Task("prefetch", "Clear Prefetch Files", "Clears prefetch data, usually not needed", clean_prefetch, default=False, admin_required=True, risk="ADVANCED", column=1),
+    Task("disk_cleanup_deep", "Deep Disk Cleanup", "Deep cleans old Windows update files", run_disk_cleanup, default=False, admin_required=True, risk="ADVANCED", column=0),
+    Task("browser_cache", "Clear Browser Cache", "Clears browser temp files, keeps passwords", clean_browser_caches, default=False, admin_required=False, column=1),
+    Task("office_cache", "Clear Office Cache", "Removes Office temporary files", clean_office_cache, default=False, admin_required=False, column=1),
+    Task("uwp_cache", "Clear UWP App Caches", "Clears Windows apps temp files like Photos", clean_uwp_cache, default=False, admin_required=False, column=1),
+    Task("font_cache", "Fix Broken Fonts", "Rebuilds fonts to fix garbled text", clean_font_cache, default=False, admin_required=True, column=1),
+    Task("store_cache", "Fix Store", "Resets Store if apps won't download", clean_store_cache, default=False, admin_required=False, column=1),
+    Task("temp_deep_clean", "Deep Temp Clean", "Deep cleans temp files with PowerShell", remove_temp_files_deep, default=False, admin_required=True, column=0),
+    Task("remove_bloat", "Remove Windows Bloat", "Removes Clipchamp, MSN apps, TikTok and other preinstalled junk", remove_windows_bloat, default=False, admin_required=True, column=1),
+    Task("winget_cache", "Clear WinGet Cache", "Removes leftover installer files and logs from Windows' app downloader", clean_winget_cache, default=False, admin_required=False, column=1),
+    Task("event_logs", "Clear Event Viewer Logs", "Wipes old Windows diagnostic logs so they start fresh", clean_event_logs, default=False, admin_required=True, column=1),
+    Task("defender_history", "Clear Defender History", "Removes stale protection-history entries that haunt the Security app", clean_defender_history, default=False, admin_required=True, column=1),
+    Task("steam_depot", "Clean Steam Download Cache", "Clears Steam's manifest cache that causes phantom update states", clean_steam_download_cache, default=False, admin_required=False, column=0),
+    Task("dev_caches", "Clean Dev Caches", "Clears VS Code, npm and pip caches for modders and AI tinkerers", clean_dev_caches, default=False, admin_required=False, column=1),
 ]

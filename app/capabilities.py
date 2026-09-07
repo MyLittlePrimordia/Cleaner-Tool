@@ -21,17 +21,9 @@ if IS_WINDOWS:
     import winreg
 
 
-def _run_ps(cmd: str, timeout: int = 20) -> str:
-    """Run a PowerShell one-liner, return stdout ('' on any failure)."""
-    try:
-        r = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", cmd],
-            shell=False, capture_output=True, text=True, timeout=timeout,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        return r.stdout or ""
-    except Exception:
-        return ""
+# audit fix (hygiene): _run_ps() had zero callers anywhere in the app —
+# removed. All capability checks here use the cheaper registry/AppxPackage
+# reads instead of shelling to PowerShell.
 
 
 def _appx_version(package_name: str) -> "str | None":
@@ -79,8 +71,10 @@ def has_winget() -> bool:
     if not IS_WINDOWS:
         return False
     try:
+        # shell=False with a list (shell=True + list is wrong-shaped on
+        # Windows and needlessly spawns cmd.exe for a PATH lookup).
         r = subprocess.run(
-            ["where", "winget"], shell=True, capture_output=True, text=True, timeout=10,
+            ["where", "winget"], shell=False, capture_output=True, text=True, timeout=10,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         return r.returncode == 0 and "winget" in (r.stdout or "").lower()

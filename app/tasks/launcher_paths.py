@@ -16,8 +16,33 @@ PROGRAMDATA = os.environ.get("ProgramData", "")
 PROGRAMFILES = os.environ.get("ProgramFiles", "")
 TEMP = os.environ.get("TEMP", "")
 USERPROFILE = os.environ.get("USERPROFILE", "")
-DOCUMENTS = os.path.join(USERPROFILE, "Documents") if USERPROFILE else ""
 LOCALLOW = os.path.join(USERPROFILE, "AppData", "LocalLow") if USERPROFILE else ""
+
+
+def _shell_folder(name: str, fallback_parts: tuple) -> str:
+    """Resolve a known folder respecting OneDrive/known-folder redirection.
+
+    F-4 audit fix: Documents is OneDrive-redirected by default on new
+    Windows 11 profiles, so %USERPROFILE%\\Documents silently misses every
+    game that stores data there (junk cleaning) AND the saves backup's
+    'My Games' source. Read the shell folder value (the same technique
+    game_tasks._desktop_dir uses for Desktop) and expandvars it; fall back
+    to the profile-relative path when the value is missing/unreadable."""
+    fallback = os.path.join(USERPROFILE, *fallback_parts) if USERPROFILE else ""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders") as k:
+            raw, _ = winreg.QueryValueEx(k, name)
+            resolved = os.path.expandvars(raw)
+            if resolved and os.path.isabs(resolved):
+                return resolved
+    except Exception:
+        pass
+    return fallback
+
+
+DOCUMENTS = _shell_folder("Personal", ("Documents",))
 
 
 def _join(base: str, *parts: str) -> str:
@@ -53,10 +78,14 @@ def _epic_webcache_paths() -> list[str]:
         pass
     return paths
 
-EPIC_CACHE_PATHS = [
-    *_epic_webcache_paths(),
-    _join(LOCALAPPDATA, "EpicGamesLauncher", "Saved", "Logs"),
-]
+def _build_epic_cache_paths() -> list[str]:
+    return [
+        *_epic_webcache_paths(),
+        _join(LOCALAPPDATA, "EpicGamesLauncher", "Saved", "Logs"),
+    ]
+
+
+EPIC_CACHE_PATHS = _build_epic_cache_paths()
 
 # EA app (current) + legacy Origin / EA Desktop
 EA_CACHE_PATHS = [
@@ -129,12 +158,13 @@ def _xbox_package_paths() -> list[str]:
 
 XBOX_CACHE_PATHS = _xbox_package_paths()
 
-# Rockstar Games Launcher (GTA V renders + launcher cache)
+# Rockstar Games Launcher (launcher cache/logs only — never user output:
+# GTA V "videos/rendered" holds rendered Rockstar Editor .mp4s, i.e.
+# user-created exports, not disposable cache, so it must not be cleaned
+# here; use the opt-in Game Captures task for captures).
 ROCKSTAR_CACHE_PATHS = [
     _join(LOCALAPPDATA, "Rockstar Games", "Launcher", "cache"),
     _join(APPDATA, "Rockstar Games", "Launcher", "logs"),
-    # PCGW-verified: rendered Rockstar Editor videos output
-    _join(LOCALAPPDATA, "Rockstar Games", "GTA V", "videos", "rendered"),
 ]
 
 # Additional launchers
@@ -461,43 +491,55 @@ SPOTIFY_CACHE_PATHS = [
 # Aggregates used by task modules
 # --------------------------------------------------------------------------- #
 
-GAMER_LAUNCHER_ALL = (
-    STEAM_CACHE_PATHS
-    + EPIC_CACHE_PATHS
-    + EA_CACHE_PATHS
-    + GOG_CACHE_PATHS
-    + BATTLENET_CACHE_PATHS
-    + RIOT_CACHE_PATHS
-    + UBISOFT_CACHE_PATHS
-    + DISCORD_CACHE_PATHS
-    + XBOX_CACHE_PATHS
-    + ROCKSTAR_CACHE_PATHS
-    + AMAZON_CACHE_PATHS
-    + ITCH_CACHE_PATHS
-    + HUMBLE_CACHE_PATHS
-    + WARGAMING_CACHE_PATHS
-    + NEXON_CACHE_PATHS
-    # M5 fix: game_tasks.clean_gamer_launchers logs "+ Slack/Teams/Spotify"
-    # but this list never included them — only the Clean tab's separate
-    # ALL_LAUNCHER_CACHE_PATHS did. Someone using only the (now-merged)
-    # Games tab got misleading output and missed cleaning. Added here so
-    # the log line is accurate and both tabs clean the same things.
-    + SLACK_CACHE_PATHS
-    + TEAMS_CACHE_PATHS
-    + SPOTIFY_CACHE_PATHS
-)
+def _build_gamer_launcher_all() -> list[str]:
+    return (
+        STEAM_CACHE_PATHS
+        + EPIC_CACHE_PATHS
+        + EA_CACHE_PATHS
+        + GOG_CACHE_PATHS
+        + BATTLENET_CACHE_PATHS
+        + RIOT_CACHE_PATHS
+        + UBISOFT_CACHE_PATHS
+        + DISCORD_CACHE_PATHS
+        + XBOX_CACHE_PATHS
+        + ROCKSTAR_CACHE_PATHS
+        + AMAZON_CACHE_PATHS
+        + ITCH_CACHE_PATHS
+        + HUMBLE_CACHE_PATHS
+        + WARGAMING_CACHE_PATHS
+        + NEXON_CACHE_PATHS
+        # M5 fix: game_tasks.clean_gamer_launchers logs "+ Slack/Teams/Spotify"
+        # but this list never included them — only the Clean tab's separate
+        # ALL_LAUNCHER_CACHE_PATHS did. Someone using only the (now-merged)
+        # Games tab got misleading output and missed cleaning. Added here so
+        # the log line is accurate and both tabs clean the same things.
+        + SLACK_CACHE_PATHS
+        + TEAMS_CACHE_PATHS
+        + SPOTIFY_CACHE_PATHS
+    )
 
-GAME_FILES_ALL = (
-    MINECRAFT_CACHE_PATHS
-    + MINECRAFT_BEDROCK_CACHE_PATHS
-    + OBS_CACHE_PATHS
-    + STREAMLABS_CACHE_PATHS
-    + CURSEFORGE_CACHE_PATHS
-    + PERIPHERAL_CACHE_PATHS
-    + ROBLOX_CACHE_PATHS
-    + _TOP_GAME_CACHE_PATHS
-    + UNREAL_UNITY_CACHE_PATHS
-)
+
+def _build_game_files_all() -> list[str]:
+    return (
+        MINECRAFT_CACHE_PATHS
+        + MINECRAFT_BEDROCK_CACHE_PATHS
+        + OBS_CACHE_PATHS
+        + STREAMLABS_CACHE_PATHS
+        + CURSEFORGE_CACHE_PATHS
+        + PERIPHERAL_CACHE_PATHS
+        + ROBLOX_CACHE_PATHS
+        + _TOP_GAME_CACHE_PATHS
+        + UNREAL_UNITY_CACHE_PATHS
+    )
+
+
+# NOTE: aggregates are LISTS (not tuples) on purpose — refresh_dynamic_paths
+# below rebuilds them in place (slice assignment), so modules that did
+# `from launcher_paths import GAMER_LAUNCHER_ALL` see fresh contents without
+# re-importing.
+GAMER_LAUNCHER_ALL = _build_gamer_launcher_all()
+
+GAME_FILES_ALL = _build_game_files_all()
 
 # M5 fix: ALL_LAUNCHER_CACHE_PATHS (Clean tab) and GAMER_LAUNCHER_ALL (Games
 # tab) are now identical in coverage — both include every launcher plus
@@ -520,3 +562,28 @@ GPU_SHADER_CACHE_ALL = (
     + STEAM_SHADER_CACHE_PATHS
     + GEFORCE_AMD_CACHE_PATHS
 )
+
+
+def refresh_dynamic_paths() -> None:
+    """Re-run the environment-dependent discoveries (M12).
+
+    The glob/listdir/isfile/walk builders above ran once at import, so files
+    created after app start (play a game → press Clean without restarting →
+    new Player.log / webcache_XXXX missed) and the import-time LocalLow walk
+    cost on Unity-heavy machines. Task entry points call this at clean time;
+    every list is mutated IN PLACE so existing `from`-import references in
+    task modules observe the refresh.
+    """
+    EPIC_CACHE_PATHS[:] = _build_epic_cache_paths()
+    XBOX_CACHE_PATHS[:] = _xbox_package_paths()
+    MINECRAFT_LAUNCHER_LOGS[:] = _minecraft_launcher_log_files()
+    MINECRAFT_BEDROCK_CACHE_PATHS[:] = _minecraft_bedrock_paths()
+    LOW_GAME_PLAYER_LOGS[:] = _build_low_game_player_logs()
+    UNITY_PLAYER_LOGS[:] = _build_unity_player_logs()
+    # F-4: a late OneDrive sign-in can redirect Documents after app start —
+    # re-resolve the known folder, then rebuild the paths that use it.
+    global DOCUMENTS
+    DOCUMENTS = _shell_folder("Personal", ("Documents",))
+    _TOP_GAME_CACHE_PATHS[:] = _build_top_game_paths()
+    GAMER_LAUNCHER_ALL[:] = _build_gamer_launcher_all()
+    GAME_FILES_ALL[:] = _build_game_files_all()

@@ -19,10 +19,18 @@ trust = ET.SubElement(root, "trustInfo", {
 })
 security = ET.SubElement(trust, "security")
 priv = ET.SubElement(security, "requestedPrivileges")
-# requireAdministrator: the frozen .exe always elevates at launch via
-# Windows UAC (no in-app Admin Gate / restart handshake needed).
+# audit fix (C2): this used to say requireAdministrator on the theory that
+# the frozen .exe always elevates at launch and the in-app Admin Gate /
+# restart handshake was unneeded. That was never true in the shipped app —
+# app/elevation.py implements a full UAC relaunch handshake and app/gui.py
+# has a real AdminGateFrame with a "Limited — cleaning only" continue path
+# (README also promises the app "works without admin"). With
+# requireAdministrator, Windows elevates before main() ever runs, so
+# is_admin() is always True in the frozen exe and all of that gate/limited-
+# mode code is dead and untestable in production. asInvoker lets the app
+# start unelevated and make its own informed choice via the Admin Gate.
 ET.SubElement(priv, "requestedExecutionLevel", {
-    "level": "requireAdministrator",
+    "level": "asInvoker",
     "uiAccess": "false"
 })
 

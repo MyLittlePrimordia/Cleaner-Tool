@@ -205,7 +205,7 @@ def run_auto_clean(selected_tasks_by_tab):
     Run the auto-clean with pre-selected tasks.
     Called when the app is launched with --auto-clean.
     """
-    from app.utils import TaskContext, TaskSkipped
+    from app.utils import TaskContext, TaskSkipped, TaskCancelled
     from app.tasks import clean_tasks, repair_tasks, tweak_tasks, game_tasks, advanced_tasks
     import threading
     import time
@@ -230,6 +230,10 @@ def run_auto_clean(selected_tasks_by_tab):
     }
 
     for tab, keys in selected_tasks_by_tab.items():
+        # H8: a hand-edited config may store a plain string instead of a
+        # list — iterating it would scatter per-character keys.
+        if isinstance(keys, str):
+            keys = [keys]
         for key in keys:
             if key in all_tasks.get(tab, {}):
                 tasks_to_run.append(all_tasks[tab][key])
@@ -242,6 +246,15 @@ def run_auto_clean(selected_tasks_by_tab):
     # a duplicated literal (audit: two hardcoded copies can drift).
     from app.tab_presets import CUT_TASK_KEYS as _cut
     tasks_to_run = [t for t in tasks_to_run if t.key not in _cut]
+    # H8: dedupe by key (same task listed under two tabs, or pre/post
+    # migration duplicates) — never run a task twice in one auto-clean.
+    _seen: set = set()
+    _deduped = []
+    for t in tasks_to_run:
+        if t.key not in _seen:
+            _seen.add(t.key)
+            _deduped.append(t)
+    tasks_to_run = _deduped
     
     if not tasks_to_run:
         return False, "No tasks selected for auto-clean"
@@ -319,6 +332,14 @@ def run_auto_clean(selected_tasks_by_tab):
             # logged as skipped, not succeeded.
             skipped_n += 1
             ctx.log(f"Skipped {task.label}: {exc}")
+        except TaskCancelled as exc:
+            # F-2 audit fix (mirrors the GUI runner): a user/tool Stop is
+            # 'stopped', not a failure — run_cmd_checked's H6 contract.
+            # The next iteration's cancelled() check ends the loop. Without
+            # this catch the generic handler counted the interrupted task
+            # as failed, flipping the run's exit code for Task Scheduler.
+            ctx.log(f"Stopped {task.label}: {exc}")
+            break
         except Exception as e:
             failed += 1
             ctx.log(f"ERROR in {task.label}: {e}")

@@ -150,11 +150,16 @@ def install_selected_apps(ctx: TaskContext, apps: list):
     ctx.log(f"Installing {len(apps)} selected app(s)...")
     ok, failed = [], []
     for app in apps:
-        rc = install_winget_app(ctx, app["id"], app["name"], fallback_url=app.get("url", ""))
-        (ok if rc == 0 else failed).append(app["name"])
         if ctx.cancelled():
             ctx.log("Stopped — remaining apps were skipped.")
             break
+        rc = install_winget_app(ctx, app["id"], app["name"], fallback_url=app.get("url", ""))
+        # H6: a cancelled install (rc -1) must not be recorded as "failed" —
+        # the run was stopped, and the caller reports Stopped vs Complete.
+        if rc == -1 or ctx.cancelled():
+            ctx.log(f"  [STOPPED] {app['name']} — cancelled by user; remaining apps skipped.")
+            break
+        (ok if rc == 0 else failed).append(app["name"])
     ctx.log("=" * 48)
     ctx.log(f"Install complete: {len(ok)} succeeded, {len(failed)} failed"
             + (f" ({', '.join(failed)})" if failed else "") + ".")
@@ -168,7 +173,14 @@ def install_selected_apps(ctx: TaskContext, apps: list):
 # need internet, so they belong on Install per the user's request)
 # --------------------------------------------------------------------------- #
 
-_WINGET_ARGS = ["--accept-package-agreements", "--accept-source-agreements", "--silent"]
+# audit fix (M8): missing --exact risked a prefix match landing on the
+# wrong package (winget picks the "best" match, not necessarily the exact
+# id), and missing --disable-interactivity let an unexpected winget prompt
+# hang the call for the full timeout (up to 900s) instead of failing fast.
+# downloader.install_winget_app already carried both flags; this path
+# (msstore installs) did not.
+_WINGET_ARGS = ["--exact", "--accept-package-agreements", "--accept-source-agreements",
+                "--silent", "--disable-interactivity"]
 
 
 def _winget_install(ctx: TaskContext, package_id: str, label: str, timeout: int = 900) -> None:
@@ -190,8 +202,9 @@ def _winget_install(ctx: TaskContext, package_id: str, label: str, timeout: int 
     ctx.log(f"Installing {label} ({package_id})...")
     rc = run_cmd(ctx, cmd, shell=False, timeout=timeout)
     rc = _norm_winget_rc(rc)
-    if ctx.cancelled():
-        raise RuntimeError(f"winget install of {label} cancelled.")
+    # H6: a stop is TaskCancelled ("stopped"), never a RuntimeError failure.
+    if ctx.cancelled() or rc == -1:
+        raise TaskCancelled(f"winget install of {label} cancelled.")
     if rc == 0:
         return
     if rc in _WINGET_BENIGN:
@@ -337,6 +350,56 @@ def task_install_vc_redists(ctx: TaskContext):
     install_vc_redists(ctx)
 
 
+def install_vcredist_allinone(ctx: TaskContext):
+    """MICROSOFT VISUAL C++ ALL-IN-ONE BUNDLE (user request 2026-09-06) —
+    the single winget package `Microsoft.VCRedist.2015+.x64` (Microsoft's
+    own "Visual C++ v14 Redistributable (x64)", verified live 2026-09-06,
+    v14.51.36247.0) — the latest VC++ 2015-2022 runtime every modern game
+    and app needs, in one click.
+
+    Deliberately SEPARATE from the "ALL VC++ Runtimes (2005-2022)" bundle:
+    that one installs all 12 packages (both arches, every year) for full
+    retro coverage with admin rights; this one is the quick single-package
+    install for users who just want the one runtime modern software asks
+    for. No admin gate — the winget MSI elevation is handled by winget."""
+    if not has_network():
+        raise RuntimeError("No internet connection — VC++ All-in-One needs to download.")
+    _ensure_winget(ctx)
+    rc = install_winget_app(ctx, "Microsoft.VCRedist.2015+.x64", "Microsoft Visual C++ All-in-One (x64)",
+                             fallback_url="https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist")
+    # H6: a cancelled install (rc -1) must not be recorded as "failed" —
+    # the run was stopped, and the caller reports Stopped vs Complete.
+    if rc == -1 or ctx.cancelled():
+        raise TaskCancelled("VC++ All-in-One install cancelled by user.")
+    if rc != 0:
+        raise RuntimeError("VC++ All-in-One install failed — see the log.")
+    ctx.log("VC++ All-in-One (2015-2022 x64) installed.")
+
+
+def install_directx_runtimes_winget(ctx: TaskContext):
+    """DIRECTX END-USER RUNTIMES BUNDLE (user request 2026-09-06) — the
+    single winget package `Microsoft.DirectX`: Microsoft's own winget
+    package carrying the legacy DirectX SDK side-by-side libraries
+    (d3dx9/d3dx10/d3dx11, XAudio 2.7, XInput 1.3, XACT, Managed DX 1.1 —
+    verified live 2026-09-06, v9.29.1974.0). Fixes the classic
+    missing-DLL game errors (d3dx9_43.dll and friends) in one click.
+
+    Deliberately SEPARATE from the "ALL DirectX Runtimes" bundle: that one
+    downloads and runs the June 2010 web-installer EXE (admin required);
+    this one is the lightweight winget MSIX path — no admin gate, silent,
+    self-updating via winget source."""
+    if not has_network():
+        raise RuntimeError("No internet connection — DirectX runtimes need to download.")
+    _ensure_winget(ctx)
+    rc = install_winget_app(ctx, "Microsoft.DirectX", "DirectX End-User Runtimes",
+                             fallback_url="https://www.microsoft.com/en-us/download/details.aspx?id=8109")
+    if rc == -1 or ctx.cancelled():
+        raise TaskCancelled("DirectX runtimes install cancelled by user.")
+    if rc != 0:
+        raise RuntimeError("DirectX runtimes install failed — see the log.")
+    ctx.log("DirectX End-User Runtimes (legacy d3dx9/d3dx10/d3dx11/XAudio/XInput) installed.")
+
+
 def install_java_bundle(ctx: TaskContext):
     """JAVA BUNDLE (user request: one click, no version guessing) —
     installs everything Java a game can need, silently, latest versions:
@@ -355,7 +418,13 @@ def install_java_bundle(ctx: TaskContext):
     ctx.log("Installing the full Java suite (17 JRE + 17 JDK + 8 JRE)...")
     failed = []
     for pid, label in parts:
+        # H6: a cancelled install (rc -1) is "stopped", not "failed" —
+        # report it as TaskCancelled and stop the batch immediately.
+        if ctx.cancelled():
+            raise TaskCancelled("Java install cancelled by user.")
         rc = install_winget_app(ctx, pid, label, fallback_url="https://adoptium.net/")
+        if rc == -1 or ctx.cancelled():
+            raise TaskCancelled("Java install cancelled by user.")
         if rc != 0:
             failed.append(label)
     if failed:
@@ -380,7 +449,12 @@ def install_dotnet_bundle(ctx: TaskContext):
         ("Microsoft.DotNet.DesktopRuntime.8", ".NET Desktop Runtime 8"),
         ("Microsoft.DotNet.DesktopRuntime.6", ".NET Desktop Runtime 6 (older games)"),
     ):
+        # H6: cancelled (rc -1) is "stopped", not "failed".
+        if ctx.cancelled():
+            raise TaskCancelled(".NET install cancelled by user.")
         rc = install_winget_app(ctx, pid, label, fallback_url="https://dotnet.microsoft.com/download/dotnet")
+        if rc == -1 or ctx.cancelled():
+            raise TaskCancelled(".NET install cancelled by user.")
         if rc != 0:
             failed.append(label)
     # legacy DISM features (best-effort — needs admin; honest skip if not)
@@ -403,11 +477,27 @@ def install_directx_bundle(ctx: TaskContext):
       * DirectX End-User Runtimes (June 2010) — d3dx9/d3dx10/d3dx11, XAudio
         2.7, XInput 1.3 side-by-side libraries (the missing-DLL fix),
         downloaded from Microsoft's CDN, SHA-256 verified, silent.
+      * Microsoft.DirectX (winget) — Microsoft's own winget package for
+        the same legacy DirectX SDK side-by-side libraries (added per user
+        request 2026-09-06; verified FOUND v9.29.1974.0, the June 2010
+        redist republished as a signed MSIX). Run AFTER the web-installer
+        path so the DLLs land even when the CDN scrape fails — winget's
+        offline MSIX install needs no elevation dance.
     Note: DirectX 12 itself is built into Windows 10/11 and updated via
     Windows Update — there is no separate installer to run. The AV1/VP9/
     Web Media codec packs live in their own 'Install Windows Codecs'
     bundle now (user request: codecs bundled as windows codecs)."""
     install_directx_runtimes(ctx)      # legacy d3dx9/d3dx10/d3dx11/XAudio/XInput
+    if ctx.cancelled():
+        raise TaskCancelled("DirectX install cancelled by user.")
+    # Winget path for the same legacy runtimes (self-healing second chance)
+    _ensure_winget(ctx)
+    rc = install_winget_app(ctx, "Microsoft.DirectX", "DirectX End-User Runtimes",
+                             fallback_url="https://www.microsoft.com/en-us/download/details.aspx?id=8109")
+    if rc == -1 or ctx.cancelled():
+        raise TaskCancelled("DirectX install cancelled by user.")
+    if rc != 0:
+        ctx.log("  ! Microsoft.DirectX winget install failed — the CDN install above may still have landed.")
 
 
 def install_codecs_bundle(ctx: TaskContext):
@@ -437,7 +527,12 @@ def install_classic_runtimes(ctx: TaskContext):
     ctx.log("Installing classic game runtimes (OpenAL + XNA + PhysX)...")
     failed = []
     for pid, label, url in parts:
+        # H6: cancelled (rc -1) is "stopped", not "failed".
+        if ctx.cancelled():
+            raise TaskCancelled("Classic runtimes install cancelled by user.")
         rc = install_winget_app(ctx, pid, label, fallback_url=url)
+        if rc == -1 or ctx.cancelled():
+            raise TaskCancelled("Classic runtimes install cancelled by user.")
         if rc != 0:
             failed.append(label)
     if failed:
@@ -564,11 +659,24 @@ def _download_binary(ctx: TaskContext, url: str, dest: str, label: str, min_byte
                 raise RuntimeError(f"server returned an HTML page, not a file (blocked/challenge?)")
             while True:
                 if ctx.cancelled():
-                    raise RuntimeError("cancelled by user")
+                    # F-7: a user Stop is 'stopped', not a download failure —
+                    # raise TaskCancelled (downloader._download's H6 contract)
+                    # so install_selected_mixed reports Stopped instead of a
+                    # failed task with a misleading download-error message.
+                    raise TaskCancelled("download cancelled by user")
                 chunk = resp.read(1 << 16)
                 if not chunk:
                     break
                 f.write(chunk)
+    except TaskCancelled:
+        # same partial-file cleanup as failures, but keep the 'stopped'
+        # classification — do not wrap it into a RuntimeError
+        try:
+            if os.path.exists(dest):
+                os.remove(dest)
+        except OSError:
+            pass
+        raise
     except Exception as exc:
         try:
             if os.path.exists(dest):
@@ -614,6 +722,10 @@ def install_apo_peace_bundle(ctx: TaskContext):
             try:
                 _download_binary(ctx, part["url"], dest, part["label"], part["min_bytes"],
                                 part=part)  # F-004b: pinned integrity gate
+            except TaskCancelled:
+                # F-7: keep the 'stopped' classification — no manual-download
+                # failure text for a user Stop; the runner reports Stopped.
+                raise
             except RuntimeError as exc:
                 raise RuntimeError(f"{exc} Manual download: {part['manual']}")
             ctx.log(f"Running silent install: {part['label']}...")
@@ -671,15 +783,25 @@ def get_installed_ids(refresh: bool = False) -> "set[str] | None":
         )
     except Exception:
         return None
+    # H7: match tokens against the KNOWN catalog/Store IDs instead of
+    # guessing the Id column position. The old heuristic read parts[-2]
+    # (the Version/Available column when a Source column is present, so
+    # versions like "1.2.3" were recorded as IDs) and its Store-ID branch
+    # (`isalnum and len==12 and isdigit`) only accepted 12-digit numbers —
+    # real Store IDs (e.g. 9MV0B5HZVK9Z) never matched. Token membership
+    # is immune to column shifts and locale.
+    try:
+        from app.app_catalog import APP_CATALOG, MSSTORE_IDS
+        known = {a.get("id", "").lower() for a in APP_CATALOG if not a.get("id", "").startswith("manual:")}
+        known |= {m.lower() for m in MSSTORE_IDS}
+    except Exception:
+        known = set()
     found = set()
     for line in (out.stdout or "").splitlines():
-        # lines look like: "Name              Id                  Version"
-        # we only need the second-from-last token column; ids never contain
-        # spaces, so take the last token as version and the one before it
-        # as the id candidate (must contain a dot or be a store id)
-        parts = line.split()
-        if len(parts) >= 3 and ("." in parts[-2] or parts[-2].isalnum() and len(parts[-2]) == 12 and parts[-2].isdigit()):
-            found.add(parts[-2].lower())
+        for tok in line.split():
+            t = tok.strip().strip(",;").lower()
+            if t and t in known:
+                found.add(t)
     _INSTALLED_CACHE[0] = found
     return found
 
@@ -838,8 +960,8 @@ def update_all_apps(ctx: TaskContext):
     rc = run_cmd(live, ["winget", "upgrade", "--all", "--silent",
                         "--accept-package-agreements", "--accept-source-agreements",
                         "--disable-interactivity"],
-                 shell=False, timeout=3600, collect=collected)
-    from app.downloader import _norm_winget_rc, _WINGET_BENIGN
+                  shell=False, timeout=3600, collect=collected)
+    # (_norm_winget_rc/_WINGET_BENIGN imported once at module top.)
     rc = _norm_winget_rc(rc)
     if ctx.cancelled() or rc == -1:
         ctx.log("  [STOPPED] Update run cancelled.")
@@ -904,10 +1026,11 @@ def install_winget_unigetui(ctx: TaskContext):
 # --------------------------------------------------------------------------- #
 # Task list — the LTSC prerequisite installers (the catalog apps are picked
 # in the Install tab UI and run through install_selected_apps, NOT one Task
-# per app — 124 preset cards would be noise; checkboxes + one Run button per
-# the Install.txt spec). `group` splits the Essentials section in two:
-# "LTSC Missing Components" first (Store brings winget, so it stays first),
-# then the "Essentials" runtime bundles. Updates live on the dedicated
+# per app — 114 catalog + 17 manual apps as preset cards would be noise;
+# checkboxes + one Run button per the Install.txt spec). `group` splits the
+# Essentials section in two: "LTSC Missing Components" first (Store brings
+# winget, so it stays first), then the "Essentials" runtime bundles. Updates
+# live on the dedicated
 # "Update Apps (N)" top-bar button (UPDATE_ALL_TASK above), not as a
 # checkbox — an update run is an action, not an install selection.
 # --------------------------------------------------------------------------- #
@@ -928,7 +1051,9 @@ TASKS = [
     Task("install_codecs_bundle", "Install Windows Codecs (AV1, VP9 + Web Media)", "One click for the codecs behind broken or black in-game cutscenes", install_codecs_bundle, default=False, admin_required=False, column=0, group="LTSC Missing Components"),
     Task("install_webview2", "Install WebView2 Runtime", "Evergreen runtime required by EA App, CurseForge, Battle.net and more", install_webview2, default=False, admin_required=False, column=0, group="LTSC Missing Components"),
     Task("install_vc_bundle", "Install ALL VC++ Runtimes (2005-2022)", "One click for every Visual C++ runtime — x64 + x86, all years; no guessing which one a game needs", task_install_vc_redists, default=False, admin_required=True, column=0),
+    Task("install_vc_allinone", "Install Microsoft Visual C++ All-in-One", "The single latest VC++ 2015-2022 x64 runtime modern games and apps ask for", install_vcredist_allinone, default=False, admin_required=False, column=0),
     Task("install_directx_bundle", "Install ALL DirectX Runtimes", "One click for d3dx9/d3dx10/d3dx11, XAudio, XInput — fixes missing-DLL game errors", install_directx_bundle, default=False, admin_required=True, column=0),
+    Task("install_directx_runtimes", "Install DirectX End-User Runtimes", "Microsoft's winget package for the legacy d3dx9/d3dx10/d3dx11 libraries behind missing-DLL game errors", install_directx_runtimes_winget, default=False, admin_required=False, column=0),
     Task("install_dotnet_bundle", "Install ALL .NET Runtimes", "One click for .NET 8 + .NET 6 (+ .NET 3.5 & DirectPlay with admin)", install_dotnet_bundle, default=False, admin_required=False, column=0),
     Task("install_java_bundle", "Install ALL Java Runtimes", "One click for Java 17 JRE + JDK and legacy Java 8 — every Minecraft era covered", install_java_bundle, default=False, admin_required=False, column=0),
     Task("install_classic_runtimes", "Install Classic Game Runtimes (OpenAL, XNA, PhysX)", "One click for OpenAL 3D audio, XNA 4.0 and legacy PhysX — S.T.A.L.K.E.R., Terraria, Mirror's Edge", install_classic_runtimes, default=False, admin_required=True, column=0),

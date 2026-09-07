@@ -10,7 +10,7 @@ import os
 import subprocess
 
 from app.utils import (TaskContext, reg_set_value, reg_set_value_checked, reg_delete_value,
-                       reg_delete_key, run_cmd, IS_WINDOWS)
+                       reg_delete_key, run_cmd, run_cmd_checked, IS_WINDOWS)
 
 if IS_WINDOWS:
     import winreg
@@ -36,29 +36,31 @@ def revert_memory_integrity(ctx: TaskContext):
 
 def disable_vmp(ctx: TaskContext):
     ctx.log("[Advanced] Disable Virtual Machine Platform (VMP / Hyper-V) [REBOOT REQUIRED]")
-    ctx.log("$ bcdedit /set hypervisorlaunchtype off")
-    # Exact spec command
-    run_cmd(ctx, "bcdedit /set hypervisorlaunchtype off")
+    # H5: bcdedit fails without admin/on LTSC — the old unchecked run_cmd
+    # logged success either way (security-relevant lie). Raise honestly.
+    run_cmd_checked(ctx, "bcdedit /set hypervisorlaunchtype off", timeout=60)
     ctx.log("Virtual Machine Platform disabled (hypervisorlaunchtype off). Reboot required.")
 
 
 def revert_vmp(ctx: TaskContext):
     ctx.log("Re-enabling Virtual Machine Platform...")
-    run_cmd(ctx, "bcdedit /set hypervisorlaunchtype auto")
+    run_cmd_checked(ctx, "bcdedit /set hypervisorlaunchtype auto", timeout=60)
     ctx.log("VMP re-enabled (hypervisorlaunchtype auto). Reboot required.")
 
 
 def disable_memory_compression(ctx: TaskContext):
     ctx.log("[Advanced] Disable Windows Memory Compression (For 32GB+ RAM PCs)")
-    ctx.log("$ Disable-MMAgent -MemoryCompression")
-    # Exact spec string
-    run_cmd(ctx, 'powershell -NoProfile -Command "Disable-MMAgent -MemoryCompression"')
+    # H5: same honest-failure treatment; shell=False argv (no cmd.exe
+    # quote mangling of the PS command).
+    run_cmd_checked(ctx, ["powershell", "-NoProfile", "-Command", "Disable-MMAgent -MemoryCompression"],
+                    shell=False, timeout=120)
     ctx.log("Windows Memory Compression disabled. For 32GB+ RAM, improves latency.")
 
 
 def revert_memory_compression(ctx: TaskContext):
     ctx.log("Re-enabling Windows Memory Compression...")
-    run_cmd(ctx, 'powershell -NoProfile -Command "Enable-MMAgent -MemoryCompression"')
+    run_cmd_checked(ctx, ["powershell", "-NoProfile", "-Command", "Enable-MMAgent -MemoryCompression"],
+                    shell=False, timeout=120)
     ctx.log("Memory Compression re-enabled.")
 
 
@@ -81,14 +83,13 @@ def revert_copilot(ctx: TaskContext):
 
 def disable_hibernation(ctx: TaskContext):
     ctx.log("[Advanced] Disable Windows Hibernation (Reclaims disk space equal to RAM size)")
-    ctx.log("$ powercfg -h off")
-    run_cmd(ctx, "powercfg -h off")
+    run_cmd_checked(ctx, "powercfg -h off", timeout=60)
     ctx.log("Hibernation disabled (powercfg -h off). Disk space reclaimed equal to RAM.")
 
 
 def revert_hibernation(ctx: TaskContext):
     ctx.log("Re-enabling Windows Hibernation...")
-    run_cmd(ctx, "powercfg -h on")
+    run_cmd_checked(ctx, "powercfg -h on", timeout=60)
     ctx.log("Hibernation re-enabled (powercfg -h on).")
 
 

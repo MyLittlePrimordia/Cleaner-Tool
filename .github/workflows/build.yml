@@ -44,9 +44,9 @@ jobs:
       - name: Build with PyInstaller
         # --onefile  : single portable .exe
         # --windowed : no console window behind the GUI
-        # --manifest : embed requireAdministrator manifest — Windows shows
-        #              UAC on every launch and the app starts elevated, so
-        #              the in-app Admin Gate / restart handshake is skipped
+        # --manifest : embed asInvoker manifest — the app starts unelevated
+        #              and uses its in-app Admin Gate / restart handshake to
+        #              elevate only when needed (cleanups work without admin)
         # --icon / --add-data : bundle colored 🧼 icon from app/assets
         run: >
           pyinstaller --onefile --windowed

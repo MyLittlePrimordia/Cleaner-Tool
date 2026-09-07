@@ -91,6 +91,54 @@ def _snapshot_powercfg_pairs(ctx: TaskContext, task_id: str, pairs: list[tuple[s
     save_tweak_snapshot(task_id, values)
 
 
+# --------------------------------------------------------------------------- #
+# Snapshot-value validation (F-1 audit fix)
+# --------------------------------------------------------------------------- #
+# tweak snapshots persist in the USER-WRITABLE config.json. Everything the
+# legit apply paths ever save is produced by this module's own parsers —
+# enum strings, parsed ints, extracted GUIDs — so anything outside these
+# shapes cannot be prior machine state. Five revert flows interpolate
+# snapshot values straight into shell=True run_cmd command strings; a
+# poisoned snapshot (hand-edited file or a same-user process) would
+# otherwise execute with the app's privilege (admin, typically) the next
+# time Undo runs. Validate at revert time and fail closed: legit values
+# are never rejected, and the snapshot is kept (C6) for manual recovery.
+
+_SC_START_TYPES = ("boot", "system", "auto", "demand", "disabled")
+
+
+def _valid_snapshot_start_type(value) -> bool:
+    """True if value is a start type this app could have snapshotted (the
+    exact keyword set `sc config start=` accepts)."""
+    return isinstance(value, str) and value in _SC_START_TYPES
+
+
+def _valid_snapshot_power_index(value) -> bool:
+    """True if value is a powercfg setting index this app could have
+    snapshotted (powercfg_query_indexes parses hex into a non-negative int)."""
+    return (isinstance(value, int) and not isinstance(value, bool)
+            and 0 <= value <= 0xFFFFFFFF)
+
+
+def _valid_snapshot_guid(value) -> bool:
+    """True if value is a canonical GUID string (active power schemes are
+    captured via a 36-char hex-and-dash regex from powercfg output)."""
+    import re as _re
+    return (isinstance(value, str)
+            and _re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+                              r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", value) is not None)
+
+
+def _snapshot_validation_error(task_id: str, field: str, value) -> RuntimeError:
+    return RuntimeError(
+        f"Saved '{task_id}' snapshot has an invalid {field} "
+        f"({value!r}) — it does not look like a value this app saved, so it "
+        "was NOT executed. Nothing was changed; the snapshot was kept. "
+        "If you hand-edited config.json, restore the real prior value there "
+        "or clear the snapshot and re-apply the tweak."
+    )
+
+
 def _restore_powercfg_pairs(ctx: TaskContext, task_id: str, pairs: list[tuple[str, str]], fallback: dict[str, int]):
     """Restore each (subgroup, setting) pair from the saved snapshot. Falls
     back to a documented-correct default only if no snapshot exists (e.g.
@@ -101,7 +149,9 @@ def _restore_powercfg_pairs(ctx: TaskContext, task_id: str, pairs: list[tuple[st
     restored the wrong side (or nothing). Both sides are now snapshotted
     and restored; powercfg_query_index gains a DC variant."""
     snapshot = get_tweak_snapshot(task_id)
+    had_snapshot = bool(snapshot)
     used_fallback = False
+    failures: list = []
     for subgroup, setting in pairs:
         key = f"{subgroup}:{setting}"
         value = snapshot.get(key)
@@ -109,16 +159,37 @@ def _restore_powercfg_pairs(ctx: TaskContext, task_id: str, pairs: list[tuple[st
             value = fallback.get(key)
             used_fallback = True
         if value is not None:
-            run_cmd(ctx, f"powercfg /setacvalueindex scheme_current {subgroup} {setting} {value}")
+            # F-1: snapshot values flow into a shell command string — only
+            # a parsed powercfg index (int) may ever run.
+            if not _valid_snapshot_power_index(value):
+                raise _snapshot_validation_error(task_id, f"power index for {key}", value)
+            rc = run_cmd(ctx, f"powercfg /setacvalueindex scheme_current {subgroup} {setting} {value}")
+            if rc != 0:
+                failures.append(f"{key} AC")
             # snapshot may also carry the DC ("key:dc") value if the machine
             # was on battery at apply time
             dc_value = snapshot.get(key + ":dc")
             if dc_value is not None:
-                run_cmd(ctx, f"powercfg /setdcvalueindex scheme_current {subgroup} {setting} {dc_value}")
-    run_cmd(ctx, "powercfg /setactive scheme_current")
+                # F-1: same shell-bound validation for the battery-side index
+                if not _valid_snapshot_power_index(dc_value):
+                    raise _snapshot_validation_error(task_id, f"DC power index for {key}", dc_value)
+                rc_dc = run_cmd(ctx, f"powercfg /setdcvalueindex scheme_current {subgroup} {setting} {dc_value}")
+                if rc_dc != 0:
+                    failures.append(f"{key} DC")
+    rc_active = run_cmd(ctx, "powercfg /setactive scheme_current")
+    if rc_active != 0:
+        failures.append("setactive")
     if used_fallback and not snapshot:
         ctx.log("  (no saved prior value found — restored to documented Windows default instead)")
-    clear_tweak_snapshot(task_id)
+    # C6: keep the snapshot when the restore failed so the true original
+    # survives for a retry; only a verified restore drops it.
+    if failures:
+        raise RuntimeError(
+            f"Could not restore {task_id} ({', '.join(failures)}) — snapshot kept "
+            "so Undo can be retried."
+        )
+    if had_snapshot:
+        clear_tweak_snapshot(task_id)
 
 
 def _active_scheme_guid() -> "str | None":
@@ -217,37 +288,47 @@ def apply_ultimate_performance(ctx: TaskContext):
 
     # Snapshot the user's current scheme so revert restores the REAL prior
     # plan (M1 pattern), not a hardcoded guess like 'Balanced'.
+    # Snapshot-failure hygiene (C5): the snapshot is taken before the
+    # mutating commands, so a later failure must NOT leave it behind —
+    # get_tweak_state() treats any snapshot as "✓ Active". Only clear what
+    # WE created (a pre-existing snapshot from an earlier success stays).
     prior_guid = _active_scheme_guid()
+    had_snapshot = bool(get_tweak_snapshot("ultimate_performance"))
     if prior_guid:
         save_tweak_snapshot("ultimate_performance", {"active_scheme": prior_guid})
 
-    guid = _find_ultimate_scheme_guid()
-    if guid is None:
-        # No scheme yet -> duplicate the hidden template, then re-detect
-        # via the registry (language- and overlay-safe).
-        rc = run_cmd(ctx, f"powercfg -duplicatescheme {ULTIMATE_PERF_GUID}")
+    try:
         guid = _find_ultimate_scheme_guid()
-        if rc != 0 or guid is None:
+        if guid is None:
+            # No scheme yet -> duplicate the hidden template, then re-detect
+            # via the registry (language- and overlay-safe).
+            rc = run_cmd(ctx, f"powercfg -duplicatescheme {ULTIMATE_PERF_GUID}")
+            guid = _find_ultimate_scheme_guid()
+            if rc != 0 or guid is None:
+                raise RuntimeError(
+                    "Could not create the Ultimate Performance power plan on this "
+                    f"PC (powercfg returned {rc}). The plan may not be supported "
+                    "by this Windows edition."
+                )
+        else:
+            ctx.log("Ultimate Performance plan already present — reusing it (no duplicate created).")
+
+        rc2 = run_cmd(ctx, f"powercfg -setactive {guid}")
+        if rc2 != 0:
+            raise RuntimeError(f"powercfg -setactive failed (code {rc2}).")
+
+        # Verify it ACTUALLY took effect — the exact check the user ran by
+        # hand when the old silent failure burned them.
+        active = _active_scheme_guid()
+        if active is None or not _guids_equal(active, guid):
             raise RuntimeError(
-                "Could not create the Ultimate Performance power plan on this "
-                f"PC (powercfg returned {rc}). The plan may not be supported "
-                "by this Windows edition."
+                "Power plan did not activate (active scheme is "
+                f"{active or 'unknown'}, expected {guid})."
             )
-    else:
-        ctx.log("Ultimate Performance plan already present — reusing it (no duplicate created).")
-
-    rc2 = run_cmd(ctx, f"powercfg -setactive {guid}")
-    if rc2 != 0:
-        raise RuntimeError(f"powercfg -setactive failed (code {rc2}).")
-
-    # Verify it ACTUALLY took effect — the exact check the user ran by
-    # hand when the old silent failure burned them.
-    active = _active_scheme_guid()
-    if active is None or not _guids_equal(active, guid):
-        raise RuntimeError(
-            "Power plan did not activate (active scheme is "
-            f"{active or 'unknown'}, expected {guid})."
-        )
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("ultimate_performance")
+        raise
     ctx.log(f"Verified: active power plan is now Ultimate Performance ({guid}).")
 
 
@@ -260,6 +341,10 @@ def revert_ultimate_performance(ctx: TaskContext):
     the M1 snapshot), falling back to Balanced only if no snapshot exists."""
     snapshot = get_tweak_snapshot("ultimate_performance")
     target = snapshot.get("active_scheme") if snapshot else None
+    # F-1: the snapshot value flows into a shell command string — only a
+    # canonical GUID this app could have parsed from powercfg may run.
+    if target is not None and not _valid_snapshot_guid(target):
+        raise _snapshot_validation_error("ultimate_performance", "active_scheme", target)
     if target and _guids_equal(target, ULTIMATE_PERF_GUID):
         # snapshot somehow holds the tweak's own output — don't restore
         # Ultimate as if it were the prior state
@@ -276,12 +361,19 @@ def revert_ultimate_performance(ctx: TaskContext):
     if not target:
         target = BALANCED_GUID
         ctx.log("  (no saved prior plan — restoring Balanced, the Windows default)")
-    run_cmd(ctx, f"powercfg -setactive {target}")
+    # Revert-failure hygiene (C6): only drop the snapshot after a VERIFIED
+    # restore. Clearing unconditionally would destroy the true original on
+    # a failed undo, and the next apply would snapshot the tweak's own
+    # output as "prior state".
+    rc = run_cmd(ctx, f"powercfg -setactive {target}")
     active = _active_scheme_guid()
-    if active is None or not _guids_equal(active, target):
-        ctx.log(f"  ! could not verify plan switch (active={active}, wanted {target})")
-    else:
-        ctx.log(f"Restored power plan {target}.")
+    if rc != 0 or active is None or not _guids_equal(active, target):
+        raise RuntimeError(
+            f"Could not restore power plan (active={active}, wanted {target}, "
+            f"exit {rc}) — snapshot kept so Undo can be retried. If this "
+            "persists, switch plans manually in Settings > Power."
+        )
+    ctx.log(f"Restored power plan {target}.")
     clear_tweak_snapshot("ultimate_performance")
 
 
@@ -313,28 +405,68 @@ def revert_classic_context_menu(ctx: TaskContext):
                 "Press Ctrl+Shift+Esc > File > Run new task > explorer.exe.")
 
 
+_GAME_DVR_SPECS = [
+    ("HKCU", "System\\GameConfigStore", "GameDVR_Enabled"),
+    ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\GameDVR", "AppCaptureEnabled"),
+    ("HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\GameDVR", "AllowGameDVR"),
+]
+
+
 def apply_disable_game_dvr(ctx: TaskContext):
-    reg_set_value_checked(ctx, "HKCU", "System\\GameConfigStore", "GameDVR_Enabled", 0)
-    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\GameDVR", "AppCaptureEnabled", 0)
-    reg_set_value_checked(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\GameDVR", "AllowGameDVR", 0)
+    # M3: snapshot priors — the old revert hardcoded 1/1 + delete.
+    had_snapshot = bool(get_tweak_snapshot("disable_game_dvr"))
+    _snap_reg_values(ctx, "disable_game_dvr", _GAME_DVR_SPECS)
+    try:
+        reg_set_value_checked(ctx, "HKCU", "System\\GameConfigStore", "GameDVR_Enabled", 0)
+        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\GameDVR", "AppCaptureEnabled", 0)
+        reg_set_value_checked(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\GameDVR", "AllowGameDVR", 0)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("disable_game_dvr")
+        raise
 
 
 def revert_disable_game_dvr(ctx: TaskContext):
-    reg_set_value_checked(ctx, "HKCU", "System\\GameConfigStore", "GameDVR_Enabled", 1)
-    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\GameDVR", "AppCaptureEnabled", 1)
-    reg_delete_value(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\GameDVR", "AllowGameDVR")
+    snap = get_tweak_snapshot("disable_game_dvr")
+    if snap and "specs" in snap:
+        _restore_reg_values(ctx, "disable_game_dvr")
+    else:
+        reg_set_value_checked(ctx, "HKCU", "System\\GameConfigStore", "GameDVR_Enabled", 1)
+        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\GameDVR", "AppCaptureEnabled", 1)
+        reg_delete_value(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\GameDVR", "AllowGameDVR")
+        ctx.log("  (no snapshot found — restored to documented Windows defaults instead)")
+
+
+_MOUSE_SPECS = [
+    ("HKCU", "Control Panel\\Mouse", "MouseSpeed", "REG_SZ"),
+    ("HKCU", "Control Panel\\Mouse", "MouseThreshold1", "REG_SZ"),
+    ("HKCU", "Control Panel\\Mouse", "MouseThreshold2", "REG_SZ"),
+]
 
 
 def apply_disable_mouse_accel(ctx: TaskContext):
-    reg_set_value_checked(ctx, "HKCU", "Control Panel\\Mouse", "MouseSpeed", "0", value_type="REG_SZ")
-    reg_set_value_checked(ctx, "HKCU", "Control Panel\\Mouse", "MouseThreshold1", "0", value_type="REG_SZ")
-    reg_set_value_checked(ctx, "HKCU", "Control Panel\\Mouse", "MouseThreshold2", "0", value_type="REG_SZ")
+    # M3: snapshot priors — the old revert hardcoded 1/6/10.
+    had_snapshot = bool(get_tweak_snapshot("mouse_accel"))
+    _snap_reg_values(ctx, "mouse_accel", _MOUSE_SPECS)
+    try:
+        reg_set_value_checked(ctx, "HKCU", "Control Panel\\Mouse", "MouseSpeed", "0", value_type="REG_SZ")
+        reg_set_value_checked(ctx, "HKCU", "Control Panel\\Mouse", "MouseThreshold1", "0", value_type="REG_SZ")
+        reg_set_value_checked(ctx, "HKCU", "Control Panel\\Mouse", "MouseThreshold2", "0", value_type="REG_SZ")
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("mouse_accel")
+        raise
 
 
 def revert_disable_mouse_accel(ctx: TaskContext):
-    reg_set_value_checked(ctx, "HKCU", "Control Panel\\Mouse", "MouseSpeed", "1", value_type="REG_SZ")
-    reg_set_value_checked(ctx, "HKCU", "Control Panel\\Mouse", "MouseThreshold1", "6", value_type="REG_SZ")
-    reg_set_value_checked(ctx, "HKCU", "Control Panel\\Mouse", "MouseThreshold2", "10", value_type="REG_SZ")
+    snap = get_tweak_snapshot("mouse_accel")
+    if snap and "specs" in snap:
+        _restore_reg_values(ctx, "mouse_accel", value_type="REG_SZ")
+    else:
+        reg_set_value_checked(ctx, "HKCU", "Control Panel\\Mouse", "MouseSpeed", "1", value_type="REG_SZ")
+        reg_set_value_checked(ctx, "HKCU", "Control Panel\\Mouse", "MouseThreshold1", "6", value_type="REG_SZ")
+        reg_set_value_checked(ctx, "HKCU", "Control Panel\\Mouse", "MouseThreshold2", "10", value_type="REG_SZ")
+        ctx.log("  (no snapshot found — restored to documented Windows defaults instead)")
 
 
 def apply_visual_effects_perf(ctx: TaskContext):
@@ -378,40 +510,86 @@ def revert_visual_effects_perf(ctx: TaskContext):
         reg_delete_value(ctx, "HKCU", "Control Panel\\Desktop", "MenuShowDelay")
 
 
+_NET_THROTTLE_SPECS = [
+    ("HKLM", "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile",
+     "NetworkThrottlingIndex"),
+    ("HKLM", "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile",
+     "SystemResponsiveness"),
+]
+
+
 def apply_network_throttling(ctx: TaskContext):
-    reg_set_value_checked(ctx, "HKLM",
-                  "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile",
-                  "NetworkThrottlingIndex", 0xFFFFFFFF)
-    # SystemResponsiveness: 10 = reserve 10% CPU for background (values <10 treated as 20%)
-    reg_set_value_checked(ctx, "HKLM",
-                  "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile",
-                  "SystemResponsiveness", 10)
+    # M3: snapshot priors — the old revert hardcoded 0xA/20.
+    had_snapshot = bool(get_tweak_snapshot("network_throttling"))
+    _snap_reg_values(ctx, "network_throttling", _NET_THROTTLE_SPECS)
+    try:
+        reg_set_value_checked(ctx, "HKLM",
+                      "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile",
+                      "NetworkThrottlingIndex", 0xFFFFFFFF)
+        # SystemResponsiveness: 10 = reserve 10% CPU for background (values <10 treated as 20%)
+        reg_set_value_checked(ctx, "HKLM",
+                      "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile",
+                      "SystemResponsiveness", 10)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("network_throttling")
+        raise
 
 
 def revert_network_throttling(ctx: TaskContext):
-    reg_set_value_checked(ctx, "HKLM",
-                  "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile",
-                  "NetworkThrottlingIndex", 0xA)
-    reg_set_value_checked(ctx, "HKLM",
-                  "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile",
-                  "SystemResponsiveness", 20)
+    snap = get_tweak_snapshot("network_throttling")
+    if snap and "specs" in snap:
+        _restore_reg_values(ctx, "network_throttling")
+    else:
+        reg_set_value_checked(ctx, "HKLM",
+                      "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile",
+                      "NetworkThrottlingIndex", 0xA)
+        reg_set_value_checked(ctx, "HKLM",
+                      "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile",
+                      "SystemResponsiveness", 20)
+        ctx.log("  (no snapshot found — restored to documented Windows defaults instead)")
+
+
+_GAMES_PRIORITY_SPECS = [
+    ("HKLM", "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile\\Tasks\\Games",
+     "Scheduling Category", "REG_SZ"),
+    ("HKLM", "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile\\Tasks\\Games",
+     "GPU Priority"),
+    ("HKLM", "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile\\Tasks\\Games",
+     "Priority"),
+    ("HKLM", "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile\\Tasks\\Games",
+     "SFIO Priority"),
+]
 
 
 def apply_games_priority(ctx: TaskContext):
     """Boost CPU/GPU/IO priority for games via Multimedia System Profile."""
+    # M3: snapshot priors — the old revert hardcoded Medium/2/2/2.
     base = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile\\Tasks\\Games"
-    reg_set_value_checked(ctx, "HKLM", base, "Scheduling Category", "High", value_type="REG_SZ")
-    reg_set_value_checked(ctx, "HKLM", base, "GPU Priority", 8)
-    reg_set_value_checked(ctx, "HKLM", base, "Priority", 6)
-    reg_set_value_checked(ctx, "HKLM", base, "SFIO Priority", 8)
+    had_snapshot = bool(get_tweak_snapshot("games_priority"))
+    _snap_reg_values(ctx, "games_priority", _GAMES_PRIORITY_SPECS)
+    try:
+        reg_set_value_checked(ctx, "HKLM", base, "Scheduling Category", "High", value_type="REG_SZ")
+        reg_set_value_checked(ctx, "HKLM", base, "GPU Priority", 8)
+        reg_set_value_checked(ctx, "HKLM", base, "Priority", 6)
+        reg_set_value_checked(ctx, "HKLM", base, "SFIO Priority", 8)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("games_priority")
+        raise
 
 
 def revert_games_priority(ctx: TaskContext):
     base = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile\\Tasks\\Games"
-    reg_set_value_checked(ctx, "HKLM", base, "Scheduling Category", "Medium", value_type="REG_SZ")
-    reg_set_value_checked(ctx, "HKLM", base, "GPU Priority", 2)
-    reg_set_value_checked(ctx, "HKLM", base, "Priority", 2)
-    reg_set_value_checked(ctx, "HKLM", base, "SFIO Priority", 2)
+    snap = get_tweak_snapshot("games_priority")
+    if snap and "specs" in snap:
+        _restore_reg_values(ctx, "games_priority")
+    else:
+        reg_set_value_checked(ctx, "HKLM", base, "Scheduling Category", "Medium", value_type="REG_SZ")
+        reg_set_value_checked(ctx, "HKLM", base, "GPU Priority", 2)
+        reg_set_value_checked(ctx, "HKLM", base, "Priority", 2)
+        reg_set_value_checked(ctx, "HKLM", base, "SFIO Priority", 2)
+        ctx.log("  (no snapshot found — restored to documented Windows defaults instead)")
 
 
 def _open_interfaces_key():
@@ -474,46 +652,121 @@ def revert_disable_nagle(ctx: TaskContext):
         pass
 
 
+_HAGS_SPECS = [
+    ("HKLM", "SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers", "HwSchMode"),
+]
+
+
 def apply_hags(ctx: TaskContext):
-    reg_set_value_checked(ctx, "HKLM", "SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers", "HwSchMode", 2)
+    # M3: snapshot priors — the old revert hardcoded 1.
+    had_snapshot = bool(get_tweak_snapshot("hags"))
+    _snap_reg_values(ctx, "hags", _HAGS_SPECS)
+    try:
+        reg_set_value_checked(ctx, "HKLM", "SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers", "HwSchMode", 2)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("hags")
+        raise
     ctx.log("Reboot required for graphics scheduling to take effect.")
 
 
 def revert_hags(ctx: TaskContext):
-    reg_set_value_checked(ctx, "HKLM", "SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers", "HwSchMode", 1)
+    snap = get_tweak_snapshot("hags")
+    if snap and "specs" in snap:
+        _restore_reg_values(ctx, "hags")
+    else:
+        reg_set_value_checked(ctx, "HKLM", "SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers", "HwSchMode", 1)
+        ctx.log("  (no snapshot found — restored to documented Windows default instead)")
     ctx.log("Reboot required for graphics scheduling to take effect.")
 
 
+_GAME_MODE_SPECS = [
+    ("HKCU", "Software\\Microsoft\\GameBar", "AutoGameModeEnabled"),
+    ("HKCU", "Software\\Microsoft\\GameBar", "AllowAutoGameMode"),
+]
+
+
 def apply_game_mode(ctx: TaskContext):
-    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\GameBar", "AutoGameModeEnabled", 1)
-    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\GameBar", "AllowAutoGameMode", 1)
+    # M3: snapshot priors — the old revert hardcoded 0/0.
+    had_snapshot = bool(get_tweak_snapshot("game_mode"))
+    _snap_reg_values(ctx, "game_mode", _GAME_MODE_SPECS)
+    try:
+        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\GameBar", "AutoGameModeEnabled", 1)
+        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\GameBar", "AllowAutoGameMode", 1)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("game_mode")
+        raise
 
 
 def revert_game_mode(ctx: TaskContext):
-    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\GameBar", "AutoGameModeEnabled", 0)
-    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\GameBar", "AllowAutoGameMode", 0)
+    snap = get_tweak_snapshot("game_mode")
+    if snap and "specs" in snap:
+        _restore_reg_values(ctx, "game_mode")
+    else:
+        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\GameBar", "AutoGameModeEnabled", 0)
+        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\GameBar", "AllowAutoGameMode", 0)
+        ctx.log("  (no snapshot found — restored to documented Windows defaults instead)")
+
+
+_FSE_SPECS = [
+    ("HKCU", "System\\GameConfigStore", "GameDVR_FSEBehaviorMode"),
+    ("HKCU", "System\\GameConfigStore", "GameDVR_DXGIHonorFSEWindowsCompatible"),
+    ("HKCU", "System\\GameConfigStore", "GameDVR_HonorUserFSEBehaviorMode"),
+]
 
 
 def apply_windowed_optimize(ctx: TaskContext):
     # Optimizations for windowed games — supported Windows 11 setting
-    reg_set_value_checked(ctx, "HKCU", "System\\GameConfigStore", "GameDVR_FSEBehaviorMode", 2)
-    reg_set_value_checked(ctx, "HKCU", "System\\GameConfigStore", "GameDVR_DXGIHonorFSEWindowsCompatible", 1)
-    reg_set_value_checked(ctx, "HKCU", "System\\GameConfigStore", "GameDVR_HonorUserFSEBehaviorMode", 1)
+    # M3: snapshot priors — the old revert hardcoded 0 + deletes.
+    had_snapshot = bool(get_tweak_snapshot("windowed_optimize"))
+    _snap_reg_values(ctx, "windowed_optimize", _FSE_SPECS)
+    try:
+        reg_set_value_checked(ctx, "HKCU", "System\\GameConfigStore", "GameDVR_FSEBehaviorMode", 2)
+        reg_set_value_checked(ctx, "HKCU", "System\\GameConfigStore", "GameDVR_DXGIHonorFSEWindowsCompatible", 1)
+        reg_set_value_checked(ctx, "HKCU", "System\\GameConfigStore", "GameDVR_HonorUserFSEBehaviorMode", 1)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("windowed_optimize")
+        raise
 
 
 def revert_windowed_optimize(ctx: TaskContext):
-    reg_set_value_checked(ctx, "HKCU", "System\\GameConfigStore", "GameDVR_FSEBehaviorMode", 0)
-    reg_delete_value(ctx, "HKCU", "System\\GameConfigStore", "GameDVR_DXGIHonorFSEWindowsCompatible")
-    reg_delete_value(ctx, "HKCU", "System\\GameConfigStore", "GameDVR_HonorUserFSEBehaviorMode")
+    snap = get_tweak_snapshot("windowed_optimize")
+    if snap and "specs" in snap:
+        _restore_reg_values(ctx, "windowed_optimize")
+    else:
+        reg_set_value_checked(ctx, "HKCU", "System\\GameConfigStore", "GameDVR_FSEBehaviorMode", 0)
+        reg_delete_value(ctx, "HKCU", "System\\GameConfigStore", "GameDVR_DXGIHonorFSEWindowsCompatible")
+        reg_delete_value(ctx, "HKCU", "System\\GameConfigStore", "GameDVR_HonorUserFSEBehaviorMode")
+        ctx.log("  (no snapshot found — restored to documented Windows defaults instead)")
+
+
+_HIBERBOOT_SPECS = [
+    ("HKLM", "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Power", "HiberbootEnabled"),
+]
 
 
 def apply_fast_startup_fix(ctx: TaskContext):
     # Correct: disable Fast Startup via HiberbootEnabled, not hibernate off
-    reg_set_value_checked(ctx, "HKLM", "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Power", "HiberbootEnabled", 0)
+    # M3: snapshot priors — the old revert hardcoded 1.
+    had_snapshot = bool(get_tweak_snapshot("disable_fast_startup"))
+    _snap_reg_values(ctx, "disable_fast_startup", _HIBERBOOT_SPECS)
+    try:
+        reg_set_value_checked(ctx, "HKLM", "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Power", "HiberbootEnabled", 0)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("disable_fast_startup")
+        raise
 
 
 def revert_fast_startup_fix(ctx: TaskContext):
-    reg_set_value_checked(ctx, "HKLM", "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Power", "HiberbootEnabled", 1)
+    snap = get_tweak_snapshot("disable_fast_startup")
+    if snap and "specs" in snap:
+        _restore_reg_values(ctx, "disable_fast_startup")
+    else:
+        reg_set_value_checked(ctx, "HKLM", "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Power", "HiberbootEnabled", 1)
+        ctx.log("  (no snapshot found — restored to documented Windows default instead)")
 
 
 def apply_limit_telemetry(ctx: TaskContext):
@@ -524,22 +777,58 @@ def revert_limit_telemetry(ctx: TaskContext):
     reg_delete_value(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\DataCollection", "AllowTelemetry")
 
 
+_PRIORITY_SEP_SPECS = [
+    ("HKLM", "SYSTEM\\CurrentControlSet\\Control\\PriorityControl", "Win32PrioritySeparation"),
+]
+
+
 def apply_priority_separation(ctx: TaskContext):
     # Foreground app gets more CPU — 0x26 = gaming bias
-    reg_set_value_checked(ctx, "HKLM", "SYSTEM\\CurrentControlSet\\Control\\PriorityControl", "Win32PrioritySeparation", 38)
+    # M3: snapshot priors — the old revert hardcoded 2.
+    had_snapshot = bool(get_tweak_snapshot("priority_separation"))
+    _snap_reg_values(ctx, "priority_separation", _PRIORITY_SEP_SPECS)
+    try:
+        reg_set_value_checked(ctx, "HKLM", "SYSTEM\\CurrentControlSet\\Control\\PriorityControl", "Win32PrioritySeparation", 38)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("priority_separation")
+        raise
 
 
 def revert_priority_separation(ctx: TaskContext):
-    reg_set_value_checked(ctx, "HKLM", "SYSTEM\\CurrentControlSet\\Control\\PriorityControl", "Win32PrioritySeparation", 2)
+    snap = get_tweak_snapshot("priority_separation")
+    if snap and "specs" in snap:
+        _restore_reg_values(ctx, "priority_separation")
+    else:
+        reg_set_value_checked(ctx, "HKLM", "SYSTEM\\CurrentControlSet\\Control\\PriorityControl", "Win32PrioritySeparation", 2)
+        ctx.log("  (no snapshot found — restored to documented Windows default instead)")
+
+
+_POWER_THROTTLE_SPECS = [
+    ("HKLM", "SYSTEM\\CurrentControlSet\\Control\\Power\\PowerThrottling", "PowerThrottlingOff"),
+]
 
 
 def apply_power_throttling_off(ctx: TaskContext):
     """Disable CPU power throttling for consistent performance."""
-    reg_set_value_checked(ctx, "HKLM", "SYSTEM\\CurrentControlSet\\Control\\Power\\PowerThrottling", "PowerThrottlingOff", 1)
+    # M3: snapshot priors — the old revert deleted unconditionally.
+    had_snapshot = bool(get_tweak_snapshot("power_throttling_off"))
+    _snap_reg_values(ctx, "power_throttling_off", _POWER_THROTTLE_SPECS)
+    try:
+        reg_set_value_checked(ctx, "HKLM", "SYSTEM\\CurrentControlSet\\Control\\Power\\PowerThrottling", "PowerThrottlingOff", 1)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("power_throttling_off")
+        raise
 
 
 def revert_power_throttling_off(ctx: TaskContext):
-    reg_delete_value(ctx, "HKLM", "SYSTEM\\CurrentControlSet\\Control\\Power\\PowerThrottling", "PowerThrottlingOff")
+    snap = get_tweak_snapshot("power_throttling_off")
+    if snap and "specs" in snap:
+        _restore_reg_values(ctx, "power_throttling_off")
+    else:
+        reg_delete_value(ctx, "HKLM", "SYSTEM\\CurrentControlSet\\Control\\Power\\PowerThrottling", "PowerThrottlingOff")
+        ctx.log("  (no snapshot found — removed the value; Windows then uses its default)")
 
 
 def apply_startup_delay(ctx: TaskContext):
@@ -587,24 +876,61 @@ def revert_usb_suspend(ctx: TaskContext):
 
 
 def apply_disk_timeout(ctx: TaskContext):
-    run_cmd(ctx, "powercfg /change disk-timeout-ac 0")
-    run_cmd(ctx, "powercfg /change disk-timeout-dc 0")
+    # NOTE: powercfg /change aliases have no per-machine snapshot (the
+    # underlying GUID pair differs by scheme); apply/reset use documented
+    # Windows defaults (0 = never spin down on AC/DC; revert = 20 min).
+    # Return codes are honored so LTSC/stripped schemes fail honestly.
+    rc_ac = run_cmd(ctx, "powercfg /change disk-timeout-ac 0")
+    rc_dc = run_cmd(ctx, "powercfg /change disk-timeout-dc 0")
+    if rc_ac != 0 and rc_dc != 0:
+        raise TaskSkipped(
+            "Disk-timeout setting not present in this power plan — "
+            "skipping (nothing to change on this PC)."
+        )
+    if rc_ac != 0 or rc_dc != 0:
+        ctx.log("  (one power side accepted the change, the other is not present — applied what exists)")
 
 
 def revert_disk_timeout(ctx: TaskContext):
-    run_cmd(ctx, "powercfg /change disk-timeout-ac 20")
-    run_cmd(ctx, "powercfg /change disk-timeout-dc 20")
+    # Restores the documented Windows default (20 min), not necessarily the
+    # exact prior value — see apply_disk_timeout note.
+    rc_ac = run_cmd(ctx, "powercfg /change disk-timeout-ac 20")
+    rc_dc = run_cmd(ctx, "powercfg /change disk-timeout-dc 20")
+    if rc_ac != 0 and rc_dc != 0:
+        raise RuntimeError("Could not restore disk timeout (powercfg rejected both sides).")
+
+
+_KEYBOARD_SPECS = [
+    ("HKCU", "Control Panel\\Keyboard", "KeyboardDelay"),
+    ("HKCU", "Control Panel\\Keyboard", "KeyboardSpeed"),
+]
 
 
 def apply_keyboard_tuning(ctx: TaskContext):
-    reg_set_value_checked(ctx, "HKCU", "Control Panel\\Keyboard", "KeyboardDelay", "0", value_type="REG_SZ")
-    reg_set_value_checked(ctx, "HKCU", "Control Panel\\Keyboard", "KeyboardSpeed", "31", value_type="REG_SZ")
+    # Snapshot first: the old revert wrote Speed=31 (identical to apply),
+    # so a non-default prior Speed was never restored (M4).
+    had_snapshot = bool(get_tweak_snapshot("keyboard_tuning"))
+    _snap_reg_values(ctx, "keyboard_tuning", _KEYBOARD_SPECS)
+    try:
+        reg_set_value_checked(ctx, "HKCU", "Control Panel\\Keyboard", "KeyboardDelay", "0", value_type="REG_SZ")
+        reg_set_value_checked(ctx, "HKCU", "Control Panel\\Keyboard", "KeyboardSpeed", "31", value_type="REG_SZ")
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("keyboard_tuning")
+        raise
 
 
 def revert_keyboard_tuning(ctx: TaskContext):
-    # Windows defaults: KeyboardDelay 1 (250ms), KeyboardSpeed 31 (fastest). Verified via AskVG/TenForums.
-    reg_set_value_checked(ctx, "HKCU", "Control Panel\\Keyboard", "KeyboardDelay", "1", value_type="REG_SZ")
-    reg_set_value_checked(ctx, "HKCU", "Control Panel\\Keyboard", "KeyboardSpeed", "31", value_type="REG_SZ")
+    # Exact prior values when snapshotted; documented Windows defaults
+    # (Delay 1 = 250ms, Speed 31) only when applied by an older version
+    # without a snapshot.
+    snap = get_tweak_snapshot("keyboard_tuning")
+    if snap and "specs" in snap:
+        _restore_reg_values(ctx, "keyboard_tuning", value_type="REG_SZ")
+    else:
+        reg_set_value_checked(ctx, "HKCU", "Control Panel\\Keyboard", "KeyboardDelay", "1", value_type="REG_SZ")
+        reg_set_value_checked(ctx, "HKCU", "Control Panel\\Keyboard", "KeyboardSpeed", "31", value_type="REG_SZ")
+        ctx.log("  (no snapshot found — restored to documented Windows defaults instead)")
 
 
 def apply_ssd_trim(ctx: TaskContext):
@@ -614,32 +940,57 @@ def apply_ssd_trim(ctx: TaskContext):
     # nothing changed. TaskSkipped = completed-with-skip (no badge).
     if not _has_ssd():
         raise TaskSkipped("No SSD detected — skipping TRIM tweak (only applies to SSDs).")
-    run_cmd(ctx, "fsutil behavior set disabledeletenotify 0")
+    rc = run_cmd(ctx, "fsutil behavior set disabledeletenotify 0")
+    if rc != 0:
+        raise RuntimeError(f"Could not enable TRIM (fsutil exited {rc}).")
 
 
 def revert_ssd_trim(ctx: TaskContext):
-    if not _has_ssd():
-        ctx.log("No SSD detected — skipping TRIM revert.")
-        return
-    # Revert should restore Windows default (TRIM enabled = 0), not disable TRIM (1).
+    # M5: restore regardless of current _has_ssd() (cached, and the disk
+    # may have changed since apply) — `disabledeletenotify 0` (TRIM
+    # enabled) is the safe Windows default on any disk. Revert restores
+    # the default (TRIM enabled = 0), never disables TRIM (1).
     # Disabling TRIM harms SSD performance/lifespan.
-    run_cmd(ctx, "fsutil behavior set disabledeletenotify 0")
+    rc = run_cmd(ctx, "fsutil behavior set disabledeletenotify 0")
+    if rc != 0:
+        raise RuntimeError(f"Could not restore TRIM default (fsutil exited {rc}).")
 
 
 def apply_ssd_superfetch(ctx: TaskContext):
     """Disable SysMain (Superfetch) — unnecessary on SSD/NVMe."""
     if not _has_ssd():
         raise TaskSkipped("No SSD detected — skipping SysMain tweak (only applies to SSDs).")
-    run_cmd(ctx, "sc config SysMain start= disabled")
+    # M5: snapshot the real prior start type (auto/demand/disabled/...) so
+    # revert restores it instead of assuming `auto`.
+    had_snapshot = bool(get_tweak_snapshot("ssd_superfetch"))
+    prior = sc_query_start_type(ctx, "SysMain")
+    if prior is not None:
+        save_tweak_snapshot("ssd_superfetch", {"start_type": prior})
+    rc = run_cmd(ctx, "sc config SysMain start= disabled")
+    if rc != 0:
+        if not had_snapshot:
+            clear_tweak_snapshot("ssd_superfetch")
+        raise RuntimeError(f"Could not disable SysMain (sc exited {rc}).")
     run_cmd(ctx, "net stop SysMain")
 
 
 def revert_ssd_superfetch(ctx: TaskContext):
-    if not _has_ssd():
-        ctx.log("No SSD detected — skipping SysMain revert.")
-        return
-    run_cmd(ctx, "sc config SysMain start= auto")
+    # M5: restore regardless of current _has_ssd() — the disk may have
+    # changed since apply, and the service exists on HDD machines too.
+    snap = get_tweak_snapshot("ssd_superfetch")
+    target = snap.get("start_type") if snap else None
+    if not target:
+        target = "auto"
+        ctx.log("  (no saved prior SysMain start type — restoring `auto`, the Windows default)")
+    elif not _valid_snapshot_start_type(target):
+        # F-1: the snapshot value flows into a shell command string — only
+        # a start-type keyword this app could have snapshotted may run.
+        raise _snapshot_validation_error("ssd_superfetch", "start_type", target)
+    rc = run_cmd(ctx, f"sc config SysMain start= {target}")
+    if rc != 0:
+        raise RuntimeError(f"Could not restore SysMain start type (sc exited {rc}) — snapshot kept.")
     run_cmd(ctx, "net start SysMain")
+    clear_tweak_snapshot("ssd_superfetch")
 
 
 def apply_ssd_last_access(ctx: TaskContext):
@@ -658,21 +1009,45 @@ def revert_ssd_last_access(ctx: TaskContext):
                   "NtfsDisableLastAccessUpdate", 0)
 
 
+_SSD_PREFETCH_PATH = "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management\\PrefetchParameters"
+_SSD_PREFETCH_SPECS = [
+    ("HKLM", _SSD_PREFETCH_PATH, "EnablePrefetcher"),
+    ("HKLM", _SSD_PREFETCH_PATH, "EnableSuperfetch"),
+]
+
+
 def apply_ssd_prefetch(ctx: TaskContext):
     """Disable Prefetcher and Superfetch for SSD."""
     if not _has_ssd():
         raise TaskSkipped("No SSD detected — skipping prefetch tweak (only applies to SSDs).")
-    reg_set_value_checked(ctx, "HKLM", "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management\\PrefetchParameters",
-                  "EnablePrefetcher", 0)
-    reg_set_value_checked(ctx, "HKLM", "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management\\PrefetchParameters",
-                  "EnableSuperfetch", 0)
+    # M5: snapshot exact priors — the old revert hardcoded 3/3, losing
+    # custom values like 1/2.
+    had_snapshot = bool(get_tweak_snapshot("ssd_prefetch"))
+    _snap_reg_values(ctx, "ssd_prefetch", _SSD_PREFETCH_SPECS)
+    try:
+        reg_set_value_checked(ctx, "HKLM", _SSD_PREFETCH_PATH,
+                      "EnablePrefetcher", 0)
+        reg_set_value_checked(ctx, "HKLM", _SSD_PREFETCH_PATH,
+                      "EnableSuperfetch", 0)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("ssd_prefetch")
+        raise
 
 
 def revert_ssd_prefetch(ctx: TaskContext):
-    reg_set_value_checked(ctx, "HKLM", "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management\\PrefetchParameters",
-                  "EnablePrefetcher", 3)
-    reg_set_value_checked(ctx, "HKLM", "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management\\PrefetchParameters",
-                  "EnableSuperfetch", 3)
+    # Exact priors when snapshotted (e.g. by this version); documented
+    # Windows default 3/3 only for pre-snapshot applies. No _has_ssd gate:
+    # restore must work even if the disk changed since apply.
+    snap = get_tweak_snapshot("ssd_prefetch")
+    if snap and "specs" in snap:
+        _restore_reg_values(ctx, "ssd_prefetch")
+    else:
+        reg_set_value_checked(ctx, "HKLM", _SSD_PREFETCH_PATH,
+                      "EnablePrefetcher", 3)
+        reg_set_value_checked(ctx, "HKLM", _SSD_PREFETCH_PATH,
+                      "EnableSuperfetch", 3)
+        ctx.log("  (no snapshot found — restored to documented Windows defaults instead)")
 
 
 # Disables activity history #
@@ -733,10 +1108,16 @@ def apply_explorer_auto_discovery_disable(ctx: TaskContext):
     ctx.log("Please sign out/in or restart to apply.")
 
 def revert_explorer_auto_discovery_disable(ctx: TaskContext):
-    for sub in (r"Software\Classes\Local Settings\Software\Microsoft\Windows\Shell\Bags",
-                r"Software\Classes\Local Settings\Software\Microsoft\Windows\Shell\BagMRU"):
-        reg_delete_key(ctx, "HKCU", sub)
-    ctx.log("Explorer AutoDiscovery reverted.")
+    # C7: the old revert deleted Bags/BagMRU AGAIN (wiping views created
+    # after apply) while leaving FolderType=NotSpecified in place — Undo
+    # made things worse. Per-folder views deleted by apply cannot be
+    # restored (no backup was taken), so revert only removes the
+    # FolderType value this tweak set and says so honestly.
+    reg_delete_value(ctx, "HKCU",
+                     r"Software\Classes\Local Settings\Software\Microsoft\Windows\Shell\Bags\AllFolders\Shell",
+                     "FolderType")
+    ctx.log("Explorer AutoDiscovery undone (FolderType reset). Note: per-folder "
+            "views cleared by apply cannot be restored — they rebuild as you browse.")
 
 # Disables background apps #
 def apply_background_apps_disable(ctx: TaskContext):
@@ -793,11 +1174,26 @@ def apply_nvidia_max_performance(ctx: TaskContext):
     ctx.log("[Tweak] Prefer Max Performance")
     # M1 fix: snapshot the real current value before we overwrite it, so
     # Undo restores what was actually there instead of a hardcoded guess.
+    # C5: drop our snapshot if the sets below fail (else a false badge).
+    had_snapshot = bool(get_tweak_snapshot("max_performance_gpu"))
     _snapshot_powercfg_pairs(ctx, "max_performance_gpu", _NVIDIA_MAX_PERF_PAIRS)
-    # Generic via powercfg + NVIDIA PowerMizer
-    run_cmd(ctx, "powercfg /setacvalueindex scheme_current sub_processor PROCTHROTTLEMAX 100")
-    run_cmd(ctx, "powercfg /setactive scheme_current")
-    run_cmd(ctx, 'powershell -NoProfile -Command "if(Test-Path \\"HKCU:\\Software\\NVIDIA Corporation\\Global\\FTS\\"){ Set-ItemProperty -Path \\"HKCU:\\Software\\NVIDIA Corporation\\Global\\FTS\\" -Name \\"PowerMizerEnable\\" -Value 0 -ErrorAction SilentlyContinue}"')
+    try:
+        # Generic via powercfg + NVIDIA PowerMizer
+        run_cmd_checked(ctx, "powercfg /setacvalueindex scheme_current sub_processor PROCTHROTTLEMAX 100", timeout=30)
+        run_cmd_checked(ctx, "powercfg /setactive scheme_current", timeout=30)
+        # H1-class quoting fix: the old shell=True string embedded literal
+        # \" sequences (PowerShell ParserError on every run, rc ignored).
+        # shell=False argv + PS single quotes; a missing FTS key is fine
+        # (non-NVIDIA or driver without it) — only a real write failure raises.
+        run_cmd(ctx, ["powershell", "-NoProfile", "-Command",
+                      "if (Test-Path 'HKCU:\\Software\\NVIDIA Corporation\\Global\\FTS\\') { "
+                      "Set-ItemProperty -Path 'HKCU:\\Software\\NVIDIA Corporation\\Global\\FTS\\' "
+                      "-Name 'PowerMizerEnable' -Value 0 -ErrorAction Stop }"],
+                shell=False, timeout=60)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("max_performance_gpu")
+        raise
     ctx.log("GPU prefer max performance set.")
 
 def revert_nvidia_max_performance(ctx: TaskContext):
@@ -841,12 +1237,21 @@ def apply_max_cpu_power(ctx: TaskContext):
     """Aggressive CPU boost + no core parking + 100% min processor state (AC).
     Biggest single CPU-latency win for gaming laptops and many desktops."""
     # M1 fix: snapshot real current values before overwriting them.
+    # H5/C5: the old unchecked run_cmd calls logged success on LTSC/VMs
+    # where powercfg exits non-zero — and left a snapshot behind (false
+    # badge). Checked writes + snapshot cleanup on failure.
+    had_snapshot = bool(get_tweak_snapshot("max_cpu_power"))
     _snapshot_powercfg_pairs(ctx, "max_cpu_power", _MAX_CPU_POWER_PAIRS)
-    run_cmd(ctx, "powercfg /setacvalueindex scheme_current sub_processor PERFBOOSTMODE 2")   # Aggressive
-    run_cmd(ctx, "powercfg /setacvalueindex scheme_current sub_processor CPMINCORES 100")    # no core parking
-    run_cmd(ctx, "powercfg /setacvalueindex scheme_current sub_processor CPMAXCORES 100")
-    run_cmd(ctx, "powercfg /setacvalueindex scheme_current sub_processor PROCTHROTTLEMIN 100")  # min 100%
-    run_cmd(ctx, "powercfg /setactive scheme_current")
+    try:
+        run_cmd_checked(ctx, "powercfg /setacvalueindex scheme_current sub_processor PERFBOOSTMODE 2", timeout=30)   # Aggressive
+        run_cmd_checked(ctx, "powercfg /setacvalueindex scheme_current sub_processor CPMINCORES 100", timeout=30)    # no core parking
+        run_cmd_checked(ctx, "powercfg /setacvalueindex scheme_current sub_processor CPMAXCORES 100", timeout=30)
+        run_cmd_checked(ctx, "powercfg /setacvalueindex scheme_current sub_processor PROCTHROTTLEMIN 100", timeout=30)  # min 100%
+        run_cmd_checked(ctx, "powercfg /setactive scheme_current", timeout=30)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("max_cpu_power")
+        raise
     ctx.log("CPU boost set to Aggressive; core parking off; min processor state 100% (AC).")
 
 def revert_max_cpu_power(ctx: TaskContext):
@@ -945,72 +1350,123 @@ def revert_taskbar_cleanup(ctx: TaskContext):
     ctx.log("Taskbar items restored. Restart Explorer to see changes.")
 
 
+_LOCAL_SEARCH_SPECS = [
+    ("HKCU", "Software\\Policies\\Microsoft\\Windows\\Explorer", "DisableSearchBoxSuggestions"),
+    ("HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\Explorer", "DisableSearchBoxSuggestions"),
+    ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Search", "BingSearchEnabled"),
+    ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Search", "CortanaConsent"),
+    ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\SearchSettings", "IsMSACloudSearchEnabled"),
+    ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\SearchSettings", "IsAADCloudSearchEnabled"),
+]
+
+
 def apply_local_search(ctx: TaskContext):
     """Make Start-menu search local-only and instant: no Bing, no web results,
     no cloud content (Sophia Script + privacy.sexy verified values)."""
-    reg_set_value_checked(ctx, "HKCU", "Software\\Policies\\Microsoft\\Windows\\Explorer", "DisableSearchBoxSuggestions", 1)
-    reg_set_value_checked(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\Explorer", "DisableSearchBoxSuggestions", 1)
-    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Search", "BingSearchEnabled", 0)
-    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Search", "CortanaConsent", 0)
-    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\SearchSettings", "IsMSACloudSearchEnabled", 0)
-    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\SearchSettings", "IsAADCloudSearchEnabled", 0)
+    # M3: snapshot priors — the old revert deleted unconditionally.
+    had_snapshot = bool(get_tweak_snapshot("local_search"))
+    _snap_reg_values(ctx, "local_search", _LOCAL_SEARCH_SPECS)
+    try:
+        reg_set_value_checked(ctx, "HKCU", "Software\\Policies\\Microsoft\\Windows\\Explorer", "DisableSearchBoxSuggestions", 1)
+        reg_set_value_checked(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\Explorer", "DisableSearchBoxSuggestions", 1)
+        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Search", "BingSearchEnabled", 0)
+        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Search", "CortanaConsent", 0)
+        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\SearchSettings", "IsMSACloudSearchEnabled", 0)
+        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\SearchSettings", "IsAADCloudSearchEnabled", 0)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("local_search")
+        raise
     ctx.log("Search is now local-only — results appear instantly with no web/Bing content.")
 
 def revert_local_search(ctx: TaskContext):
-    reg_delete_value(ctx, "HKCU", "Software\\Policies\\Microsoft\\Windows\\Explorer", "DisableSearchBoxSuggestions")
-    reg_delete_value(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\Explorer", "DisableSearchBoxSuggestions")
-    reg_delete_value(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Search", "BingSearchEnabled")
-    reg_delete_value(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Search", "CortanaConsent")
-    reg_delete_value(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\SearchSettings", "IsMSACloudSearchEnabled")
-    reg_delete_value(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\SearchSettings", "IsAADCloudSearchEnabled")
+    snap = get_tweak_snapshot("local_search")
+    if snap and "specs" in snap:
+        _restore_reg_values(ctx, "local_search")
+    else:
+        reg_delete_value(ctx, "HKCU", "Software\\Policies\\Microsoft\\Windows\\Explorer", "DisableSearchBoxSuggestions")
+        reg_delete_value(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\Explorer", "DisableSearchBoxSuggestions")
+        reg_delete_value(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Search", "BingSearchEnabled")
+        reg_delete_value(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Search", "CortanaConsent")
+        reg_delete_value(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\SearchSettings", "IsMSACloudSearchEnabled")
+        reg_delete_value(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\SearchSettings", "IsAADCloudSearchEnabled")
+        ctx.log("  (no snapshot found — removed the values; Windows then uses its defaults)")
     ctx.log("Search restored to defaults (Bing + web suggestions back).")
+
+
+_ADS_CDM_NAMES = (
+    "SubscribedContent-338387Enabled",
+    "SubscribedContent-338388Enabled",
+    "SubscribedContent-338389Enabled",
+    "SubscribedContent-338393Enabled",
+    "SubscribedContent-353694Enabled",
+    "SubscribedContent-353696Enabled",
+    "SilentInstalledAppsEnabled",
+    "PreInstalledAppsEnabled",
+    "OemPreInstalledAppsEnabled",
+    "SystemPaneSuggestionsEnabled",
+    "RotatingLockScreenOverlayEnabled",
+    "SoftLandingEnabled",
+)
+_ADS_CDM = "Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager"
+_STOP_ADS_SPECS = (
+    [("HKCU", _ADS_CDM, n) for n in _ADS_CDM_NAMES]
+    + [("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\UserProfileEngagement",
+        "ScoobeSystemSettingEnabled")]
+    + [("HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\CloudContent", "DisableSoftLanding")]
+    + [("HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\CloudContent", "DisableCloudOptimizedContent")]
+)
 
 
 def apply_stop_windows_ads(ctx: TaskContext):
     """The full ContentDeliveryManager sweep — every 'suggested content',
     auto-installed app, lock-screen ad and tip switch in one go."""
-    cdm = "Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager"
-    for name in (
-        "SubscribedContent-338387Enabled",
-        "SubscribedContent-338388Enabled",
-        "SubscribedContent-338389Enabled",
-        "SubscribedContent-338393Enabled",
-        "SubscribedContent-353694Enabled",
-        "SubscribedContent-353696Enabled",
-        "SilentInstalledAppsEnabled",
-        "PreInstalledAppsEnabled",
-        "OemPreInstalledAppsEnabled",
-        "SystemPaneSuggestionsEnabled",
-        "RotatingLockScreenOverlayEnabled",
-        "SoftLandingEnabled",
-    ):
-        reg_set_value_checked(ctx, "HKCU", cdm, name, 0)
-    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\UserProfileEngagement", "ScoobeSystemSettingEnabled", 0)
-    reg_set_value_checked(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\CloudContent", "DisableSoftLanding", 1)
-    reg_set_value_checked(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\CloudContent", "DisableCloudOptimizedContent", 1)
+    # M3: snapshot priors — the old revert hardcoded 1s + deletes.
+    cdm = _ADS_CDM
+    had_snapshot = bool(get_tweak_snapshot("stop_windows_ads"))
+    _snap_reg_values(ctx, "stop_windows_ads", _STOP_ADS_SPECS)
+    try:
+        for name in _ADS_CDM_NAMES:
+            reg_set_value_checked(ctx, "HKCU", cdm, name, 0)
+        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\UserProfileEngagement", "ScoobeSystemSettingEnabled", 0)
+        reg_set_value_checked(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\CloudContent", "DisableSoftLanding", 1)
+        reg_set_value_checked(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\CloudContent", "DisableCloudOptimizedContent", 1)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("stop_windows_ads")
+        raise
     ctx.log("Windows ads, suggestions, auto-installs and lock-screen tips disabled.")
 
 def revert_stop_windows_ads(ctx: TaskContext):
-    cdm = "Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager"
-    for name in (
-        "SubscribedContent-338387Enabled",
-        "SubscribedContent-338388Enabled",
-        "SubscribedContent-338389Enabled",
-        "SubscribedContent-338393Enabled",
-        "SubscribedContent-353694Enabled",
-        "SubscribedContent-353696Enabled",
-        "SilentInstalledAppsEnabled",
-        "PreInstalledAppsEnabled",
-        "OemPreInstalledAppsEnabled",
-        "SystemPaneSuggestionsEnabled",
-        "RotatingLockScreenOverlayEnabled",
-        "SoftLandingEnabled",
-    ):
-        reg_set_value_checked(ctx, "HKCU", cdm, name, 1)
-    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\UserProfileEngagement", "ScoobeSystemSettingEnabled", 1)
-    reg_delete_value(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\CloudContent", "DisableSoftLanding")
-    reg_delete_value(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\CloudContent", "DisableCloudOptimizedContent")
+    snap = get_tweak_snapshot("stop_windows_ads")
+    if snap and "specs" in snap:
+        _restore_reg_values(ctx, "stop_windows_ads")
+    else:
+        cdm = _ADS_CDM
+        for name in _ADS_CDM_NAMES:
+            reg_set_value_checked(ctx, "HKCU", cdm, name, 1)
+        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\UserProfileEngagement", "ScoobeSystemSettingEnabled", 1)
+        reg_delete_value(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\CloudContent", "DisableSoftLanding")
+        reg_delete_value(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\CloudContent", "DisableCloudOptimizedContent")
+        ctx.log("  (no snapshot found — restored to documented Windows defaults instead)")
     ctx.log("Windows suggestions and tips restored to defaults.")
+
+
+_PRIVACY_BASELINE_SPECS = [
+    ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\AdvertisingInfo", "Enabled"),
+    ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Privacy", "TailoredExperiencesWithDiagnosticDataEnabled"),
+    ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", "Start_TrackProgs"),
+    ("HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\System", "EnableActivityFeed"),
+    ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\humaninterfaceenterprise",
+     "Value", "REG_SZ"),
+    ("HKCU", "Control Panel\\International\\User Profile", "HttpAcceptLanguageOptOut"),
+    ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\OnlineSpeechPrivacy", "HasAccepted"),
+    ("HKCU", "Software\\Microsoft\\Siuf\\Rules", "NumberOfSIUFInPeriod"),
+    ("HKCU", "Software\\Microsoft\\Input\\TIPC", "Enabled"),
+    ("HKLM", "SOFTWARE\\Policies\\Microsoft\\Input\\TIPC", "Enabled"),
+    ("HKCU", "Software\\Microsoft\\Personalization\\Settings", "AcceptedPrivacyPolicy"),
+    ("HKCU", "Software\\Microsoft\\InputPersonalization\\TrainedDataStore", "HarvestContacts"),
+]
 
 
 def apply_privacy_baseline(ctx: TaskContext):
@@ -1018,18 +1474,27 @@ def apply_privacy_baseline(ctx: TaskContext):
     tracking, input personalization, online speech, tailored experiences,
     language-list access, feedback prompts. All standard HKCU values that
     Windows itself exposes in Settings — fully reversible."""
-    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\AdvertisingInfo", "Enabled", 0)
-    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Privacy", "TailoredExperiencesWithDiagnosticDataEnabled", 0)
-    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", "Start_TrackProgs", 0)
-    reg_set_value_checked(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\System", "EnableActivityFeed", 0)
-    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\humaninterfaceenterprise", "Value", "Deny", value_type="REG_SZ")
-    reg_set_value_checked(ctx, "HKCU", "Control Panel\\International\\User Profile", "HttpAcceptLanguageOptOut", 1)
-    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Speech_OneCore\\Settings\\OnlineSpeechPrivacy", "HasAccepted", 0)
-    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Siuf\\Rules", "NumberOfSIUFInPeriod", 0)
-    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Input\\TIPC", "Enabled", 0)
-    reg_set_value_checked(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Input\\TIPC", "Enabled", 0)
-    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Personalization\\Settings", "AcceptedPrivacyPolicy", 0)
-    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\InputPersonalization\\TrainedDataStore", "HarvestContacts", 0)
+    # M3: snapshot priors — the old revert deleted unconditionally, losing
+    # any non-default priors (e.g. a user who had tailored experiences ON).
+    had_snapshot = bool(get_tweak_snapshot("privacy_baseline"))
+    _snap_reg_values(ctx, "privacy_baseline", _PRIVACY_BASELINE_SPECS)
+    try:
+        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\AdvertisingInfo", "Enabled", 0)
+        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Privacy", "TailoredExperiencesWithDiagnosticDataEnabled", 0)
+        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", "Start_TrackProgs", 0)
+        reg_set_value_checked(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\System", "EnableActivityFeed", 0)
+        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\humaninterfaceenterprise", "Value", "Deny", value_type="REG_SZ")
+        reg_set_value_checked(ctx, "HKCU", "Control Panel\\International\\User Profile", "HttpAcceptLanguageOptOut", 1)
+        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\OnlineSpeechPrivacy", "HasAccepted", 0)
+        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Siuf\\Rules", "NumberOfSIUFInPeriod", 0)
+        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Input\\TIPC", "Enabled", 0)
+        reg_set_value_checked(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Input\\TIPC", "Enabled", 0)
+        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Personalization\\Settings", "AcceptedPrivacyPolicy", 0)
+        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\InputPersonalization\\TrainedDataStore", "HarvestContacts", 0)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("privacy_baseline")
+        raise
     # audit fix (AllowTelemetry coupling): this task used to ALSO write
     # AllowTelemetry=1 here and DELETE it in revert — the exact same value
     # limit_telemetry owns. Reverting Privacy Baseline silently undid
@@ -1038,18 +1503,23 @@ def apply_privacy_baseline(ctx: TaskContext):
     ctx.log("Privacy baseline applied: ads ID, activity feed, tracking, typing data and speech uploads off.")
 
 def revert_privacy_baseline(ctx: TaskContext):
-    reg_delete_value(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\AdvertisingInfo", "Enabled")
-    reg_delete_value(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Privacy", "TailoredExperiencesWithDiagnosticDataEnabled")
-    reg_delete_value(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", "Start_TrackProgs")
-    reg_delete_value(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\System", "EnableActivityFeed")
-    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\humaninterfaceenterprise", "Value", "Allow", value_type="REG_SZ")
-    reg_delete_value(ctx, "HKCU", "Control Panel\\International\\User Profile", "HttpAcceptLanguageOptOut")
-    reg_delete_value(ctx, "HKCU", "Software\\Microsoft\\Speech_OneCore\\Settings\\OnlineSpeechPrivacy", "HasAccepted")
-    reg_delete_value(ctx, "HKCU", "Software\\Microsoft\\Siuf\\Rules", "NumberOfSIUFInPeriod")
-    reg_delete_value(ctx, "HKCU", "Software\\Microsoft\\Input\\TIPC", "Enabled")
-    reg_delete_value(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Input\\TIPC", "Enabled")
-    reg_delete_value(ctx, "HKCU", "Software\\Microsoft\\Personalization\\Settings", "AcceptedPrivacyPolicy")
-    reg_delete_value(ctx, "HKCU", "Software\\Microsoft\\InputPersonalization\\TrainedDataStore", "HarvestContacts")
+    snap = get_tweak_snapshot("privacy_baseline")
+    if snap and "specs" in snap:
+        _restore_reg_values(ctx, "privacy_baseline")
+    else:
+        reg_delete_value(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\AdvertisingInfo", "Enabled")
+        reg_delete_value(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Privacy", "TailoredExperiencesWithDiagnosticDataEnabled")
+        reg_delete_value(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", "Start_TrackProgs")
+        reg_delete_value(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\System", "EnableActivityFeed")
+        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\humaninterfaceenterprise", "Value", "Allow", value_type="REG_SZ")
+        reg_delete_value(ctx, "HKCU", "Control Panel\\International\\User Profile", "HttpAcceptLanguageOptOut")
+        reg_delete_value(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\OnlineSpeechPrivacy", "HasAccepted")
+        reg_delete_value(ctx, "HKCU", "Software\\Microsoft\\Siuf\\Rules", "NumberOfSIUFInPeriod")
+        reg_delete_value(ctx, "HKCU", "Software\\Microsoft\\Input\\TIPC", "Enabled")
+        reg_delete_value(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Input\\TIPC", "Enabled")
+        reg_delete_value(ctx, "HKCU", "Software\\Microsoft\\Personalization\\Settings", "AcceptedPrivacyPolicy")
+        reg_delete_value(ctx, "HKCU", "Software\\Microsoft\\InputPersonalization\\TrainedDataStore", "HarvestContacts")
+        ctx.log("  (no snapshot found — removed the values; Windows then uses its defaults)")
     # audit fix: AllowTelemetry delete removed — limit_telemetry owns that
     # value (see the note in apply_privacy_baseline). Deleting it here broke
     # Limit Tracking for anyone who had both applied.
@@ -1061,10 +1531,10 @@ def apply_stop_telemetry(ctx: TaskContext):
     Does NOT block network hosts or delete system files (safety: keeps
     Windows Update fully functional). Services are set to 'disabled' and
     can be restored by the revert."""
-    run_cmd(ctx, "sc config DiagTrack start= disabled")
-    run_cmd(ctx, "net stop DiagTrack", timeout=30)
-    run_cmd(ctx, "sc config dmwappushservice start= disabled")
-    for task in (
+    # H5: the old unchecked run_cmd calls logged success even when every
+    # service/task was absent (LTSC) or access-denied. Best-effort with
+    # honest counting: individual misses warn, but zero successes raises.
+    _telemetry_tasks = (
         "\\Microsoft\\Windows\\Application Experience\\Microsoft Compatibility Appraiser",
         "\\Microsoft\\Windows\\Application Experience\\ProgramDataUpdater",
         "\\Microsoft\\Windows\\Application Experience\\StartupAppTask",
@@ -1075,15 +1545,27 @@ def apply_stop_telemetry(ctx: TaskContext):
         "\\Microsoft\\Windows\\Customer Experience Improvement Program\\UsbCeip",
         "\\Microsoft\\Windows\\DiskDiagnostic\\Microsoft-Windows-DiskDiagnosticDataCollector",
         "\\Microsoft\\Windows\\Windows Error Reporting\\QueueReporting",
-    ):
-        run_cmd(ctx, f'schtasks /change /tn "{task}" /disable', timeout=30)
-    ctx.log("Telemetry services and diagnostic scheduled tasks disabled.")
+    )
+    _ok = 0
+    for _cmd in ("sc config DiagTrack start= disabled",
+                 "sc config dmwappushservice start= disabled"):
+        if run_cmd(ctx, _cmd, timeout=30) == 0:
+            _ok += 1
+        else:
+            ctx.log(f"  ! skipped (service absent or access denied): {_cmd}")
+    if run_cmd(ctx, "net stop DiagTrack", timeout=30) == 0:
+        _ok += 1
+    for task in _telemetry_tasks:
+        if run_cmd(ctx, f'schtasks /change /tn "{task}" /disable', timeout=30) == 0:
+            _ok += 1
+        else:
+            ctx.log(f"  ! skipped (task absent): {task}")
+    if _ok == 0:
+        raise RuntimeError("No telemetry service or task could be changed — nothing was disabled.")
+    ctx.log(f"Telemetry services and diagnostic scheduled tasks disabled ({_ok} change(s) applied).")
 
 def revert_stop_telemetry(ctx: TaskContext):
-    run_cmd(ctx, "sc config DiagTrack start= auto")
-    run_cmd(ctx, "net start DiagTrack", timeout=30)
-    run_cmd(ctx, "sc config dmwappushservice start= demand")
-    for task in (
+    _telemetry_tasks = (
         "\\Microsoft\\Windows\\Application Experience\\Microsoft Compatibility Appraiser",
         "\\Microsoft\\Windows\\Application Experience\\ProgramDataUpdater",
         "\\Microsoft\\Windows\\Application Experience\\StartupAppTask",
@@ -1094,9 +1576,24 @@ def revert_stop_telemetry(ctx: TaskContext):
         "\\Microsoft\\Windows\\Customer Experience Improvement Program\\UsbCeip",
         "\\Microsoft\\Windows\\DiskDiagnostic\\Microsoft-Windows-DiskDiagnosticDataCollector",
         "\\Microsoft\\Windows\\Windows Error Reporting\\QueueReporting",
-    ):
-        run_cmd(ctx, f'schtasks /change /tn "{task}" /enable', timeout=30)
-    ctx.log("Telemetry services and tasks re-enabled.")
+    )
+    _ok = 0
+    for _cmd in ("sc config DiagTrack start= auto",
+                 "sc config dmwappushservice start= demand"):
+        if run_cmd(ctx, _cmd, timeout=30) == 0:
+            _ok += 1
+        else:
+            ctx.log(f"  ! skipped (service absent or access denied): {_cmd}")
+    if run_cmd(ctx, "net start DiagTrack", timeout=30) == 0:
+        _ok += 1
+    for task in _telemetry_tasks:
+        if run_cmd(ctx, f'schtasks /change /tn "{task}" /enable', timeout=30) == 0:
+            _ok += 1
+        else:
+            ctx.log(f"  ! skipped (task absent): {task}")
+    if _ok == 0:
+        raise RuntimeError("No telemetry service or task could be restored.")
+    ctx.log(f"Telemetry services and tasks re-enabled ({_ok} change(s) applied).")
 
 
 def apply_nvidia_telemetry_optout(ctx: TaskContext):
@@ -1163,6 +1660,10 @@ def revert_nvidia_telemetry_optout(ctx: TaskContext):
     # the same "demand" value apply() already wrote.
     snap = get_tweak_snapshot("nvidia_telemetry")
     start_type = snap.get("NvTelemetryContainer_start_type", "demand")
+    # F-1: the snapshot value flows into a shell command string — only a
+    # start-type keyword this app could have snapshotted may run.
+    if not _valid_snapshot_start_type(start_type):
+        raise _snapshot_validation_error("nvidia_telemetry", "start_type", start_type)
     run_cmd(ctx, f"sc config NvTelemetryContainer start= {start_type}")
     clear_tweak_snapshot("nvidia_telemetry")
     for task in ("NvTmRep_C", "NvTmRepOnLogon_C", "NvTmMon_C"):
@@ -1220,7 +1721,12 @@ def apply_ad_blocker(ctx: TaskContext):
     except Exception as exc:
         raise RuntimeError(f"Could not read bundled ad-block list: {exc}")
 
-    domain_count = sum(1 for line in block_lines.splitlines() if line.strip())
+    # M4: count real domain mappings, not every non-blank line (future
+    # header/comment lines in the bundled list must not inflate the count).
+    # Hosts mapping lines start with 0.0.0.0 (the list's redirect target).
+    domain_count = sum(1 for line in block_lines.splitlines()
+                       if line.strip() and not line.strip().startswith("#")
+                       and line.split()[0] == "0.0.0.0")
 
     if not base_content.endswith("\n"):
         base_content += "\n"
@@ -1460,6 +1966,14 @@ def _query_eee_props() -> "list[tuple[str, str, str]]":
     return rows
 
 
+def _ps_sq(s: str) -> str:
+    """Escape a string for embedding in a PowerShell single-quoted literal
+    (L3: adapter/property names are system-controlled but can contain `'`,
+    e.g. "John's Ethernet" — an unescaped quote breaks out of the PS
+    string; doubling is PS's escape)."""
+    return str(s).replace("'", "''")
+
+
 def apply_eee_disable(ctx: TaskContext):
     """Disable Energy Efficient Ethernet / Green Ethernet on active NICs —
     the documented cause of micro-disconnects and speed drops on Realtek
@@ -1473,21 +1987,31 @@ def apply_eee_disable(ctx: TaskContext):
     snapshot = {"adapters": {}}                    # {adapter: {display: prior_value}}
     for adapter, display, value in props:
         snapshot["adapters"].setdefault(adapter, {})[display] = value
+    # C5: a failed apply must not leave this snapshot behind (false badge).
+    had_snapshot = bool(get_tweak_snapshot("eee_disable"))
     save_tweak_snapshot("eee_disable", snapshot)
     changed = 0
-    for adapter, display, _value in props:
-        rc = run_cmd(
-            ctx,
-            f'powershell -NoProfile -Command "Set-NetAdapterAdvancedProperty -Name \'{adapter}\' '
-            f'-DisplayName \'{display}\' -DisplayValue \'Disabled\'"',
-            timeout=60)
-        if rc == 0:
-            changed += 1
-        else:
-            ctx.log(f"  ! {adapter}/{display}: could not set (code {rc}) — this NIC may use different values.")
-    if not changed:
-        # honest failure: nothing accepted the change — never claim success
-        raise RuntimeError("No adapter accepted the change (NICs vary — check your adapter's own advanced tab).")
+    try:
+        for adapter, display, _value in props:
+            # shell=False argv (no cmd.exe mangling) + ''-escaped names.
+            rc = run_cmd(
+                ctx,
+                ["powershell", "-NoProfile", "-Command",
+                 f"Set-NetAdapterAdvancedProperty -Name '{_ps_sq(adapter)}' "
+                 f"-DisplayName '{_ps_sq(display)}' -DisplayValue 'Disabled'"],
+                shell=False,
+                timeout=60)
+            if rc == 0:
+                changed += 1
+            else:
+                ctx.log(f"  ! {adapter}/{display}: could not set (code {rc}) — this NIC may use different values.")
+        if not changed:
+            # honest failure: nothing accepted the change — never claim success
+            raise RuntimeError("No adapter accepted the change (NICs vary — check your adapter's own advanced tab).")
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("eee_disable")
+        raise
     ctx.log(f"EEE disabled on {changed} propert(ies). Brief network blip is normal; reconnect if you were in a game.")
 
 
@@ -1501,11 +2025,21 @@ def revert_eee_disable(ctx: TaskContext):
     adapters = snap.get("adapters", {}) if snap else {}
     if not adapters:
         raise RuntimeError("No snapshot on file — cannot know the prior values. Set them manually in Device Manager.")
+    restored = 0
     for adapter, props in adapters.items():
         for display, value in props.items():
-            run_cmd(ctx,
-                    f'powershell -NoProfile -Command "Set-NetAdapterAdvancedProperty -Name \'{adapter}\' '
-                    f'-DisplayName \'{display}\' -DisplayValue \'{value}\'"', timeout=60)
+            rc = run_cmd(ctx,
+                         ["powershell", "-NoProfile", "-Command",
+                          f"Set-NetAdapterAdvancedProperty -Name '{_ps_sq(adapter)}' "
+                          f"-DisplayName '{_ps_sq(display)}' -DisplayValue '{_ps_sq(value)}'"],
+                         shell=False, timeout=60)
+            if rc == 0:
+                restored += 1
+            else:
+                ctx.log(f"  ! {adapter}/{display}: could not restore (code {rc}) — adapter may be gone.")
+    # C6: keep the snapshot when NOTHING restored so Undo can be retried.
+    if restored == 0:
+        raise RuntimeError("No EEE setting could be restored — snapshot kept so Undo can be retried.")
     clear_tweak_snapshot("eee_disable")
     ctx.log("Energy Efficient Ethernet restored to previous values.")
 
@@ -1540,14 +2074,26 @@ def apply_ntfs_8dot3_disable(ctx: TaskContext):
                 f"(rc={out.returncode}: {(out.stdout or out.stderr or '').strip()[:120]}) — "
                 "aborting so a revert never has to guess.")
         raise RuntimeError("Could not read the current 8.3 name setting — nothing was changed.")
+    # C5: a failed set must not leave this snapshot behind (false badge).
+    had_snapshot = bool(get_tweak_snapshot("ntfs_8dot3"))
     save_tweak_snapshot("ntfs_8dot3", {"value": prior_value})
-    run_cmd_checked(ctx, "fsutil behavior set disable8dot3 1")
+    try:
+        run_cmd_checked(ctx, "fsutil behavior set disable8dot3 1")
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("ntfs_8dot3")
+        raise
     ctx.log("8.3 short-name creation disabled (speeds up folders with many files).")
 
 
 def revert_ntfs_8dot3_disable(ctx: TaskContext):
     snap = get_tweak_snapshot("ntfs_8dot3")
-    run_cmd_checked(ctx, f"fsutil behavior set disable8dot3 {snap.get('value', 2) if snap else 2}")
+    prior = snap.get("value", 2) if snap else 2
+    # F-1: the snapshot value flows into a shell command string — only a
+    # numeric fsutil state (0/1/2/3) this app could have parsed may run.
+    if not (isinstance(prior, int) and not isinstance(prior, bool) and 0 <= prior <= 3):
+        raise _snapshot_validation_error("ntfs_8dot3", "value", prior)
+    run_cmd_checked(ctx, f"fsutil behavior set disable8dot3 {prior}")
     clear_tweak_snapshot("ntfs_8dot3")
     ctx.log("8.3 name creation restored to previous setting.")
 
@@ -1609,14 +2155,29 @@ def apply_gaming_dns(ctx: TaskContext):
         if not idx.isdigit():
             continue
         snapshot["adapters"][idx] = servers.strip() or None   # None = DHCP
-        rc = run_cmd(ctx, f'netsh interface ip set dns name="{idx}" static 1.1.1.1 primary', timeout=30)
-        # netsh needs the adapter NAME for the secondary; get it via the index
-        # in one pass: set primary worked above, secondary via PowerShell.
-        run_cmd(ctx, f'netsh interface ip add dns name="{idx}" 1.0.0.1 index=2', timeout=30)
+        # H4: netsh `name=` wants the adapter NAME, not the numeric ifIndex
+        # (passing the index fails or hits the wrong NIC). The PowerShell
+        # cmdlet takes -InterfaceIndex directly — unambiguous, shell=False
+        # argv so no quoting/injection surface. NOTE: ifIndex can change
+        # across reboots/NIC swaps; revert only touches these snapshot
+        # indexes and reports misses honestly.
+        rc = run_cmd(ctx, ["powershell", "-NoProfile", "-Command",
+                           f"Set-DnsClientServerAddress -InterfaceIndex {idx} "
+                           f"-ServerAddresses ('1.1.1.1','1.0.0.1')"],
+                     shell=False, timeout=30)
         if rc == 0:
             switched += 1
+        else:
+            ctx.log(f"  ! could not set DNS on adapter index {idx} (exit {rc}) — skipping it.")
     if not snapshot["adapters"]:
         raise RuntimeError("No active network adapters found — nothing to switch.")
+    # H4/C5: saving before verifying left a snapshot + success log on 0
+    # switched adapters (false badge). Only save when something changed.
+    if switched == 0:
+        raise RuntimeError(
+            "Could not switch DNS on any adapter — nothing was changed "
+            "(snapshot NOT saved, tweak not marked applied)."
+        )
     save_tweak_snapshot("gaming_dns", snapshot)
     ctx.log(f"DNS switched to Cloudflare on {switched} adapter(s). (Snapshot saved for undo.)")
 
@@ -1643,14 +2204,40 @@ def revert_gaming_dns(ctx: TaskContext):
             "Internet > your adapter > DNS (or ask your network "
             "administrator / ISP for the correct servers)."
         )
+    import re as _re
+    failures: list = []
     for idx, servers in adapters.items():
-        if servers:  # had static servers before
-            first, *rest = [s for s in servers.split(",") if s.strip()]
-            run_cmd(ctx, f'netsh interface ip set dns name="{idx}" static {first.strip()} primary', timeout=30)
-            for i, s in enumerate(rest, start=2):
-                run_cmd(ctx, f'netsh interface ip add dns name="{idx}" {s.strip()} index={i}', timeout=30)
+        if not str(idx).strip().isdigit():
+            failures.append(str(idx))
+            continue
+        if servers:  # had static servers before — validate (snapshot lives
+            # in user-writable config.json; never interpolate raw into PS)
+            toks = [s.strip() for s in str(servers).split(",") if s.strip()]
+            if not toks or not all(_re.fullmatch(r"[0-9.]+", t) for t in toks):
+                ctx.log(f"  ! snapshot for adapter {idx} has unexpected servers {servers!r} — skipping it.")
+                failures.append(str(idx))
+                continue
+            quoted = ",".join(f"'{t}'" for t in toks)
+            rc = run_cmd(ctx, ["powershell", "-NoProfile", "-Command",
+                               f"Set-DnsClientServerAddress -InterfaceIndex {idx} "
+                               f"-ServerAddresses ({quoted})"],
+                         shell=False, timeout=30)
+            if rc != 0:
+                failures.append(str(idx))
         else:        # was DHCP — clear static servers back to automatic
-            run_cmd(ctx, f'netsh interface ip set dns name="{idx}" dhcp', timeout=30)
+            rc = run_cmd(ctx, ["powershell", "-NoProfile", "-Command",
+                               f"Set-DnsClientServerAddress -InterfaceIndex {idx} "
+                               "-ResetServerAddresses"],
+                         shell=False, timeout=30)
+            if rc != 0:
+                failures.append(str(idx))
+    # C6: keep the snapshot when any adapter failed so Undo can be retried.
+    if failures:
+        raise RuntimeError(
+            f"Could not restore DNS on adapter(s) {', '.join(failures)} — "
+            "snapshot kept so Undo can be retried. Restore manually: "
+            "Settings > Network & Internet > your adapter > DNS."
+        )
     clear_tweak_snapshot("gaming_dns")
     ctx.log("DNS restored to previous settings.")
 
@@ -1866,21 +2453,30 @@ def revert_gpu_preference_high(ctx: TaskContext):
 
 
 # --- Round 4: snapshot helpers (one value or several per tweak) --- #
-def _snap_reg_values(ctx: TaskContext, task_id: str, specs: "list[tuple[str, str, str]]"):
+def _snap_reg_values(ctx: TaskContext, task_id: str, specs: "list[tuple]"):
     """Snapshot the real prior state (value or absent) of each registry
-    value so revert restores exactly what was there — never a guess."""
+    value so revert restores exactly what was there — never a guess.
+
+    Each spec is (hive, path, name) or (hive, path, name, value_type);
+    the per-value type is stored so mixed-type tweaks (REG_SZ + REG_DWORD)
+    restore with the right type (M7 audit gap: the old single value_type
+    arg restored every value as one type).
+    """
     from app.config_persist import save_tweak_snapshot
-    data: dict = {"specs": [list(s) for s in specs]}
-    for i, (hive, path, name) in enumerate(specs):
+    data: dict = {"specs": [list(s[:3]) for s in specs]}
+    for i, spec in enumerate(specs):
+        hive, path, name = spec[0], spec[1], spec[2]
         prior = reg_get_value(ctx, hive, path, name)
         data[f"{i}:present"] = prior is not None
         data[f"{i}:value"] = prior
+        data[f"{i}:type"] = spec[3] if len(spec) > 3 else "REG_DWORD"
     save_tweak_snapshot(task_id, data)
 
 
 def _restore_reg_values(ctx: TaskContext, task_id: str, value_type: str = "REG_DWORD"):
     """Restore a snapshot taken by _snap_reg_values (exact prior values;
-    absent values are deleted back to Windows defaults)."""
+    absent values are deleted back to Windows defaults). Per-value stored
+    types win; `value_type` is the fallback for pre-fix snapshots."""
     from app.config_persist import get_tweak_snapshot, clear_tweak_snapshot
     snap = get_tweak_snapshot(task_id)
     if not snap or "specs" not in snap:
@@ -1888,9 +2484,11 @@ def _restore_reg_values(ctx: TaskContext, task_id: str, value_type: str = "REG_D
         return
     for i, (hive, path, name) in enumerate(snap["specs"]):
         if snap.get(f"{i}:present"):
-            reg_set_value_checked(ctx, hive, path, name, snap.get(f"{i}:value"), value_type=value_type)
+            vtype = snap.get(f"{i}:type", value_type)
+            reg_set_value_checked(ctx, hive, path, name, snap.get(f"{i}:value"), value_type=vtype)
         else:
-            reg_delete_value(ctx, hive, path, name)
+            if not reg_delete_value(ctx, hive, path, name):
+                raise RuntimeError(f"Could not remove {hive}\\{path}\\{name} during revert.")
     clear_tweak_snapshot(task_id)
 
 
@@ -2056,6 +2654,195 @@ def revert_snap_flyout_off(ctx: TaskContext):
     ctx.log("Snap flyout restored.")
 
 
+_SENSE = ("HKCU",
+          "Software\\Microsoft\\Windows\\CurrentVersion\\StorageSense"
+          "\\Parameters\\StoragePolicy")
+
+def apply_storage_sense(ctx: TaskContext):
+    """Turn ON Windows' built-in Storage Sense (Settings > System >
+    Storage) so junk gets cleaned automatically — the machine maintains
+    itself between Cleaner Tool runs.
+
+    Writes the documented StoragePolicy values (same ones the Settings
+    app writes): '01'=Sense enabled, '04'=clean temp files, '2048'=clean
+    recycle bin — with a monthly cadence ('256'=0x30 days, the default
+    Windows picks). Deliberately does NOT touch Downloads cleanup
+    ('08'/'512' family) — auto-deleting user Downloads can destroy
+    someone's files; Sense keeps to temp/bin debris only.
+
+    HKCU-only (per-user setting) — no admin needed, undoable."""
+    _snap_reg_values(ctx, "storage_sense",
+                     [(_SENSE[0], _SENSE[1], "01"),
+                      (_SENSE[0], _SENSE[1], "04"),
+                      (_SENSE[0], _SENSE[1], "256")])
+    reg_set_value_checked(ctx, _SENSE[0], _SENSE[1], "01", 1)
+    reg_set_value_checked(ctx, _SENSE[0], _SENSE[1], "04", 1)
+    reg_set_value_checked(ctx, _SENSE[0], _SENSE[1], "256", 0)  # 0 = cadence picks default
+    ctx.log("Storage Sense ON — Windows now auto-cleans temp junk (monthly, default cadence).")
+
+def revert_storage_sense(ctx: TaskContext):
+    _restore_reg_values(ctx, "storage_sense")
+    ctx.log("Storage Sense restored to its prior setting.")
+
+
+_DESKTOP = "Control Panel\\Desktop"
+
+
+def apply_fast_app_close(ctx: TaskContext):
+    """Fast shutdown: Windows waits up to 20 seconds (20000ms) for apps
+    to close on their own before force-killing them — that is the
+    'Shutting down…' hang after quitting a game. Cuts the waits:
+      * WaitToKillAppTimeout  20000 -> 2000  (grace period per app)
+      * HungAppTimeout        5000  -> 1000  (before 'not responding')
+    Plus AutoEndTasks=1 so Windows actually ends them instead of
+    sitting on the 'These apps are preventing shutdown' screen.
+
+    HKCU-only, snapshot + revert, no admin. These values only take
+    effect at the next sign-out/shutdown."""
+    _snap_reg_values(ctx, "fast_app_close",
+                     [("HKCU", _DESKTOP, "WaitToKillAppTimeout"),
+                      ("HKCU", _DESKTOP, "HungAppTimeout"),
+                      ("HKCU", _DESKTOP, "AutoEndTasks")])
+    reg_set_value_checked(ctx, "HKCU", _DESKTOP, "WaitToKillAppTimeout", "2000", value_type="REG_SZ")
+    reg_set_value_checked(ctx, "HKCU", _DESKTOP, "HungAppTimeout", "1000", value_type="REG_SZ")
+    reg_set_value_checked(ctx, "HKCU", _DESKTOP, "AutoEndTasks", "1", value_type="REG_SZ")
+    ctx.log("Fast app close on: shutdown waits drop from 20s to 2s before apps are ended.")
+
+def revert_fast_app_close(ctx: TaskContext):
+    from app.config_persist import get_tweak_snapshot, clear_tweak_snapshot
+    snap = get_tweak_snapshot("fast_app_close")
+    if not snap:
+        ctx.log("  (no snapshot found — restoring Windows defaults)")
+        reg_set_value_checked(ctx, "HKCU", _DESKTOP, "WaitToKillAppTimeout", "20000", value_type="REG_SZ")
+        reg_set_value_checked(ctx, "HKCU", _DESKTOP, "HungAppTimeout", "5000", value_type="REG_SZ")
+        reg_delete_value(ctx, "HKCU", _DESKTOP, "AutoEndTasks")
+    else:
+        _restore_reg_values(ctx, "fast_app_close", value_type="REG_SZ")
+    clear_tweak_snapshot("fast_app_close")
+    ctx.log("Shutdown waits restored.")
+
+
+def apply_instant_alt_tab(ctx: TaskContext):
+    """Instant window focus: Windows enforces a 200000ms (!) lockout
+    during which a background window may NOT steal focus — that is the
+    lag when alt-tabbing back into a fullscreen game (the click 'eats'
+    for a moment, the shell feels sticky). Setting ForegroundLockTimeout
+    to 0 removes the lockout delay so the switch is immediate. The
+    official 'prevent focus stealing' config pairs this with
+    ForegroundFlashCount=0 (no orange taskbar flashing fight).
+
+    HKCU-only, snapshot + revert, no admin, takes effect at next
+    sign-in (Explorer reads it at logon)."""
+    _snap_reg_values(ctx, "instant_alt_tab",
+                     [("HKCU", _DESKTOP, "ForegroundLockTimeout"),
+                      ("HKCU", _DESKTOP, "ForegroundFlashCount")])
+    reg_set_value_checked(ctx, "HKCU", _DESKTOP, "ForegroundLockTimeout", 0)   # REG_DWORD needs an int, not "0"
+    reg_set_value_checked(ctx, "HKCU", _DESKTOP, "ForegroundFlashCount", 0)
+    ctx.log("Alt-tab focus delay removed — windows switch instantly at next sign-in.")
+
+def revert_instant_alt_tab(ctx: TaskContext):
+    from app.config_persist import get_tweak_snapshot, clear_tweak_snapshot
+    snap = get_tweak_snapshot("instant_alt_tab")
+    if not snap:
+        ctx.log("  (no snapshot found — restoring Windows defaults)")
+        reg_set_value_checked(ctx, "HKCU", _DESKTOP, "ForegroundLockTimeout", 200000)
+        reg_delete_value(ctx, "HKCU", _DESKTOP, "ForegroundFlashCount")
+    else:
+        _restore_reg_values(ctx, "instant_alt_tab")
+    clear_tweak_snapshot("instant_alt_tab")
+    ctx.log("Focus lockout restored.")
+
+
+def apply_numlock_boot(ctx: TaskContext):
+    """NumLock ON at every boot — for MMO/RPG players whose muscle memory
+    expects the numpad. Windows remembers the numlock state per user,
+    but fast startup, some BIOSes and certain keyboards reset it, and on
+    fresh sign-ins it lands off. InitialKeyboardIndicators = "2" is the
+    documented 'always on at logon' value (2147483648 variants exist for
+    scroll lock combos; 2 is the standard numlock-only form).
+
+    HKCU-only (per-user), REG_SZ, snapshot + revert, no admin.
+    Takes effect at the next sign-in/boot."""
+    _snap_reg_values(ctx, "numlock_boot",
+                     [("HKCU", _DESKTOP, "InitialKeyboardIndicators")])
+    reg_set_value_checked(ctx, "HKCU", _DESKTOP, "InitialKeyboardIndicators", "2", value_type="REG_SZ")
+    ctx.log("NumLock will be ON at every boot from the next sign-in.")
+
+def revert_numlock_boot(ctx: TaskContext):
+    from app.config_persist import get_tweak_snapshot, clear_tweak_snapshot
+    snap = get_tweak_snapshot("numlock_boot")
+    if not snap:
+        ctx.log("  (no snapshot found — restoring Windows default)")
+        reg_set_value_checked(ctx, "HKCU", _DESKTOP, "InitialKeyboardIndicators", "2147483648", value_type="REG_SZ")
+    else:
+        _restore_reg_values(ctx, "numlock_boot", value_type="REG_SZ")
+    clear_tweak_snapshot("numlock_boot")
+    ctx.log("NumLock boot behavior restored.")
+
+
+def apply_clipboard_sync_off(ctx: TaskContext):
+    """Stop Windows from syncing your clipboard to the cloud and your
+    phone: Win+V history is local, but with a Microsoft account the
+    'Sync across devices' feature uploads copied text (and screenshots
+    of it) to Microsoft servers. Privacy-relevant for anyone who copies
+    passwords, keys or personal text. AllowCrossDeviceClipboard=1 is
+    Microsoft's documented policy that disables the sync/cloud half
+    while leaving local Win+V history working.
+
+    HKLM policy key (admin), snapshot + revert."""
+    _snap_reg_values(ctx, "clipboard_sync_off",
+                     [("HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\System",
+                       "AllowCrossDeviceClipboard")])
+    reg_set_value_checked(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\System",
+                          "AllowCrossDeviceClipboard", 1)
+    ctx.log("Cloud clipboard sync disabled — Win+V keeps working, locally only.")
+
+def revert_clipboard_sync_off(ctx: TaskContext):
+    _restore_reg_values(ctx, "clipboard_sync_off")
+    ctx.log("Cloud clipboard sync restored to its prior setting.")
+
+
+def apply_reserved_storage_off(ctx: TaskContext):
+    """Free ~7 GB: Windows sets aside a chunk of your drive ('reserved
+    storage') so future updates always have room. If your drive is
+    tight, DISM /Set-ReservedStorageState 0 releases it immediately —
+    Windows just downloads update payloads to normal free space instead.
+    Fully reversible: /Set-ReservedStorageState 1 re-reserves it (it
+    needs free space available to do so, which undo guidance logs).
+
+    Admin required (DISM). The state is machine-wide disk config, not a
+    per-user value, so there is no registry snapshot — the revert is
+    the documented on switch, the exact inverse operation."""
+    ctx.set_status("Releasing reserved storage (~7 GB)...")
+    rc = run_cmd(ctx, "dism /Online /Set-ReservedStorageState 0", timeout=900)
+    if rc == 740:
+        raise RuntimeError("DISM needs Administrator rights — restart the app as Administrator.")
+    if rc != 0:
+        # verify the actual state before declaring failure (DISM can be
+        # noisy about reboot-pending flags)
+        chk = run_cmd(ctx, "dism /Online /Get-ReservedStorageState", timeout=300)
+        if chk == 0:
+            ctx.log("  (DISM reported an earlier flag, but the state query verified.)")
+        else:
+            raise RuntimeError(f"Could not release reserved storage (exit code {rc}).")
+    ctx.log("Reserved storage released — ~7 GB back on your drive.")
+
+def revert_reserved_storage_off(ctx: TaskContext):
+    """Re-reserve the update storage (the documented inverse). Needs ~7 GB
+    free; logs honestly when the drive is too full to restore it."""
+    ctx.set_status("Re-reserving update storage...")
+    rc = run_cmd(ctx, "dism /Online /Set-ReservedStorageState 1", timeout=900)
+    if rc == 0:
+        ctx.log("Reserved storage re-enabled — updates have their safety pad again.")
+        return
+    if rc == 740:
+        raise RuntimeError("DISM needs Administrator rights — restart the app as Administrator.")
+    raise RuntimeError(
+        "Could not re-enable reserved storage — your drive may not have "
+        "~7 GB free for Windows to set aside. Free up space and run Undo again."
+    )
+
+
 from app.tasks import Task  # noqa: E402
 
 TASKS = [
@@ -2098,7 +2885,7 @@ TASKS = [
     Task("consumer_features", "Disable Consumer Features", "Stops Windows installing suggested apps", apply_consumer_features_disable, default=False, admin_required=True, revert=revert_consumer_features_disable, column=0),
     Task("tweak_delivery_optimization", "Disable Delivery Optimization", "Stops sharing updates with other PCs", apply_delivery_optimization_disable, default=False, admin_required=True, revert=revert_delivery_optimization_disable, column=1),
     Task("end_task_taskbar", "Enable End Task on Taskbar", "Lets you right-click taskbar to close frozen apps", apply_end_task_on_taskbar, default=False, admin_required=False, revert=revert_end_task_on_taskbar, column=1),
-    Task("explorer_auto_discovery", "No Explorer Auto Discovery", "Stops Explorer guessing folder types; also resets your folder view/sort settings", apply_explorer_auto_discovery_disable, default=False, admin_required=False, revert=revert_explorer_auto_discovery_disable, column=0),
+    Task("explorer_auto_discovery", "No Explorer Auto Discovery", "Stops Explorer guessing folder types — IRREVERSIBLY clears all saved folder views/sorts (Undo cannot restore them)", apply_explorer_auto_discovery_disable, default=False, admin_required=False, revert=revert_explorer_auto_discovery_disable, column=0, risk="ADVANCED"),
     Task("background_apps", "Disable Background Apps", "Stops apps running in background so games get more power", apply_background_apps_disable, default=False, admin_required=False, revert=revert_background_apps_disable, column=0),
     Task("shader_cache_10gb", "Shader Cache 10GB", "Sets shader cache to 10GB to stop stutter", apply_shader_cache_10gb, default=False, admin_required=False, revert=revert_shader_cache_10gb, column=1),
     Task("max_performance_gpu", "Prefer Max Performance", "Tells GPU to use max power for games", apply_nvidia_max_performance, default=False, admin_required=True, revert=revert_nvidia_max_performance, column=1),
@@ -2131,4 +2918,12 @@ TASKS = [
     Task("widgets_board_off", "Disable Widgets Board", "Kills the Widgets news board entirely, not just its taskbar icon", apply_widgets_board_off, default=False, revert=revert_widgets_board_off, admin_required=True, column=0),
     Task("autoplay_off", "Disable USB AutoPlay", "Stops USB sticks auto-launching apps when plugged in", apply_autoplay_off, default=False, revert=revert_autoplay_off, admin_required=False, column=0),
     Task("snap_flyout_off", "No Snap Popups", "Stops layout popups when hovering maximize mid-game", apply_snap_flyout_off, default=False, revert=revert_snap_flyout_off, admin_required=False, column=0),
+
+    # --- Round 5 tasks (user request: self-maintaining PC + responsiveness) --- #
+    Task("storage_sense", "Auto Cleanup (Storage Sense)", "Windows cleans its own temp junk monthly — the PC maintains itself", apply_storage_sense, default=False, revert=revert_storage_sense, admin_required=False, column=0),
+    Task("fast_app_close", "Fast App Close", "Shutdown stops waiting 20 seconds for frozen apps to close", apply_fast_app_close, default=False, revert=revert_fast_app_close, admin_required=False, column=0),
+    Task("instant_alt_tab", "Instant Alt-Tab Focus", "Removes the window-focus lockout delay when alt-tabbing back into games", apply_instant_alt_tab, default=False, revert=revert_instant_alt_tab, admin_required=False, column=0),
+    Task("numlock_boot", "NumLock at Boot", "Keeps the numpad ready at every boot for MMO and RPG muscle memory", apply_numlock_boot, default=False, revert=revert_numlock_boot, admin_required=False, column=0),
+    Task("clipboard_sync_off", "Stop Cloud Clipboard Sync", "Stops copied text being uploaded to Microsoft's cloud — Win+V stays local", apply_clipboard_sync_off, default=False, revert=revert_clipboard_sync_off, admin_required=True, column=0),
+    Task("reserved_storage_off", "Free Reserved Storage", "Releases the ~7 GB Windows locks away for updates — back when you undo", apply_reserved_storage_off, default=False, revert=revert_reserved_storage_off, admin_required=True, column=0),
 ]

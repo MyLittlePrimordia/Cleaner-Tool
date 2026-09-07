@@ -193,7 +193,7 @@ def main():
         f"essentials vars {n_task_vars} != {len(gui.TABS['Install'])} install tasks")
     # Essentials: checkbox rows exist and select into the shared pool
     ess = ipage.ess_vars
-    assert len(ess) >= 11, f"expected 11 Essentials, got {len(ess)}"
+    assert len(ess) >= 13, f"expected 13 Essentials, got {len(ess)}"
     ess_key = next(iter(ess))
     ess[ess_key].set(True)
     sel = ipage.selected_apps()

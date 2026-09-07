@@ -5,10 +5,13 @@ Laymen short labels + hover tooltips; compact symmetrical grid.
 
 import glob as globmod
 import os
-import subprocess
+# audit fix (hygiene): module-level `subprocess` was unused — every caller
+# that needs it already does its own local `import subprocess`.
 
 from app.utils import TaskContext, clean_folder_contents, run_cmd, restart_explorer
-from app.tasks.launcher_paths import ALL_LAUNCHER_CACHE_PATHS, GPU_SHADER_CACHE_ALL
+from app.tasks.launcher_paths import (
+    ALL_LAUNCHER_CACHE_PATHS, GPU_SHADER_CACHE_ALL, refresh_dynamic_paths,
+)
 
 _LOCALAPPDATA = os.environ.get("LOCALAPPDATA", "")
 _APPDATA = os.environ.get("APPDATA", "")
@@ -47,6 +50,9 @@ def clean_shader_cache(ctx: TaskContext):
 
 
 def clean_launcher_cache(ctx: TaskContext):
+    # M12: re-run the glob/listdir discoveries now (not import time) so
+    # launchers installed/updated since app start are covered.
+    refresh_dynamic_paths()
     return _clean_many(ctx, ALL_LAUNCHER_CACHE_PATHS, "launcher cache")
 
 
@@ -168,7 +174,14 @@ def clean_windows_update_cache(ctx: TaskContext):
 
 
 def clean_delivery_optimization(ctx: TaskContext):
-    return clean_folder_contents(ctx, f"{_WINDIR}\\SoftwareDistribution\\DeliveryOptimization")
+    # M13: stop DoSvc first (same stopped[] pattern as the update-cache
+    # sibling) — otherwise its files stay locked and the clean under-delivers.
+    stopped = run_cmd(ctx, "net stop DoSvc", timeout=30) == 0
+    try:
+        return clean_folder_contents(ctx, f"{_WINDIR}\\SoftwareDistribution\\DeliveryOptimization")
+    finally:
+        if stopped:
+            run_cmd(ctx, "net start DoSvc", timeout=30)
 
 
 def clean_recycle_bin_and_dumps(ctx: TaskContext):
@@ -216,6 +229,28 @@ def clean_error_reports(ctx: TaskContext):
         os.path.join(_LOCALAPPDATA, "Microsoft\\Windows\\WER\\ReportQueue"),
     ]
     return _clean_many(ctx, folders, "error report")
+
+
+def clean_gpu_watchdog_dumps(ctx: TaskContext):
+    """Empty C:\\Windows\\LiveKernelReports — the GPU watchdog dump folder.
+
+    When a display driver hangs and recovers ('display driver stopped
+    responding and has recovered' / a black-screen flash), Windows can
+    drop multi-GB kernel dumps here (WATCHDOG subfolder is the classic
+    NVIDIA/AMD case). They are pure post-mortem debugging artifacts:
+    nothing reads them back, they accumulate silently, and they are NOT
+    covered by clean_recycle_bin_and_dumps (Minidump/Memory.dmp) or
+    clean_error_reports (WER queues) — this folder is the gap.
+
+    Same safety contract as every dump cleaner: locked files are skipped
+    honestly, junction-guarded clean_folder_contents walks the tree."""
+    folders = [
+        os.path.join(_WINDIR, "LiveKernelReports"),
+    ]
+    total = _clean_many(ctx, folders, "GPU watchdog dump")
+    if not os.path.isdir(folders[0]):
+        ctx.log("No LiveKernelReports folder — no GPU watchdog dumps on this PC.")
+    return total
 
 
 def clean_inet_cache(ctx: TaskContext):
@@ -280,11 +315,19 @@ def clean_thumbnail_icon_cache(ctx: TaskContext):
     their icons. Fix: use the shared restart_explorer() helper, which
     launches Explorer detached and never waits on it.
     """
+    # M13: never kill the shell after the user pressed Stop, and never
+    # report success when the shell failed to come back.
+    if ctx.cancelled():
+        ctx.log("  ! cancelled — leaving Explorer running.")
+        return 0
     explorer_dir = os.path.join(_LOCALAPPDATA, "Microsoft\\Windows\\Explorer")
     run_cmd(ctx, "taskkill /f /im explorer.exe", timeout=10)
     total = clean_folder_contents(ctx, explorer_dir, extensions=[".db"])
     # Always bring Explorer back — detached, non-blocking (see docstring above)
-    restart_explorer(ctx)
+    if not restart_explorer(ctx):
+        raise RuntimeError(
+            "Explorer did not come back after the thumbnail clean — press "
+            "Ctrl+Shift+Esc, File > Run new task, type explorer.exe.")
     return total
 
 
@@ -386,11 +429,18 @@ def clean_browser_caches(ctx: TaskContext):
 
 def clean_font_cache(ctx: TaskContext):
     ctx.set_status("Rebuilding font cache...")
-    run_cmd(ctx, "net stop FontCache", timeout=30)
-    total = clean_folder_contents(
-        ctx, f"{_WINDIR}\\ServiceProfiles\\LocalService\\AppData\\Local\\FontCache"
-    )
-    run_cmd(ctx, "net start FontCache", timeout=30)
+    # M13: track the stop like clean_windows_update_cache does — the old
+    # code unconditionally ran `net start`, which would START a service the
+    # admin deliberately disabled. Restart only what WE stopped, in a
+    # finally so a clean error can't skip it.
+    stopped = run_cmd(ctx, "net stop FontCache", timeout=30) == 0
+    try:
+        total = clean_folder_contents(
+            ctx, f"{_WINDIR}\\ServiceProfiles\\LocalService\\AppData\\Local\\FontCache"
+        )
+    finally:
+        if stopped:
+            run_cmd(ctx, "net start FontCache", timeout=30)
     return total
 
 
@@ -498,7 +548,6 @@ def clean_activity_traces(ctx: TaskContext):
     Removes jump lists (recent files), Run-dialog MRU, typed paths, and recent
     docs. Purely local privacy hygiene — no functionality lost beyond history.
     """
-    import subprocess
     total = 0
     # Jump lists (AutomaticDestinations / CustomDestinations)
     recent = os.path.join(_APPDATA, "Microsoft\\Windows\\Recent")
@@ -550,12 +599,17 @@ def run_disk_cleanup(ctx: TaskContext):
 # Removes temp files via PowerShell #
 def remove_temp_files_deep(ctx: TaskContext):
     ctx.log("[Clean] Temporary Files - Remove")
-    ps_cmd1 = 'powershell -NoProfile -Command "Remove-Item -Path \\"$Env:Temp\\*\\" -Recurse -Force -ErrorAction SilentlyContinue"'
-    ps_cmd2 = 'powershell -NoProfile -Command "Remove-Item -Path \\"$Env:SystemRoot\\Temp\\*\\" -Recurse -Force -ErrorAction SilentlyContinue"'
-    ctx.log("$ Remove-Item -Path \"$Env:Temp\\*\" -Recurse -Force")
-    run_cmd(ctx, ps_cmd1)
-    ctx.log("$ Remove-Item -Path \"$Env:SystemRoot\\Temp\\*\" -Recurse -Force")
-    run_cmd(ctx, ps_cmd2)
+    # shell=False argv + PowerShell double quotes (variables expand in PS
+    # double-quoted strings; no backslash escaping — \" would end the PS
+    # string early with a ParserError). Timeouts + cancel checks so Stop works.
+    for script in (
+        'Remove-Item -Path "$Env:Temp\\*" -Recurse -Force -ErrorAction SilentlyContinue',
+        'Remove-Item -Path "$Env:SystemRoot\\Temp\\*" -Recurse -Force -ErrorAction SilentlyContinue',
+    ):
+        if ctx.cancelled():
+            break
+        run_cmd(ctx, ["powershell", "-NoProfile", "-Command", script],
+                shell=False, timeout=120)
     # audit fix: both _clean_many return values were discarded and the task
     # reported 0 bytes freed. The fallback walkers do the real accounting
     # (they stat+remove and count) — the PS pass above only catches what
@@ -584,10 +638,20 @@ def remove_windows_bloat(ctx: TaskContext):
         "Microsoft.WindowsFeedbackHub",   # (only app users report issues with)
     ]
     for pkg in bloat:
-        run_cmd(ctx, f'powershell -NoProfile -Command "Get-AppxPackage -Name \\"{pkg}\\" -AllUsers | Remove-AppxPackage -ErrorAction SilentlyContinue"')
+        if ctx.cancelled():
+            ctx.log("  ! cancelled — stopping bloat removal.")
+            break
+        # shell=False argv + PS single quotes (package names need no
+        # expansion; backslash-escaped double quotes would ParserError).
+        run_cmd(ctx, ["powershell", "-NoProfile", "-Command",
+                      f"Get-AppxPackage -Name '{pkg}' -AllUsers | Remove-AppxPackage -ErrorAction SilentlyContinue"],
+                shell=False, timeout=60)
         ctx.log(f"  Checked {pkg}")
     # TikTok registers under different publisher names; catch-all fallback
-    run_cmd(ctx, 'powershell -NoProfile -Command "Get-AppxPackage -AllUsers | Where-Object {$_.Name -like \\"*TikTok*\\"} | Remove-AppxPackage -ErrorAction SilentlyContinue"')
+    if not ctx.cancelled():
+        run_cmd(ctx, ["powershell", "-NoProfile", "-Command",
+                      "Get-AppxPackage -AllUsers | Where-Object {$_.Name -like '*TikTok*'} | Remove-AppxPackage -ErrorAction SilentlyContinue"],
+                shell=False, timeout=60)
     # Note: blocking auto-reinstall of consumer suggestions (DisableWindowsConsumerFeatures)
     # lives in the Tweak tab's "Stop Windows Ads & Tips" task instead, since that task has
     # a working revert. This Clean-tab task only removes apps (Store-reinstallable, no
@@ -600,13 +664,22 @@ def clean_event_logs(ctx: TaskContext):
     """Clear Windows Event Viewer logs (diagnostic history only — the logs
     start fresh; fixes bloated evtx files, admin)."""
     collected: "list[str]" = []
-    run_cmd(ctx, 'wevtutil el', shell=True, timeout=120, collect=collected)
+    # shell=False argv lists: channel names are system output and must never
+    # be interpolated into a shell=True string (injection via crafted
+    # channel name when elevated). Per-log timeout is short so ~200 logs
+    # can't stall for hours; the loop honors Stop.
+    rc = run_cmd(ctx, ["wevtutil", "el"], shell=False, timeout=60, collect=collected)
+    if rc != 0 and not collected:
+        raise RuntimeError(f"Could not list event logs (wevtutil el exited {rc}).")
     cleared = 0
     for name in collected:
+        if ctx.cancelled():
+            ctx.log("  ! cancelled — stopping event-log clear.")
+            break
         name = name.strip()
         if not name:
             continue
-        rc = run_cmd(ctx, f'wevtutil cl "{name}"', shell=True, timeout=120)
+        rc = run_cmd(ctx, ["wevtutil", "cl", name], shell=False, timeout=30)
         if rc == 0:
             cleared += 1
         else:
@@ -637,16 +710,36 @@ def _steam_root() -> str:
     return os.path.join(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"), "Steam")
 
 
+def _steam_running() -> bool:
+    """True if steam.exe is currently running (active downloads may be writing)."""
+    try:
+        import subprocess as _sp
+        out = _sp.check_output(
+            'tasklist /fi "imagename eq steam.exe" /fo csv /nh',
+            shell=True, text=True, timeout=10, stderr=_sp.DEVNULL,
+            creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
+        )
+        return "steam.exe" in (out or "").lower()
+    except Exception:
+        return False
+
+
 def clean_steam_download_cache(ctx: TaskContext):
     """Clear Steam's depot manifest cache + stale appinfo (fixes phantom
     'update required' states; Steam re-downloads them on launch)."""
+    if _steam_running():
+        ctx.log("Steam is running — skipping to avoid touching active downloads.")
+        return 0
     root = _steam_root()
     total = _clean_many(ctx, [os.path.join(root, "depotcache")], "Steam depot cache")
     appinfo = os.path.join(root, "appcache", "appinfo.vdf")
     try:
         if os.path.isfile(appinfo):
-            total += os.path.getsize(appinfo)
+            # Count only AFTER a successful remove (a locked file must not
+            # inflate the freed-space total).
+            size = os.path.getsize(appinfo)
             os.remove(appinfo)
+            total += size
             ctx.log(f"Removed stale app manifest: {appinfo}")
     except OSError as exc:
         ctx.log(f"  (kept appinfo.vdf: {exc})")
@@ -700,8 +793,9 @@ def clean_terminal_history(ctx: TaskContext):
     for path in files:
         try:
             if os.path.isfile(path):
-                total += os.path.getsize(path)
+                size = os.path.getsize(path)
                 os.remove(path)
+                total += size
                 ctx.log(f"Removed terminal history: {path}")
         except OSError as exc:
             ctx.log(f"  (kept history file: {exc})")
@@ -724,6 +818,7 @@ TASKS = [
     Task("inet_cache", "Clear Internet Cache", "Clears old internet temp files", clean_inet_cache, default=True, admin_required=False, column=0),
     Task("recycle_bin", "Empty Bin & Crash Reports", "Empties trash and removes old crash dumps", clean_recycle_bin_and_dumps, default=True, admin_required=True, column=1),
     Task("error_reports", "Clear Error Reports", "Deletes old Windows error reports", clean_error_reports, default=True, admin_required=False, column=1),
+    Task("gpu_watchdog_dumps", "Clean GPU Watchdog Dumps", "Removes multi-GB driver-hang dumps that pile up after black-screen flashes", clean_gpu_watchdog_dumps, default=False, admin_required=True, column=1),
     Task("thumbnail_cache", "Fix Blurry Icons", "Rebuilds icons, fixes missing thumbnails", clean_thumbnail_icon_cache, default=True, admin_required=False, column=1),
     Task("chk_fragments", "Remove Disk Fragments", "Deletes leftover files from disk checks", clean_chk_fragments, default=True, admin_required=True, column=1),
     Task("old_logs", "Clear System Logs", "Removes old Windows logs", clean_old_logs, default=True, admin_required=True, column=1),

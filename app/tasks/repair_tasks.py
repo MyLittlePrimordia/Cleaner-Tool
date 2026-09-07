@@ -45,7 +45,32 @@ def repair_chkdsk_scan(ctx: TaskContext):
         _sd_root = _sd + "\\"
     else:
         _sd_root = _sd if _sd.endswith("\\") else _sd + "\\"
-    run_cmd(ctx, f"chkdsk {_sd_root} /scan", timeout=900)
+    # F-5 audit fix: the exit code used to be discarded, so a drive WITH
+    # filesystem errors (chkdsk rc=3: "errors found, not fixed" — observed
+    # live) reported as a 'succeeded' task. smart_verdict/gpu_driver_age
+    # already raise on negative verdicts (this module's own honesty
+    # contract); chkdsk now does the same with a plain-language verdict.
+    # rc 0 = clean. rc 3 = errors found by the read-only scan. Anything
+    # else (or -1 cancel/timeout) is surfaced honestly below.
+    rc = run_cmd(ctx, f"chkdsk {_sd_root} /scan", timeout=900)
+    if ctx.cancelled():
+        from app.utils import TaskCancelled
+        raise TaskCancelled(f"chkdsk scan of {_sd_root} was cancelled by user.")
+    if rc == 0:
+        ctx.log(f"VERDICT: {_sd_root} scanned clean — no filesystem errors found.")
+        return
+    if rc == 3:
+        raise RuntimeError(
+            f"Filesystem errors were FOUND on {_sd_root} (chkdsk exit code 3, "
+            "read-only scan). Back up important saves/files NOW, then fix them: "
+            "right-click the drive in Explorer > Properties > Tools > Check "
+            f"(or run 'chkdsk {_sd_root} /f' from an Administrator prompt and "
+            "reboot when it asks)."
+        )
+    raise RuntimeError(
+        f"chkdsk scan of {_sd_root} did not complete (exit code {rc}) — "
+        "close open files and retry, or run it from an Administrator prompt."
+    )
 
 
 def repair_windows_update_reset(ctx: TaskContext):
@@ -78,12 +103,27 @@ def repair_windows_update_reset(ctx: TaskContext):
                 # folder actually has content worth backing up; an empty
                 # live folder means a backup already exists from a prior
                 # run and should be left alone.
+                # M11: a single small stub file (Windows' just-recreated
+                # placeholder) also counts as "content" for any() — and
+                # would still clobber a good backup. Require SUBSTANTIAL
+                # content: >1 top-level entry, or one entry larger than 1MB.
                 try:
-                    has_content = any(os.scandir(folder))
+                    with os.scandir(folder) as it:
+                        entries = list(it)
+                    if len(entries) > 1:
+                        has_content = True
+                    elif len(entries) == 1:
+                        try:
+                            e = entries[0]
+                            has_content = (not e.is_file()) or (e.stat().st_size > 1048576)
+                        except Exception:
+                            has_content = True  # can't tell — be safe, don't skip
+                    else:
+                        has_content = False
                 except Exception:
                     has_content = True  # can't tell — be safe, don't skip
                 if not has_content and os.path.exists(backup):
-                    ctx.log(f"  {folder} is already empty — keeping existing backup at {backup} untouched.")
+                    ctx.log(f"  {folder} holds only a stub — keeping existing backup at {backup} untouched.")
                     continue
                 try:
                     if os.path.exists(backup):
@@ -148,11 +188,15 @@ def repair_search_index(ctx: TaskContext):
 
 def repair_print_spooler(ctx: TaskContext):
     ctx.set_status("Clearing stuck print jobs and restarting the Print Spooler...")
+    # H5: the old unchecked stop/start logged success either way. A failed
+    # stop usually means the service is already stopped/disabled — clean
+    # anyway, but restart honestly.
     run_cmd(ctx, "net stop spooler", timeout=30)
     spool_dir = f"{_WINDIR}\\System32\\spool\\PRINTERS"
     if os.path.exists(spool_dir):
         clean_folder_contents(ctx, spool_dir)
-    run_cmd(ctx, "net start spooler", timeout=30)
+    if run_cmd(ctx, "net start spooler", timeout=30) != 0:
+        raise RuntimeError("Print Spooler jobs cleared but the service would not start — reboot, then check Services.")
 
 
 def repair_wmi_repository(ctx: TaskContext):
@@ -174,23 +218,29 @@ def repair_reregister_store_apps(ctx: TaskContext):
         'Add-AppxPackage -DisableDevelopmentMode '
         '-Register ($_.InstallLocation + \'\\AppXManifest.xml\') -ErrorAction SilentlyContinue }"'
     )
-    run_cmd(ctx, ps_cmd, timeout=600)
+    # H5: a timed-out/failed 10-minute re-register used to log nothing and
+    # count as success. Non-zero (or -1 cancel/timeout) raises honestly.
+    run_cmd_checked(ctx, ps_cmd, timeout=600)
 
 
 def repair_time_sync(ctx: TaskContext):
     ctx.set_status("Syncing system clock (fixes update/cert errors)...")
+    # H5: unchecked resync reported "synced" on failure (no NTP reach).
     run_cmd(ctx, "net start w32time", timeout=30)
-    run_cmd(ctx, "w32tm /resync", timeout=30)
+    if run_cmd(ctx, "w32tm /resync", timeout=60) != 0:
+        raise RuntimeError("Clock resync failed (no NTP response?) — check internet/timezone, then retry.")
 
 
 def repair_gpupdate(ctx: TaskContext):
     ctx.set_status("Refreshing Group Policy (fixes policy-locked updates)...")
-    run_cmd(ctx, "gpupdate /force", timeout=120)
+    # H5: gpupdate fails without admin/domain — raise instead of silencing.
+    run_cmd_checked(ctx, "gpupdate /force", timeout=180)
 
 
 def repair_bits_reset(ctx: TaskContext):
     ctx.set_status("Resetting BITS queue...")
-    run_cmd(ctx, "bitsadmin /reset /allusers", timeout=60)
+    # H5: bitsadmin fails when BITS is disabled — raise honestly.
+    run_cmd_checked(ctx, "bitsadmin /reset /allusers", timeout=60)
 
 
 def repair_xbox_game_apps(ctx: TaskContext):
@@ -204,44 +254,71 @@ def repair_xbox_game_apps(ctx: TaskContext):
         "Microsoft.XboxIdentityProvider",
         "Microsoft.XboxGamingOverlay",
     ]
+    # H5/H1: the old shell=True strings embedded literal \" sequences
+    # (PowerShell ParserError on every package, rc ignored, unconditional
+    # "Re-registered" log). shell=False argv + PS single quotes; per-package
+    # rc counted honestly — absent packages simply no-op under
+    # SilentlyContinue, but a total failure raises.
+    _ok = 0
     for pkg in packages:
-        run_cmd(
+        rc = run_cmd(
             ctx,
-            f'powershell -NoProfile -Command "Get-AppxPackage -Name \\"{pkg}\\" | '
-            f'ForEach-Object {{ Add-AppxPackage -DisableDevelopmentMode -Register '
-            f'($_.InstallLocation + \'\\AppXManifest.xml\') -ErrorAction SilentlyContinue }}"',
+            ["powershell", "-NoProfile", "-Command",
+             f"Get-AppxPackage -Name '{pkg}' | "
+             f"ForEach-Object {{ Add-AppxPackage -DisableDevelopmentMode -Register "
+             f"($_.InstallLocation + '\\AppXManifest.xml') }}"],
+            shell=False,
             timeout=120,
         )
-        ctx.log(f"  Re-registered {pkg}")
+        if rc == 0:
+            _ok += 1
+            ctx.log(f"  Re-registered {pkg}")
+        else:
+            ctx.log(f"  ! re-register failed for {pkg} (exit {rc})")
     # GamingServices also installs a Win32 service pair; re-register its appx explicitly
-    run_cmd(
+    rc = run_cmd(
         ctx,
-        'powershell -NoProfile -Command "Get-AppxPackage -Name \\"Microsoft.GamingServices\\" -AllUsers | '
-        'ForEach-Object { Add-AppxPackage -DisableDevelopmentMode -Register ($_.InstallLocation + \'\\AppXManifest.xml\') -ErrorAction SilentlyContinue }"',
+        ["powershell", "-NoProfile", "-Command",
+         "Get-AppxPackage -Name 'Microsoft.GamingServices' -AllUsers | "
+         "ForEach-Object { Add-AppxPackage -DisableDevelopmentMode -Register ($_.InstallLocation + '\\AppXManifest.xml') }"],
+        shell=False,
         timeout=120,
     )
+    if rc == 0:
+        _ok += 1
+    else:
+        ctx.log(f"  ! re-register failed for Microsoft.GamingServices (-AllUsers, exit {rc})")
+    if _ok == 0:
+        raise RuntimeError("No Xbox package could be re-registered — see the log.")
     ctx.log("Xbox / Game Pass apps repaired. Reboot if the Xbox app still misbehaves.")
 
 
 def repair_ssd_maintenance(ctx: TaskContext):
     """SSD maintenance: retrim all SSDs (defrag /L) + SMART health report."""
     ctx.set_status("Running SSD retrim and reporting drive health...")
-    run_cmd(ctx, "defrag /C /L /U /V", timeout=1800)
+    # H5: defrag fails on HDD-only machines / without admin — the old
+    # unchecked call still logged "Retrim complete".
+    if run_cmd(ctx, "defrag /C /L /U /V", timeout=1800) != 0:
+        ctx.log("  ! retrim pass reported an issue (HDD-only PC or access denied?) — continuing to health report.")
     run_cmd(
         ctx,
         'powershell -NoProfile -Command "Get-PhysicalDisk | Select-Object FriendlyName, MediaType, HealthStatus | Format-Table -AutoSize"',
         timeout=60,
     )
-    ctx.log("Retrim complete. Any drive above shows OK health or needs attention.")
+    ctx.log("Retrim pass done. Any drive above shows OK health or needs attention.")
 
 
 def repair_vss_restore_points(ctx: TaskContext):
     """Restart the Volume Shadow Copy service and list writers — fixes
     failing System Restore point creation (complements the Safety Checkpoint task)."""
     ctx.set_status("Restarting Volume Shadow Copy (VSS) service...")
+    # H5: VSS stop often fails (already stopped / access denied) — don't
+    # claim a restart that never happened; the writers list is the proof.
     run_cmd(ctx, "net stop VSS", timeout=60)
-    run_cmd(ctx, "net start VSS", timeout=60)
-    run_cmd(ctx, "vssadmin list writers", timeout=120)
+    if run_cmd(ctx, "net start VSS", timeout=60) != 0:
+        raise RuntimeError("VSS would not start — System Restore stays broken; reboot, then re-run.")
+    if run_cmd(ctx, "vssadmin list writers", timeout=120) != 0:
+        ctx.log("  ! could not list VSS writers (service restarted anyway).")
     ctx.log("VSS restarted and writers listed above (look for [x] Stable).")
 
 
@@ -250,13 +327,38 @@ def repair_network_stack_defaults(ctx: TaskContext):
     Fixes damage left by other 'optimizers' (autotuning disabled causes slow
     downloads on Steam/Epic)."""
     ctx.set_status("Resetting network stack to Windows defaults...")
-    run_cmd(ctx, "netsh winsock reset", timeout=60)
-    run_cmd(ctx, "netsh int ip reset", timeout=60)
-    run_cmd(ctx, "netsh int tcp set global autotuninglevel=normal", timeout=60)
-    run_cmd(ctx, "netsh int tcp set global rss=enabled", timeout=60)
-    run_cmd(ctx, "ipconfig /release", timeout=60)
-    run_cmd(ctx, "ipconfig /renew", timeout=60)
-    run_cmd(ctx, "ipconfig /flushdns", timeout=30)
+    # H5: every step checked — the old fire-and-forget run_cmd calls logged
+    # success even when the stack was untouched.
+    failures: list = []
+    for cmd, to in (("netsh winsock reset", 60),
+                    ("netsh int ip reset", 60),
+                    ("netsh int tcp set global autotuninglevel=normal", 60),
+                    ("netsh int tcp set global rss=enabled", 60)):
+        if run_cmd(ctx, cmd, timeout=to) != 0:
+            failures.append(cmd)
+    # H5-offline risk: release+renew is the dangerous pair — if release
+    # succeeds and renew fails (router down, remote session), the machine
+    # is left without an IP. Check each side; abort loudly on renew failure.
+    if ctx.cancelled():
+        raise RuntimeError("Network reset cancelled by user before DHCP renew.")
+    if run_cmd(ctx, "ipconfig /release", timeout=60) != 0:
+        failures.append("ipconfig /release")
+        ctx.log("  ! DHCP release failed — skipping renew (address left as-is).")
+    else:
+        if run_cmd(ctx, "ipconfig /renew", timeout=120) != 0:
+            raise RuntimeError(
+                "DHCP renew FAILED after release — this PC may be offline. "
+                "Check your router/cable, then run `ipconfig /renew` manually. "
+                "Earlier steps: "
+                + ("all ok" if not failures else f"also failed: {', '.join(failures)}")
+            )
+    if run_cmd(ctx, "ipconfig /flushdns", timeout=30) != 0:
+        failures.append("ipconfig /flushdns")
+    if failures:
+        raise RuntimeError(
+            "Network reset partially failed: " + ", ".join(failures)
+            + ". A reboot is recommended, then re-run this task."
+        )
     ctx.log("Network stack reset to defaults. A reboot is recommended.")
 
 
@@ -284,13 +386,25 @@ def repair_smart_verdict(ctx: TaskContext):
     lines = [l.strip() for l in (out.stdout or "").splitlines() if l.strip() and not l.startswith("#")]
     if len(lines) < 2:
         raise RuntimeError("No drives reported — SMART data unavailable (or storage service disabled).")
+    import csv as _csv
+    import io as _io
     bad = []
     ok_n = 0
-    for row in lines[1:]:
-        parts = [p.strip('"') for p in row.split(",")]
+    seen_any = False
+    # csv module: FriendlyName may itself contain a comma (e.g.
+    # "Samsung SSD 870, EVO") which ConvertTo-Csv quotes — a naive
+    # split(",") would misalign the HealthStatus column.
+    try:
+        reader = _csv.reader(_io.StringIO("\n".join(lines)))
+        header = next(reader, None)
+        rows = list(reader)
+    except Exception:
+        rows = []
+    for parts in rows:
         if len(parts) < 3:
             continue
-        name, media, health = parts[0], parts[1], parts[2]
+        seen_any = True
+        name, media, health = parts[0].strip(), parts[1].strip(), parts[2].strip()
         ctx.log(f"  {name} ({media}): {health}")
         if health and health.lower() != "healthy":
             bad.append(name)
@@ -301,6 +415,8 @@ def repair_smart_verdict(ctx: TaskContext):
             f"Drive health WARNING: {', '.join(bad)} — back up your game library "
             "and saves NOW; a failing drive is the one thing this app can't repair."
         )
+    if not seen_any:
+        raise RuntimeError("Could not parse any drive health rows — check the log.")
     ctx.log(f"VERDICT: all {ok_n} drive(s) Healthy — no action needed.")
 
 
@@ -310,7 +426,7 @@ def repair_gpu_driver_age(ctx: TaskContext):
     year, or older than 6 months with a gentle note. Report-only."""
     ctx.set_status("Checking GPU driver age...")
     import subprocess as _sp
-    from datetime import datetime, timezone
+    from datetime import datetime
     try:
         # A1 fix: PowerShell's ConvertTo-Csv serializes DateTime in the
         # current culture's SHORT-DATE format (on en-US: "7/23/2026 7:00:00
@@ -347,7 +463,10 @@ def repair_gpu_driver_age(ctx: TaskContext):
         except ValueError:
             continue  # genuinely unparsable row — skip it, don't abort
         seen_any = True
-        age_days = (datetime.now(timezone.utc).replace(tzinfo=None) - d).days
+        # M6: WMI DriverDate is local wall-time — compare against local
+        # now, not UTC (the old mix skewed boundary verdicts by the TZ
+        # offset, up to a day near the 365-day threshold).
+        age_days = (datetime.now() - d).days
         ctx.log(f"  {name}: driver dated {d.date()} ({age_days} days old)")
         if age_days > 365:
             stale.append(f"{name} ({age_days // 30} months old)")
@@ -516,20 +635,39 @@ def repair_icon_cache(ctx: TaskContext):
     """Fix blank/white desktop icons: stop Explorer, delete the icon cache
     databases, restart Explorer (verified back — never left without a shell)."""
     ctx.set_status("Rebuilding the icon cache...")
-    run_cmd(ctx, "taskkill /f /im explorer.exe", timeout=15)
     local = os.environ.get("LOCALAPPDATA", "")
-    removed = 0
+    # Gather first so a no-op run never kills Explorer for nothing.
+    # Win10/11 live in Microsoft\Windows\Explorer (iconcache_*.db +
+    # thumbcache_*.db); root IconCache.db is the Win7/8 legacy name.
+    candidates: list = []
     if local and os.path.isabs(local):
         import glob as _glob
-        for path in [os.path.join(local, "IconCache.db")] + \
-                _glob.glob(os.path.join(local, "iconcache_*.db")):
+        explorer_dir = os.path.join(local, "Microsoft", "Windows", "Explorer")
+        for path in ([os.path.join(local, "IconCache.db")]
+                     + _glob.glob(os.path.join(local, "iconcache_*.db"))
+                     + _glob.glob(os.path.join(explorer_dir, "iconcache_*.db"))
+                     + _glob.glob(os.path.join(explorer_dir, "thumbcache_*.db"))):
             try:
                 if os.path.isfile(path):
-                    os.remove(path)
-                    removed += 1
-                    ctx.log(f"Removed stale icon cache: {path}")
-            except OSError as exc:
-                ctx.log(f"  (kept {path}: {exc})")
+                    candidates.append(path)
+            except OSError:
+                continue
+    if not candidates:
+        ctx.log("  ! No icon-cache databases found — nothing to clear, Explorer left running.")
+        return
+    # Files are locked by the running shell, so Explorer must go down first.
+    run_cmd(ctx, "taskkill /f /im explorer.exe", timeout=15)
+    removed = 0
+    for path in candidates:
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+                removed += 1
+                ctx.log(f"Removed stale icon cache: {path}")
+        except OSError as exc:
+            ctx.log(f"  (kept {path}: {exc})")
+    if removed == 0:
+        ctx.log("  ! Icon-cache files reappeared or stayed locked — restarting Explorer anyway.")
     if not restart_explorer(ctx):
         ctx.log("  ! Explorer did not come back on its own — press Ctrl+Shift+Esc, File > Run, type explorer.exe")
     else:
@@ -542,6 +680,168 @@ def repair_store_cache_reset(ctx: TaskContext):
     ctx.set_status("Resetting the Store download cache (wsreset)...")
     run_cmd_checked(ctx, "wsreset.exe", timeout=600, success_codes=(0,))
     ctx.log("Store cache reset — reopen the Store and retry the download.")
+
+
+def repair_restart_explorer(ctx: TaskContext):
+    """Restart Explorer (taskbar, desktop, Start menu) — the classic
+    fix for a frozen/garbled shell without rebooting. The race-hardened
+    restart_explorer() helper (app.utils) kills, WAITS for full exit,
+    respawns with retries, and verifies the new shell survives; this
+    task just exposes it as a one-click Repair. Open windows stay open
+    (they are separate processes); tray icons of dead apps may vanish —
+    that is Explorer behavior, not a failure."""
+    ctx.set_status("Restarting Explorer (taskbar will disappear and return)...")
+    if not restart_explorer(ctx):
+        raise RuntimeError(
+            "Explorer did not come back on its own. Press Ctrl+Shift+Esc, "
+            "click File > Run new task, type explorer.exe and press Enter."
+        )
+    ctx.log("Explorer restarted — taskbar and desktop are back.")
+
+
+def restart_camera_devices(ctx: TaskContext):
+    """Power-cycle webcam devices — the streamer's fix for a camera that
+    shows a black feed, wrong resolution, or 'camera in use' after a
+    crash, without rebooting. Disables then re-enables every present
+    Camera/Image-class PnP device (that is exactly what 'unplug and
+    replug' does electrically).
+
+    Honesty contract (restart_bluetooth_stack pattern): a PC with no
+    camera reports 'nothing found' — never a silent fake success. Apps
+    must re-open the camera afterwards (they hold the old handle)."""
+    ctx.set_status("Restarting camera devices...")
+    ps = (
+        "$ErrorActionPreference='Stop';"
+        "$cams = Get-PnpDevice -PresentOnly | Where-Object "
+        "{ ($_.Class -eq 'Camera') -or ($_.Class -eq 'Image') -or "
+        "($_.FriendlyName -like '*webcam*') };"
+        "if (-not $cams) { Write-Output 'NO_CAMERAS'; exit 0 };"
+        "$failed = 0;"
+        "foreach ($c in $cams) {"
+        "  try {"
+        "    Disable-PnpDevice -InstanceId $c.InstanceId -Confirm:$false -ErrorAction Stop;"
+        "    Start-Sleep -Milliseconds 800;"
+        "    Enable-PnpDevice -InstanceId $c.InstanceId -Confirm:$false -ErrorAction Stop;"
+        "    Write-Output ('RESTARTED: ' + $c.FriendlyName);"
+        "  } catch { $failed++; Write-Output ('FAILED: ' + $c.FriendlyName) }"
+        "};"
+        "if ($failed -gt 0) { exit 3 } else { exit 0 }"
+    )
+    _cam_out: list = []
+    rc = run_cmd(ctx, ["powershell", "-NoProfile", "-Command", ps],
+                 shell=False, timeout=180, collect=_cam_out)
+    if "NO_CAMERAS" in " ".join(_cam_out):
+        raise RuntimeError(
+            "No camera found on this PC — nothing to restart "
+            "(check Settings > Bluetooth & devices > Cameras)."
+        )
+    if rc == 3:
+        raise RuntimeError(
+            "One or more cameras could not be power-cycled — they may be in use. "
+            "Close Zoom/Discord/OBS and try again."
+        )
+    if rc != 0:
+        raise RuntimeError(f"Camera restart failed (exit code {rc}) — see the log.")
+    ctx.log("Cameras power-cycled. Re-open the camera in your app (old handles die with the restart).")
+
+
+def run_defender_quick_scan(ctx: TaskContext):
+    """One-click Defender quick scan via MpCmdRun (the same engine the
+    Security app uses, minus the GUI). Catches active malware behind
+    'game won't launch' / random-crash symptoms. Quick scan = memory +
+    startup items + common hideouts (minutes, not hours). MpCmdRun exit
+    codes: 0 = clean, 2 = THREATS FOUND (that is SUCCESS at finding —
+    the log says so, never reported as a tool failure). Anything else
+    fails honestly (Defender disabled by third-party AV = the usual
+    0x800106B9 family)."""
+    import os as _os
+    ctx.set_status("Scanning for viruses (quick scan, a few minutes)...")
+    mpcmd = None
+    pf = _os.environ.get("ProgramFiles", r"C:\Program Files")
+    for candidate in (
+        _os.path.join(pf, "Windows Defender Advanced Threat Protection") + "\\MpCmdRun.exe",
+        _os.path.join(pf, "Windows Defender") + "\\MpCmdRun.exe",
+        _os.path.join(_os.environ.get("ProgramFiles(x86)", pf), "Windows Defender") + "\\MpCmdRun.exe",
+    ):
+        if _os.path.isfile(candidate):
+            mpcmd = candidate
+            break
+    if not mpcmd:
+        raise RuntimeError(
+            "Defender's scanner (MpCmdRun.exe) was not found — Defender is "
+            "likely disabled by a third-party antivirus. Use your AV's own scan."
+        )
+    rc = run_cmd(ctx, f'"{mpcmd}" -Scan -ScanType 1', timeout=3600)
+    if rc == 0:
+        ctx.log("Quick scan complete — no threats found.")
+        return
+    if rc == 2:
+        ctx.log("  ! Threats were FOUND and handled by Defender.")
+        ctx.log("Open Windows Security > Protection history to review and remove them.")
+        return
+    raise RuntimeError(
+        f"Quick scan did not run (exit code {rc}) — a third-party antivirus "
+        "is probably managing this PC, or Defender is turned off."
+    )
+
+
+def find_power_drains(ctx: TaskContext):
+    """LAPTOPS ONLY (user ruling 2026-09-06): run `powercfg /energy`, the
+    60-second diagnostic that reports exactly what keeps the machine
+    awake / drains its battery (background apps blocking sleep, power
+    requests, timeout misconfigurations). The HTML report lands in %TEMP%
+    and is opened in the browser.
+
+    Gated on battery presence via Win32_Battery: desktop PCs (no battery)
+    get an honest skip — /energy findings are about battery/sleep, which
+    desktops don't have. (A UPS can appear as a battery; harmless — the
+    report is still valid.)
+
+    Honesty: powercfg /energy returns non-zero on some builds even when
+    the report was written; success is judged by the report FILE existing."""
+    import os as _os
+    import subprocess as _sp
+    ctx.set_status("Checking power drains (60 seconds — leave the PC idle)...")
+    # battery gate — TaskSkipped, not an error: a desktop isn't wrong,
+    # this check just isn't for it
+    try:
+        _proc = _sp.run(
+            ["powershell", "-NoProfile", "-Command",
+             "if (Get-CimInstance Win32_Battery) { 'yes' } else { 'no' }"],
+            capture_output=True, text=True, timeout=30,
+            creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
+        )
+        has_battery = "yes" in (_proc.stdout or "")
+    except Exception:
+        has_battery = True  # can't tell — don't block the task on the probe
+    if not has_battery:
+        from app.utils import TaskSkipped
+        raise TaskSkipped(
+            "Laptops only — this PC has no battery, so there is nothing "
+            "to drain (desktops don't sleep on battery)."
+        )
+    out_dir = _os.environ.get("TEMP", _os.environ.get("TMP", "."))
+    report = _os.path.join(out_dir, "cleaner-energy-report.html")
+    try:
+        if _os.path.exists(report):
+            _os.remove(report)
+    except OSError:
+        pass
+    run_cmd(ctx, f'powercfg /energy /output "{report}"', timeout=180)
+    if not _os.path.exists(report):
+        # powercfg writes energy-report(1).html when /output is misquoted
+        # on localized builds — fall back to the default name
+        fallback = _os.path.join(out_dir, "energy-report.html")
+        if _os.path.exists(fallback):
+            report = fallback
+        else:
+            raise RuntimeError(
+                "powercfg /energy did not produce a report — try running "
+                "the app as Administrator."
+            )
+    ctx.log(f"Energy report saved: {report}")
+    _sp.Popen(["cmd", "/c", "start", "", report], creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0))
+    ctx.log("Opening the report — see 'Power Efficiency Diagnostics' errors/warnings for your drains.")
 
 
 def repair_enable_system_restore(ctx: TaskContext):
@@ -572,8 +872,12 @@ def repair_teredo(ctx: TaskContext):
     default server). No firewall or router changes; harmless on PCs
     without Xbox networking."""
     ctx.set_status("Resetting Teredo for Xbox multiplayer networking...")
-    run_cmd(ctx, "netsh interface teredo set state enterpriseclient", timeout=60)
-    run_cmd(ctx, "netsh interface teredo set state servername=default", timeout=60)
+    # H5: both sets must land — a half-reset Teredo still fails qualification.
+    _fails = [c for c in ("netsh interface teredo set state enterpriseclient",
+                          "netsh interface teredo set state servername=default")
+              if run_cmd(ctx, c, timeout=60) != 0]
+    if _fails:
+        raise RuntimeError(f"Teredo reset failed ({len(_fails)}/2 commands) — retry as Administrator.")
     ctx.log("Teredo reset to defaults — retry the Xbox party/game invite.")
 
 
@@ -695,6 +999,10 @@ TASKS = [
     Task("gpu_reset", "Restart Graphics Driver", "Fixes black screens and resolution bugs instantly, no reboot", reset_graphics_driver, default=False, admin_required=False, column=1),
     Task("anticheat_repair", "Fix Anti-Cheat Errors", "Resets EasyAntiCheat and BattlEye to fix launch errors like 30005", repair_anticheat_services, default=False, admin_required=True, column=1),
     Task("icon_cache", "Fix Blank Icons", "Rebuilds the icon cache that causes blank or white desktop icons", repair_icon_cache, default=False, admin_required=False, column=1),
+    Task("restart_explorer", "Restart Explorer", "Fixes a frozen taskbar, desktop or Start menu without rebooting", repair_restart_explorer, default=False, admin_required=False, column=1),
+    Task("restart_camera", "Restart Camera (Webcam)", "Power-cycles your webcam to fix black feeds and 'camera in use' errors", restart_camera_devices, default=False, admin_required=True, column=1),
+    Task("defender_quick_scan", "Run Security Scan", "Quick Defender virus scan for the malware behind game crashes", run_defender_quick_scan, default=False, admin_required=False, column=0),
+    Task("power_drains", "Find Power Drains (Laptops)", "Finds what's draining your battery and blocking sleep — opens a report", find_power_drains, default=False, admin_required=True, column=0),
     Task("wsreset_store", "Reset Store Downloads", "Resets the Store cache when app downloads fail or hang", repair_store_cache_reset, default=False, admin_required=False, column=1),
     Task("enable_restore", "Turn On System Protection", "Re-enables restore points on C: if something turned them off", repair_enable_system_restore, default=False, admin_required=True, column=0),
     Task("power_plans", "Reset Power Plans", "Restores Microsoft's default power plans when optimizers break them", repair_power_plans, default=False, admin_required=True, column=0),

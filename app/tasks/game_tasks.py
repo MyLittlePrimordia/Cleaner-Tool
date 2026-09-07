@@ -13,6 +13,7 @@ Tasks:
 import os
 
 from app.utils import TaskContext, clean_folder_contents
+from app.tasks import launcher_paths as _lp
 from app.tasks.launcher_paths import (
     GAMER_LAUNCHER_ALL,
     GAME_FILES_ALL,
@@ -38,6 +39,24 @@ def _desktop_dir() -> str:
         return os.path.join(os.environ.get("USERPROFILE", ""), "Desktop")
 
 
+def _shell_dir(name: str, fallback: str) -> str:
+    """Known-folder path with OneDrive redirection (F-4): Documents is
+    OneDrive-redirected by default on new Win11 profiles, so a saves backup
+    built from USERPROFILE\\Documents would silently miss My Games. Same
+    technique as _desktop_dir, with the given profile-relative fallback."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders") as k:
+            raw, _ = winreg.QueryValueEx(k, name)
+            resolved = os.path.expandvars(raw)
+            if resolved and os.path.isabs(resolved):
+                return resolved
+    except OSError:
+        pass
+    return fallback
+
+
 def backup_game_saves(ctx: TaskContext):
     """Zip known save locations to the Desktop, timestamped. Read-only on
     sources; creates ONE file; deletes nothing — the safety net that pairs
@@ -51,8 +70,15 @@ def backup_game_saves(ctx: TaskContext):
     from datetime import datetime
 
     sources = [
-        (os.path.join(os.environ.get("USERPROFILE", ""), "Saved Games"), "Saved Games"),
-        (os.path.join(os.environ.get("USERPROFILE", ""), "Documents", "My Games"), "My Games"),
+        # F-4: resolve the real known-folder paths — OneDrive-redirected
+        # profiles keep Saved Games / Documents under OneDrive, and a
+        # USERPROFILE-relative path would silently miss the saves this
+        # backup exists to protect.
+        (_shell_dir("{4C5C32FF-BB9D-43B0-B5B4-2D72E54EAAA4}",
+                    os.path.join(os.environ.get("USERPROFILE", ""), "Saved Games")), "Saved Games"),
+        (os.path.join(_shell_dir("Personal",
+                                 os.path.join(os.environ.get("USERPROFILE", ""), "Documents")),
+                      "My Games"), "My Games"),
         (os.path.join(os.environ.get("APPDATA", ""), ".minecraft", "saves"), "Minecraft"),
         # extend with verified per-game roots only, per launcher_paths.py's
         # 'verified live' policy: a wrong folder just bloats the zip, but a
@@ -123,6 +149,10 @@ def _clean_files(ctx: TaskContext, files, label):
     """Remove individual files (e.g. launcher_log.txt) and count freed bytes."""
     total = 0
     for f in files:
+        # F-3: honor Stop here too — the Unity Player.log sweep can list
+        # hundreds of files on Unity-heavy machines; leave the rest in place.
+        if ctx.cancelled():
+            break
         if not f or not os.path.isabs(f) or not os.path.isfile(f):
             continue
         try:
@@ -138,6 +168,9 @@ def _clean_files(ctx: TaskContext, files, label):
 def clean_gamer_launchers(ctx: TaskContext):
     # M5 fix: log line now matches GAMER_LAUNCHER_ALL's real contents
     # (Slack/Teams/Spotify are actually included now, see launcher_paths.py).
+    # M12: refresh glob/listdir discoveries at clean time (lists mutate in
+    # place, so the imported names below observe the refresh).
+    _lp.refresh_dynamic_paths()
     ctx.log("Cleaning gamer launchers (Steam, Epic, EA, GOG, Battle.net, Riot, Ubisoft,")
     ctx.log("Discord, Xbox, Rockstar, Amazon, itch, Humble, Wargaming, Nexon, Slack, Teams, Spotify)")
     return _clean_many(ctx, GAMER_LAUNCHER_ALL, "launcher cache")
@@ -149,6 +182,8 @@ def clean_game_files(ctx: TaskContext):
 
     Only touches logs, crash dumps, web caches and shader caches — never saves.
     """
+    # M12: fresh Unity/LocalLow + Minecraft discoveries (in-place refresh).
+    _lp.refresh_dynamic_paths()
     ctx.log("Cleaning game files (verified top titles, Minecraft, CurseForge, OBS,")
     ctx.log("Streamlabs, Logitech G Hub, Razer, Roblox, Unreal/Unity engine caches,")
     ctx.log("Unity Player.log sweep)")

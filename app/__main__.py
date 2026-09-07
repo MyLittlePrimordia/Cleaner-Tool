@@ -51,9 +51,14 @@ _enable_dpi_awareness()
 if __package__ in (None, ""):
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from app.gui import launch  # noqa: E402
 from app.config_persist import load_config  # noqa: E402
 from app.scheduler import run_auto_clean, run_auto_update  # noqa: E402
+# M16: gui (4785-line Tk import) used to load even for headless
+# --auto-clean/--auto-update runs that never create a window. Import it
+# lazily inside main() so the scheduler stays light and decoupled from Tk.
+def _launch_gui():
+    from app.gui import launch as _launch  # noqa: E402
+    _launch()
 
 # Signal elevated startup early (for elevation coordination), but only on Windows
 # and after imports so --elevation-token is already in sys.argv.
@@ -70,19 +75,25 @@ def main():
         print("This application is designed for Windows only.")
         return
 
-    # Handle --auto-clean flag (called from Windows Task Scheduler)
-    if "--auto-clean" in sys.argv:
-        config = load_config()
-        selected = config.get("selected_tasks", {})
-        success, summary = run_auto_clean(selected)
-        sys.exit(0 if success else 1)
+    # M16: both flags present used to silently drop --auto-update (first
+    # `if` won). Run both in order when combined.
+    want_clean = "--auto-clean" in sys.argv
+    want_update = "--auto-update" in sys.argv
+    if want_clean or want_update:
+        code = 0
+        if want_clean:
+            config = load_config()
+            selected = config.get("selected_tasks", {})
+            success, summary = run_auto_clean(selected)
+            print(f"[AUTO] clean: {summary}")
+            code |= 0 if success else 1
+        if want_update:
+            success, summary = run_auto_update()
+            print(f"[AUTO] update: {summary}")
+            code |= 0 if success else 1
+        sys.exit(code)
 
-    # Handle --auto-update flag (scheduled 'Update Everything' run)
-    if "--auto-update" in sys.argv:
-        success, summary = run_auto_update()
-        sys.exit(0 if success else 1)
-
-    launch()
+    _launch_gui()
 
 
 if __name__ == "__main__":

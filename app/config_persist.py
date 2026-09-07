@@ -55,6 +55,22 @@ _LEGACY_GAMES_TO_CLEAN = {
 _LEGACY_CUT_KEYS = {"adv_memory_integrity", "adv_vmp", "wpbt_disable"}
 
 
+def _legacy_key_resolves(key: str) -> "bool | None":
+    """True/False when the live task tables can decide whether `key` is a
+    real task; None when the tables can't be imported (import-time
+    circularity guard — config_persist must stay import-light)."""
+    try:
+        from app.tasks import clean_tasks, repair_tasks, tweak_tasks, game_tasks, advanced_tasks
+        known = ({t.key for t in clean_tasks.TASKS}
+                 | {t.key for t in game_tasks.TASKS}
+                 | {t.key for t in repair_tasks.TASKS}
+                 | {t.key for t in tweak_tasks.TASKS}
+                 | {t.key for t in advanced_tasks.TASKS})
+        return key in known
+    except Exception:
+        return None
+
+
 def _migrate_selected_tasks(data: dict) -> dict:
     """Fold legacy 5-tab selected_tasks into the 3-tab layout, in place."""
     st = data.get("selected_tasks")
@@ -65,10 +81,25 @@ def _migrate_selected_tasks(data: dict) -> dict:
     # audit fix (probe-confirmed): a hand-edited config could store a task
     # list as a plain string ("gamer_launchers") — iterating it scattered
     # per-character keys ['g','a','m','e','r',...] into the list. Coerce
-    # every tab's list to an actual list of strings first.
-    for tab_name in ("Clean", "Tweak"):
+    # every tab's list to an actual list of strings first (H8: Repair was
+    # missing, so a Repair string still scattered).
+    for tab_name in ("Clean", "Repair", "Tweak"):
         if isinstance(st.get(tab_name), str):
             st[tab_name] = [st[tab_name]]
+    # F-6 audit fix: 'Game' is the pre-release singular spelling of the old
+    # Games tab (observed in a live config) — fold it exactly like 'Games'.
+    # 'Install' keys were persisted by an older GUI but resolve in no tab
+    # the scheduler knows; keep them (scheduler tolerates unknown keys)
+    # unless the live task tables say the key is dead — then drop the cruft
+    # instead of silently carrying it forever. When the tables cannot be
+    # imported (import-time migration), leave the list untouched — the
+    # scheduler's tolerant resolver keeps behavior identical to before.
+    if "Game" in st and "Games" not in st:
+        st["Games"] = st.pop("Game")
+    elif "Game" in st:
+        merged = st.pop("Game") or []
+        existing = st.get("Games") or []
+        st["Games"] = list(existing) + [k for k in merged if k not in existing]
     for legacy_tab in ("Games", "Advanced"):
         keys = st.pop(legacy_tab, []) or []
         if isinstance(keys, str):
@@ -84,6 +115,20 @@ def _migrate_selected_tasks(data: dict) -> dict:
                     continue
                 if key not in tweak:
                     tweak.append(key)
+    if "Install" in st:
+        kept = []
+        for key in st.pop("Install") or []:
+            if isinstance(key, str) and key:
+                resolves = _legacy_key_resolves(key)
+                if resolves is not False:
+                    kept.append(key)
+        # Keys that resolve (or can't be checked — import-time migration)
+        # go to Tweak so a live scheduler can still run them via its
+        # Advanced-alias table; keys the live task tables say are dead are
+        # dropped instead of silently carried forever.
+        for key in kept:
+            if key not in tweak:
+                tweak.append(key)
     return data
 
 # In-memory cache
@@ -107,8 +152,17 @@ def _quarantine_corrupt_config(exc: Exception) -> None:
     except Exception:
         target = None
     where = f"quarantined to {target}" if target else "could NOT be moved aside (keeping it in place)"
-    print(f"[CleanerTool] config_persist: {CONFIG_FILE} is corrupt or unreadable "
-          f"({type(exc).__name__}: {exc}) — {where}. Starting with defaults.", file=sys.stderr)
+    # M15: sys.stderr can be None/closed in pythonw or the windowed frozen
+    # exe — an unguarded print would raise out of the corrupt-config handler
+    # and crash startup on exactly the case it was meant to survive.
+    try:
+        stream = sys.stderr if getattr(sys, "stderr", None) is not None else None
+        if stream is None:
+            return
+        print(f"[CleanerTool] config_persist: {CONFIG_FILE} is corrupt or unreadable "
+              f"({type(exc).__name__}: {exc}) — {where}. Starting with defaults.", file=stream)
+    except Exception:
+        pass
 
 
 def _load_config_from_disk() -> dict:
@@ -131,6 +185,15 @@ def _load_config_from_disk() -> dict:
                 for tab in DEFAULT_CONFIG["selected_tasks"]:
                     data["selected_tasks"].setdefault(tab, [])
                 _migrate_selected_tasks(data)
+            # H8/H9: validate the tweak-state containers — a hand-edited
+            # string here would scatter per-character badge keys in
+            # get_tweak_state(). Coerce junk back to empty defaults.
+            if not isinstance(data.get("applied_tweaks"), list):
+                data["applied_tweaks"] = []
+            else:
+                data["applied_tweaks"] = [t for t in data["applied_tweaks"] if isinstance(t, str)]
+            if not isinstance(data.get("tweak_snapshots"), dict):
+                data["tweak_snapshots"] = {}
             return data
         except FileNotFoundError:
             pass  # file vanished between exists() and open() — treat as missing
@@ -160,8 +223,16 @@ def save_config(config: dict) -> None:
     # variable that never existed anywhere else — removed.)
     with _config_lock:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        # Use .json.tmp to avoid with_suffix clobbering (config.json -> config.tmp)
-        tmp = CONFIG_FILE.with_name(CONFIG_FILE.name + ".tmp")
+        # audit fix (H9): a fixed name (config.json.tmp) let the GUI process
+        # and a concurrent --auto-clean/--auto-update process interleave —
+        # A writes its tmp, B overwrites the same tmp path, then A's
+        # os.replace wins with B's bytes (or vice versa), silently dropping
+        # whichever write lost the race. Make the tmp name unique per
+        # writer (pid + a random token) so two processes never touch the
+        # same file; only the final os.replace (atomic on the same volume)
+        # decides what lands in config.json.
+        import secrets
+        tmp = CONFIG_FILE.with_name(f"{CONFIG_FILE.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
         # Write to temp
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2)
@@ -195,6 +266,30 @@ def save_config(config: dict) -> None:
         _config_cache = copy.deepcopy(config)
 
 
+def update_config(mutate) -> dict:
+    """Atomically load, mutate, and save the config under a single lock hold.
+
+    audit fix (H9): every read-modify-write helper below used to call
+    load_config() (acquire lock, copy, release) and save_config() (acquire
+    lock again) as two separate steps, with the lock released in between.
+    The GUI's main thread and its worker thread call these concurrently
+    (e.g. mark_tweak_applied after a run finishes while another tweak's
+    apply/revert is snapshotting), so a load-mutate-save on one thread
+    could be clobbered by the other's save landing in between — a lost
+    update. `mutate` receives the live config dict and mutates it in
+    place (or returns a replacement); the load, mutate, and save all
+    happen while _config_lock is held, so no other config read/write can
+    interleave. Returns the config actually saved.
+    """
+    with _config_lock:
+        cfg = load_config()
+        result = mutate(cfg)
+        if result is not None:
+            cfg = result
+        save_config(cfg)
+        return cfg
+
+
 # --------------------------------------------------------------------------- #
 # Tweak snapshot helpers — real pre-tweak values for accurate revert
 # --------------------------------------------------------------------------- #
@@ -212,22 +307,25 @@ def save_tweak_snapshot(task_id: str, values: dict) -> None:
     apply (which would just re-snapshot the tweak's own output)."""
     if not values:
         return
-    cfg = load_config()
-    snapshots = cfg.setdefault("tweak_snapshots", {})
-    if task_id in snapshots and snapshots[task_id]:
-        return
-    snapshots[task_id] = values
-    save_config(cfg)
+
+    def _mutate(cfg):
+        snapshots = cfg.setdefault("tweak_snapshots", {})
+        if task_id in snapshots and snapshots[task_id]:
+            return None
+        snapshots[task_id] = values
+
+    update_config(_mutate)
 
 
 def clear_tweak_snapshot(task_id: str) -> None:
     """Drop a tweak's saved snapshot after a successful revert, so the next
     apply starts capturing fresh again."""
-    cfg = load_config()
-    snapshots = cfg.get("tweak_snapshots", {})
-    if task_id in snapshots:
-        del snapshots[task_id]
-        save_config(cfg)
+    def _mutate(cfg):
+        snapshots = cfg.get("tweak_snapshots", {})
+        if task_id in snapshots:
+            del snapshots[task_id]
+
+    update_config(_mutate)
 
 
 # --------------------------------------------------------------------------- #
@@ -243,19 +341,21 @@ def clear_tweak_snapshot(task_id: str) -> None:
 # get_tweak_state() merges both in a single config load.
 
 def mark_tweak_applied(task_id: str) -> None:
-    cfg = load_config()
-    applied = cfg.setdefault("applied_tweaks", [])
-    if task_id not in applied:
-        applied.append(task_id)
-        save_config(cfg)
+    def _mutate(cfg):
+        applied = cfg.setdefault("applied_tweaks", [])
+        if task_id not in applied:
+            applied.append(task_id)
+
+    update_config(_mutate)
 
 
 def mark_tweak_reverted(task_id: str) -> None:
-    cfg = load_config()
-    applied = cfg.get("applied_tweaks", [])
-    if task_id in applied:
-        applied.remove(task_id)
-        save_config(cfg)
+    def _mutate(cfg):
+        applied = cfg.get("applied_tweaks", [])
+        if task_id in applied:
+            applied.remove(task_id)
+
+    update_config(_mutate)
 
 
 def get_tweak_state() -> dict:

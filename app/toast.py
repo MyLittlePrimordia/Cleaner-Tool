@@ -58,15 +58,23 @@ def show_toast(title: str, message: str, duration: str = "short"):
         return False
 
 
-def notify_clean_complete(freed_bytes: int, task_count: int, failed: int = 0):
+def notify_clean_complete(freed_bytes: int, task_count: int, failed: int = 0,
+                          skipped: int = 0):
     """Show toast for a finished Clean run. The copy is truthful about
     failures (audit minor 3: this used to say 'Clean Complete' even when
-    every task failed)."""
+    every task failed). `skipped` (nothing-to-do on this PC) is reported
+    too, so an all-skipped run doesn't toast a bare "0 tasks finished".
+
+    NOTE: returncode==0 from the PowerShell host only means the COM call
+    was issued — notifications-disabled / Focus Assist / dropped delivery
+    still return 0. Best-effort, no delivery guarantee.
+    """
     from app.utils import format_bytes
+    skip_copy = f" ({skipped} skipped — already clean)" if skipped and not failed else ""
     if not failed:
         show_toast(
             "Cleaner Tool - Clean Complete",
-            f"{task_count} tasks finished. Freed {format_bytes(freed_bytes)}.",
+            f"{task_count} tasks finished. Freed {format_bytes(freed_bytes)}.{skip_copy}",
             "short"
         )
     elif task_count:

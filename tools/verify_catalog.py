@@ -164,7 +164,14 @@ def main() -> int:
         print(f"report -> {REPORT}", flush=True)
     except Exception as exc:
         print(f"could not write report: {exc}", flush=True)
+    # M14: a skipped live check (winget absent) used to be filtered out of
+    # `bad`, printing VERIFY: ALL PASS with exit 0 — CI green-lighting a
+    # check that never ran. Report it distinctly with exit 2.
+    aborted = [p for p in (live_problems if live else []) if p.startswith("LIVE ABORTED")]
     bad = [p for p in (off + (live_problems if live else [])) if not p.startswith("LIVE ABORTED")]
+    if aborted and not bad:
+        print("VERIFY: ABORTED (live check skipped — winget unavailable)", flush=True)
+        return 2
     print("VERIFY: ALL PASS" if not bad else f"VERIFY: {len(bad)} PROBLEM(S)", flush=True)
     return 1 if bad else 0
 

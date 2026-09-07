@@ -985,8 +985,20 @@ class AnimatedProgressBar(tk.Canvas):
         self._draw()
 
     def set_indeterminate(self, on: bool):
+        # M10: a second set_indeterminate(True) without an intervening
+        # False used to start a second _shimmer_loop, orphaning the first
+        # (double speed + one un-cancellable timer). Re-entry is a no-op;
+        # a fresh start cancels any in-flight tick first.
+        if on and self._indeterminate and getattr(self, "_shimmer_after", None) is not None:
+            return
         self._indeterminate = on
         if on:
+            try:
+                if getattr(self, "_shimmer_after", None) is not None:
+                    self.after_cancel(self._shimmer_after)
+                    self._shimmer_after = None
+            except Exception:
+                pass
             self._shimmer_loop()
         # audit fix (minor): turning it off left the last scheduled
         # _shimmer_loop after() running one more frame (and redrawing the
@@ -1198,6 +1210,25 @@ class ScrollableRoundedPanel(tk.Canvas):
 
     def view_height(self):
         return max(1, self.winfo_height() - self.INSET_Y * 2)
+
+    def remap_children(self):
+        """Force the canvas-window child (self.inner) to (re)map.
+
+        Tk quirk (reproduced minimal, 2026-09-06): a frame embedded via
+        create_window() does NOT remap when an ANCESTOR of the canvas is
+        pack_forget()ten and re-pack()ed — the canvas maps again but the
+        embedded window stays unmapped forever (winfo_ismapped()==0), so
+        the body cache's re-shown grids rendered BLANK and every filter
+        check on their rows saw nothing. Re-asserting the item's
+        geometry (coords + itemconfigure) forces Tk through the geometry
+        pass that remaps the embedded frame. Called by _build_body on
+        every cache-hit re-show; cheap (two canvas ops, no rebuild)."""
+        try:
+            w = self.winfo_width()
+            self.itemconfigure(self._win, width=max(10, w - self.INSET_X - self.SB_W - 2))
+            self.coords(self._win, self.INSET_X, self.INSET_Y)
+        except Exception:
+            pass
 
     @property
     def scroll_enabled(self):
@@ -1604,15 +1635,51 @@ class TaskTab(tk.Frame):
         self.vars must follow the SHOWN body: each cached body remembers
         its own var dict (custom and undo bodies have different var sets),
         and showing a cached body restores its dict — otherwise Run would
-        read the previous mode's vars (bug caught by the layout test)."""
+        read the previous mode's vars (bug caught by the layout test).
+
+        F8 (user bug report 2026-09-06: 'the Custom filter search box does
+        nothing'): the cache-hit path restored ONLY vars. _cell_blocks /
+        _cells still pointed at whatever grid was built LAST (the preset
+        summary, or another mode's grid), so the filter's grid_remove()s
+        landed on a HIDDEN grid while the visible one never changed —
+        'it still shows all the toggles'. The cache now stores the full
+        (vars, cells, cell_blocks) tuple and every cache hit restores all
+        three, so _cell_blocks always describes the SHOWN body."""
         # hide all cached bodies
         for w in self.body_area.winfo_children():
             w.pack_forget()
         cache_key = self.mode if self.mode != "preset" else f"preset:{self._selected_preset}"
         if cache_key in self._body_cache:
             self._body_cache[cache_key].pack(fill="both", expand=True)
+            # F8b: pack_forget/pack of a body whose panel embeds content
+            # via create_window() leaves the embedded frame UNMAPPED (Tk
+            # quirk — see ScrollableRoundedPanel.remap_children). The
+            # re-assert must run AFTER the repack's geometry settles
+            # (itemconfigure issued pre-mapping is ignored by Tk —
+            # reproduced minimal, 2026-09-06), so it rides the idle
+            # queue, one event-loop turn later.
+            _panel_fix = None
+            for _w in self._body_cache[cache_key].winfo_children():
+                if isinstance(_w, ScrollableRoundedPanel):
+                    _panel_fix = _w
+                    break
+            if _panel_fix is not None:
+                def _remap(_p=_panel_fix):
+                    try:
+                        if _p.winfo_exists():
+                            _p.remap_children()
+                    except Exception:
+                        pass
+                try:
+                    _panel_fix.after_idle(_remap)
+                except Exception:
+                    pass
             if cache_key in self._body_vars:
-                self.vars = self._body_vars[cache_key]
+                cached = self._body_vars[cache_key]
+                if isinstance(cached, tuple) and len(cached) == 3:
+                    self.vars, self._cells, self._cell_blocks = cached
+                else:
+                    self.vars = cached   # legacy shape — defensive
             return
         wrap = tk.Frame(self.body_area, bg=COLORS["bg"])
         self._body_cache[cache_key] = wrap
@@ -1623,15 +1690,30 @@ class TaskTab(tk.Frame):
             self._build_toggle_grid(wrap, mode="run")
         else:
             self._build_toggle_grid(wrap, mode="undo")
-        # builders refresh self.vars — remember it as this body's dict
+        # builders refresh self.vars — remember this body's FULL grid
+        # state (F8) so a later cache hit can restore all of it
         if self.mode != "preset":
-            self._body_vars[cache_key] = self.vars
+            self._body_vars[cache_key] = (self.vars, self._cells, self._cell_blocks)
 
     def _clear_body_cache(self):
         """Drop cached bodies (called when tab's tasks/state change — undo
-        badges depend on live tweak state)."""
+        badges depend on live tweak state). MUST run on the Tk thread: it
+        destroys widgets (worker-thread Tcl calls are unsafe) and the old
+        dict-drop-only version leaked every cached wrap as a hidden child
+        of body_area on each run. Rebuilds the visible mode immediately so
+        the panel never shows blank and badges reflect post-run state."""
+        for wrap in list(self._body_cache.values()):
+            try:
+                if wrap is not None and wrap.winfo_exists():
+                    wrap.destroy()
+            except Exception:
+                pass
         self._body_cache = {}
         self._body_vars = {}
+        try:
+            self._build_body()
+        except Exception:
+            pass
 
     def _prewarm_body(self, mode: str) -> bool:
         """F6(b): build one body (custom/undo) into the cache WITHOUT
@@ -1658,7 +1740,10 @@ class TaskTab(tk.Frame):
             wrap = tk.Frame(self.body_area, bg=COLORS["bg"])
             self._body_cache[mode] = wrap
             self._build_toggle_grid(wrap, mode="run" if mode == "custom" else "undo")
-            self._body_vars[mode] = self.vars
+            # F8: store the FULL grid state — vars alone left _cell_blocks
+            # stale on the cache-hit path, which is exactly why the Custom
+            # filter search box appeared dead (it filtered a hidden grid).
+            self._body_vars[mode] = (self.vars, self._cells, self._cell_blocks)
             # the hidden wrap measures ~1px wide, so labels were wrapped to
             # the narrow fallback — the grid's own debounced <Configure>
             # refit (_fit_toggle_labels) re-wraps them to the real column
@@ -1809,10 +1894,15 @@ class TaskTab(tk.Frame):
                  fg=COLORS["subtext"]).pack(side="left", padx=10)
         # search filter (user request: find one option among dozens fast) —
         # rounded corners, centered in the leftover space (user request)
+        #
+        # F8 (user bug: the filter 'did nothing'): the trace used to call
+        # _apply_toggle_filter which read self._cell_blocks LIVE — shared
+        # mutable state pointing at whatever grid was built last. This box's
+        # grid is `blocks` (built below in THIS method), so the trace now
+        # passes THIS grid's blocks explicitly; the filter can never again
+        # operate on a stale/hidden grid while the visible one ignores it.
         _ph = f"Filter {len(self.tasks)} options…"
         _sv = tk.StringVar(value=_ph)
-        _sv.trace_add("write", lambda *_: self._apply_toggle_filter(
-            _sv.get().strip(), _ph, mode))
         _mid = tk.Frame(topbar, bg=COLORS["bg"])
         _mid.pack(side="left", expand=True, fill="x")
         _re = RoundedEntry(_mid, textvariable=_sv, width=20, accent=accent)
@@ -1940,6 +2030,13 @@ class TaskTab(tk.Frame):
         _fit_toggle_labels()
         panel.resize_decide_cb = None
         panel.refresh_scroll()
+
+        # F8: wire the search trace LAST, once `blocks` fully describes
+        # THIS grid — the closure captures this grid's own rows, so the
+        # filter always operates on exactly the grid the user sees,
+        # never a stale shared _cell_blocks (the original dead-filter bug).
+        _sv.trace_add("write", lambda *_: self._apply_toggle_filter(
+            _sv.get().strip(), _ph, mode, blocks=blocks, panel=panel))
 
     def _build_toggle_row(self, parent, t, mode, state, accent, col_w=380):
         """One compact settings-row cell (2-column grid, Install-tab density):
@@ -2202,11 +2299,19 @@ class TaskTab(tk.Frame):
             self._suspend_count_refresh = False
         self._refresh_run_count()
 
-    def _apply_toggle_filter(self, q, placeholder, mode):
+    def _apply_toggle_filter(self, q, placeholder, mode, blocks=None, panel=None):
         """Filter the Custom/Undo rows as the user types: hide rows whose
         label/description doesn't match; hide empty group headers. 'All On/
         All Off' still respect hidden rows' vars (they act on self.vars
         directly), which is the honest behavior — hidden ≠ deselected.
+
+        F8 (user bug 2026-09-06: typing in the box changed nothing): this
+        used to read self._cell_blocks live — shared mutable state that on
+        a cache hit pointed at whatever grid was built LAST (often a
+        hidden one), so the filter happily grid_remove()d rows the user
+        couldn't see. Callers now pass THIS grid's blocks + panel; the
+        self._cell_blocks fallback stays only for legacy direct calls
+        (the smoke harness), which are single-grid and safe.
 
         Grid mode (2-column): hidden cells use grid_remove() so their
         grid slot (row/column) is REMEMBERED — re-showing restores the
@@ -2214,7 +2319,7 @@ class TaskTab(tk.Frame):
         collapses empty rows."""
         q = (q or "").strip().lower()
         show_all = (not q) or q == placeholder.lower()
-        blocks = getattr(self, "_cell_blocks", None) or []
+        blocks = blocks if blocks is not None else (getattr(self, "_cell_blocks", None) or [])
         for _hdr, rows in blocks:
             if not rows:
                 continue
@@ -2239,6 +2344,12 @@ class TaskTab(tk.Frame):
         # scroll metrics only recompute in refresh_scroll(); hiding rows
         # shrinks the inner frame — without this the thumb/offsets describe
         # the pre-filter content (overshoot scrolling, wrong thumb size).
+        if panel is not None:
+            try:
+                panel.refresh_scroll()
+                return
+            except Exception:
+                pass
         for w in self.body_area.winfo_children():
             if not w.winfo_ismapped():
                 continue
@@ -2602,7 +2713,8 @@ class InstallTab(tk.Frame):
                     continue
                 if show_all or (q in app["name"].lower()
                                 or q in app["id"].lower()
-                                or q in app["description"].lower()):
+                                or q in app["description"].lower()
+                                or q in app.get("hardware", "").lower()):
                     visible_rows.append((app_id, row))
             any_visible = bool(visible_rows)
             # re-pack visible rows inside their OWN column frames, in original
@@ -2754,8 +2866,13 @@ class InstallTab(tk.Frame):
         """Show a green '✓ Installed' badge next to every catalog app that
         winget reports as present. Runs once per session (cached upstream).
 
-        (Redesign note: rows no longer carry a '↗' link — names are the
-        links now — so the badge simply packs at the row's right edge.)"""
+        (Placement fix, user feedback 2026-09-06: the badge used to pack at
+        the row's FAR-RIGHT edge — visually divorced from the name it
+        belongs to. It now packs side="left" AFTER the existing left-side
+        widgets, so it joins the name cluster directly (name | FOSS | OEM |
+        🔗 | ✓ Installed) instead of floating at the row's end. Color note:
+        green stays reserved for this badge alone — the FOSS chip was
+        recolored sky blue (accent_sky) so the two never read as one.)"""
         self._installed_ids = installed_ids or set()
         if not self._catalog_ready:
             # F6(a): the badge scan is kicked off at construction, but the
@@ -2770,7 +2887,10 @@ class InstallTab(tk.Frame):
             n += 1
             b = tk.Label(row, text="✓ Installed", font=(F, 7, "bold"),
                          bg=COLORS["bg_alt"], fg=COLORS["accent_green"])
-            b.pack(side="right", padx=(0, 2))
+            # beside the name cluster, not exiled to the row's right edge —
+            # packed left it lands right after the last badge (FOSS / OEM /
+            # 🔗), keeping the marker adjacent to the app it belongs to
+            b.pack(side="left", padx=(6, 0))
         if n:
             self.app.log(f"Install tab: {n} of your catalog apps are already installed (badges shown).")
 
@@ -3069,14 +3189,29 @@ class InstallTab(tk.Frame):
                                 fg=COLORS["text"], activebackground=COLORS["bg_alt"],
                                 selectcolor=COLORS["surface"], onvalue=True, offvalue=False)
             cb.pack(side="left")
-            # tooltip: short description only (user request: no URLs in tips)
+            # tooltip: short description only (user request: no URLs in tips);
+            # OEM-exclusive apps append their hardware tag (user request
+            # 2026-09-06) so non-matching users are warned before installing
             tip = app["description"]
+            hw = app.get("hardware", "")
+            if hw:
+                tip += f" ({hw})"
             name_lbl = _make_name_link(row, app["name"], app["url"], tip)
             name_lbl.pack(side="left", padx=(6, 4))
             if app["foss"]:
+                # sky blue, NOT the tab accent: the accent IS green here, and
+                # green is the "✓ Installed" badge's color — the two chips sat
+                # next to each other in the same green (user feedback
+                # 2026-09-06). accent_sky is the palette's designated Install
+                # alt so FOSS/Installed read as different signals at a glance.
                 foss = tk.Label(row, text="FOSS", font=(F, 7, "bold"),
-                                bg=COLORS["bg_alt"], fg=accent)
+                                bg=COLORS["bg_alt"], fg=COLORS["accent_sky"])
                 foss.pack(side="left", padx=(4, 0))
+            if hw:
+                hw_lbl = tk.Label(row, text="⚠ OEM", font=(F, 7, "bold"),
+                                  bg=COLORS["bg_alt"], fg=COLORS["accent_yellow"])
+                Tooltip(hw_lbl, f"Hardware restricted — {hw}. Do not install this on other systems.")
+                hw_lbl.pack(side="left", padx=(4, 0))
             # mirror link (user design): 🔗 beside the name as the SECONDARY
             # link when a verified fallback_url exists; the name stays the
             # primary. ↗ arrows are gone entirely.
@@ -3106,8 +3241,10 @@ class InstallTab(tk.Frame):
                                         base_fg=COLORS["text"])
             name_lbl.pack(side="left", padx=(6, 4))
             if app["foss"]:
+                # sky blue to match the winget-row FOSS chips (green belongs
+                # to the "✓ Installed" badge alone — see _paint_installed_badges)
                 foss = tk.Label(row, text="FOSS", font=(F, 7, "bold"),
-                                bg=COLORS["bg_alt"], fg=accent)
+                                bg=COLORS["bg_alt"], fg=COLORS["accent_sky"])
                 foss.pack(side="left", padx=(4, 0))
             if fallback:
                 self._make_mirror_link(row, fallback)
@@ -4158,11 +4295,19 @@ class Application:
                 pass
         self._disk_monitor_running = True
 
-        def update_disk():
+        # audit fix (M9): _query_drives() called GetDiskFreeSpaceExW for up
+        # to 26 drive letters synchronously on the Tk thread every 30s (plus
+        # once at startup). An unreachable mapped network drive can make
+        # that Win32 call stall for its OS-level timeout, freezing the
+        # entire UI (no repaint, no button clicks) until it returns. Query
+        # in a daemon thread and marshal only the paint back to Tk via
+        # root.after(0, ...).
+        import threading as _threading
+
+        def _apply_drives(drives):
             if not getattr(self, "_disk_monitor_running", False):
                 return
             try:
-                drives = self._query_drives()
                 # rebuild widgets only when the drive SET changes (plug /
                 # unplug); color+text refresh in place on every tick
                 key = tuple(d[0] for d in drives)
@@ -4184,6 +4329,22 @@ class Application:
                     self._disk_monitor_after_id = self.root.after(30000, update_disk)
             except Exception:
                 pass
+
+        def _query_then_apply():
+            try:
+                drives = self._query_drives()
+            except Exception:
+                drives = []
+            try:
+                if getattr(self, "_disk_monitor_running", False) and self.root.winfo_exists():
+                    self.root.after(0, lambda: _apply_drives(drives))
+            except Exception:
+                pass
+
+        def update_disk():
+            if not getattr(self, "_disk_monitor_running", False):
+                return
+            _threading.Thread(target=_query_then_apply, daemon=True).start()
 
         try:
             self._disk_monitor_after_id = self.root.after(0, update_disk)
@@ -4307,8 +4468,10 @@ class Application:
     def _set_progress(self, value, maximum=None):
         def _do():
             try:
-                if maximum:
-                    self.progress_bar.set_fraction(value / maximum)
+                # M10: `if maximum:` misrouted maximum=0 into the fraction
+                # branch (and a real value/0 would raise); be explicit.
+                if maximum is not None:
+                    self.progress_bar.set_fraction(value / maximum if maximum else 0.0)
                 else:
                     self.progress_bar.set_fraction(value)
             except Exception:
@@ -4513,7 +4676,10 @@ class Application:
                     pass
                 self.set_status(summary)
                 messagebox.showinfo("Install Done", summary)
-            self.root.after(0, _ui)
+            try:
+                self.root.after(0, _ui)
+            except Exception:
+                pass
 
         def _worker():
             ok_n, fail_n, stopped = 0, 0, False
@@ -4542,7 +4708,23 @@ class Application:
             # real per-app outcome)
             if not stopped and apps:
                 from app.tasks.install_tasks import install_selected_apps as _runner
-                app_ok, app_fail = _runner(ctx, apps)
+                try:
+                    app_ok, app_fail = _runner(ctx, apps)
+                except TaskCancelled as exc:
+                    stopped = True
+                    self.log(f"  app installs were cancelled: {exc}")
+                    app_ok, app_fail = [], []
+                except Exception as exc:
+                    # _runner raises only when EVERY app failed — count them
+                    # all as failed instead of dying with _done never called
+                    # (which wedged the UI busy with a frozen progress bar).
+                    self.log(f"  ! app installs failed: {exc}")
+                    app_ok, app_fail = [], [a["name"] for a in apps]
+                else:
+                    # A mid-batch Stop breaks the runner without raising —
+                    # report Stopped, not Complete.
+                    if ctx.cancelled():
+                        stopped = True
                 ok_n += len(app_ok)
                 fail_n += len(app_fail)
             if stopped:
@@ -4702,6 +4884,19 @@ class Application:
                 # '✓ Active' badge must show what is actually active).
                 skipped_n += 1
                 self.log(f"  (skipped) {task.label}: {exc}")
+            except TaskCancelled as exc:
+                # F-2 audit fix: utils.run_cmd_checked deliberately raises
+                # TaskCancelled for a user Stop (its H6 contract), and
+                # install_selected_mixed already treats it as 'stopped' —
+                # but this loop's generic `except Exception` below counted
+                # the interrupted task as FAILED ("Running stopped early:
+                # 0 succeeded, 1 failed" with an 'ERROR' line saying
+                # 'cancelled by user'). Catch it first: the run was
+                # stopped, not failed; no tweak is marked applied/reverted,
+                # remaining tasks are skipped by the next iteration's
+                # cancelled() check, and the summary reports 'stopped'.
+                cancelled = True
+                self.log(f"  (stopped) {task.label}: {exc}")
             except Exception as exc:
                 failed += 1
                 self.log(f"  ! ERROR in '{task.label}': {exc}")
@@ -4717,10 +4912,13 @@ class Application:
         # this but had zero call sites — _enter_undo only popped the 'undo'
         # key, leaving preset/custom bodies stale after a revert. Drop all
         # cached bodies now that the machine state has actually changed.
+        # H11: _clear_body_cache destroys widgets — marshal to the Tk
+        # thread like every other worker→UI hop (direct call mutated the
+        # cache dicts from the worker and leaked the widget handles).
         try:
             tweak_tab = self.tabs.get("Tweak")
             if tweak_tab is not None:
-                tweak_tab._clear_body_cache()
+                self.root.after(0, tweak_tab._clear_body_cache)
         except Exception:
             pass
 
@@ -4764,7 +4962,13 @@ class Application:
             else:
                 _themed_showinfo(self.root, "Done", summary,
                                  accent=COLORS["accent_green"])
-        self.root.after(0, _done_popup)
+        # H6-shutdown race: after() on a destroyed root (window closed
+        # mid-run) raises TclError out of the worker — guard like the
+        # sibling hops (_set_progress/_set_buttons_enabled).
+        try:
+            self.root.after(0, _done_popup)
+        except Exception:
+            pass
 
         # audit fix (A3-M1): the "Clean Complete — freed X" toast fired for
         # Repair and Tweak/Undo runs too (with a misleading "Freed 0 Bytes"
@@ -4774,7 +4978,8 @@ class Application:
                 # audit minor 3: pass the failure count so the toast copy is
                 # truthful (only claims a clean completion when nothing failed)
                 threading.Thread(target=notify_clean_complete,
-                                 args=(total_bytes, completed, failed), daemon=True).start()
+                                 args=(total_bytes, completed, failed, skipped_n),
+                                 daemon=True).start()
             except Exception:
                 pass
 

@@ -303,6 +303,11 @@ def run_cmd_checked(ctx: TaskContext, command: str, shell: bool = True, timeout:
     failures.
     """
     rc = run_cmd(ctx, command, shell=shell, timeout=timeout)
+    # H6: rc -1 means cancelled/timed-out/gave-up (see run_cmd). A user
+    # Stop must surface as TaskCancelled ("stopped") — never as a plain
+    # RuntimeError failure. Timeouts (cancelled() False) stay failures.
+    if rc == -1 and ctx.cancelled():
+        raise TaskCancelled(f"Command cancelled by user: {command}")
     if rc not in success_codes:
         raise RuntimeError(f"Command failed (code {rc}): {command}")
     if rc != 0 and rc in success_codes:
@@ -321,15 +326,27 @@ def format_bytes(size_bytes: float) -> str:
     # the threshold — the old float compare rendered 1023.6 B as
     # "1024 Bytes", 1048575.9 B as "1024.00 KB" (pseudo-units: a value
     # displayed as exactly 1024 of a unit is always really 1 of the next).
+    # M1 residual: ceil fixed the threshold pick but `:.2f` rounding can
+    # still promote (1048575 B -> 1024.00 KB). Promote when the ROUNDED
+    # display value reaches 1024.
     import math
     n = math.ceil(size_bytes)
     kib, mib, gib = 1024, 1024 ** 2, 1024 ** 3
     if n >= gib:
-        return f"{n / gib:.2f} GB"
+        v = n / gib
+        if round(v, 2) < 1024:
+            return f"{v:.2f} GB"
+        return f"{n / (gib * 1024):.2f} TB"
     if n >= mib:
-        return f"{n / mib:.2f} MB"
+        v = n / mib
+        if round(v, 2) < 1024:
+            return f"{v:.2f} MB"
+        return f"{v / 1024:.2f} GB"
     if n >= kib:
-        return f"{n / kib:.2f} KB"
+        v = n / kib
+        if round(v, 2) < 1024:
+            return f"{v:.2f} KB"
+        return f"{v / 1024:.2f} MB"
     return f"{n} Bytes"
 
 
@@ -344,7 +361,17 @@ def clean_folder_contents(ctx: TaskContext, folder_path: str, remove_root: bool 
     # prune and does not treat Windows junctions as links — a junction
     # anywhere under folder_path redirected deletions into its target
     # (empirically verified). Walk top-down and skip reparse points.
+    stopped = False
     for root, dirs, files in os.walk(folder_path, topdown=True, followlinks=False):
+        # F-3 audit fix: the Stop button previously only killed the tracked
+        # SUBPROCESS — this pure-Python walker kept deleting for minutes on
+        # big trees (shader caches: tens of thousands of files) after the
+        # user pressed Stop. Poll cancellation here (per directory) and per
+        # file below; a stop leaves the remaining files in place and returns
+        # the partial total, exactly like the run_cmd kill path.
+        if ctx.cancelled():
+            stopped = True
+            break
         # never descend into junctions / symlinked dirs
         dirs[:] = [d for d in dirs if not _is_reparse_point(os.path.join(root, d))]
         for f in files:
@@ -354,6 +381,9 @@ def clean_folder_contents(ctx: TaskContext, folder_path: str, remove_root: bool 
             if _is_reparse_point(filepath):
                 skipped += 1
                 continue
+            if ctx.cancelled():
+                stopped = True
+                break
             try:
                 # Get size and remove atomically (avoid TOCTOU race)
                 st = os.stat(filepath)
@@ -363,23 +393,32 @@ def clean_folder_contents(ctx: TaskContext, folder_path: str, remove_root: bool 
             except (PermissionError, OSError, FileNotFoundError):
                 skipped += 1
                 continue
+        if stopped:
+            break
 
         if not extensions:
             for d in dirs:
+                if ctx.cancelled():
+                    stopped = True
+                    break
                 dirpath = os.path.join(root, d)
                 try:
                     if os.path.exists(dirpath) and not os.listdir(dirpath):
                         os.rmdir(dirpath)
                 except OSError:
                     continue
+            if stopped:
+                break
 
-    if remove_root and not extensions and not _is_reparse_point(folder_path):
+    if remove_root and not extensions and not _is_reparse_point(folder_path) and not stopped:
         try:
             if os.path.exists(folder_path) and not os.listdir(folder_path):
                 os.rmdir(folder_path)
         except OSError:
             pass
 
+    if stopped:
+        ctx.log(f"  ! stopped early — some files were left in place under {folder_path}")
     if skipped:
         ctx.log(f"  (skipped {skipped} locked files in {folder_path})")
     return bytes_freed
@@ -589,22 +628,33 @@ def powercfg_query_indexes(ctx: TaskContext, subgroup: str, setting: str) -> "tu
     except Exception as exc:
         ctx.log(f"  ! could not query power setting {subgroup}:{setting}: {exc}")
         return None, None
-    indexes = []
-    for line in out.splitlines():
-        m = _re.search(r":\s*0x([0-9A-Fa-f]+)[ \t]*$", line)
-        if m:
-            indexes.append(m.group(1))
+    # M2: the old order tried the last-two-hex heuristic first, so on
+    # English systems a Minimum/Maximum/AC triple (or any extra trailing
+    # hex line) silently misread max-as-AC. Try the precise English labels
+    # first (exact when they match); use the label-free last-two heuristic
+    # only where labels are localized away, warning when the shape is
+    # ambiguous (>2 candidates).
     ac = dc = None
-    if len(indexes) >= 2:
-        ac, dc = int(indexes[-2], 16), int(indexes[-1], 16)
-    else:
-        # English-label fallback (the pre-B6 parser) for unusual shapes
-        m = _re.search(r"Current AC Power Setting Index:\s*0x([0-9A-Fa-f]+)", out)
-        if m:
-            ac = int(m.group(1), 16)
-        m = _re.search(r"Current DC Power Setting Index:\s*0x([0-9A-Fa-f]+)", out)
-        if m:
-            dc = int(m.group(1), 16)
+    m = _re.search(r"Current AC Power Setting Index:\s*0x([0-9A-Fa-f]+)", out)
+    if m:
+        ac = int(m.group(1), 16)
+    m = _re.search(r"Current DC Power Setting Index:\s*0x([0-9A-Fa-f]+)", out)
+    if m:
+        dc = int(m.group(1), 16)
+    if ac is None or dc is None:
+        indexes = []
+        for line in out.splitlines():
+            m = _re.search(r":\s*0x([0-9A-Fa-f]+)[ \t]*$", line)
+            if m:
+                indexes.append(m.group(1))
+        if len(indexes) >= 2:
+            if len(indexes) > 2:
+                ctx.log(f"  ! powercfg output for {setting} has an unexpected shape "
+                        f"({len(indexes)} hex values) — taking the last two as AC/DC.")
+            if ac is None:
+                ac = int(indexes[-2], 16)
+            if dc is None:
+                dc = int(indexes[-1], 16)
     if ac is None or dc is None:
         # powercfg exits 0 even when the setting is not present in the
         # scheme (e.g. hidden by the 24H2 power-mode overlay) — make that

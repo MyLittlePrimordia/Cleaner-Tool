@@ -27,7 +27,7 @@ import subprocess
 import tempfile
 import urllib.request
 
-from app.utils import TaskContext, run_cmd, run_cmd_checked
+from app.utils import TaskContext, TaskCancelled, run_cmd, run_cmd_checked
 from app import capabilities as cap
 
 _UA = "CleanerTool/2.0 (component installer)"
@@ -56,7 +56,7 @@ def _download(ctx: TaskContext, url: str, dest: str, expected_size: int,
                 # 600s. Check every chunk; abort leaves a partial file the
                 # except clause below removes.
                 if ctx.cancelled():
-                    raise RuntimeError("cancelled by user")
+                    raise TaskCancelled("download cancelled by user")
                 chunk = resp.read(1 << 16)
                 if not chunk:
                     break
@@ -83,6 +83,16 @@ def _download(ctx: TaskContext, url: str, dest: str, expected_size: int,
                                f"(got {actual[:16]}..., pinned {sha256[:16]}...)")
         _log(ctx, "  signature verified (SHA-256 match).")
         return True
+    except TaskCancelled:
+        # H6: cancel must propagate as TaskCancelled (runner reports
+        # "stopped"), not collapse into `False` → "check internet".
+        try:
+            if os.path.exists(dest):
+                os.remove(dest)
+        except OSError:
+            pass
+        _log(ctx, "  ! download cancelled by user.")
+        raise
     except Exception as e:
         try:
             if os.path.exists(dest):
@@ -137,8 +147,10 @@ _DIRECTX_REDIST = {
     "page": "https://www.microsoft.com/en-us/download/details.aspx?id=8109",
     "size": 100275120,
     "sha256": "053f76dcbb28802e23341b6a787e3b0791c0fa5c8d4d011b1044172dbf89c73b",
-    # silent flags: /Q = quiet, /T:<dir> + /C = extract-only (DXSETUP inside
-    # is what actually installs). The June2010 package supports /Q for silent.
+    # silent flags: /Q = quiet install for the June2010 self-extracting
+    # wrapper (the manual alternative is /T:<dir> + /C extract-only, then
+    # DXSETUP.exe /silent inside). Success is verified by sentinel-DLL
+    # presence in install_directx_runtimes, not by exit code alone.
     "silent_args": "/Q",
 }
 
@@ -245,7 +257,22 @@ def install_directx_runtimes(ctx: TaskContext):
         rc = run_cmd(ctx, f'"{dest}" {info["silent_args"]}', timeout=1800)
         if rc not in (0, 3010, 1638):  # 1638 = already installed per MSI semantics
             raise RuntimeError(f"DirectX installer exited with code {rc}.")
-        _log(ctx, "Legacy DirectX runtimes installed.")
+        # M7: exit 0 alone never proved the runtimes landed (the /Q wrapper
+        # vs extract+DXSETUP question). Verify sentinel DLLs the redist is
+        # supposed to drop; fail honestly instead of reporting "installed".
+        if not cap.IS_WINDOWS:
+            _log(ctx, "Legacy DirectX runtimes installed.")
+        else:
+            windir = os.environ.get("WINDIR", r"C:\Windows")
+            sentinels = [os.path.join(windir, "System32", "d3dx9_43.dll"),
+                         os.path.join(windir, "SysWOW64", "d3dx9_43.dll")]
+            missing = [p for p in sentinels if not os.path.isfile(p)]
+            if missing and rc != 1638:
+                raise RuntimeError(
+                    "DirectX installer reported success but the runtime DLLs "
+                    f"are still missing ({', '.join(missing)}). Re-run as "
+                    "Administrator or install manually from microsoft.com.")
+            _log(ctx, "Legacy DirectX runtimes installed (sentinel DLLs verified).")
     finally:
         try:
             if os.path.exists(dest):
@@ -270,12 +297,19 @@ def install_vc_redists(ctx: TaskContext):
     _require_admin_for_install("VC++ runtimes")
     installed, skipped, failed = [], [], []
     for pkg_id, label in _VCREDIST_WINGET_IDS:
+        # H6: Stop must stop the batch — an rc of -1 (cancelled/timeout)
+        # used to be recorded as a plain failure and the loop marched on
+        # through the remaining packages.
+        if ctx.cancelled():
+            raise TaskCancelled("VC++ install cancelled by user.")
         if _vcredist_installed(pkg_id):
             skipped.append(label)
             _log(ctx, f"{label}: already installed — skipping (latest stays available via winget).")
             continue
         ctx.set_status(f"Installing {label}...")
         rc = _winget_silent(ctx, pkg_id)
+        if rc == -1 or ctx.cancelled():
+            raise TaskCancelled("VC++ install cancelled by user.")
         if rc == 0:
             if _vcredist_installed(pkg_id):
                 installed.append(label)
@@ -295,10 +329,16 @@ def install_vc_redists(ctx: TaskContext):
         else:
             failed.append(f"{label} (rc {rc})")
             _log(ctx, f"  ! {label} failed with winget exit code {rc}")
+    if ctx.cancelled():
+        raise TaskCancelled("VC++ install cancelled by user.")
     _log(ctx, f"VC++ runtimes: {len(installed)} installed, {len(skipped)} already present"
-              + (f", {len(failed)} failed: {', '.join(failed)}" if failed else ""))
-    if failed and not installed:
-        raise RuntimeError("Every VC++ package failed to install — check the log (Quick Tools > Export Logs).")
+               + (f", {len(failed)} failed: {', '.join(failed)}" if failed else ""))
+    # M17: same contract as the Java/.NET/Classic bundles — ANY failure
+    # raises (the runner reports it; the log above shows what landed).
+    # The old `failed and not installed` gate reported partial installs
+    # (e.g. 1 ok + 11 missing) as full success.
+    if failed:
+        raise RuntimeError(f"VC++ suite partially failed: {', '.join(failed)} — see the log.")
 
 
 # winget exit codes that mean benign outcomes, NOT failures (verified on a

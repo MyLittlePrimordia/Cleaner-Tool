@@ -176,13 +176,23 @@ def _wait_for_elevated_process(timeout: float = 60.0) -> bool:
     while time.time() - start_time < timeout:
         pid, token = _read_elevation_cookie()
         if pid is not None:
-            # If a token was issued, the cookie must match it
-            if expected_token and token != expected_token:
+            # audit fix (H10): a falsy expected_token (relaunch_as_admin
+            # always writes one, but a transient read failure returned
+            # None/"") used to skip the match check entirely, accepting
+            # ANY cookie — including one written by an unrelated already-
+            # running copy of this exe. Fail closed instead: no readable
+            # pending token means we can't verify identity, so don't
+            # accept this cookie as ours.
+            if not expected_token:
+                time.sleep(0.2)
+                continue
+            if token != expected_token:
                 time.sleep(0.2)
                 continue
             # Verify the process is still alive
+            # (ctypes.wintypes import hoisted out of the poll loop — it was
+            # re-executed every 200ms while waiting for UAC.)
             try:
-                import ctypes.wintypes
                 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
                 handle = ctypes.windll.kernel32.OpenProcess(
                     PROCESS_QUERY_LIMITED_INFORMATION, False, pid
@@ -214,6 +224,13 @@ def _wait_for_elevated_process(timeout: float = 60.0) -> bool:
             except Exception:
                 pass
         time.sleep(0.2)
+    # audit fix (H10): a timed-out wait left the pending token (and any
+    # stale cookie) on disk. A later, unrelated elevation attempt reusing
+    # the temp path — or a delayed cookie write arriving after we've given
+    # up and moved on — could then be accepted by a *different* wait call
+    # as if it were this one. Clear both on timeout so a give-up is final.
+    _clear_pending_token()
+    _clear_elevation_cookie()
     return False
 
 

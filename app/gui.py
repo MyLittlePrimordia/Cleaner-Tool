@@ -2412,7 +2412,7 @@ class InstallTab(tk.Frame):
         self._cat_frames = {}     # category -> (header_frame, body_frame, open)
         self._app_rows = {}       # app id -> row widget (for installed badges)
         self._cat_sections = []  # (category, header, body, all_row_widgets) for the search filter
-        self._bundle_rows = []   # (row_widget, searchable_text) — embedded bundle rows (APO+Peace)
+        self._bundle_rows = []   # (row_widget, searchable_text) — embedded bundle/task rows
         self._installed_ids = None  # cached set from install_tasks.get_installed_ids
         accent = TAB_ACCENTS["Install"]
 
@@ -2694,8 +2694,9 @@ class InstallTab(tk.Frame):
           * Essentials sections (LTSC components / runtime bundles) hide
             during a query too — they're one-click tasks, not catalog
             apps, so a name search must not leave them stranded mid-page
-          * the embedded Equalizer APO + Peace GUI row participates like
-            any app: hidden unless the query matches its label/description
+          * the embedded bundle rows (APO + Peace GUI, APO + FluidEQ,
+            RustDesk, FreeFileSync) participate like any app: hidden
+            unless the query matches their label/description
 
         2-column layout: rows live inside per-column frames. Hiding one
         leaves a gap in that column, so visible rows are RE-PACKED per
@@ -2764,7 +2765,7 @@ class InstallTab(tk.Frame):
                     body.pack(fill="x")
                 elif not cat_open and body.winfo_manager() == "pack":
                     body.pack_forget()
-            # embedded bundle rows (APO + Peace GUI): filter by their own
+            # embedded bundle rows (APO bundles etc.): filter by their own
             # searchable text; hide during a non-matching query
             for _row, text in getattr(self, "_bundle_rows", []):
                 if _row.master is not outer_block:
@@ -3048,7 +3049,9 @@ class InstallTab(tk.Frame):
                 t = task_by_key.get(key)
                 if t:
                     result.append(("task", t))
-        # catalog-embedded bundles (APO + Peace lives in Media)
+        # catalog-embedded bundles (APO + Peace / APO + FluidEQ live in
+        # Media; RustDesk / FreeFileSync in Utilities — any task in
+        # EMBEDDED_TASKS_BY_CATEGORY)
         for key, (var, t) in getattr(self, "bundle_vars", {}).items():
             if var.get():
                 result.append(("task", t))
@@ -3250,15 +3253,16 @@ class InstallTab(tk.Frame):
                 self._make_mirror_link(row, fallback)
             cat_rows.append((app["id"], row))
 
-        # Equalizer APO + Peace GUI bundle row (user request: lives at the
-        # end of Media, not in its own section). Full-width below the
-        # columns. Search behavior (user request): this row is NO LONGER
+        # Embedded bundle/task rows (APO + Peace GUI, APO + FluidEQ, RustDesk,
+        # FreeFileSync — anything in install_tasks.EMBEDDED_TASKS_BY_CATEGORY):
+        # full-width checkbox rows at the END of the category, below the
+        # columns. Search behavior (user request): these rows are NO LONGER
         # exempt from the filter — typing e.g. 'rufus' must clear the page
-        # to ONLY matching apps, so the bundle hides too unless the query
-        # matches it ('peace', 'eq', 'equalizer'...). Registered as a
+        # to ONLY matching apps, so they hide too unless the query matches
+        # ('peace', 'fluideq', 'rustdesk'...). Each is registered as a
         # pseudo-app row the filter can match and hide.
-        if cat == "Media, Streaming & Audio":
-            from app.tasks.install_tasks import APO_PEACE_TASK as _bundle
+        from app.tasks.install_tasks import EMBEDDED_TASKS_BY_CATEGORY as _EMBED
+        for _bundle in _EMBED.get(cat, []):
             _bvar = tk.BooleanVar(value=False)
             self.bundle_vars[_bundle.key] = (_bvar, _bundle)
             self._trace_install_var(_bvar)
@@ -3271,10 +3275,11 @@ class InstallTab(tk.Frame):
             _blbl = tk.Label(_brow, text=_bundle.label, font=(F, 9, "bold"),
                              bg=COLORS["bg_alt"], fg=COLORS["text"])
             _blbl.pack(side="left", padx=(6, 4))
-            _bsh = tk.Label(_brow, text="🛡️", font=("Segoe UI Emoji", 9),
-                            bg=COLORS["bg_alt"], fg=COLORS["text"], cursor="hand2")
-            _bsh.pack(side="left", padx=(6, 0))
-            Tooltip(_bsh, "Admin Required — needs Administrator rights (skipped in limited mode)")
+            if _bundle.admin_required:
+                _bsh = tk.Label(_brow, text="🛡️", font=("Segoe UI Emoji", 9),
+                                bg=COLORS["bg_alt"], fg=COLORS["text"], cursor="hand2")
+                _bsh.pack(side="left", padx=(6, 0))
+                Tooltip(_bsh, "Admin Required — needs Administrator rights (skipped in limited mode)")
             Tooltip(_blbl, _bundle.description)
             Tooltip(_bcb, _bundle.description)
             # filter registration: searchable text from the bundle's own

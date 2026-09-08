@@ -1,6 +1,36 @@
 """
 Install tab — Master App Catalog data.
 
+2026-09-08 round-8 curation (user request: extend the APO+Peace verified
+download method to more non-winget apps + FluidEQ bundle). IDs/URLs for
+every NEW or CHANGED entry were live-verified via `winget search
+--exact` / `winget show`, the GitHub API and HTTP probes on 2026-09-08:
+  * Xenia Canary: NOW ON WINGET — Xenia.XeniaCanary resolves (verified
+    FOUND v9132035, portable zip with VC++ dependency, homepage
+    xenia-canary-releases). The old manual: entry is REMOVED; a winget
+    entry under that ID replaces it.
+  * Lime3DS -> Azahar: the project renamed and moved to
+    azahar-emu/azahar; Lime3DS/Lime3DS now only hosts source + the
+    Azahar succession. Azahar IS on winget — AzaharEmu.Azahar (verified
+    FOUND v2126.0, nullsoft installer, homepage azahar-emu.org, live
+    200). The old manual:lime3ds entry is REPLACED by a winget entry for
+    Azahar (honest name: the 3DS emulator's real current project).
+  * RustDesk: REMOVED from MANUAL_ONLY_APPS — installed by the new
+    verified-download RUSTDESK_TASK (embedded Utilities row; verified
+    NOT on winget anymore, so winget id RustDesk.RustDesk does not
+    resolve and the GitHub-releases method is the honest automated path).
+  * FreeFileSync: REMOVED from MANUAL_ONLY_APPS — installed by the new
+    FREEFILESYNC_TASK (embedded Utilities row; author distributes only
+    via freefilesync.org, no winget package, installer Authenticode-
+    signed by the author — signature-gated like Peace).
+  * DS4Windows: repo MOVED — Ryochan7/DS4Windows is 404 (verified
+    live); the project lives at github.com/ds4windowsapp/DS4Windows
+    now. Link-only manual entry stays (portable zip, needs ViGEmBus
+    driver — no honest silent-install path), with the corrected URL.
+  * New embedded bundle task "Equalizer APO + FluidEQ" lives in
+    install_tasks.py (APO_FLUIDEQ_TASK) next to the Peace bundle — the
+    user picks either GUI; both render in the Media category.
+
 2026-09-06 round-7 curation (user request: consolidated master list —
 remove 55 apps, add 13, add 2 bundle items, tag 3 OEM apps, move
 LosslessCut + Xenia Canary to manual-only). IDs/URLs for every NEW or
@@ -113,14 +143,12 @@ MANUAL_ONLY_APPS = [
      "description": 'Forces older games into borderless fullscreen mode', "foss": True,
      "url": 'https://github.com/andrewmd5/Borderless-Gaming/releases/latest'},
     {"id": 'manual:ds4windows', "name": 'DS4Windows', "category": 'Gaming Tools & Emulators',
-     "description": 'Use PlayStation controllers on PC with gyro support', "foss": False,
-     "url": 'https://github.com/Ryochan7/DS4Windows/releases/latest'},
+     "description": 'Use PlayStation controllers on PC with gyro support (portable zip — needs the ViGEmBus driver)',
+     "foss": False,
+     "url": 'https://github.com/ds4windowsapp/DS4Windows/releases/latest'},
     {"id": 'manual:google-play-games', "name": 'Google Play Games for PC', "category": 'Gaming Tools & Emulators',
      "description": 'Official Google Android gaming platform on PC with keyboard/mouse mapping and zero adware', "foss": False,
      "url": 'https://play.google.com/googleplaygames'},
-    {"id": 'manual:lime3ds', "name": 'Lime3DS (3DS Emulator)', "category": 'Gaming Tools & Emulators',
-     "description": 'Open-source Nintendo 3DS emulator with 4K upscaling (Citra continuation; no winget package — official releases on GitHub)', "foss": True,
-     "url": 'https://lime3ds.github.io/', "fallback_url": 'https://github.com/Lime3DS/Lime3DS'},
     {"id": 'manual:rpcs3', "name": "RPCS3", "category": "Gaming Tools & Emulators",
      "description": "PS3 emulator with 4K support - official build (no winget package)",
      "foss": True, "url": "https://rpcs3.net/"},
@@ -133,19 +161,9 @@ MANUAL_ONLY_APPS = [
     {"id": 'manual:davinci-resolve', "name": 'DaVinci Resolve', "category": 'Creative & Productivity',
      "description": 'Hollywood-grade free video editor and color grading suite', "foss": False,
      "url": 'https://www.blackmagicdesign.com/products/davinciresolve'},
-    {"id": 'manual:rustdesk', "name": 'RustDesk', "category": 'Utilities & Cleaners',
-     "description": 'FOSS remote desktop - replaces TeamViewer', "foss": True,
-     "url": 'https://rustdesk.com/', "fallback_url": 'https://github.com/rustdesk/rustdesk/releases/latest'},
     {"id": 'manual:losslesscut', "name": 'LosslessCut', "category": 'Media, Streaming & Audio',
      "description": 'Lossless video/audio trimmer and joiner — free official FOSS build (no winget package)', "foss": True,
      "url": 'https://github.com/mifi/lossless-cut/releases', "fallback_url": 'https://mifi.no/losslesscut/'},
-    {"id": 'manual:xenia-canary', "name": 'Xenia Canary (Xbox 360 Emulator)', "category": 'Gaming Tools & Emulators',
-     "description": 'Actively maintained Xbox 360 emulator — official GitHub builds (no winget package)', "foss": True,
-     "url": 'https://github.com/xenia-canary/xenia-canary/releases',
-     "fallback_url": 'https://github.com/xenia-canary/xenia-canary-releases/releases'},
-    {"id": 'manual:freefilesync', "name": 'FreeFileSync', "category": 'Utilities & Cleaners',
-     "description": 'Visual 1-click folder and drive backup mirror — no winget package, official site only', "foss": True,
-     "url": 'https://freefilesync.org/', "fallback_url": 'https://freefilesync.org/download.php'},
 
 ]
 
@@ -229,6 +247,9 @@ APP_CATALOG = [
     {"id": 'AntiMicroX.antimicrox', "name": 'AntiMicroX', "category": 'Gaming Tools & Emulators',
      "description": 'Maps controller inputs to keyboard/mouse with virtual gamepad emulation', "foss": True,
      "url": 'https://github.com/AntiMicroX/antimicrox'},
+    {"id": 'AzaharEmu.Azahar', "name": 'Azahar (3DS Emulator)', "category": 'Gaming Tools & Emulators',
+     "description": 'Open-source Nintendo 3DS emulator with 4K upscaling (the maintained Citra/Lime3DS continuation)', "foss": True,
+     "url": 'https://azahar-emu.org/', "fallback_url": 'https://github.com/azahar-emu/azahar'},
     {"id": 'Cemu.Cemu', "name": 'Cemu (Wii U Emulator)', "category": 'Gaming Tools & Emulators',
      "description": 'Wii U emulator (plays Zelda: Breath of the Wild at 4K/60+ FPS)', "foss": True,
      "url": 'https://cemu.info/'},
@@ -265,6 +286,10 @@ APP_CATALOG = [
     {"id": 'xemu-project.xemu', "name": 'xemu (Original Xbox Emulator)', "category": 'Gaming Tools & Emulators',
      "description": 'Original Xbox emulator with higher resolutions', "foss": True,
      "url": 'https://xemu.app/'},
+    {"id": 'Xenia.XeniaCanary', "name": 'Xenia Canary (Xbox 360 Emulator)', "category": 'Gaming Tools & Emulators',
+     "description": 'Actively maintained Xbox 360 emulator — now on winget (portable build; auto-installs the VC++ runtime it needs)', "foss": True,
+     "url": 'https://github.com/xenia-canary/xenia-canary-releases',
+     "fallback_url": 'https://github.com/xenia-canary/xenia-canary-releases/releases'},
     # D. Web Browsers
     {"id": 'Brave.Brave', "name": 'Brave Browser', "category": 'Web Browsers',
      "description": 'Chromium-based browser with built-in ad/tracker blocking and low RAM usage', "foss": True,

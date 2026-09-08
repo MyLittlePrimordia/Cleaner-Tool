@@ -12,6 +12,19 @@ The catalog lives in app_catalog.py (verified IDs). This module exposes:
   * there is deliberately NO "Runtimes & Dependencies" catalog category:
     every runtime lives in an Essentials bundle below, so non-technical
     users just check the bundles instead of guessing versions.
+
+Round-8 (2026-09-08, user request — "bring the Equalizer APO + Peace
+download method to more apps"): three new verified-download installers
+for apps winget does NOT carry (all verified live on 2026-09-08):
+  * Equalizer APO + FluidEQ — second GUI choice for the APO engine,
+    resolved 'latest' from the developer's electron-builder update feed
+    (exact size + SHA-512 base64), self-healing on every release.
+  * RustDesk — GitHub 'latest' release asset, SHA-256 verified against
+    GitHub's own API digest (self-healing), WiX Burn silent install.
+  * FreeFileSync — versioned URL resolved from the author's official
+    page, Authenticode signature REQUIRED (Peace-style moving pin),
+    Inno Setup silent install.
+These render as embedded checkbox rows via EMBEDDED_TASKS_BY_CATEGORY.
 """
 
 from app.utils import TaskContext, TaskCancelled, run_cmd, run_cmd_checked
@@ -581,6 +594,16 @@ _APO_PARTS = [
 ]
 
 
+def _is_hex(s: str) -> bool:
+    """True when s is a plain hexadecimal digest (vs electron-builder's
+    base64 sha512 form)."""
+    try:
+        int(s, 16)
+        return True
+    except ValueError:
+        return False
+
+
 def _verify_download_integrity(ctx: TaskContext, dest: str, label: str, part: dict) -> None:
     """Pin-based integrity gate for the APO/Peace installers (F-004b).
 
@@ -599,8 +622,10 @@ def _verify_download_integrity(ctx: TaskContext, dest: str, label: str, part: di
                 f"{expected_size:,} — the download is not the verified file "
                 f"(corrupt transfer, or SourceForge changed/redirected it). "
                 f"Refusing to run it.")
-    # hash pins (streamed, so a 55MB file is not loaded whole)
-    for algo, key in (("sha256", "sha256"), ("md5", "md5")):
+    # hash pins (streamed, so a 200MB file is not loaded whole). sha512
+    # pins are electron-builder BASE64 (the format the update feed itself
+    # publishes) — decoded to raw bytes and compared as hex.
+    for algo, key in (("sha256", "sha256"), ("md5", "md5"), ("sha512", "sha512")):
         expected = part.get(key)
         if expected is None:
             continue
@@ -609,6 +634,10 @@ def _verify_download_integrity(ctx: TaskContext, dest: str, label: str, part: di
             for chunk in iter(lambda: f.read(1 << 20), b""):
                 h.update(chunk)
         actual = h.hexdigest()
+        if algo == "sha512" and not _is_hex(expected):
+            # base64 form (electron-builder latest.yml): compare b64-to-b64
+            import base64 as _b64
+            actual = _b64.b64encode(h.digest()).decode("ascii")
         if actual.lower() != expected.lower():
             raise RuntimeError(
                 f"{label} {algo.upper()} MISMATCH — expected {expected[:16]}..., "
@@ -690,7 +719,13 @@ def _download_binary(ctx: TaskContext, url: str, dest: str, label: str, min_byte
             magic = f.read(2)
     except OSError as exc:
         raise RuntimeError(f"could not read downloaded {label}: {exc}")
-    if size < min_bytes or magic != b"MZ":
+    # first-pass magic gate: EXE = MZ, MSI = the OLE compound-file signature
+    # (verified: rustdesk's .msi starts D0 CF 11 E0 — an HTML challenge
+    # page served instead fails loudly here, never at execution)
+    expected_magic = part.get("magic") if part else None
+    if expected_magic is None:
+        expected_magic = b"MZ"
+    if size < min_bytes or magic != expected_magic[:2]:
         try:
             os.remove(dest)
         except OSError:
@@ -704,6 +739,38 @@ def _download_binary(ctx: TaskContext, url: str, dest: str, label: str, min_byte
         _verify_download_integrity(ctx, dest, label, part)
 
 
+def _apo_engine_present() -> bool:
+    """True when the Equalizer APO engine is already installed (either
+    bundle's APO part). APO 1.4.x installs to 'EqualizerAPO' under Program
+    Files and registers an 'Equalizer APO' uninstall entry, so either
+    sentinel proves presence. Used so checking BOTH bundle rows (or re-
+    running a bundle) skips the second APO install instead of running its
+    installer twice (its exit codes already tolerate 1638, but an honest
+    'already installed — skipping' log line is better than a 3-minute
+    silent installer rerun)."""
+    if not cap.IS_WINDOWS:
+        return False
+    for env_var, sub in (("ProgramFiles", "EqualizerAPO"), ("ProgramFiles(x86)", "EqualizerAPO")):
+        base = os.environ.get(env_var)
+        if base and os.path.isdir(os.path.join(base, sub)):
+            return True
+    # registry sentinel: the APO uninstall key (name matches regardless of
+    # version; quiet query, no output)
+    import subprocess as _sp
+    try:
+        out = _sp.run(
+            ["reg", "query", r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+             "/f", "Equalizer APO", "/reg:64"],
+            capture_output=True, text=True, timeout=15,
+            creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
+        )
+        if "Equalizer APO" in (out.stdout or ""):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def install_apo_peace_bundle(ctx: TaskContext):
     """APO + PEACE BUNDLE: system-wide parametric EQ (hear footsteps) with
     the Peace graphical interface, in one click. Admin required (audio
@@ -715,7 +782,12 @@ def install_apo_peace_bundle(ctx: TaskContext):
         raise RuntimeError("No internet connection — APO + Peace need to download.")
     import tempfile as _tf
     ctx.log("Installing Equalizer APO + Peace (audio EQ stack)...")
+    _ran_apo = False
     for part in _APO_PARTS:
+        if part is _APO_PARTS[0] and _apo_engine_present():
+            ctx.log("  Equalizer APO engine already installed — skipping (each bundle "
+                    "installs it once; the GUI part below still installs).")
+            continue
         fd, dest = _tf.mkstemp(prefix="cleaner_apo_", suffix=".exe")
         os.close(fd)
         try:
@@ -734,6 +806,7 @@ def install_apo_peace_bundle(ctx: TaskContext):
                 raise RuntimeError(
                     f"{part['label']} installer exited with code {rc}. "
                     f"Manual download: {part['manual']}")
+            _ran_apo = _ran_apo or part is _APO_PARTS[0]
             ctx.log(f"  [OK] {part['label']} installed.")
         finally:
             try:
@@ -745,6 +818,322 @@ def install_apo_peace_bundle(ctx: TaskContext):
             ctx.log("Stopped — remaining parts were skipped.")
             return
     ctx.log("APO + Peace complete — reboot to finish the audio driver, then open Peace and pick your output device.")
+
+
+# --------------------------------------------------------------------------- #
+# Latest-version resolvers (round-8, user request: bring the APO+Peace
+# one-click download method to more apps that have NO winget package).
+#
+# F-004b supply-chain contract per source type:
+#   * MOVING 'latest' with a machine-readable feed (FluidEQ's electron-
+#     builder latest.yml, RustDesk's GitHub API digest) -> download the
+#     hash FROM THE DEVELOPER'S OWN FEED at run time and verify against
+#     it (self-healing: a new release updates the pin automatically —
+#     NO app release needed, nothing to go stale).
+#   * Static versioned URL, no published hashes (FreeFileSync) -> the
+#     Authenticode signature MUST be valid (author code-signs every
+#     release), exactly like the Peace pin design.
+#   * Every download still passes the MZ magic + min_bytes + (MSI magic
+#     for .msi) first-pass gates, and runs only via the shared
+#     _download_binary / _verify_download_integrity fail-closed path.
+# --------------------------------------------------------------------------- #
+
+_ELECTRON_YML_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " \
+                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+
+
+def _resolve_github_latest_asset(ctx: TaskContext, repo: str, asset_pattern: str,
+                                 label: str) -> "tuple[str, str, int] | None":
+    """Resolve the CURRENT latest-release asset on GitHub for `repo`
+    matching `asset_pattern` (case-insensitive substring). Returns
+    (download_url, sha256_hex, size_bytes) from GitHub's own API — the
+    digest is computed and published by GitHub, so verifying against it is
+    a first-party gate that self-heals on every release (verified live:
+    rustdesk 1.4.9 ships sha256 digests per asset). None on failure, with
+    honest log lines (caller decides whether to raise or fall back)."""
+    import json as _json
+    import urllib.request as _urllib
+    url = f"https://api.github.com/repos/{repo}/releases/latest"
+    ctx.log(f"  resolving latest {label} from {repo} (GitHub API)...")
+    req = _urllib.Request(url, headers={"User-Agent": _ELECTRON_YML_UA,
+                                        "Accept": "application/vnd.github+json"})
+    try:
+        with _urllib.urlopen(req, timeout=30) as resp:
+            data = _json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception as exc:
+        ctx.log(f"  ! GitHub API resolve failed for {repo}: {exc}")
+        return None
+    tag = data.get("tag_name", "?")
+    for asset in data.get("assets", []):
+        name = (asset.get("name") or "")
+        if asset_pattern.lower() in name.lower():
+            digest = (asset.get("digest") or "")
+            if digest.startswith("sha256:"):
+                sha = digest[len("sha256:"):].lower()
+                size = int(asset.get("size") or 0)
+                url = asset.get("browser_download_url") or ""
+                if url and sha and size:
+                    ctx.log(f"  latest {label}: {tag} ({name}, {size:,} bytes, "
+                            f"sha256 {sha[:12]}...)")
+                    return url, sha, size
+    ctx.log(f"  ! no asset matching '{asset_pattern}' (with a sha256 digest) "
+            f"in {repo} latest release {tag}.")
+    return None
+
+
+def _resolve_electron_latest_yml(ctx: TaskContext, yml_url: str, label: str,
+                                 min_bytes: int = 5_000_000) -> "tuple[str, str, int, str] | None":
+    """Resolve the CURRENT release from an electron-builder `latest.yml`
+    update feed (a stable, versionless URL the developer publishes). The
+    feed carries the installer filename, exact size and SHA-512 (base64)
+    — computed by the developer's own build pipeline, so verifying
+    against it is a first-party gate that self-heals on every release.
+    Returns (installer_url, sha512_b64, exact_size, version) or None.
+    (Verified live: StartSWest/FluidEQ serves this feed — v1.6.4,
+    FluidEQ-Setup-1.6.4.exe, 206,667,756 bytes, sha512 base64 matching
+    both the fluideq.com download page and the GitHub release digest.)"""
+    import base64 as _b64
+    import re as _re
+    import urllib.request as _urllib
+    ctx.log(f"  resolving latest {label} from its update feed...")
+    req = _urllib.Request(yml_url, headers={"User-Agent": _ELECTRON_YML_UA})
+    try:
+        with _urllib.urlopen(req, timeout=30) as resp:
+            yml = resp.read().decode("utf-8", "replace")
+    except Exception as exc:
+        ctx.log(f"  ! update feed resolve failed ({yml_url}): {exc}")
+        return None
+    version = ""
+    m = _re.search(r"^version:\s*(\S+)", yml, _re.MULTILINE)
+    if m:
+        version = m.group(1)
+    # the fields live under a YAML list item ('  - url: …'), so the dash
+    # is optional whitespace-adjacent prefix on each line
+    url_m = _re.search(r"^\s*(?:-\s+)?url:\s*(\S+)", yml, _re.MULTILINE)
+    sha_m = _re.search(r"^\s*(?:-\s+)?sha512:\s*(\S+)", yml, _re.MULTILINE)
+    size_m = _re.search(r"^\s*(?:-\s+)?size:\s*(\d+)", yml, _re.MULTILINE)
+    if not (url_m and sha_m and size_m):
+        ctx.log("  ! update feed did not carry url/sha512/size — refusing to guess.")
+        return None
+    fname, sha512, size = url_m.group(1), sha_m.group(1), int(size_m.group(1))
+    try:
+        digest_bytes = _b64.b64decode(sha512, validate=True)
+    except Exception:
+        ctx.log("  ! update feed sha512 is not valid base64 — refusing.")
+        return None
+    if size < min_bytes or not digest_bytes:
+        ctx.log("  ! update feed values failed sanity checks — refusing.")
+        return None
+    # the feed's relative filename resolves against the same directory as
+    # the yml itself (electron-builder convention: .../releases/latest/download/)
+    installer_url = yml_url.rsplit("/", 1)[0] + "/" + fname
+    ctx.log(f"  latest {label}: v{version} ({fname}, {size:,} bytes, sha512 feed-pinned).")
+    return installer_url, sha512, size, version
+
+
+def _run_verified_installer(ctx: TaskContext, label: str, dest: str, silent: str,
+                            manual: str, ok_codes: "tuple[int, ...]" = (0, 3010, 1638)) -> None:
+    """Silently execute a just-downloaded installer with the same honest
+    contract as the APO+Peace bundle: cancel-tolerant run via run_cmd,
+    exit-code gate (0 / 3010 reboot-needed / 1638 already-installed),
+    temp file always removed. Raises RuntimeError pointing at the manual
+    link on failure."""
+    ctx.log(f"Running silent install: {label}...")
+    rc = run_cmd(ctx, f'"{dest}" {silent}', shell=True, timeout=1200)
+    if rc not in ok_codes:
+        raise RuntimeError(f"{label} installer exited with code {rc}. "
+                           f"Manual download: {manual}")
+    ctx.log(f"  [OK] {label} installed.")
+
+
+def install_apo_fluideq_bundle(ctx: TaskContext):
+    """APO + FLUIDEQ BUNDLE (user request: pick between the two Equalizer
+    APO interfaces): Equalizer APO (the engine) + FluidEQ, the modern
+    GUI (128-band EQ, per-output profiles, headphone correction library,
+    convolution, karaoke). Same shape as the Peace bundle: admin required,
+    APO first (skipped when already present), GUI second — FluidEQ's own
+    docs confirm it leaves an existing APO completely alone.
+
+    Integrity (F-004b): FluidEQ's installer is UNSIGNED, so there is no
+    Authenticode gate — instead the exact file is pinned by the developer's
+    OWN electron-builder update feed (latest.yml: exact size + SHA-512
+    base64), resolved fresh at run time, cross-published on fluideq.com's
+    download page and the GitHub release digest (verified matching on
+    2026-09-08). A mismatch aborts before execution. New FluidEQ releases
+    heal automatically — the feed moves, nothing in this app is pinned.
+
+    Honest notes: the 197MB download dwarfs Peace's 55MB; Windows
+    SmartScreen warns on manual runs of the unsigned build (the app's
+    silent path bypasses that dialog); FluidEQ also carries APO itself
+    and offers to install it on first run, but installing our verified
+    APO first keeps both bundles identical in shape. FOSS (GPL-3.0+)."""
+    _require_admin_for_install("Equalizer APO + FluidEQ")
+    if not has_network():
+        raise RuntimeError("No internet connection — APO + FluidEQ need to download.")
+    import tempfile as _tf
+    ctx.log("Installing Equalizer APO + FluidEQ (audio EQ stack)...")
+    # 1) engine first — once per run/machine (same skip as the Peace bundle)
+    apo = _APO_PARTS[0]
+    if _apo_engine_present():
+        ctx.log("  Equalizer APO engine already installed — skipping (FluidEQ needs it, it is here).")
+    else:
+        fd, dest = _tf.mkstemp(prefix="cleaner_apo_", suffix=".exe")
+        os.close(fd)
+        try:
+            try:
+                _download_binary(ctx, apo["url"], dest, apo["label"], apo["min_bytes"], part=apo)
+            except TaskCancelled:
+                raise
+            except RuntimeError as exc:
+                raise RuntimeError(f"{exc} Manual download: {apo['manual']}")
+            _run_verified_installer(ctx, apo["label"], dest, apo["silent"], apo["manual"])
+        finally:
+            try:
+                if os.path.exists(dest):
+                    os.remove(dest)
+            except OSError:
+                pass
+        if ctx.cancelled():
+            ctx.log("Stopped — FluidEQ was skipped.")
+            return
+    # 2) FluidEQ GUI, resolved 'latest' from the developer's own feed
+    resolved = _resolve_electron_latest_yml(
+        ctx, "https://github.com/StartSWest/FluidEQ/releases/latest/download/latest.yml",
+        "FluidEQ")
+    if resolved is None:
+        raise RuntimeError("Could not resolve the current FluidEQ release from its "
+                           "official update feed. Manual download: "
+                           "https://fluideq.com/")
+    installer_url, sha512, exact_size, _version = resolved
+    part = {"label": "FluidEQ (equalizer interface)", "url": installer_url,
+            "min_bytes": 100_000_000, "sha512": sha512, "exact_size": exact_size,
+            "manual": "https://fluideq.com/"}
+    fd, dest = _tf.mkstemp(prefix="cleaner_fluideq_", suffix=".exe")
+    os.close(fd)
+    try:
+        try:
+            _download_binary(ctx, part["url"], dest, part["label"], part["min_bytes"], part=part)
+        except TaskCancelled:
+            raise
+        except RuntimeError as exc:
+            raise RuntimeError(f"{exc} Manual download: {part['manual']}")
+        # electron-builder NSIS: /S is the documented silent flag
+        _run_verified_installer(ctx, part["label"], dest, "/S", part["manual"])
+    finally:
+        try:
+            if os.path.exists(dest):
+                os.remove(dest)
+        except OSError:
+            pass
+    ctx.log("APO + FluidEQ complete — reboot to finish the audio driver, then open "
+            "FluidEQ and pick your output device.")
+
+
+def install_rustdesk(ctx: TaskContext):
+    """RUSTDESK (round-8, user request: the APO+Peace download method for
+    apps winget does not carry — RustDesk was removed from winget,
+    verified 2026-09-08: 'No package found matching input criteria').
+    Resolves the CURRENT x64 EXE from the official rustdesk/rustdesk
+    GitHub 'latest' release and verifies its SHA-256 against GitHub's
+    own API digest before running it — the pin moves with every release,
+    so nothing goes stale (verified live: 1.4.9, sha256 matches the API).
+
+    Installer: WiX Burn bundle (verified: 'burn'/'WiX' markers in the PE
+    strings, Authenticode valid, signer PURSLANE — RustDesk's legal
+    entity). Silent flags '/quiet /norestart'; 3010 (reboot needed) and
+    1638 (already installed) count as success. FOSS; installs as a
+    service, so admin is required for a silent run."""
+    _require_admin_for_install("RustDesk")
+    if not has_network():
+        raise RuntimeError("No internet connection — RustDesk needs to download.")
+    import tempfile as _tf
+    ctx.log("Installing RustDesk (FOSS remote desktop)...")
+    resolved = _resolve_github_latest_asset(
+        ctx, "rustdesk/rustdesk", "x86_64.exe", "RustDesk")
+    if resolved is None or "-x86_64.exe" not in resolved[0] or "sciter" in resolved[0].lower():
+        # guard: the pattern must hit the FULL x64 setup exe, not the
+        # sciter legacy/32-bit variants
+        ctx.log("  ! exact x86_64 setup asset not found — aborting honestly.")
+        raise RuntimeError("Could not resolve RustDesk's x64 installer from the "
+                           "official GitHub releases. Manual download: "
+                           "https://github.com/rustdesk/rustdesk/releases/latest")
+    installer_url, sha256, exact_size = resolved
+    part = {"label": "RustDesk (remote desktop)", "url": installer_url,
+            "min_bytes": 15_000_000, "sha256": sha256, "exact_size": exact_size,
+            "manual": "https://github.com/rustdesk/rustdesk/releases/latest"}
+    fd, dest = _tf.mkstemp(prefix="cleaner_rustdesk_", suffix=".exe")
+    os.close(fd)
+    try:
+        try:
+            _download_binary(ctx, part["url"], dest, part["label"], part["min_bytes"], part=part)
+        except TaskCancelled:
+            raise
+        except RuntimeError as exc:
+            raise RuntimeError(f"{exc} Manual download: {part['manual']}")
+        _run_verified_installer(ctx, part["label"], dest, "/quiet /norestart", part["manual"])
+    finally:
+        try:
+            if os.path.exists(dest):
+                os.remove(dest)
+        except OSError:
+            pass
+    ctx.log("RustDesk installed — launch it and set a password to accept remote sessions.")
+
+
+def install_freefilesync(ctx: TaskContext):
+    """FREEFILESYNC (round-8, user request): the author (Zenju) distributes
+    only via freefilesync.org with NO published hashes and NO winget
+    package — so this uses the Peace-style pin: resolve the CURRENT
+    versioned setup URL from the official download page (the static
+    /download/FreeFileSync_<ver>_Windows_Setup.exe path), then require a
+    VALID Authenticode signature (verified live: every release is signed
+    'Florian BAUER', the author's cert) before the silent Inno Setup run
+    (/VERYSILENT /NORESTART). A signature failure aborts — exactly the
+    fail-closed contract Peace established for moving pins."""
+    _require_admin_for_install("FreeFileSync")
+    if not has_network():
+        raise RuntimeError("No internet connection — FreeFileSync needs to download.")
+    import re as _re
+    import tempfile as _tf
+    import urllib.request as _urllib
+    ctx.log("Installing FreeFileSync (folder backup & sync)...")
+    # resolve the current versioned installer URL from the official page
+    page_url = "https://freefilesync.org/download.php"
+    req = _urllib.Request(page_url, headers={"User-Agent": _ELECTRON_YML_UA})
+    try:
+        with _urllib.urlopen(req, timeout=30) as resp:
+            html = resp.read().decode("utf-8", "replace")
+    except Exception as exc:
+        raise RuntimeError(f"could not load the FreeFileSync download page ({exc}). "
+                           "Manual download: https://freefilesync.org/download.php")
+    m = _re.search(r"(/download/FreeFileSync_[\w.]+_Windows_Setup\.exe)", html)
+    if not m:
+        raise RuntimeError("could not find the current FreeFileSync Windows installer "
+                           "link on the official page. Manual download: "
+                           "https://freefilesync.org/download.php")
+    installer_url = "https://freefilesync.org" + m.group(1)
+    ctx.log(f"  resolved current installer: {m.group(1)}")
+    part = {"label": "FreeFileSync", "url": installer_url, "min_bytes": 10_000_000,
+            "require_signature": True, "manual": "https://freefilesync.org/download.php"}
+    fd, dest = _tf.mkstemp(prefix="cleaner_ffs_", suffix=".exe")
+    os.close(fd)
+    try:
+        try:
+            _download_binary(ctx, part["url"], dest, part["label"], part["min_bytes"], part=part)
+        except TaskCancelled:
+            raise
+        except RuntimeError as exc:
+            raise RuntimeError(f"{exc} Manual download: {part['manual']}")
+        # Inno Setup (verified live: 'Inno Setup' PE strings + signed)
+        _run_verified_installer(ctx, part["label"], dest, "/VERYSILENT /NORESTART",
+                                part["manual"])
+    finally:
+        try:
+            if os.path.exists(dest):
+                os.remove(dest)
+        except OSError:
+            pass
+    ctx.log("FreeFileSync installed — open it to set up your first folder pair.")
 
 
 def install_webview2(ctx: TaskContext):
@@ -1066,3 +1455,31 @@ TASKS = [
 APO_PEACE_TASK = Task("install_apo_peace", "Equalizer APO + Peace GUI",
                       "One click for system-wide EQ (hear footsteps) with the Peace interface — reboot finishes it",
                       install_apo_peace_bundle, default=False, admin_required=True, column=0)
+
+# Equalizer APO + FluidEQ (round-8, user request: a second GUI choice for
+# the same engine — the user picks Peace OR FluidEQ, both bundles live in
+# the Media category). Same embedded-row pattern as APO_PEACE_TASK.
+APO_FLUIDEQ_TASK = Task("install_apo_fluideq", "Equalizer APO + FluidEQ",
+                        "Same EQ engine with the modern FluidEQ interface (per-output profiles, headphone correction) — bigger download",
+                        install_apo_fluideq_bundle, default=False, admin_required=True, column=0)
+
+# RustDesk + FreeFileSync (round-8): the APO+Peace download method applied
+# to two former MANUAL_ONLY_APPS (both verified NOT on winget). They render
+# as installable checkbox rows inside their old categories instead of
+# link-only manual rows.
+RUSTDESK_TASK = Task("install_rustdesk", "RustDesk",
+                     "FOSS remote desktop (TeamViewer replacement) — installed from the official GitHub release, hash-verified",
+                     install_rustdesk, default=False, admin_required=False, column=0)
+FREEFILESYNC_TASK = Task("install_freefilesync", "FreeFileSync",
+                         "1-click folder/drive backup mirror — installed from the author's signed official installer",
+                         install_freefilesync, default=False, admin_required=False, column=0)
+
+# Embedded per-category task rows (round-8): maps a catalog category to the
+# standalone tasks that render as checkbox rows at the END of that
+# category (after the winget apps + manual links), picked up by the
+# Install tab's bundle-row renderer. The GUI reads ONLY this mapping —
+# adding a future embedded task is a one-line change here.
+EMBEDDED_TASKS_BY_CATEGORY = {
+    "Media, Streaming & Audio": [APO_PEACE_TASK, APO_FLUIDEQ_TASK],
+    "Utilities & Cleaners": [RUSTDESK_TASK, FREEFILESYNC_TASK],
+}

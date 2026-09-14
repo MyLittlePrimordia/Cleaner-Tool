@@ -116,6 +116,33 @@ def _process_image_name(pid: int) -> str | None:
     return None
 
 
+def process_exe_path(pid: int) -> str:
+    """FULL executable path of the process under `pid` ('' when unknown).
+
+    Phase-5 pilot overhaul: the basename-truncating twin above stays for
+    the elevation handshake; this one returns the whole path so the
+    Auto-Pilot can verify a process really runs from a watched game
+    folder (same-name-exe-anywhere no longer triggers a session)."""
+    try:
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return ""
+        try:
+            buf = ctypes.create_unicode_buffer(1024)
+            size = ctypes.wintypes.DWORD(1024)
+            ok = ctypes.windll.kernel32.QueryFullProcessImageNameW(
+                handle, 0, buf, ctypes.byref(size))
+            if ok:
+                return buf.value or ""
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    except Exception:
+        pass
+    return ""
+
+
 def _process_is_elevated(pid: int) -> bool:
     """True if the process under `pid` runs with an elevated (admin) token.
 

@@ -10,8 +10,11 @@ red = Undo. All keys from the old palette are kept so existing modules
 APP_NAME = "Cleaner Tool"
 APP_SHORT_NAME = "Cleaner Tool"
 APP_VERSION = "2.0.0"
-WINDOW_SIZE = "980x720"
-WINDOW_MIN_SIZE = (920, 660)
+# Default window (user request 2026-09): roomier for the Install/Tools
+# tab scrolling — 1040x800. Popups are 800x600 and stay centered with
+# margin. Minsize raised to match (small screens can still shrink it).
+WINDOW_SIZE = "1040x800"
+WINDOW_MIN_SIZE = (980, 700)
 
 COLORS = {
     # Base surfaces (dark navy)

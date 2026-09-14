@@ -59,7 +59,7 @@ def main():
     root.deiconify()
     root.attributes("-topmost", True)   # keep above the terminal running us
     root.lift()
-    root.geometry("980x720+60+40")
+    root.geometry("1040x800+60+40")
     root.update()
     root.after(400, lambda: None)
     root.update()

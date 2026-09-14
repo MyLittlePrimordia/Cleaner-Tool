@@ -1,6 +1,20 @@
 """
 Install tab — Master App Catalog data.
 
+2026-09-12 addition (user request): OpenRGB (OpenRGB.OpenRGB, verified
+FOUND on winget, homepage openrgb.org live 200) in Hardware Diagnostics
+& Tuning, next to Fan Control. Fan Control itself (Rem0o.FanControl,
+verified FOUND) was already catalogued — no duplicate added.
+
+2026-09-12 addition (user request: EarTrumpet, Sunshine, CapFrameX only —
+no other picks): EarTrumpet (File-New-Project.EarTrumpet, verified FOUND
+v2.3.0.0, eartrumpet.app live 200) in Media, Streaming & Audio; Sunshine
+(LizardByte.Sunshine, verified FOUND, project docs live 200) in Gaming
+Tools & Emulators next to Moonlight; CapFrameX (CXWorld.CapFrameX —
+note the publisher prefix, verified FOUND v1.9.0.8, capframex.com live
+200; the Beta variant CXWorld.CapFrameX.Beta deliberately not added) in
+Hardware Diagnostics & Tuning. All three FOSS, no accounts, no tiers.
+
 2026-09-08 round-8 curation (user request: extend the APO+Peace verified
 download method to more non-winget apps + FluidEQ bundle). IDs/URLs for
 every NEW or CHANGED entry were live-verified via `winget search
@@ -164,6 +178,9 @@ MANUAL_ONLY_APPS = [
     {"id": 'manual:losslesscut', "name": 'LosslessCut', "category": 'Media, Streaming & Audio',
      "description": 'Lossless video/audio trimmer and joiner — free official FOSS build (no winget package)', "foss": True,
      "url": 'https://github.com/mifi/lossless-cut/releases', "fallback_url": 'https://mifi.no/losslesscut/'},
+    {"id": 'manual:tiktok-live-studio', "name": 'TikTok LIVE Studio', "category": 'Media, Streaming & Audio',
+     "description": 'Official TikTok desktop app for going live (no winget package)', "foss": False,
+     "url": 'https://www.tiktok.com/live/studio'},
 
 ]
 
@@ -216,6 +233,9 @@ APP_CATALOG = [
     {"id": 'ItchIo.Itch', "name": 'itch.io', "category": 'Game Launchers, Stores & Mod Managers',
      "description": 'Indie game marketplace client', "foss": True,
      "url": 'https://itch.io/app'},
+    {"id": 'Mojang.MinecraftLauncher', "name": 'Minecraft Launcher', "category": 'Game Launchers, Stores & Mod Managers',
+     "description": 'Official launcher for Minecraft Java and Bedrock editions', "foss": False,
+     "url": 'https://www.minecraft.net/'},
     {"id": 'ModOrganizer2.modorganizer', "name": 'Mod Organizer 2', "category": 'Game Launchers, Stores & Mod Managers',
      "description": 'Best mod manager for Skyrim and Fallout', "foss": True,
      "url": 'https://modorganizer.org/'},
@@ -268,6 +288,9 @@ APP_CATALOG = [
     {"id": 'Blinue.Magpie', "name": 'Magpie (FSR Upscaler)', "category": 'Gaming Tools & Emulators',
      "description": 'Adds FSR, integer scaling, and Lanczos upscaling to any windowed game', "foss": True,
      "url": 'https://github.com/Blinue/Magpie'},
+    {"id": 'JeffreyPfau.mGBA', "name": 'mGBA (GBA Emulator)', "category": 'Gaming Tools & Emulators',
+     "description": 'Standalone Game Boy Advance emulator — simpler than RetroArch for casual play', "foss": True,
+     "url": 'https://mgba.io/'},
     {"id": 'MoonlightGameStreamingProject.Moonlight', "name": 'Moonlight Game Streaming', "category": 'Gaming Tools & Emulators',
      "description": 'FOSS client to stream PC games to laptops, TVs, or Steam Deck at 120 FPS', "foss": True,
      "url": 'https://moonlight-stream.org/'},
@@ -280,9 +303,18 @@ APP_CATALOG = [
     {"id": 'PPSSPPTeam.PPSSPP', "name": 'PPSSPP', "category": 'Gaming Tools & Emulators',
      "description": 'PlayStation Portable emulator with HD resolution and texture upscaling', "foss": True,
      "url": 'https://www.ppsspp.org/'},
+    {"id": 'Reshade.Setup', "name": 'ReShade', "category": 'Gaming Tools & Emulators',
+     "description": 'One-click graphics injector with a per-game setup wizard', "foss": True,
+     "url": 'https://reshade.me/'},
     {"id": 'Libretro.RetroArch', "name": 'RetroArch', "category": 'Gaming Tools & Emulators',
      "description": 'All-in-one frontend for retro consoles (GBA, DS, Dreamcast and more built in)', "foss": True,
      "url": 'https://www.retroarch.com/'},
+    {"id": 'SteamGridDB.RomManager', "name": 'Steam ROM Manager', "category": 'Gaming Tools & Emulators',
+     "description": 'Adds emulated ROMs to Steam with cover art (pairs with RetroArch)', "foss": True,
+     "url": 'https://github.com/SteamGridDB/steam-rom-manager'},
+    {"id": 'LizardByte.Sunshine', "name": 'Sunshine', "category": 'Gaming Tools & Emulators',
+     "description": 'Stream your PC games to a TV, laptop or handheld (pairs with Moonlight)', "foss": True,
+     "url": 'https://docs.lizardbyte.dev/projects/sunshine/'},
     {"id": 'xemu-project.xemu', "name": 'xemu (Original Xbox Emulator)', "category": 'Gaming Tools & Emulators',
      "description": 'Original Xbox emulator with higher resolutions', "foss": True,
      "url": 'https://xemu.app/'},
@@ -303,6 +335,12 @@ APP_CATALOG = [
     {"id": 'Mozilla.Firefox', "name": 'Mozilla Firefox', "category": 'Web Browsers',
      "description": 'Independent open-source browser with rich privacy and extension support', "foss": True,
      "url": 'https://www.mozilla.org/firefox/'},
+    {"id": 'Opera.OperaGX', "name": 'Opera GX', "category": 'Web Browsers',
+     "description": 'Gamer browser with RAM/CPU limiters and a Twitch sidebar', "foss": False,
+     "url": 'https://www.opera.com/gx'},
+    {"id": 'Vivaldi.Vivaldi', "name": 'Vivaldi', "category": 'Web Browsers',
+     "description": 'Power browser with built-in adblock, mail and tab stacks', "foss": False,
+     "url": 'https://vivaldi.com/'},
     {"id": 'Zen-Team.Zen-Browser', "name": 'Zen Browser', "category": 'Web Browsers',
      "description": 'High-speed modern Firefox fork with native vertical tabs and split view', "foss": True,
      "url": 'https://zen-browser.app/'},
@@ -319,6 +357,15 @@ APP_CATALOG = [
     {"id": 'Digimezzo.Dopamine.3', "name": 'Dopamine', "category": 'Media, Streaming & Audio',
      "description": 'Clean minimalist local music player', "foss": True,
      "url": 'https://github.com/digimezzo/dopamine-windows/releases/latest'},
+    {"id": 'File-New-Project.EarTrumpet', "name": 'EarTrumpet', "category": 'Media, Streaming & Audio',
+     "description": 'Per-app volume mixer that lives in your taskbar', "foss": True,
+     "url": 'https://eartrumpet.app/'},
+    {"id": 'Elgato.CameraHub', "name": 'Elgato Camera Hub', "category": 'Media, Streaming & Audio',
+     "description": 'One-screen webcam tuning for streams and calls', "foss": False,
+     "url": 'https://www.elgato.com/downloads'},
+    {"id": 'Elgato.WaveLink', "name": 'Elgato Wave Link', "category": 'Media, Streaming & Audio',
+     "description": 'Stream audio mixer for mic, game and Discord levels', "foss": False,
+     "url": 'https://www.elgato.com/downloads'},
     {"id": 'FreeTube.FreeTube', "name": 'FreeTube', "category": 'Media, Streaming & Audio',
      "description": 'Private ad-free YouTube client with SponsorBlock and local subscriptions', "foss": True,
      "url": 'https://freetubeapp.io/'},
@@ -364,6 +411,9 @@ APP_CATALOG = [
     {"id": 'KRTirtho.Spotube', "name": 'Spotube', "category": 'Media, Streaming & Audio',
      "description": 'Spotify client that plays and downloads tracks as MP3/FLAC', "foss": True,
      "url": 'https://spotube.cc/'},
+    {"id": 'SteelSeries.GG', "name": 'SteelSeries GG', "category": 'Media, Streaming & Audio',
+     "description": 'Free headset EQ (Sonar) plus automatic game-clip capture', "foss": False,
+     "url": 'https://steelseries.com/gg'},
     {"id": 'Stremio.Stremio', "name": 'Stremio', "category": 'Media, Streaming & Audio',
      "description": 'All-in-one media aggregator for videos, series, and channels', "foss": True,
      "url": 'https://www.stremio.com/'},
@@ -373,6 +423,9 @@ APP_CATALOG = [
     {"id": 'VideoLAN.VLC', "name": 'VLC Media Player', "category": 'Media, Streaming & Audio',
      "description": 'Versatile open-source media player supporting all audio and video formats', "foss": True,
      "url": 'https://www.videolan.org/vlc/'},
+    {"id": 'th-ch.YouTubeMusic', "name": 'YouTube Music', "category": 'Media, Streaming & Audio',
+     "description": 'YouTube Music desktop app with adblock and SponsorBlock', "foss": True,
+     "url": 'https://github.com/th-ch/youtube-music'},
     # F. Creative & Productivity
     {"id": 'BlenderFoundation.Blender', "name": 'Blender', "category": 'Creative & Productivity',
      "description": 'Professional 3D modeling, animation, VFX, and game asset creation suite', "foss": True,
@@ -380,6 +433,9 @@ APP_CATALOG = [
     {"id": 'GIMP.GIMP', "name": 'GIMP', "category": 'Creative & Productivity',
      "description": 'Open-source image editor', "foss": True,
      "url": 'https://www.gimp.org/'},
+    {"id": 'Greenshot.Greenshot', "name": 'Greenshot', "category": 'Creative & Productivity',
+     "description": 'One-key screenshots with instant crop, arrows and blur', "foss": True,
+     "url": 'https://getgreenshot.org/'},
     {"id": 'Inkscape.Inkscape', "name": 'Inkscape', "category": 'Creative & Productivity',
      "description": 'FOSS vector graphics editor (Illustrator alternative)', "foss": True,
      "url": 'https://inkscape.org/'},
@@ -413,6 +469,9 @@ APP_CATALOG = [
     {"id": 'Pinta.Pinta', "name": 'Pinta', "category": 'Creative & Productivity',
      "description": 'Simple layer-based image editor — an easy Paint.NET alternative', "foss": True,
      "url": 'https://www.pinta-project.com/', "fallback_url": 'https://github.com/PintaProject/Pinta'},
+    {"id": 'Proton.ProtonMail', "name": 'Proton Mail', "category": 'Creative & Productivity',
+     "description": 'Encrypted email app that works with a free Proton account', "foss": False,
+     "url": 'https://proton.me/mail'},
     {"id": 'jurplel.qView', "name": 'qView', "category": 'Creative & Productivity',
      "description": 'Ultra-minimal fast image viewer', "foss": True,
      "url": 'https://interversehq.com/qview/'},
@@ -422,6 +481,9 @@ APP_CATALOG = [
     {"id": 'SumatraPDF.SumatraPDF', "name": 'SumatraPDF', "category": 'Creative & Productivity',
      "description": 'Ultra-fast, lightweight open-source PDF, EPUB, MOBI, and comic reader', "foss": True,
      "url": 'https://www.sumatrapdfreader.org/'},
+    {"id": 'Mozilla.Thunderbird', "name": 'Thunderbird', "category": 'Creative & Productivity',
+     "description": 'Simple private desktop email that just works', "foss": True,
+     "url": 'https://www.thunderbird.net/'},
     # G. Utilities & Cleaners
     {"id": 'amir1376.ABDownloadManager', "name": 'AB Download Manager', "category": 'Utilities & Cleaners',
      "description": 'Fast multi-threaded download accelerator', "foss": True,
@@ -502,6 +564,9 @@ APP_CATALOG = [
      "description": 'Instant visual disk space scanner — finds huge game folders in seconds', "foss": False,
      "url": 'https://diskanalyzer.com/'},
     # H. Hardware Diagnostics & Tuning
+    {"id": 'CXWorld.CapFrameX', "name": 'CapFrameX', "category": 'Hardware Diagnostics & Tuning',
+     "description": 'Measure FPS and frametimes to see how smoothly games really run', "foss": True,
+     "url": 'https://www.capframex.com/'},
     {"id": 'CPUID.CPU-Z', "name": 'CPU-Z', "category": 'Hardware Diagnostics & Tuning',
      "description": 'Live CPU, memory and motherboard specs', "foss": False,
      "url": 'https://www.cpuid.com/softwares/cpu-z.html'},
@@ -526,7 +591,13 @@ APP_CATALOG = [
     {"id": 'Guru3D.Afterburner', "name": 'MSI Afterburner', "category": 'Hardware Diagnostics & Tuning',
      "description": 'GPU overclocking, undervolting, and in-game FPS/temp overlay (via RTSS)', "foss": False,
      "url": 'https://www.msi.com/Landing/afterburner'},
+    {"id": 'OpenRGB.OpenRGB', "name": 'OpenRGB', "category": 'Hardware Diagnostics & Tuning',
+     "description": 'Open-source RGB lighting control for keyboards, mice, RAM, fans and more', "foss": True,
+     "url": 'https://openrgb.org/'},
     # I. Disk Imaging, VMs & Torrents
+    {"id": 'Balena.Etcher', "name": 'balenaEtcher', "category": 'Disk Imaging, VMs & Torrents',
+     "description": 'Dead-simple USB flasher for ISOs — Rufus without the options maze', "foss": True,
+     "url": 'https://etcher.balena.io/'},
     {"id": 'qBittorrent.qBittorrent', "name": 'qBittorrent', "category": 'Disk Imaging, VMs & Torrents',
      "description": 'Ad-free, open-source BitTorrent client with integrated search engine', "foss": True,
      "url": 'https://www.qbittorrent.org/'},

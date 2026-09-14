@@ -2125,12 +2125,32 @@ def _dns_snapshot_key():
     return {"schema": 1, "adapters": {}}
 
 
-def apply_gaming_dns(ctx: TaskContext):
-    """Switch every active adapter's DNS to Cloudflare (1.1.1.1 / 1.0.0.1),
-    snapshotting the prior static servers first so revert is exact.
-    1.1.1.1 is consistently among the fastest public resolvers for game
-    server lookups; fully reversible, no reset needed."""
-    ctx.set_status("Switching DNS to Cloudflare 1.1.1.1...")
+def _dns_set_command(idx: str, servers) -> list:
+    """PowerShell argv that sets an adapter's DNS servers (shell=False,
+    no quoting surface). Extracted pure so the harness can assert the
+    exact command for default AND custom servers without executing it."""
+    quoted = ",".join(f"'{s}'" for s in servers)
+    return ["powershell", "-NoProfile", "-Command",
+            f"Set-DnsClientServerAddress -InterfaceIndex {idx} "
+            f"-ServerAddresses ({quoted})"]
+
+
+def apply_gaming_dns(ctx: TaskContext, servers=None):
+    """Switch every active adapter's DNS (default Cloudflare 1.1.1.1 /
+    1.0.0.1), snapshotting the prior static servers first so revert is
+    exact. 1.1.1.1 is consistently among the fastest public resolvers
+    for game server lookups; fully reversible, no reset needed.
+
+    servers: optional (primary, secondary) pair — the DNS tester dialog
+    passes the measured winner here. Default None keeps the classic
+    Cloudflare behavior byte-identical (same command, same snapshot,
+    same logs for the default pair)."""
+    if servers is None:
+        servers = tuple(_DNS_CLOUDFLARE)
+    else:
+        servers = (str(servers[0]), str(servers[1]))
+    _label = "Cloudflare" if list(servers) == _DNS_CLOUDFLARE else " / ".join(servers)
+    ctx.set_status(f"Switching DNS to {_label}...")
     if not IS_WINDOWS:
         raise RuntimeError("Windows only.")
     import subprocess as _sp
@@ -2150,20 +2170,24 @@ def apply_gaming_dns(ctx: TaskContext):
     for line in (out.stdout or "").splitlines():
         if not line.startswith("ADAPT|"):
             continue
-        _, idx, servers = line.split("|", 2)
+        # B-1 audit fix: the unpack target MUST NOT be named `servers` — it
+        # shadowed the function parameter holding the NEW pair to apply, so
+        # _dns_set_command received each adapter's OLD value (a comma-joined
+        # string, iterated char-by-char into garbage single-char 'servers')
+        # and the chosen pair was never set. `prior` is the adapter's current
+        # DNS (snapshot use only); the set below uses the parameter.
+        _, idx, prior = line.split("|", 2)
         idx = idx.strip()
         if not idx.isdigit():
             continue
-        snapshot["adapters"][idx] = servers.strip() or None   # None = DHCP
+        snapshot["adapters"][idx] = prior.strip() or None   # None = DHCP
         # H4: netsh `name=` wants the adapter NAME, not the numeric ifIndex
         # (passing the index fails or hits the wrong NIC). The PowerShell
         # cmdlet takes -InterfaceIndex directly — unambiguous, shell=False
         # argv so no quoting/injection surface. NOTE: ifIndex can change
         # across reboots/NIC swaps; revert only touches these snapshot
         # indexes and reports misses honestly.
-        rc = run_cmd(ctx, ["powershell", "-NoProfile", "-Command",
-                           f"Set-DnsClientServerAddress -InterfaceIndex {idx} "
-                           f"-ServerAddresses ('1.1.1.1','1.0.0.1')"],
+        rc = run_cmd(ctx, _dns_set_command(idx, servers),
                      shell=False, timeout=30)
         if rc == 0:
             switched += 1
@@ -2179,7 +2203,7 @@ def apply_gaming_dns(ctx: TaskContext):
             "(snapshot NOT saved, tweak not marked applied)."
         )
     save_tweak_snapshot("gaming_dns", snapshot)
-    ctx.log(f"DNS switched to Cloudflare on {switched} adapter(s). (Snapshot saved for undo.)")
+    ctx.log(f"DNS switched to {_label} on {switched} adapter(s). (Snapshot saved for undo.)")
 
 
 def revert_gaming_dns(ctx: TaskContext):
@@ -2845,55 +2869,307 @@ def revert_reserved_storage_off(ctx: TaskContext):
 
 from app.tasks import Task  # noqa: E402
 
+
+# --------------------------------------------------------------------------- #
+# Tweak Health verify functions (user-approved feature 2, 2026-09)
+#
+# READ-ONLY drift detectors: each returns True (tweak still applied), False
+# (Windows Update / a driver / the user reset it), or None (cannot tell).
+# They read EXACTLY the values the matching apply_* function writes — no
+# new registry knowledge, just the existing write specs read back. A tweak
+# with no verify function simply shows 'applied' in the Health view (the
+# config registry's word is trusted); False only ever comes from a
+# definitive read of a tweaked value that is no longer the tweaked value.
+# __verify_read is a no-log reader: the health check runs outside a run
+# and must not pollute the run log.
+# --------------------------------------------------------------------------- #
+
+def __verify_read(hive: str, path: str, name: str):
+    """reg_get_value without a TaskContext — silent, read-only, no log."""
+    try:
+        from app.utils import reg_get_value as _rgv
+        class _NoCtx:
+            @staticmethod
+            def log(_m):
+                pass
+            @staticmethod
+            def set_status(_m):
+                pass
+            @staticmethod
+            def cancelled():
+                return False
+        return _rgv(_NoCtx, hive, path, name)  # type: ignore[arg-type]
+    except Exception:
+        return None
+
+
+def _verify_all_values(specs_and_expected) -> "bool | None":
+    """True when EVERY (hive, path, name, expected) tuple reads the
+    expected value; None when the FIRST readable value doesn't match (or
+    nothing could be read). Missing keys count as drifted: apply's writes
+    make the values exist, so an absent value after an apply means it was
+    removed. But if NOTHING is readable at all we return None — the honest
+    'cannot tell' — rather than guessing False from a dead registry read."""
+    saw_any = False
+    for hive, path, name, expected in specs_and_expected:
+        v = __verify_read(hive, path, name)
+        if v is None:
+            continue
+        saw_any = True
+        if v != expected and str(v) != str(expected):
+            return False
+    return True if saw_any else None
+
+
+def _verify_value(hive: str, path: str, name: str, expected) -> "bool | None":
+    return _verify_all_values([(hive, path, name, expected)])
+
+
+def verify_ultimate_performance() -> "bool | None":
+    """Active scheme is an Ultimate Performance duplicate."""
+    try:
+        guid = _active_scheme_guid()
+        if not guid:
+            return None
+        return _guids_equal(guid, ULTIMATE_PERF_GUID) or _guids_equal(
+            guid, _find_ultimate_scheme_guid() or "")
+    except Exception:
+        return None
+
+
+def verify_classic_context_menu() -> "bool | None":
+    v = __verify_read("HKCU", f"Software\\Classes\\CLSID\\{CONTEXT_MENU_CLSID}\\InprocServer32", "")
+    return None if v is None else (str(v) == "")
+
+
+def verify_disable_game_dvr() -> "bool | None":
+    return _verify_all_values([
+        ("HKCU", "System\\GameConfigStore", "GameDVR_Enabled", 0),
+        ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\GameDVR", "AppCaptureEnabled", 0),
+        ("HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\GameDVR", "AllowGameDVR", 0),
+    ])
+
+
+def verify_game_mode() -> "bool | None":
+    return _verify_all_values([
+        ("HKCU", "Software\\Microsoft\\GameBar", "AutoGameModeEnabled", 1),
+        ("HKCU", "Software\\Microsoft\\GameBar", "AllowAutoGameMode", 1),
+    ])
+
+
+def verify_windowed_optimize() -> "bool | None":
+    return _verify_all_values([
+        ("HKCU", "System\\GameConfigStore", "GameDVR_FSEBehaviorMode", 2),
+        ("HKCU", "System\\GameConfigStore", "GameDVR_DXGIHonorFSEWindowsCompatible", 1),
+        ("HKCU", "System\\GameConfigStore", "GameDVR_HonorUserFSEBehaviorMode", 1),
+    ])
+
+
+def verify_hags() -> "bool | None":
+    return _verify_value("HKLM", "SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers", "HwSchMode", 2)
+
+
+def verify_priority_separation() -> "bool | None":
+    return _verify_value("HKLM", "SYSTEM\\CurrentControlSet\\Control\\PriorityControl", "Win32PrioritySeparation", 38)
+
+
+def verify_power_throttling_off() -> "bool | None":
+    return _verify_value("HKLM", "SYSTEM\\CurrentControlSet\\Control\\Power\\PowerThrottling", "PowerThrottlingOff", 1)
+
+
+def verify_mouse_accel() -> "bool | None":
+    return _verify_all_values([
+        ("HKCU", "Control Panel\\Mouse", "MouseSpeed", "0"),
+        ("HKCU", "Control Panel\\Mouse", "MouseThreshold1", "0"),
+        ("HKCU", "Control Panel\\Mouse", "MouseThreshold2", "0"),
+    ])
+
+
+def verify_keyboard_tuning() -> "bool | None":
+    return _verify_all_values([
+        ("HKCU", "Control Panel\\Keyboard", "KeyboardDelay", "0"),
+        ("HKCU", "Control Panel\\Keyboard", "KeyboardSpeed", "31"),
+    ])
+
+
+def verify_network_throttling() -> "bool | None":
+    return _verify_value("HKLM", "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile",
+                         "NetworkThrottlingIndex", 0xFFFFFFFF)
+
+
+def verify_games_priority() -> "bool | None":
+    return _verify_all_values([
+        ("HKLM", "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile\\Tasks\\Games",
+         "Scheduling Category", "High"),
+        ("HKLM", "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile\\Tasks\\Games",
+         "GPU Priority", 8),
+        ("HKLM", "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile\\Tasks\\Games",
+         "Priority", 6),
+        ("HKLM", "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile\\Tasks\\Games",
+         "SFIO Priority", 8),
+    ])
+
+
+def verify_disable_nagle() -> "bool | None":
+    """Nagle applies to every interface subkey — check the first readable
+    one. TcpAckFrequency=1/TCPNoDelay=1 after apply; revert deletes them."""
+    try:
+        key = _open_interfaces_key()
+        try:
+            i = 0
+            while True:
+                try:
+                    sub = winreg.EnumKey(key, i)
+                except OSError:
+                    break
+                i += 1
+                base = f"SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces\\{sub}"
+                v1 = __verify_read("HKLM", base, "TcpAckFrequency")
+                v2 = __verify_read("HKLM", base, "TCPNoDelay")
+                if v1 is None and v2 is None:
+                    continue   # adapter with neither value (e.g. read-only)
+                return (v1 == 1 and v2 == 1)
+        finally:
+            winreg.CloseKey(key)
+    except Exception:
+        return None
+    return None
+
+
+def verify_disable_sticky_keys() -> "bool | None":
+    return _verify_all_values([
+        ("HKCU", "Control Panel\\Accessibility\\StickyKeys", "Flags", "506"),
+        ("HKCU", "Control Panel\\Accessibility\\Keyboard Response", "Flags", "122"),
+        ("HKCU", "Control Panel\\Accessibility\\ToggleKeys", "Flags", "58"),
+    ])
+
+
+def verify_suppress_crash_popups() -> "bool | None":
+    return _verify_value("HKCU", "Software\\Microsoft\\Windows\\Windows Error Reporting", "DontShowUI", 1)
+
+
+def verify_no_update_reboot() -> "bool | None":
+    return _verify_value("HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU",
+                         "NoAutoRebootWithLoggedOnUsers", 1)
+
+
+def verify_mpo_fix() -> "bool | None":
+    return _verify_value("HKLM", "SOFTWARE\\Microsoft\\Windows\\Dwm", "OverlayTestMode", 5)
+
+
+def verify_background_apps() -> "bool | None":
+    return _verify_value("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\BackgroundAccessApplications",
+                         "GlobalUserDisabled", 1)
+
+
+def verify_fullscreen_opt() -> "bool | None":
+    return _verify_value("HKCU", "Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\Layers",
+                         "DISABLEDXMAXIMIZEDWINDOWEDMODE", 1)
+
+
+def verify_local_search() -> "bool | None":
+    return _verify_value("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Search", "BingSearchEnabled", 0)
+
+
+def verify_visual_effects() -> "bool | None":
+    return _verify_value("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                         "EnableTransparency", 0)
+
+
+def verify_end_task_taskbar() -> "bool | None":
+    return _verify_value("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced\\TaskbarDeveloperSettings",
+                         "TaskbarEndTask", 1)
+
+
+def verify_startup_delay() -> "bool | None":
+    return _verify_value("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Serialize",
+                         "StartupDelayInMSec", 0)
+
+
+def verify_limit_telemetry() -> "bool | None":
+    return _verify_value("HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\DataCollection", "AllowTelemetry", 1)
+
+
+def verify_shader_cache_10gb() -> "bool | None":
+    """NVIDIA-only: RMShaderCacheSize=10240 (MB, 10 GB)."""
+    return _verify_value("HKCU", "Software\\NVIDIA Corporation\\Global\\FTS", "RMShaderCacheSize", 10240)
+
+
+def verify_max_cpu_power() -> "bool | None":
+    """PERFBOOSTMODE=2 (Aggressive) on the AC side of the current scheme."""
+    try:
+        class _NoCtx:
+            @staticmethod
+            def log(_m): pass
+            @staticmethod
+            def set_status(_m): pass
+            @staticmethod
+            def cancelled(): return False
+        from app.utils import powercfg_query_index as _pqi
+        v = _pqi(_NoCtx, "sub_processor", "PERFBOOSTMODE")  # type: ignore[arg-type]
+        return None if v is None else v == 2
+    except Exception:
+        return None
+
+
+def verify_ssd_superfetch() -> "bool | None":
+    """SysMain disabled — service start type read via the registry
+    (locale-free, the same source sc_query_start_type uses)."""
+    v = __verify_read("HKLM", "SYSTEM\\CurrentControlSet\\Services\\SysMain", "Start")
+    if v is None:
+        return None
+    return v == 4          # 4 = disabled
+
+
 TASKS = [
     Task("restore_point_tweak", "Safety Checkpoint", "Saves a restore point so you can undo changes", create_restore_point, default=True, admin_required=True, column=0),
-    Task("ultimate_performance", "Max Performance Mode", "Turns on hidden fastest power plan for better FPS", apply_ultimate_performance, default=True, admin_required=True, revert=revert_ultimate_performance, column=0),
+    Task("ultimate_performance", "Max Performance Mode", "Turns on hidden fastest power plan for better FPS", apply_ultimate_performance, default=True, admin_required=True, revert=revert_ultimate_performance, verify=verify_ultimate_performance, column=0),
     # audit fix (12 mis-gated HKCU tweaks): these are pure HKCU in BOTH apply
     # and revert — the Task default admin_required=True needlessly skipped
     # them for every non-admin (limited-mode) user.
-    Task("classic_context_menu", "Full Right-Click Menu", "Shows full menu right away, no extra click", apply_classic_context_menu, default=True, admin_required=False, revert=revert_classic_context_menu, column=0),
-    Task("disable_game_dvr", "Stop Background Recording", "Stops Xbox recording games in background that slows you", apply_disable_game_dvr, default=True, admin_required=False, revert=revert_disable_game_dvr, column=0),
-    Task("game_mode", "Turn On Game Mode", "Lets Windows focus on your game, not background apps", apply_game_mode, default=True, admin_required=False, revert=revert_game_mode, column=0),
-    Task("windowed_optimize", "Smooth Windowed Games", "Makes games smoother when playing in a window", apply_windowed_optimize, default=True, admin_required=False, revert=revert_windowed_optimize, column=0),
-    Task("hags", "Faster Graphics (HAGS)", "Lets graphics card handle memory faster, needs restart", apply_hags, default=False, admin_required=True, revert=revert_hags, risk="REBOOT REQUIRED", column=0),
-    Task("priority_separation", "Prioritize Your Game", "Gives your open game more CPU power", apply_priority_separation, default=False, admin_required=True, revert=revert_priority_separation, risk="REBOOT REQUIRED", column=0),
-    Task("power_throttling_off", "Disable CPU Power Throttling", "Stops Windows from slowing CPU to save power", apply_power_throttling_off, default=False, admin_required=True, revert=revert_power_throttling_off, risk="REBOOT REQUIRED", column=0),
+    Task("classic_context_menu", "Full Right-Click Menu", "Shows full menu right away, no extra click", apply_classic_context_menu, default=True, admin_required=False, revert=revert_classic_context_menu, verify=verify_classic_context_menu, column=0),
+    Task("disable_game_dvr", "Stop Background Recording", "Stops Xbox recording games in background that slows you", apply_disable_game_dvr, default=True, admin_required=False, revert=revert_disable_game_dvr, verify=verify_disable_game_dvr, column=0),
+    Task("game_mode", "Turn On Game Mode", "Lets Windows focus on your game, not background apps", apply_game_mode, default=True, admin_required=False, revert=revert_game_mode, verify=verify_game_mode, column=0),
+    Task("windowed_optimize", "Smooth Windowed Games", "Makes games smoother when playing in a window", apply_windowed_optimize, default=True, admin_required=False, revert=revert_windowed_optimize, verify=verify_windowed_optimize, column=0),
+    Task("hags", "Faster Graphics (HAGS)", "Lets graphics card handle memory faster, needs restart", apply_hags, default=False, admin_required=True, revert=revert_hags, verify=verify_hags, risk="REBOOT REQUIRED", column=0),
+    Task("priority_separation", "Prioritize Your Game", "Gives your open game more CPU power", apply_priority_separation, default=False, admin_required=True, revert=revert_priority_separation, verify=verify_priority_separation, risk="REBOOT REQUIRED", column=0),
+    Task("power_throttling_off", "Disable CPU Power Throttling", "Stops Windows from slowing CPU to save power", apply_power_throttling_off, default=False, admin_required=True, revert=revert_power_throttling_off, verify=verify_power_throttling_off, risk="REBOOT REQUIRED", column=0),
     Task("ssd_trim", "Enable SSD TRIM", "Keeps your SSD fast and healthy", apply_ssd_trim, default=False, admin_required=True, revert=revert_ssd_trim, risk="REBOOT REQUIRED", column=1),
-    Task("ssd_superfetch", "Disable SysMain (Superfetch)", "Turns off old hard drive helper not needed for SSD", apply_ssd_superfetch, default=False, admin_required=True, revert=revert_ssd_superfetch, risk="REBOOT REQUIRED", column=1),
+    Task("ssd_superfetch", "Disable SysMain (Superfetch)", "Turns off old hard drive helper not needed for SSD", apply_ssd_superfetch, default=False, admin_required=True, revert=revert_ssd_superfetch, verify=verify_ssd_superfetch, risk="REBOOT REQUIRED", column=1),
     Task("ssd_last_access", "Disable Last Access Updates", "Stops Windows writing every time you open a file", apply_ssd_last_access, default=False, admin_required=True, revert=revert_ssd_last_access, risk="REBOOT REQUIRED", column=1),
     Task("ssd_prefetch", "Disable Prefetcher", "Turns off extra loading helper for fast drives", apply_ssd_prefetch, default=False, admin_required=True, revert=revert_ssd_prefetch, risk="REBOOT REQUIRED", column=1),
-    Task("disable_nagle", "Lower Ping (Advanced)", "Makes online games respond faster", apply_disable_nagle, default=False, admin_required=True, revert=revert_disable_nagle, risk="ADVANCED", column=1),
-    Task("startup_delay", "Faster Startup", "Removes small delay before startup apps open", apply_startup_delay, default=False, admin_required=False, revert=revert_startup_delay, column=0),
-    Task("max_cpu_power", "Max CPU Power", "Aggressive boost, no core parking, full speed while gaming", apply_max_cpu_power, default=False, admin_required=True, revert=revert_max_cpu_power, column=0),
+    Task("disable_nagle", "Lower Ping (Advanced)", "Makes online games respond faster", apply_disable_nagle, default=False, admin_required=True, revert=revert_disable_nagle, verify=verify_disable_nagle, risk="ADVANCED", column=1),
+    Task("startup_delay", "Faster Startup", "Removes small delay before startup apps open", apply_startup_delay, default=False, admin_required=False, revert=revert_startup_delay, verify=verify_startup_delay, column=0),
+    Task("max_cpu_power", "Max CPU Power", "Aggressive boost, no core parking, full speed while gaming", apply_max_cpu_power, default=False, admin_required=True, revert=revert_max_cpu_power, verify=verify_max_cpu_power, column=0),
     Task("taskbar_cleanup", "Remove Taskbar Junk", "Turns off Widgets, Chat icon, search highlights and Explorer ads", apply_taskbar_cleanup, default=False, admin_required=False, revert=revert_taskbar_cleanup, column=0),
-    Task("local_search", "Fast Local Search", "Makes Start search instant with no Bing or web results", apply_local_search, default=False, admin_required=False, revert=revert_local_search, column=0),
+    Task("local_search", "Fast Local Search", "Makes Start search instant with no Bing or web results", apply_local_search, default=False, admin_required=False, revert=revert_local_search, verify=verify_local_search, column=0),
     Task("stop_windows_ads", "Stop Windows Ads & Tips", "Blocks every suggestion, auto-install and lock-screen ad", apply_stop_windows_ads, default=False, admin_required=False, revert=revert_stop_windows_ads, column=0),
     Task("privacy_baseline", "Privacy Baseline", "One switch for ad ID, tracking, typing data and speech opt-outs", apply_privacy_baseline, default=False, admin_required=False, revert=revert_privacy_baseline, column=0),
     Task("stop_telemetry", "Stop Telemetry", "Turns off diagnostic services and tracking tasks safely", apply_stop_telemetry, default=False, admin_required=True, revert=revert_stop_telemetry, column=0),
     Task("nvidia_telemetry", "NVIDIA Telemetry Opt-Out", "Turns off NVIDIA's usage reports (driver untouched)", apply_nvidia_telemetry_optout, default=False, admin_required=True, revert=revert_nvidia_telemetry_optout, column=0),
     Task("ad_blocker", "System-Wide Ad Blocker", "Blocks ~78,000 known ad/tracker domains via the hosts file", apply_ad_blocker, default=False, revert=revert_ad_blocker, admin_required=True, risk="ADVANCED", column=0),
-    Task("visual_effects", "Faster Animations", "Turns off transparency and animations for speed", apply_visual_effects_perf, default=False, admin_required=False, revert=revert_visual_effects_perf, column=1),
-    Task("mouse_accel", "1:1 Mouse Aim", "Turns off mouse speedup so aim is steady", apply_disable_mouse_accel, default=False, admin_required=False, revert=revert_disable_mouse_accel, column=1),
-    Task("keyboard_tuning", "Faster Keyboard", "Makes keys repeat faster when you hold them", apply_keyboard_tuning, default=False, admin_required=False, revert=revert_keyboard_tuning, column=1),
-    Task("network_throttling", "Faster Online Gaming", "Removes speed limit Windows uses for videos", apply_network_throttling, default=False, admin_required=True, revert=revert_network_throttling, column=1),
-    Task("games_priority", "Boost Game Priority", "Raises game priority for CPU and graphics", apply_games_priority, default=False, admin_required=True, revert=revert_games_priority, column=1),
+    Task("visual_effects", "Faster Animations", "Turns off transparency and animations for speed", apply_visual_effects_perf, default=False, admin_required=False, revert=revert_visual_effects_perf, verify=verify_visual_effects, column=1),
+    Task("mouse_accel", "1:1 Mouse Aim", "Turns off mouse speedup so aim is steady", apply_disable_mouse_accel, default=False, admin_required=False, revert=revert_disable_mouse_accel, verify=verify_mouse_accel, column=1),
+    Task("keyboard_tuning", "Faster Keyboard", "Makes keys repeat faster when you hold them", apply_keyboard_tuning, default=False, admin_required=False, revert=revert_keyboard_tuning, verify=verify_keyboard_tuning, column=1),
+    Task("network_throttling", "Faster Online Gaming", "Removes speed limit Windows uses for videos", apply_network_throttling, default=False, admin_required=True, revert=revert_network_throttling, verify=verify_network_throttling, column=1),
+    Task("games_priority", "Boost Game Priority", "Raises game priority for CPU and graphics", apply_games_priority, default=False, admin_required=True, revert=revert_games_priority, verify=verify_games_priority, column=1),
     Task("usb_suspend", "Fix USB Dropouts", "Stops Windows pausing USB mics and controllers", apply_usb_suspend, default=False, admin_required=True, revert=revert_usb_suspend, column=1),
     Task("disk_timeout", "Keep Drive Awake", "Stops drive from sleeping while you game", apply_disk_timeout, default=False, admin_required=True, revert=revert_disk_timeout, column=1),
     Task("disable_fast_startup", "Fix Boot Issues", "Turns off fast boot to fix driver problems", apply_fast_startup_fix, default=False, admin_required=True, revert=revert_fast_startup_fix, column=1),
-    Task("limit_telemetry", "Limit Tracking", "Tells Windows to collect less info about you", apply_limit_telemetry, default=False, admin_required=True, revert=revert_limit_telemetry, column=1),
+    Task("limit_telemetry", "Limit Tracking", "Tells Windows to collect less info about you", apply_limit_telemetry, default=False, admin_required=True, revert=revert_limit_telemetry, verify=verify_limit_telemetry, column=1),
     Task("activity_history", "Disable Activity History", "Stops Windows saving your recent files and history", apply_activity_history_disable, default=False, admin_required=True, revert=revert_activity_history_disable, column=0),
     Task("consumer_features", "Disable Consumer Features", "Stops Windows installing suggested apps", apply_consumer_features_disable, default=False, admin_required=True, revert=revert_consumer_features_disable, column=0),
     Task("tweak_delivery_optimization", "Disable Delivery Optimization", "Stops sharing updates with other PCs", apply_delivery_optimization_disable, default=False, admin_required=True, revert=revert_delivery_optimization_disable, column=1),
-    Task("end_task_taskbar", "Enable End Task on Taskbar", "Lets you right-click taskbar to close frozen apps", apply_end_task_on_taskbar, default=False, admin_required=False, revert=revert_end_task_on_taskbar, column=1),
+    Task("end_task_taskbar", "Enable End Task on Taskbar", "Lets you right-click taskbar to close frozen apps", apply_end_task_on_taskbar, default=False, admin_required=False, revert=revert_end_task_on_taskbar, verify=verify_end_task_taskbar, column=1),
     Task("explorer_auto_discovery", "No Explorer Auto Discovery", "Stops Explorer guessing folder types — IRREVERSIBLY clears all saved folder views/sorts (Undo cannot restore them)", apply_explorer_auto_discovery_disable, default=False, admin_required=False, revert=revert_explorer_auto_discovery_disable, column=0, risk="ADVANCED"),
-    Task("background_apps", "Disable Background Apps", "Stops apps running in background so games get more power", apply_background_apps_disable, default=False, admin_required=False, revert=revert_background_apps_disable, column=0),
-    Task("shader_cache_10gb", "Shader Cache 10GB", "Sets shader cache to 10GB to stop stutter", apply_shader_cache_10gb, default=False, admin_required=False, revert=revert_shader_cache_10gb, column=1),
+    Task("background_apps", "Disable Background Apps", "Stops apps running in background so games get more power", apply_background_apps_disable, default=False, admin_required=False, revert=revert_background_apps_disable, verify=verify_background_apps, column=0),
+    Task("shader_cache_10gb", "Shader Cache 10GB", "Sets shader cache to 10GB to stop stutter", apply_shader_cache_10gb, default=False, admin_required=False, revert=revert_shader_cache_10gb, verify=verify_shader_cache_10gb, column=1),
     Task("max_performance_gpu", "Prefer Max Performance", "Tells GPU to use max power for games", apply_nvidia_max_performance, default=False, admin_required=True, revert=revert_nvidia_max_performance, column=1),
-    Task("fullscreen_opt", "Fullscreen Optimizations Off", "Fixes game lag in borderless window", apply_fullscreen_optimizations_disable, default=False, admin_required=False, revert=revert_fullscreen_optimizations_disable, column=0),
-    Task("disable_sticky_keys", "Stop Sticky Keys Popups", "Stops Shift-spam popups/beeps interrupting games", apply_disable_sticky_keys, default=False, revert=revert_disable_sticky_keys, admin_required=False, column=0),
-    Task("suppress_crash_popups", "Stop Crash Popups", "Background app crashes no longer pause or cover your game", apply_suppress_crash_popups, default=False, revert=revert_suppress_crash_popups, admin_required=False, column=0),
-    Task("no_update_reboot", "Block Update Reboots", "Windows Update won't force-restart your PC while you're using it", apply_no_update_reboot, default=False, revert=revert_no_update_reboot, admin_required=True, column=0),
-    Task("mpo_fix", "Fix Monitor Flicker (MPO)", "Fixes black-screen flashes and stutter on multi-monitor setups", apply_mpo_fix, default=False, revert=revert_mpo_fix, admin_required=True, risk="REBOOT REQUIRED", column=0),
+    Task("fullscreen_opt", "Fullscreen Optimizations Off", "Fixes game lag in borderless window", apply_fullscreen_optimizations_disable, default=False, admin_required=False, revert=revert_fullscreen_optimizations_disable, verify=verify_fullscreen_opt, column=0),
+    Task("disable_sticky_keys", "Stop Sticky Keys Popups", "Stops Shift-spam popups/beeps interrupting games", apply_disable_sticky_keys, default=False, revert=revert_disable_sticky_keys, verify=verify_disable_sticky_keys, admin_required=False, column=0),
+    Task("suppress_crash_popups", "Stop Crash Popups", "Background app crashes no longer pause or cover your game", apply_suppress_crash_popups, default=False, revert=revert_suppress_crash_popups, verify=verify_suppress_crash_popups, admin_required=False, column=0),
+    Task("no_update_reboot", "Block Update Reboots", "Windows Update won't force-restart your PC while you're using it", apply_no_update_reboot, default=False, revert=revert_no_update_reboot, verify=verify_no_update_reboot, admin_required=True, column=0),
+    Task("mpo_fix", "Fix Monitor Flicker (MPO)", "Fixes black-screen flashes and stutter on multi-monitor setups", apply_mpo_fix, default=False, revert=revert_mpo_fix, verify=verify_mpo_fix, admin_required=True, risk="REBOOT REQUIRED", column=0),
 
     # --- Round 2 feature tasks (user request) --- #
     Task("gaming_dns", "Gaming DNS (Cloudflare)", "Switches DNS to Cloudflare 1.1.1.1/1.0.0.1 — often the fastest for game servers; fully undoable", apply_gaming_dns, default=False, revert=revert_gaming_dns, admin_required=True, column=0),

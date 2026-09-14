@@ -39,6 +39,28 @@ DEFAULT_CONFIG = {
     # the source for the UI's "Applied" badges, kept distinct from the
     # on/off state of any toggle. Snapshots (above) also imply "applied".
     "applied_tweaks": [],
+    # Game Session Auto-Pilot (user-approved feature 6, 2026-09): all
+    # off/empty by default. enabled = watcher thread may run while the
+    # app is open; games = extra .exe names the user added (lowercase,
+    # with extension); preset = which Tweak preset to apply per session.
+    # Phase-5 keys: paths = full exe paths of picked games (watch-matched
+    # by parent dir, immune to same-name exes elsewhere); watch_all =
+    # auto-watch every installed game found by app.game_catalog at
+    # watcher start (OFF by default — explicit consent, no magic).
+    # Additive keys — old configs merge them on load (see below).
+    "session_pilot_enabled": False,
+    "session_pilot_games": [],
+    "session_pilot_preset": "Game Session",
+    "session_pilot_paths": [],
+    # Default-ON for NEW configs (user ruling 2026-09-12): watch-all gives
+    # wide, path-verified detection with zero setup. The flip is a
+    # DEFAULT only — any config that already carries the key (every
+    # config touched by a prior app version) keeps the user's explicit
+    # choice, because the merge below only fills MISSING keys.
+    "session_pilot_watch_all": True,
+    # display names for path picks (path -> "Baldur's Gate 3"): pure UI
+    # sugar, never consulted by matching. Dict coerced like the others.
+    "session_pilot_names": {},
 }
 
 # Phase 2 (#12): mapping used to migrate configs saved by the old 5-tab UI.
@@ -192,6 +214,40 @@ def _load_config_from_disk() -> dict:
                 data["applied_tweaks"] = []
             else:
                 data["applied_tweaks"] = [t for t in data["applied_tweaks"] if isinstance(t, str)]
+            # Session Pilot (feature 6): same hand-edited-config hazards —
+            # a string here would scatter per-character exe names into the
+            # watchlist; coerce junk back to defaults.
+            if not isinstance(data.get("session_pilot_games"), list):
+                data["session_pilot_games"] = []
+            else:
+                data["session_pilot_games"] = [
+                    g for g in data["session_pilot_games"]
+                    if isinstance(g, str) and g.strip()]
+            if not isinstance(data.get("session_pilot_preset"), str):
+                data["session_pilot_preset"] = copy.deepcopy(
+                    DEFAULT_CONFIG["session_pilot_preset"])
+            if not isinstance(data.get("session_pilot_enabled"), bool):
+                data["session_pilot_enabled"] = False
+            # Phase-5 keys: same coercion contract (strings scatter;
+            # junk degrades to defaults, never raises)
+            if not isinstance(data.get("session_pilot_paths"), list):
+                data["session_pilot_paths"] = []
+            else:
+                data["session_pilot_paths"] = [
+                    p for p in data["session_pilot_paths"]
+                    if isinstance(p, str) and p.strip()]
+            if "session_pilot_watch_all" in data:
+                # explicit user choice (or legacy default) — validate only
+                if not isinstance(data["session_pilot_watch_all"], bool):
+                    data["session_pilot_watch_all"] = bool(
+                        DEFAULT_CONFIG["session_pilot_watch_all"])
+            else:
+                # key absent = brand-new install (or never touched pilot):
+                # the new-config default applies (True — see DEFAULT_CONFIG)
+                data["session_pilot_watch_all"] = copy.deepcopy(
+                    DEFAULT_CONFIG["session_pilot_watch_all"])
+            if not isinstance(data.get("session_pilot_names"), dict):
+                data["session_pilot_names"] = {}
             if not isinstance(data.get("tweak_snapshots"), dict):
                 data["tweak_snapshots"] = {}
             return data

@@ -98,3 +98,20 @@ def notify_scheduled_run():
         "Scheduled maintenance started in background.",
         "short"
     )
+
+
+def notify_low_space(drive_letter: str, free_gb: float):
+    """Nudge toast when a drive crosses the red fill threshold (<=5%
+    free). Fire-and-forget like the other notifiers: no delivery
+    guarantee, and never raised. Duration long — a low-space warning
+    deserves the full 25s on screen."""
+    try:
+        free_txt = f"{free_gb:.1f} GB"
+    except Exception:
+        free_txt = "very little space"
+    show_toast(
+        "Cleaner Tool - Drive Nearly Full",
+        f"{drive_letter}: only {free_txt} free. Open Storage Insight "
+        "to see what's eating it and clean the safe junk.",
+        "long",
+    )

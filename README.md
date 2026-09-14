@@ -25,6 +25,12 @@ A free Windows 10/11 utility for gamers: cleans junk, fixes common Windows probl
       <img src="screenshots/install.png" alt="Install Tab" width="100%" />
     </td>
   </tr>
+  <tr>
+    <td align="center" colspan="2" width="100%">
+      <b>Tools Tab</b><br/><br/>
+      <img src="screenshots/tools.png" alt="Tools Tab" width="50%" />
+    </td>
+  </tr>
 </table>
 
 ---
@@ -55,6 +61,11 @@ A free Windows 10/11 utility for gamers: cleans junk, fixes common Windows probl
 - One-click runtimes every game needs: DirectX, VC++, .NET, Java
 - Essentials for stripped Windows (LTSC): Store, winget, Xbox stack, Game Bar, codecs
 - Curated app catalog and one-click "Update Everything"
+
+**Tools**
+- Storage Insight, PC Health report, fastest-DNS test, and game session Auto-Pilot
+- Internet Speed Test with folk-friendly ratings (browsing, gaming, streaming, calls)
+- Quick Tools shortcuts: system utilities, settings pages, maintenance, logs
 
 **Also included**
 - Safety checkpoint (restore point) before changes

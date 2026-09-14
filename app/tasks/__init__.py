@@ -26,3 +26,12 @@ class Task:
     column: int = 0                # deprecated: layout is auto-balanced round-robin in gui.py (kept for backward compat)
     group: str = "Essentials"      # Install-tab Essentials section this task renders under
                                    # ("Essentials" or "LTSC Missing Components"); ignored elsewhere
+    verify: Optional[Callable[[], "bool | None"]] = None
+                                   # Tweak Health (2026-09): READ-ONLY check that the
+                                   # tweak's applied state is still live on this machine.
+                                   # Returns True (applied), False (drifted — Windows
+                                   # Update / a driver reset it), or None (cannot tell —
+                                   # no verify defined or the read failed). The health
+                                   # check never writes anything; a missing verify just
+                                   # leaves the row showing "applied" (registry of trust),
+                                   # never a false drift alarm.

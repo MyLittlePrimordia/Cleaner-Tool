@@ -147,6 +147,7 @@ def _clean_many(ctx: TaskContext, folders, label):
 
 def _clean_files(ctx: TaskContext, files, label):
     """Remove individual files (e.g. launcher_log.txt) and count freed bytes."""
+    dry = bool(getattr(ctx, "dry_run", False))
     total = 0
     for f in files:
         # F-3: honor Stop here too — the Unity Player.log sweep can list
@@ -157,9 +158,11 @@ def _clean_files(ctx: TaskContext, files, label):
             continue
         try:
             st = os.stat(f)
-            os.remove(f)
+            if not dry:
+                os.remove(f)
             total += st.st_size
-            ctx.log(f"Cleaning {label}: {f}")
+            if not dry:
+                ctx.log(f"Cleaning {label}: {f}")
         except OSError:
             continue
     return total
@@ -222,6 +225,223 @@ def clean_game_captures(ctx: TaskContext):
     return _clean_many(ctx, GAME_CAPTURES_PATHS, "game captures")
 
 
+def _process_running(image: str) -> bool:
+    """True if a process with this image name is currently running
+    (active game/launcher files may be mid-write — callers skip instead of
+    touching live data; same shape as the Steam guard below)."""
+    try:
+        import subprocess as _sp
+        out = _sp.check_output(
+            f'tasklist /fi "imagename eq {image}" /fo csv /nh',
+            shell=True, text=True, timeout=10, stderr=_sp.DEVNULL,
+            creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
+        )
+        return image.lower() in (out or "").lower()
+    except Exception:
+        return False
+
+
+def clean_vrchat_cache(ctx: TaskContext):
+    """Clear VRChat's downloaded-content cache (avatars, worlds, images —
+    default 20 GB cap, the classic VRChat disk hog).
+
+    Source: VRChat's own local-storage docs (docs.vrchat.com,
+    'Local VRChat Storage'): `%LocalLow%\\VRChat\\VRChat\\Cache-WindowsPlayer`
+    is the asset download cache; `config.json`, `LocalAvatarData`,
+    `LocalPlayerModerations` (saves/moderation data), `Avatars` (local test
+    avatars) and `OSC` are settings/user data and are NEVER touched — only
+    the cache folder goes. A relocated cache (`cache_directory` in the
+    game's own config.json, read-only parse) is honored too.
+    Redownloads on demand; safe to run any time."""
+    import json as _json
+    local_low = _lp.LOCALLOW if hasattr(_lp, "LOCALLOW") else ""
+    if not local_low:
+        userprofile = os.environ.get("USERPROFILE", "")
+        local_low = os.path.join(userprofile, "AppData", "LocalLow") if userprofile else ""
+    base = os.path.join(local_low, "VRChat", "VRChat") if local_low else ""
+    if not base or not os.path.isdir(base):
+        ctx.log("VRChat data folder not found — nothing to do.")
+        return 0
+    targets = [os.path.join(base, "Cache-WindowsPlayer")]
+    # Relocated cache (the game's own config may point anywhere, even another
+    # drive): read-only parse, absolute dirs only, junctions still skipped by
+    # the walker (a symlinked custom dir is left alone, never followed).
+    try:
+        with open(os.path.join(base, "config.json"), "r", encoding="utf-8") as f:
+            custom = (_json.load(f) or {}).get("cache_directory", "")
+        if isinstance(custom, str) and custom.strip() and os.path.isabs(custom):
+            norm = os.path.normpath(custom.strip())
+            if norm not in targets:
+                targets.append(norm)
+                ctx.log(f"VRChat uses a relocated cache: {norm}")
+    except (OSError, ValueError):
+        pass
+    total = _clean_many(ctx, [t for t in targets if os.path.isdir(t)],
+                        "VRChat cache")
+    if total:
+        ctx.log("VRChat cache cleared — avatars and worlds redownload as you visit them.")
+    return total
+
+
+def clean_fivem_cache(ctx: TaskContext):
+    """Clear FiveM's client download caches (server assets that pile up to
+    tens of GB and the classic fix for broken textures / loading loops).
+
+    Community-verified layout (Cfx.re forums + client guides):
+    `%LOCALAPPDATA%\\FiveM\\FiveM.app\\data\\` holds `cache`,
+    `server-cache`, `server-cache-priv` (and the newer `server-cache-priv-cl2`)
+    — downloaded server assets, safe to empty. `game-storage` (the downloaded
+    game build — GBs to refetch), `CitizenFX.ini` and everything else are
+    deliberately left alone. Characters and saves live server-side, so
+    clearing never loses progress.
+
+    Safety: skips entirely while FiveM is running (locked cache databases,
+    active session). Default FiveM location only — a portable install
+    elsewhere is left alone with an honest log line."""
+    ctx.set_status("Cleaning FiveM download caches...")
+    if _process_running("FiveM.exe"):
+        ctx.log("FiveM is running — skipping to avoid touching the live session.")
+        return 0
+    localappdata = os.environ.get("LOCALAPPDATA", "")
+    data = os.path.join(localappdata, "FiveM", "FiveM.app", "data") if localappdata else ""
+    if not data or not os.path.isdir(data):
+        ctx.log("FiveM data folder not found at its default location — nothing to do.")
+        return 0
+    total = 0
+    for sub in ("cache", "server-cache", "server-cache-priv", "server-cache-priv-cl2"):
+        folder = os.path.join(data, sub)
+        if os.path.isdir(folder):
+            ctx.log(f"Cleaning FiveM cache: {folder}")
+            total += clean_folder_contents(ctx, folder)
+    if total:
+        ctx.log("FiveM caches cleared — servers redownload their assets on next join "
+                "(first join takes longer; characters and saves are server-side and safe).")
+    else:
+        ctx.log("FiveM caches already empty.")
+    return total
+
+
+# Star Citizen per-channel USER preserves (first-party RSI launcher
+# "Delete Local Settings" contract): keybindings, settings profile, custom
+# characters and screenshots survive; everything else under USER (shaders,
+# logs, stale state — the patch-day crash fix) goes.
+_SC_USER_PRESERVE_DIRS = ("controls", "profiles", "customcharacters")
+
+
+def _sc_user_clean_targets(user_dir: str):
+    """Yield (path, is_dir) entries under a Star Citizen USER folder that are
+    safe to clean: everything EXCEPT the preserved names below. Pure function
+    of the directory listing (unit-tested with fixtures) — the caller does
+    the deleting through the junction-guarded cleaners.
+
+    Preserved (never yielded):
+      * Controls / Profiles / CustomCharacters (keybindings, settings,
+        custom characters — the launcher's own preservation list)
+      * any directory whose name contains 'screenshot' (player captures)
+      * any file named user.cfg (custom graphics/settings overrides)
+    """
+    try:
+        entries = sorted(os.listdir(user_dir))
+    except OSError:
+        return
+    for entry in entries:
+        full = os.path.join(user_dir, entry)
+        try:
+            if os.path.isdir(full) and not os.path.islink(full):
+                low = entry.lower()
+                if low in _SC_USER_PRESERVE_DIRS:
+                    continue
+                if "screenshot" in low:
+                    continue
+                yield full, True
+            elif os.path.isfile(full):
+                if entry.lower() == "user.cfg":
+                    continue
+                yield full, False
+        except OSError:
+            continue
+
+
+def clean_starcitizen_cache(ctx: TaskContext):
+    """Clear Star Citizen's shader + USER caches — RSI's own patch-day fix
+    for crashes and broken graphics after updates.
+
+    Sources (first-party): the RSI launcher's 'Delete Local Settings'
+    definition + support KB 'delete the USER folder' guidance:
+      * `%LOCALAPPDATA%\\Star Citizen` shaders, EXCEPT the `Crashes`
+        subfolder (crash dumps belong to support tickets — never touched)
+      * `%APPDATA%\\rsilauncher\\Cache` + `GPUCache` (launcher web caches,
+        per the launcher-troubleshooting KB)
+      * `<install>\\<LIVE|PTU|EPTU>\\USER` with the preserved set above
+        (keybindings, settings profile, custom characters, screenshots,
+        user.cfg all survive)
+
+    Default install location only — a custom library drive is left alone
+    with an honest log line (no guessing). Needs admin (Program Files)."""
+    from app.utils import _is_reparse_point
+    ctx.set_status("Cleaning Star Citizen caches...")
+    total = 0
+    appdata = os.environ.get("APPDATA", "")
+    localappdata = os.environ.get("LOCALAPPDATA", "")
+    # 1) launcher web caches (per-user, no admin needed for these two)
+    if appdata:
+        for sub in (os.path.join("rsilauncher", "Cache"),
+                    os.path.join("rsilauncher", "GPUCache")):
+            folder = os.path.join(appdata, sub)
+            if os.path.isdir(folder):
+                ctx.log(f"Cleaning RSI Launcher cache: {folder}")
+                total += clean_folder_contents(ctx, folder)
+    # 2) local shader cache — everything except Crashes (CIG's own carve-out)
+    if localappdata:
+        shader_root = os.path.join(localappdata, "Star Citizen")
+        if os.path.isdir(shader_root):
+            try:
+                names = sorted(os.listdir(shader_root))
+            except OSError:
+                names = []
+            for name in names:
+                if ctx.cancelled():
+                    break
+                if name.lower() == "crashes":
+                    continue  # crash dumps stay for support tickets
+                full = os.path.join(shader_root, name)
+                if os.path.isdir(full) and not _is_reparse_point(full):
+                    ctx.log(f"Cleaning Star Citizen shaders: {full}")
+                    total += clean_folder_contents(ctx, full)
+    # 3) per-channel USER folders (default install location)
+    pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+    game_root = os.path.join(pf, "Roberts Space Industries", "StarCitizen")
+    if not os.path.isdir(game_root):
+        ctx.log(f"Star Citizen install not found at {game_root} — "
+                "custom library drives are left alone.")
+    else:
+        for channel in ("LIVE", "PTU", "EPTU"):
+            user_dir = os.path.join(game_root, channel, "USER")
+            if not os.path.isdir(user_dir):
+                continue
+            ctx.log(f"Cleaning Star Citizen {channel} USER cache "
+                    "(keybindings, settings, characters and screenshots kept)...")
+            for path, is_dir in _sc_user_clean_targets(user_dir):
+                if ctx.cancelled():
+                    break
+                if _is_reparse_point(path):
+                    continue
+                try:
+                    if is_dir:
+                        total += clean_folder_contents(ctx, path, remove_root=True)
+                    else:
+                        size = os.path.getsize(path)
+                        os.remove(path)
+                        total += size
+                except OSError:
+                    continue
+    if total:
+        ctx.log("Star Citizen caches cleared — shaders rebuild on next launch.")
+    else:
+        ctx.log("No Star Citizen caches found to clean.")
+    return total
+
+
 def clean_steam_stuck_downloads(ctx: TaskContext):
     """Remove Steam's orphaned staging files from failed/paused/cancelled
     updates (steamapps\\downloading + steamapps\\temp). These can pile up
@@ -273,4 +493,10 @@ TASKS = [
     # default=False ON PURPOSE: an always-on backup in the weekly scheduler
     # would pile up timestamped zips on the Desktop forever.
     Task("backup_saves", "Back Up Game Saves", "Zips your save folders (Saved Games, My Games, Minecraft) to a timestamped file on your Desktop", backup_game_saves, default=False, admin_required=False, column=0),
+    # Per-game mega-caches (user request 2026-09-12): separate opt-in rows so
+    # a layman sees WHAT will redownload. All default=False (redownload cost
+    # or game-specific), all skip honestly when the game isn't installed.
+    Task("vrchat_cache", "Clear VRChat Cache", "Frees gigabytes of downloaded avatars and worlds; they redownload as you visit them", clean_vrchat_cache, default=False, admin_required=False, column=1),
+    Task("fivem_cache", "Clear FiveM Cache", "Fixes broken textures and loading loops on roleplay servers; servers resend their files on next join", clean_fivem_cache, default=False, admin_required=False, column=1),
+    Task("starcitizen_cache", "Clean Star Citizen Files", "Clears shader and user caches behind patch-day crashes; keeps keybindings, settings, characters and screenshots", clean_starcitizen_cache, default=False, admin_required=True, column=0),
 ]

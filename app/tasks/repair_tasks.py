@@ -6,7 +6,7 @@ Fixed: search index path, return-code checking, added safe new tasks.
 import os
 import shutil
 
-from app.utils import TaskContext, run_cmd, run_cmd_checked, create_restore_point, clean_folder_contents, restart_explorer
+from app.utils import TaskContext, run_cmd, run_cmd_checked, create_restore_point, clean_folder_contents, restart_explorer, reg_get_value, reg_delete_value
 
 _WINDIR = os.environ.get("WINDIR", "C:\\Windows")
 
@@ -963,6 +963,237 @@ def repair_hosts_file(ctx: TaskContext):
     ctx.log("Hosts file restored to Windows defaults.")
 
 
+def _repair_desktop_dir() -> str:
+    """Real Desktop path honoring OneDrive/known-folder redirection (backups
+    below must land where the user actually sees them). Same shell-folder
+    technique as game_tasks._desktop_dir; local copy keeps this module's
+    imports light (the _clean_many precedent: small helpers live per module)."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders") as k:
+            raw, _ = winreg.QueryValueEx(k, "Desktop")
+            resolved = os.path.expandvars(raw)
+            if resolved and os.path.isabs(resolved):
+                return resolved
+    except OSError:
+        pass
+    return os.path.join(os.environ.get("USERPROFILE", ""), "Desktop")
+
+
+def _repair_stamp() -> str:
+    from datetime import datetime
+    return datetime.now().strftime("%Y-%m-%d_%H%M%S")
+
+
+def restart_startmenu_search(ctx: TaskContext):
+    """Restart the Start Menu + Windows Search processes — the classic fix
+    for a frozen Start button or a dead search box, without rebooting.
+    StartMenuExperienceHost.exe and SearchHost.exe both auto-respawn when
+    killed (Windows relaunches them on demand); the task VERIFIES both are
+    back within ~15s and fails honestly otherwise (a missing process binary
+    means a deeper problem than a restart can fix). No admin needed — these
+    are the user's own processes."""
+    ctx.set_status("Restarting the Start menu and Search...")
+    import subprocess as _sp
+    for proc in ("StartMenuExperienceHost.exe", "SearchHost.exe"):
+        run_cmd(ctx, f"taskkill /f /im {proc}", timeout=15)
+    deadline = 15
+    import time as _time
+    for _ in range(deadline * 2):
+        if ctx.cancelled():
+            from app.utils import TaskCancelled
+            raise TaskCancelled("Start menu restart cancelled by user.")
+        try:
+            out = _sp.check_output(
+                'tasklist /fi "imagename eq StartMenuExperienceHost.exe" /fo csv /nh',
+                shell=True, text=True, timeout=10, stderr=_sp.DEVNULL,
+                creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
+            )
+            start_ok = "startmenuexperiencehost.exe" in (out or "").lower()
+            out2 = _sp.check_output(
+                'tasklist /fi "imagename eq SearchHost.exe" /fo csv /nh',
+                shell=True, text=True, timeout=10, stderr=_sp.DEVNULL,
+                creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
+            )
+            search_ok = "searchhost.exe" in (out2 or "").lower()
+        except Exception:
+            start_ok = search_ok = False
+        if start_ok and search_ok:
+            ctx.log("Start menu and Search restarted — try the Start button now.")
+            return
+        _time.sleep(0.5)
+    raise RuntimeError(
+        "Start Menu / Search did not come back after restart — reboot, "
+        "then run 'Fix Missing Apps / Start Menu' if it is still broken.")
+
+
+_TRAYNOTIFY_PATH = "Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell\\Bags\\TrayNotify"
+
+
+def repair_tray_icons(ctx: TaskContext):
+    """Fix blank/missing taskbar corner (tray) icons: delete the icon-stream
+    caches and restart Explorer (verified back — never left without a shell).
+
+    Honesty: newer Windows builds removed these values entirely — when both
+    are absent there is nothing to rebuild, so the task skips WITHOUT
+    restarting Explorer (verified live: the key is gone on current builds)."""
+    ctx.set_status("Rebuilding the taskbar tray icons...")
+    has_streams = reg_get_value(ctx, "HKCU", _TRAYNOTIFY_PATH, "IconStreams") is not None
+    has_past = reg_get_value(ctx, "HKCU", _TRAYNOTIFY_PATH, "PastIconsStream") is not None
+    if not has_streams and not has_past:
+        ctx.log("No tray icon cache on this Windows build — nothing to rebuild, "
+                "Explorer left running.")
+        return
+    for name in ("IconStreams", "PastIconsStream"):
+        reg_delete_value(ctx, "HKCU", _TRAYNOTIFY_PATH, name)
+    if not restart_explorer(ctx):
+        raise RuntimeError(
+            "Tray caches cleared but Explorer did not restart cleanly — "
+            "press Ctrl+Shift+Esc, File > Run new task, type explorer.exe.")
+    ctx.log("Tray icons rebuilt — missing icons should be back.")
+
+
+def backup_firewall_rules(ctx: TaskContext):
+    """Export the current Windows Firewall rules to a timestamped .wfw file
+    on the Desktop — the safety net that pairs with 'Reset Firewall'
+    (which wipes every per-app rule). Backup-only: changes nothing, returns
+    None so the runner never counts it as freed space. Admin required
+    (firewall policy is machine-wide)."""
+    desktop = _repair_desktop_dir()
+    if not desktop or not os.path.isdir(desktop):
+        raise RuntimeError("Could not find your Desktop folder — nothing was backed up.")
+    dest = os.path.join(desktop, f"FirewallRules_{_repair_stamp()}.wfw")
+    ctx.set_status("Backing up firewall rules...")
+    run_cmd_checked(ctx, f'netsh advfirewall export "{dest}"', timeout=120)
+    if not os.path.isfile(dest):
+        raise RuntimeError("Export reported success but no backup file appeared — nothing was backed up.")
+    ctx.log(f"Firewall rules backed up to {dest}")
+    ctx.log("To restore later: Windows Defender Firewall > Action > Import Policy.")
+    return None
+
+
+def backup_registry_hives(ctx: TaskContext):
+    """Save copies of the SYSTEM, SOFTWARE and current-user registry hives
+    to a timestamped folder on the Desktop — a restore point for settings.
+    Backup-only: changes nothing. Admin required (HKLM hives). Verifies
+    every file landed before reporting success."""
+    desktop = _repair_desktop_dir()
+    if not desktop or not os.path.isdir(desktop):
+        raise RuntimeError("Could not find your Desktop folder — nothing was backed up.")
+    dest_dir = os.path.join(desktop, f"RegistryBackup_{_repair_stamp()}")
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+    except OSError as exc:
+        raise RuntimeError(f"Could not create the backup folder: {exc}")
+    ctx.set_status("Backing up registry hives...")
+    hives = [
+        ("HKLM\\SYSTEM", "SYSTEM.hiv"),
+        ("HKLM\\SOFTWARE", "SOFTWARE.hiv"),
+        ("HKCU", "NTUSER.hiv"),
+    ]
+    saved = []
+    for hive, fname in hives:
+        dest = os.path.join(dest_dir, fname)
+        # shell=False argv (hive names are constants; the path is quoted by
+        # argv conventions, never interpolated into a shell string)
+        rc = run_cmd(ctx, ["reg", "save", hive, dest, "/y"],
+                     shell=False, timeout=120)
+        if rc == 0 and os.path.isfile(dest):
+            saved.append(fname)
+            ctx.log(f"  Saved {hive} -> {fname}")
+        else:
+            ctx.log(f"  ! could not save {hive} (exit {rc})")
+    if not saved:
+        raise RuntimeError("No registry hives could be saved — see the log.")
+    if len(saved) < len(hives):
+        ctx.log(f"  (partial backup: {len(saved)} of {len(hives)} hives — "
+                "the missing ones are logged above)")
+    else:
+        ctx.log(f"Registry backed up to {dest_dir}")
+    return None
+
+
+def backup_drivers(ctx: TaskContext):
+    """Export all third-party drivers to a timestamped folder on the Desktop
+    (DISM driver export) — the safety net before reinstalling GPU drivers
+    with DDU or swapping hardware. Backup-only: changes nothing. Admin
+    required. Verifies the folder is non-empty before reporting success."""
+    desktop = _repair_desktop_dir()
+    if not desktop or not os.path.isdir(desktop):
+        raise RuntimeError("Could not find your Desktop folder — nothing was backed up.")
+    dest_dir = os.path.join(desktop, f"DriverBackup_{_repair_stamp()}")
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+    except OSError as exc:
+        raise RuntimeError(f"Could not create the backup folder: {exc}")
+    ctx.set_status("Backing up installed drivers (a few minutes)...")
+    run_cmd_checked(ctx, f'dism /online /export-driver /destination:"{dest_dir}"',
+                    timeout=1800, success_codes=(0,))
+    try:
+        exported = [e for e in os.listdir(dest_dir)
+                    if os.path.isdir(os.path.join(dest_dir, e))]
+    except OSError:
+        exported = []
+    if not exported:
+        raise RuntimeError("DISM reported success but no drivers landed — nothing was backed up.")
+    ctx.log(f"Backed up {len(exported)} driver package(s) to {dest_dir}")
+    ctx.log("To use after a reinstall: Device Manager > device > Update driver > "
+            "Browse > point at this folder.")
+    return None
+
+
+def audit_startup_impact(ctx: TaskContext):
+    """Report-only startup audit: lists what launches at boot (Run registry
+    keys for all users + both Startup folders) so a slow boot can be traced
+    to real entries. Changes NOTHING — read-only by design (disabling
+    startup entries is a user decision the app won't make silently)."""
+    ctx.set_status("Listing what starts with Windows...")
+    import glob as _glob
+    found: list = []
+    # Run keys (per-user + machine)
+    try:
+        import winreg as _wr
+        for hive, path in (
+                (_wr.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run"),
+                (_wr.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run")):
+            try:
+                with _wr.OpenKey(hive, path) as k:
+                    i = 0
+                    while True:
+                        try:
+                            name, value, _t = _wr.EnumValue(k, i)
+                        except OSError:
+                            break
+                        i += 1
+                        found.append(f"[Run] {name} = {str(value)[:90]}")
+            except OSError:
+                continue
+    except Exception:
+        pass
+    # Startup folders (per-user + common)
+    for folder in (
+            os.path.join(os.environ.get("APPDATA", ""),
+                         r"Microsoft\Windows\Start Menu\Programs\Startup"),
+            os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"),
+                         r"Microsoft\Windows\Start Menu\Programs\Startup")):
+        try:
+            if folder and os.path.isdir(folder):
+                for entry in sorted(os.listdir(folder)):
+                    found.append(f"[Startup folder] {entry}")
+        except OSError:
+            continue
+    if not found:
+        ctx.log("Nothing launches at boot besides Windows itself — startup is clean.")
+        return None
+    ctx.log(f"{len(found)} startup entr{'y' if len(found) == 1 else 'ies'} found:")
+    for line in found:
+        ctx.log(f"  {line}")
+    ctx.log("Audit only — nothing was changed. To remove one: Task Manager > "
+            "Startup apps (right-click > Disable).")
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # Installer tasks MOVED to app/tasks/install_tasks.py (Install tab) — every
 # internet-required task lives there now, per the user's 4th-tab request.
@@ -1008,4 +1239,13 @@ TASKS = [
     Task("power_plans", "Reset Power Plans", "Restores Microsoft's default power plans when optimizers break them", repair_power_plans, default=False, admin_required=True, column=0),
     Task("teredo_fix", "Fix Xbox Multiplayer (Teredo)", "Resets Teredo tunneling to fix Xbox party and matchmaking errors", repair_teredo, default=False, admin_required=True, column=1),
     Task("hosts_restore", "Restore Hosts File", "Restores the stock hosts file when blockers break sites or logins", repair_hosts_file, default=False, admin_required=True, column=1),
+    # User-requested additions 2026-09-12 (layman-safe only): instant fixes
+    # without rebooting, safety-net backups, and a report-only startup audit.
+    # All default=False (Custom-only); presets untouched by design.
+    Task("restart_startmenu", "Restart Start Menu & Search", "Fixes a frozen Start button or dead search box instantly, no reboot", restart_startmenu_search, default=False, admin_required=False, column=1),
+    Task("tray_icons", "Fix Missing Tray Icons", "Rebuilds the taskbar corner icons that disappear or turn blank", repair_tray_icons, default=False, admin_required=False, column=1),
+    Task("firewall_backup", "Back Up Firewall Rules", "Saves your firewall rules to the Desktop before you ever reset them", backup_firewall_rules, default=False, admin_required=True, column=1),
+    Task("registry_backup", "Back Up Registry", "Saves a copy of your system settings to the Desktop as a safety net", backup_registry_hives, default=False, admin_required=True, column=0),
+    Task("driver_export", "Back Up Drivers", "Saves copies of your working drivers to the Desktop before reinstalling any", backup_drivers, default=False, admin_required=True, column=1),
+    Task("startup_audit", "Check Startup Programs", "Shows what slows your boot; changes nothing, removes nothing", audit_startup_impact, default=False, admin_required=False, column=0),
 ]

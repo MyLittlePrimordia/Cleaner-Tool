@@ -126,6 +126,11 @@ def _get_uwp_package_folders() -> list[str]:
         "Microsoft.ZuneMusic",
         "Microsoft.ZuneVideo",
         "Microsoft.GamingApp",  # Xbox Game Bar / PC app
+        # user request 2026-09-12: Game Bar overlay + Mixed Reality Portal
+        # keep their own LocalCache/TempState (clips stay in Videos\Captures,
+        # handled by the separate game_captures task — never touched here)
+        "Microsoft.XboxGamingOverlay",
+        "Microsoft.MixedReality.Portal",
     )
     
     try:
@@ -380,6 +385,8 @@ def clean_browser_caches(ctx: TaskContext):
         os.path.join(_LOCALAPPDATA, "Microsoft\\Edge\\User Data"),
         os.path.join(_LOCALAPPDATA, "BraveSoftware\\Brave-Browser\\User Data"),
         os.path.join(_LOCALAPPDATA, "Vivaldi\\User Data"),
+        # user request 2026-09-12: Arc uses the same Chromium layout
+        os.path.join(_LOCALAPPDATA, "Arc\\User Data"),
     ]
     for base in base_patterns:
         if not base or not os.path.isabs(base) or not os.path.isdir(base):
@@ -403,15 +410,21 @@ def clean_browser_caches(ctx: TaskContext):
                 if os.path.isdir(p):
                     ctx.log(f"Cleaning browser cache: {p}")
                     total += clean_folder_contents(ctx, p)
-    # Opera
-    for op in [os.path.join(_APPDATA, "Opera Software\\Opera Stable\\Cache"),
-               os.path.join(_APPDATA, "Opera Software\\Opera Stable\\Code Cache")]:
-        if op and os.path.isabs(op) and os.path.isdir(op):
-            ctx.log(f"Cleaning browser cache: {op}")
-            total += clean_folder_contents(ctx, op)
-    # Firefox
-    ff_base = os.path.join(_LOCALAPPDATA, "Mozilla\\Firefox\\Profiles")
-    if ff_base and os.path.isabs(ff_base) and os.path.isdir(ff_base):
+    # Opera (Stable + GX — GX keeps its own "Opera GX Stable" profile dir)
+    for op_branch in ("Opera Stable", "Opera GX Stable"):
+        for op in [os.path.join(_APPDATA, f"Opera Software\\{op_branch}\\Cache"),
+                   os.path.join(_APPDATA, f"Opera Software\\{op_branch}\\Code Cache")]:
+            if op and os.path.isabs(op) and os.path.isdir(op):
+                ctx.log(f"Cleaning browser cache: {op}")
+                total += clean_folder_contents(ctx, op)
+    # Firefox + its forks (identical Profiles\*\cache2 layout, different roots)
+    for ff_root, ff_label in (
+            (os.path.join(_LOCALAPPDATA, "Mozilla\\Firefox\\Profiles"), "Firefox"),
+            (os.path.join(_APPDATA, "librewolf\\Profiles"), "LibreWolf"),
+            (os.path.join(_APPDATA, "Floorp\\Profiles"), "Floorp")):
+        ff_base = ff_root
+        if not (ff_base and os.path.isabs(ff_base) and os.path.isdir(ff_base)):
+            continue
         try:
             ff_profiles = os.listdir(ff_base)
         except OSError as e:
@@ -422,7 +435,7 @@ def clean_browser_caches(ctx: TaskContext):
                 break
             cache2 = os.path.join(ff_base, profile, "cache2")
             if os.path.isdir(cache2):
-                ctx.log(f"Cleaning Firefox cache: {cache2}")
+                ctx.log(f"Cleaning {ff_label} cache: {cache2}")
                 total += clean_folder_contents(ctx, cache2)
     return total
 
@@ -581,6 +594,97 @@ def clean_winget_cache(ctx: TaskContext):
         os.path.join(_TEMP, "WinGet"),
     ]
     return _clean_many(ctx, folders, "winget cache")
+
+
+def clean_onedrive_logs(ctx: TaskContext):
+    """Clear OneDrive's diagnostic logs (user request 2026-09-12).
+
+    OneDrive writes verbose sync/troubleshooting logs under
+    %LOCALAPPDATA%\\Microsoft\\OneDrive\\logs that never rotate on their
+    own. Pure logs — sync state, settings and files are elsewhere and
+    untouched. Skips honestly when OneDrive isn't installed."""
+    folders = [os.path.join(_LOCALAPPDATA, "Microsoft\\OneDrive\\logs")]
+    if not any(os.path.isdir(f) for f in folders):
+        ctx.log("OneDrive logs not found (OneDrive not installed?) — nothing to do.")
+        return 0
+    return _clean_many(ctx, folders, "OneDrive logs")
+
+
+# Exact dirname + exact cache leaves for the WebView2 sweep below. Storage,
+# Local Storage, Session Storage, IndexedDB and friends are DELIBERATELY
+# absent — website data is user data; only regenerable browser caches go.
+_WEBVIEW_ROOT_NAME = "EBWebView"
+_WEBVIEW_CACHE_SUBS = ("Cache", "Code Cache", "GPUCache", "GrShaderCache",
+                       "GraphiteDawnCache", "DawnGraphiteCache",
+                       "DawnWebGPUCache")
+_WEBVIEW_MAX_DEPTH = 6
+
+
+def _find_webview_roots(base_dir: str, max_depth: int = _WEBVIEW_MAX_DEPTH) -> list:
+    """Every directory named exactly EBWebView under base_dir (bounded depth,
+    junctions never followed, unreadable folders skipped). Pure function of
+    the tree (unit-tested with fixtures) — the caller cleans only the known
+    cache leaves inside each root."""
+    from app.utils import _is_reparse_point
+    found: list = []
+    if not base_dir or not os.path.isdir(base_dir):
+        return found
+    stack = [(base_dir, 0)]
+    while stack:
+        directory, depth = stack.pop()
+        if depth > max_depth:
+            continue
+        try:
+            with os.scandir(directory) as it:
+                entries = list(it)
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                if _is_reparse_point(entry.path):
+                    continue
+                if entry.name == _WEBVIEW_ROOT_NAME:
+                    found.append(entry.path)
+                    # still descend: an app can nest runtimes (x86/x64 side
+                    # by side), and each nesting is its own cache
+                    stack.append((entry.path, depth + 1))
+                else:
+                    stack.append((entry.path, depth + 1))
+            except OSError:
+                continue
+    return found
+
+
+def clean_webview_caches(ctx: TaskContext):
+    """Clear embedded-browser (WebView2) caches — user request 2026-09-12.
+
+    EA App, CurseForge/Overwolf, Battle.net and dozens of other launchers
+    embed Chromium (WebView2), each keeping its own Cache/Code Cache/GPUCache
+    under an EBWebView folder. Same junk class as the main-browser caches,
+    but no per-app table could ever cover them all — hence the bounded exact-
+    name sweep (mirrors the Unity Player.log sweep design). Website storage
+    (cookies, local storage, logins) is never in the cleaned leaves."""
+    if not _LOCALAPPDATA or not os.path.isdir(_LOCALAPPDATA):
+        ctx.log("LocalAppData not found — nothing to do.")
+        return 0
+    total = 0
+    roots = _find_webview_roots(_LOCALAPPDATA)
+    if not roots:
+        ctx.log("No embedded-browser (WebView2) caches found.")
+        return 0
+    for eb_root in roots:
+        if ctx.cancelled():
+            break
+        for sub in _WEBVIEW_CACHE_SUBS:
+            p = os.path.join(eb_root, sub)
+            if os.path.isdir(p):
+                ctx.log(f"Cleaning embedded browser cache: {p}")
+                total += clean_folder_contents(ctx, p)
+    if not total:
+        ctx.log("Embedded-browser caches already empty.")
+    return total
 
 
 # Cleans disk via cleanmgr (no ResetBase — keeps your ability to roll back updates) #
@@ -842,4 +946,6 @@ TASKS = [
     Task("dev_caches", "Clean Dev Caches", "Clears VS Code, npm and pip caches for modders and AI tinkerers", clean_dev_caches, default=False, admin_required=False, column=1),
     Task("pkg_caches", "Clean Package Caches", "Clears NuGet, Cargo and Gradle download caches; projects untouched", clean_package_manager_caches, default=False, admin_required=False, column=1),
     Task("terminal_history", "Clear Terminal History", "Clears PowerShell command history for privacy; settings untouched", clean_terminal_history, default=False, admin_required=False, column=0),
+    Task("onedrive_logs", "Clear OneDrive Logs", "Removes diagnostic logs OneDrive leaves behind; files and settings untouched", clean_onedrive_logs, default=False, admin_required=False, column=1),
+    Task("webview_cache", "Clear WebView App Caches", "Clears embedded-browser junk from EA App, CurseForge and similar launchers; logins kept", clean_webview_caches, default=False, admin_required=False, column=1),
 ]

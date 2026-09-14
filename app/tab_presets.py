@@ -68,13 +68,19 @@ def _merge_tweak():
 # The three tabs
 # --------------------------------------------------------------------------- #
 
-TAB_NAMES = ["Clean", "Repair", "Tweak", "Install"]
+TAB_NAMES = ["Clean", "Repair", "Tweak", "Install", "Tools"]
 
 TABS = {
     "Clean": _merge_clean(),
     "Repair": list(repair_tasks.TASKS),
     "Tweak": _merge_tweak(),
     "Install": list(install_tasks.TASKS),
+    # Tools embeds the power features in-tab (user redesign 2026-09):
+    # Storage Insight, DNS tester, Health Report, Session Pilot panels +
+    # Windows shortcut link-rows. No runnable tasks live here, but an
+    # empty task list keeps the tab machinery (run_tasks guards, sched-
+    # tolerant resolvers) happy without special-casing.
+    "Tools": [],
 }
 
 # --------------------------------------------------------------------------- #
@@ -102,7 +108,12 @@ PRESETS = {
             "user_temp_files", "system_temp_files", "win_update_cache",
             "delivery_optimization", "inet_cache", "recycle_bin", "error_reports",
             "thumbnail_cache", "chk_fragments", "old_logs", "dns_flush", "ram_purge",
-            "game_files", "game_captures", "update_leftovers", "activity_traces",
+            "game_files", "game_captures",
+            # user request 2026-09-12: the big per-game caches live here too
+            # (each skips honestly when its game isn't installed; Star Citizen
+            # needs admin like the other Program-Files tasks in this preset).
+            "vrchat_cache", "fivem_cache", "starcitizen_cache",
+            "update_leftovers", "activity_traces",
             "browser_cache", "office_cache", "uwp_cache", "font_cache", "store_cache",
             "remove_bloat", "prefetch", "disk_cleanup_deep",
         ],
@@ -174,7 +185,8 @@ CUSTOM_GROUPS = {
     "Clean": [
         ("Game files & caches",
          ["shader_cache", "launcher_cache", "engine_cache", "driver_junk",
-          "game_files", "game_captures", "steam_stuck", "steam_depot"]),
+          "game_files", "game_captures", "steam_stuck", "steam_depot",
+          "vrchat_cache", "fivem_cache", "starcitizen_cache"]),
         ("Saves safety net",
          ["backup_saves"]),
         ("Windows temp & system junk",
@@ -187,7 +199,7 @@ CUSTOM_GROUPS = {
         ("App, browser & Store caches",
          ["inet_cache", "browser_cache", "office_cache", "uwp_cache",
           "font_cache", "store_cache", "thumbnail_cache", "winget_cache",
-          "dev_caches", "pkg_caches"]),
+          "dev_caches", "pkg_caches", "onedrive_logs", "webview_cache"]),
         ("Privacy traces",
          ["activity_traces", "terminal_history"]),
         ("Quick fixes & bloat removal",
@@ -196,7 +208,8 @@ CUSTOM_GROUPS = {
     "Repair": [
         ("Safety & drives",
          ["restore_point", "ssd_maintenance", "chkdsk_scan", "vss_repair",
-           "smart_verdict", "enable_restore", "power_plans", "power_drains"]),
+           "smart_verdict", "enable_restore", "power_plans", "power_drains",
+           "registry_backup", "startup_audit"]),
         ("Windows image & system files",
          ["dism_checkhealth", "dism_scanhealth", "sfc_scan",
            "dism_restorehealth", "dism_cleanup", "defender_quick_scan"]),
@@ -204,13 +217,14 @@ CUSTOM_GROUPS = {
          ["wu_reset", "bits_reset", "time_sync", "gpupdate"]),
         ("Network & firewall",
          ["network_reset", "firewall_reset", "arp_flush", "teredo_fix",
-          "hosts_restore"]),
+          "hosts_restore", "firewall_backup"]),
         ("Apps, Xbox, devices & drivers",
          ["xbox_apps", "store_apps_reregister", "search_index",
            "print_spooler", "wmi_repair", "restart_audio",
            "gpu_driver_age", "restart_bluetooth", "gpu_reset",
            "anticheat_repair", "icon_cache", "wsreset_store",
-           "restart_explorer", "restart_camera"]),
+           "restart_explorer", "restart_camera", "restart_startmenu",
+           "tray_icons", "driver_export"]),
     ],
     "Tweak": [
         ("Safety net",

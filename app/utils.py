@@ -128,6 +128,12 @@ class TaskContext:
     log: Callable[[str], None]
     set_status: Callable[[str], None]
     cancelled: Callable[[], bool] = field(default=lambda: False)
+    dry_run: bool = False
+    """Measure-only mode (Storage Insight scan, 2026-09): walkers stat
+    and sum but never delete. Default False keeps every existing caller
+    byte-identical; the scan engine passes dry_run=True so all pure
+    folder-cleaning tasks can be invoked directly for honest estimates
+    with zero changes to any task module."""
 
 
 class TaskSkipped(RuntimeError):
@@ -356,6 +362,12 @@ def clean_folder_contents(ctx: TaskContext, folder_path: str, remove_root: bool 
     skipped = 0
     if not folder_path or not os.path.exists(folder_path):
         return 0
+    # Storage Insight scan (2026-09): ctx.dry_run walks the exact same
+    # tree with the exact same guards (junctions, cancel checks) but
+    # never deletes — the returned total is what a real run WOULD free.
+    # The flag is ctx-carried (not a parameter) so every pure task
+    # function (_clean_many callers) measures correctly with no edits.
+    dry = bool(getattr(ctx, "dry_run", False))
 
     # Security guard (audit HIGH finding): os.walk(topdown=False) cannot
     # prune and does not treat Windows junctions as links — a junction
@@ -385,10 +397,12 @@ def clean_folder_contents(ctx: TaskContext, folder_path: str, remove_root: bool 
                 stopped = True
                 break
             try:
-                # Get size and remove atomically (avoid TOCTOU race)
+                # Get size and remove atomically (avoid TOCTOU race).
+                # Dry-run: stat only, never remove — same accounting.
                 st = os.stat(filepath)
                 size = st.st_size
-                os.remove(filepath)
+                if not dry:
+                    os.remove(filepath)
                 bytes_freed += size
             except (PermissionError, OSError, FileNotFoundError):
                 skipped += 1
@@ -396,7 +410,7 @@ def clean_folder_contents(ctx: TaskContext, folder_path: str, remove_root: bool 
         if stopped:
             break
 
-        if not extensions:
+        if not extensions and not dry:
             for d in dirs:
                 if ctx.cancelled():
                     stopped = True
@@ -410,7 +424,7 @@ def clean_folder_contents(ctx: TaskContext, folder_path: str, remove_root: bool 
             if stopped:
                 break
 
-    if remove_root and not extensions and not _is_reparse_point(folder_path) and not stopped:
+    if remove_root and not extensions and not dry and not _is_reparse_point(folder_path) and not stopped:
         try:
             if os.path.exists(folder_path) and not os.listdir(folder_path):
                 os.rmdir(folder_path)
@@ -418,9 +432,15 @@ def clean_folder_contents(ctx: TaskContext, folder_path: str, remove_root: bool 
             pass
 
     if stopped:
-        ctx.log(f"  ! stopped early — some files were left in place under {folder_path}")
+        if dry:
+            ctx.log(f"  ! scan stopped early — sizes under {folder_path} are partial")
+        else:
+            ctx.log(f"  ! stopped early — some files were left in place under {folder_path}")
     if skipped:
-        ctx.log(f"  (skipped {skipped} locked files in {folder_path})")
+        if dry:
+            ctx.log(f"  (skipped {skipped} unreadable files in {folder_path})")
+        else:
+            ctx.log(f"  (skipped {skipped} locked files in {folder_path})")
     return bytes_freed
 
 

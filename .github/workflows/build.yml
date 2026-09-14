@@ -39,7 +39,12 @@ jobs:
         # audit fix: the build never ran any test — regressions (like the
         # ToggleSwitch duplicate-def bug) shipped silently. The harness
         # checks run headless-safe; Tk is present on windows-latest runners.
-        run: python -X utf8 -m tools.smoke_gui
+        # smoke_async is the mainloop-driven twin: worker-thread after()
+        # delivery (run engine -> scorecard, health check worker) only
+        # works under a real mainloop, never under a manual update() pump.
+        run: |
+          python -X utf8 -m tools.smoke_gui
+          python -X utf8 -m tools.smoke_async
 
       - name: Build with PyInstaller
         # --onefile  : single portable .exe

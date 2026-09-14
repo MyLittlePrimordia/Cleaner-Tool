@@ -98,11 +98,3 @@ Test it:
 ```powershell
 python tools/smoke_gui.py
 ```
-
----
-
-## For contributors
-
-- New task? Add a `Task(...)` in `app/tasks/` — the GUI picks it up automatically. Tweaks need a revert function so Undo works.
-- New game? Add its Logs/Crashes/CrashDumps subfolder to `_TOP_GAME_JUNK` / `_DOC_GAME_JUNK` / `_LOW_GAME_JUNK` in `app/tasks/launcher_paths.py`. Never add save/config folders (see the exclusion notes in that file). Unity games need no entry — the `Player.log` sweep covers them.
-- Layout: `app/gui.py` (UI), `app/tab_presets.py` (tabs + presets), `app/tasks/` (work), `app/utils.py` (shared helpers).

@@ -246,6 +246,21 @@ def main():
     # the hasattr guard failed, vacuously passing. Compare directly.
     assert n_task_vars == len(gui.TABS["Install"]), (
         f"essentials vars {n_task_vars} != {len(gui.TABS['Install'])} install tasks")
+    # row icons: every catalog row shows its app logo (user call), max 22px
+    # so rows stay compact; PhotoImages cached (no GC thinning, no reloads)
+    _icons = getattr(ipage, "_icon_cache", {})
+    _got = [k for k, v in _icons.items() if v is not None]
+    # every catalog + manual + embedded-bundle row carries its logo
+    # (166 + 13 + 4); a miss means a wrong filename or bad image bytes
+    assert len(_got) == len(_icons) == 166 + 13 + 4, \
+        f"{len(_got)}/{len(_icons)} row icons loaded"
+    for _img in _icons.values():
+        if _img is not None:
+            assert _img.width() <= 22 and _img.height() <= 22, \
+                (_img.width(), _img.height())
+    _srow = ipage._app_rows["Valve.Steam"]
+    assert any(isinstance(w, tk.Label) and str(w.cget("image")).strip()
+               for w in _srow.winfo_children()), "Steam row has no icon"
     # Essentials: checkbox rows exist and select into the shared pool
     ess = ipage.ess_vars
     assert len(ess) >= 13, f"expected 13 Essentials, got {len(ess)}"

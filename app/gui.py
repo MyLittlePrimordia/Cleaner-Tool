@@ -6421,6 +6421,49 @@ class InstallTab(tk.Frame):
         tasks = [s for kind, s in selected if kind == "task"]
         self.app.install_selected_mixed(apps, tasks)
 
+    def _row_icon(self, row, app_name, size=22):
+        """App icon label for a catalog row (user call: logos next to
+        names, big enough to read). Loads app/assets/apps/<name>.png
+        once and caches the PhotoImage (anti-GC, tab-icon pattern);
+        subsamples to a ~22px box so every row stays the same height.
+        Missing file -> fixed-width spacer so names never misalign."""
+        try:
+            cache = self.__dict__.setdefault("_icon_cache", {})
+            if app_name not in cache:
+                cache[app_name] = None
+                try:
+                    import math as _math
+                    import re as _re
+                    base = _re.sub(r"\s*\(.*?\)", "", str(app_name))
+                    base = _re.sub(r"[^a-z0-9]", "", base.lower()) + ".png"
+                    from app.utils import resolve_asset_path as _rap
+                    path = _rap(os.path.join("apps", base))
+                    if path:
+                        img = tk.PhotoImage(file=path)
+                        w, h = img.width(), img.height()
+                        if w > 0 and h > 0:
+                            f = max(1, int(_math.ceil(max(w, h) / float(size))))
+                            if f > 1:
+                                img = img.subsample(f, f)
+                            cache[app_name] = img
+                except Exception:
+                    cache[app_name] = None
+            img = cache.get(app_name)
+            if img is not None:
+                lbl = tk.Label(row, image=img, bg=COLORS["bg_alt"],
+                               bd=0, highlightthickness=0)
+                lbl.pack(side="left", padx=(2, 0))
+                return lbl
+        except Exception:
+            pass
+        try:
+            sp = tk.Frame(row, bg=COLORS["bg_alt"], width=size, height=size)
+            sp.pack(side="left", padx=(2, 0))
+            sp.pack_propagate(False)
+        except Exception:
+            pass
+        return None
+
     def _build_category(self, parent, cat, apps, manuals, accent):
         outer = tk.Frame(parent, bg=COLORS["bg_alt"])
         outer.pack(fill="x", pady=(6, 4))
@@ -6543,6 +6586,7 @@ class InstallTab(tk.Frame):
                                 fg=COLORS["text"], activebackground=COLORS["bg_alt"],
                                 selectcolor=COLORS["surface"], onvalue=True, offvalue=False)
             cb.pack(side="left")
+            self._row_icon(row, app["name"])
             # tooltip: short description only (user request: no URLs in tips);
             # OEM-exclusive apps append their hardware tag (user request
             # 2026-09-06) so non-matching users are warned before installing
@@ -6585,6 +6629,7 @@ class InstallTab(tk.Frame):
             row = tk.Frame(col_frames[(len(apps) + ci) % cols], bg=COLORS["bg_alt"])
             row.pack(fill="x", padx=4, pady=2)
             _checkbox_width_spacer(row)
+            self._row_icon(row, app["name"])
             fallback = app.get("fallback_url", "")
             # tooltip: short description only (user request: no URLs in tips;
             # the row has no checkbox, which already says "open the page")
@@ -6620,9 +6665,10 @@ class InstallTab(tk.Frame):
             _brow = tk.Frame(outer, bg=COLORS["bg_alt"])
             _brow.pack(fill="x", padx=10, pady=(2, 6))
             _bcb = tk.Checkbutton(_brow, variable=_bvar, bg=COLORS["bg_alt"],
-                                  fg=COLORS["text"], activebackground=COLORS["bg_alt"],
-                                  selectcolor=COLORS["surface"], onvalue=True, offvalue=False)
+                                   fg=COLORS["text"], activebackground=COLORS["bg_alt"],
+                                   selectcolor=COLORS["surface"], onvalue=True, offvalue=False)
             _bcb.pack(side="left")
+            self._row_icon(_brow, _bundle.label)
             _blbl = tk.Label(_brow, text=_bundle.label, font=(F, 9, "bold"),
                              bg=COLORS["bg_alt"], fg=COLORS["text"])
             _blbl.pack(side="left", padx=(6, 4))

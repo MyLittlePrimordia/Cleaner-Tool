@@ -803,11 +803,27 @@ def clean_defender_history(ctx: TaskContext):
 
 def _steam_root() -> str:
     """Steam install dir: registry first, default path as fallback."""
+    def _looks_like_steam(path: str) -> bool:
+        # F16: HKCU SteamPath is user-writable — require Steam fingerprints
+        # before trusting it as an elevated delete root; refuse system roots.
+        try:
+            norm = os.path.normpath(path or "")
+            if not norm or not os.path.isdir(norm):
+                return False
+            root = os.path.splitdrive(norm)[0] + os.sep
+            windir = os.environ.get("WINDIR", "")
+            profile = os.environ.get("USERPROFILE", "")
+            if norm.lower() in (root.lower(), windir.lower() if windir else "", profile.lower() if profile else ""):
+                return False
+            return (os.path.isfile(os.path.join(norm, "steam.exe"))
+                    or os.path.isdir(os.path.join(norm, "steamapps")))
+        except Exception:
+            return False
     try:
         import winreg
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as k:
             path, _ = winreg.QueryValueEx(k, "SteamPath")
-            if path and os.path.isdir(path):
+            if path and _looks_like_steam(path):
                 return path
     except Exception:
         pass

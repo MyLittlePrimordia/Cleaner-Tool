@@ -140,6 +140,9 @@ def is_private_ip(ip: str) -> bool:
         a, b = parts[0], parts[1]
         if a == 10 or a == 127:
             return True
+        # L05: CGNAT 100.64/10 (RFC6598) is ISP-internal, not testable.
+        if a == 100 and 64 <= b <= 127:
+            return True
         if a == 172 and 16 <= b <= 31:
             return True
         if a == 192 and b == 168:

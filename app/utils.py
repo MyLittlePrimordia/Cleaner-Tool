@@ -362,6 +362,15 @@ def clean_folder_contents(ctx: TaskContext, folder_path: str, remove_root: bool 
     skipped = 0
     if not folder_path or not os.path.exists(folder_path):
         return 0
+    # F03 entry guard: os.walk(top) enumerates THROUGH a junction root even
+    # with followlinks=False (only subdirs are pruned). Refuse to walk when
+    # the root itself is a reparse point — both _clean_many funnels land here.
+    if _is_reparse_point(folder_path):
+        try:
+            ctx.log(f"  ! skipping junction/symlink root: {folder_path}")
+        except Exception:
+            pass
+        return 0
     # Storage Insight scan (2026-09): ctx.dry_run walks the exact same
     # tree with the exact same guards (junctions, cancel checks) but
     # never deletes — the returned total is what a real run WOULD free.
@@ -483,7 +492,13 @@ _TYPE_MAP = {
     "REG_DWORD": winreg.REG_DWORD if IS_WINDOWS else None,
     "REG_BINARY": winreg.REG_BINARY if IS_WINDOWS else None,
     "REG_EXPAND_SZ": winreg.REG_EXPAND_SZ if IS_WINDOWS else None,
+    "REG_QWORD": winreg.REG_QWORD if IS_WINDOWS else None,
+    "REG_MULTI_SZ": winreg.REG_MULTI_SZ if IS_WINDOWS else None,
 }
+
+# F13 sentinel: value exists but is unreadable (access denied). Distinct
+# from None (absent) so snapshots never record "absent" for denied keys.
+_REG_DENIED = object()
 
 
 def _reg_access(write: bool = True) -> int:
@@ -569,10 +584,10 @@ def reg_delete_value(ctx: TaskContext, hive: str, path: str, name: str) -> bool:
 
 
 def reg_get_value(ctx: TaskContext, hive: str, path: str, name: str):
-    """Read a registry value. Returns the value, or None if the key/value
-    doesn't exist or can't be read. Used to snapshot a setting's real prior
-    value before a tweak overwrites it, so revert can restore the exact
-    value instead of a hardcoded guess."""
+    """Read a registry value. Returns the value; None if the key/value
+    doesn't exist; _REG_DENIED if it exists but can't be read (F13:
+    missing vs denied must not collapse — a denied prior snapshotted as
+    absent made revert DELETE a pre-existing value)."""
     key = None
     try:
         root = _HIVES[hive]
@@ -580,6 +595,13 @@ def reg_get_value(ctx: TaskContext, hive: str, path: str, name: str):
         value, _ = winreg.QueryValueEx(key, name if name else None)
         return value
     except FileNotFoundError:
+        return None
+    except PermissionError:
+        return _REG_DENIED
+    except OSError as exc:
+        # ERROR_ACCESS_DENIED == 5 (winerror); errnos vary by SKU.
+        if getattr(exc, "winerror", None) == 5 or getattr(exc, "errno", None) in (5, 13):
+            return _REG_DENIED
         return None
     except Exception:
         return None

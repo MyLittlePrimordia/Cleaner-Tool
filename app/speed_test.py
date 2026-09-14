@@ -129,7 +129,10 @@ def download_mbps(num_bytes: int = 1_000_000,
                   timeout: float = LEG_TIMEOUT_S,
                   cancelled=None, progress_cb=None,
                   url: str = DOWNLOAD_URL) -> "float | None":
-    """Timed GET of `num_bytes`; Mbps or None. `progress_cb(got, total)`."""
+    """Timed GET of `num_bytes`; Mbps or None.
+
+    progress_cb convention (L04): INCREMENTAL (delta_bytes, total) — the
+    same contract the parallel streams use (the GUI sums deltas)."""
     is_cancelled = cancelled or (lambda: False)
     try:
         req_url = f"{url}?bytes={int(num_bytes)}" if url == DOWNLOAD_URL else url
@@ -146,7 +149,7 @@ def download_mbps(num_bytes: int = 1_000_000,
                 got += len(chunk)
                 try:
                     if progress_cb is not None:
-                        progress_cb(got, num_bytes)
+                        progress_cb(len(chunk), num_bytes)
                 except Exception:
                     pass
                 # Stop once we have enough (fallback URL ignores ?bytes).
@@ -274,8 +277,12 @@ def download_parallel(num_bytes_per_stream: int, streams: int = PARALLEL_STREAMS
                for _ in range(max(1, int(streams)))]
     for t in threads:
         t.start()
+    # L04: deadline joins — sequential t.join(timeout+5) stacked to ~100s
+    # worst-case (4 streams x 25s). Cap the whole round at timeout+5.
+    import time as _time
+    deadline = _time.monotonic() + timeout + 5.0
     for t in threads:
-        t.join(timeout + 5.0)
+        t.join(max(0.0, deadline - _time.monotonic()))
         if is_cancelled():
             break
     if not results:

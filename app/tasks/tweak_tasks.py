@@ -414,16 +414,29 @@ _GAME_DVR_SPECS = [
 
 def apply_disable_game_dvr(ctx: TaskContext):
     # M3: snapshot priors — the old revert hardcoded 1/1 + delete.
+    # F09: mixed HKCU/HKLM but admin_required=False — best-effort per value
+    # (taskbar_cleanup pattern) so limited-mode still gets the HKCU half
+    # instead of a guaranteed whole-task failure.
+    from app.utils import reg_set_value as _set
     had_snapshot = bool(get_tweak_snapshot("disable_game_dvr"))
     _snap_reg_values(ctx, "disable_game_dvr", _GAME_DVR_SPECS)
-    try:
-        reg_set_value_checked(ctx, "HKCU", "System\\GameConfigStore", "GameDVR_Enabled", 0)
-        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\GameDVR", "AppCaptureEnabled", 0)
-        reg_set_value_checked(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\GameDVR", "AllowGameDVR", 0)
-    except Exception:
+    writes = [
+        ("HKCU", "System\\GameConfigStore", "GameDVR_Enabled", 0),
+        ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\GameDVR", "AppCaptureEnabled", 0),
+        ("HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\GameDVR", "AllowGameDVR", 0),
+    ]
+    ok, skipped = 0, []
+    for hive, path, name, val in writes:
+        if _set(ctx, hive, path, name, val):
+            ok += 1
+        else:
+            skipped.append(f"{hive}\\{name}")
+    if ok == 0:
         if not had_snapshot:
             clear_tweak_snapshot("disable_game_dvr")
-        raise
+        raise RuntimeError("Could not apply Game DVR settings (all writes blocked). Nothing was marked as applied.")
+    if skipped:
+        ctx.log(f"  (applied {ok} of {len(writes)}; skipped: {'; '.join(skipped)} — admin rights needed for HKLM)")
 
 
 def revert_disable_game_dvr(ctx: TaskContext):
@@ -481,14 +494,20 @@ def apply_visual_effects_perf(ctx: TaskContext):
     # both tweaks are applied, undoing them in apply order lands on the
     # true original value — undoing in reverse order lands on the other
     # tweak's output.
+    had_snapshot = bool(get_tweak_snapshot("visual_effects"))
     _snap_reg_values(ctx, "visual_effects",
                      [("HKCU", "Control Panel\\Desktop", "MenuShowDelay")])
-    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
-                  "EnableTransparency", 0)
-    reg_set_value_checked(ctx, "HKCU", "Control Panel\\Desktop\\WindowMetrics", "MinAnimate", "0", value_type="REG_SZ")
-    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
-                  "TaskbarAnimations", 0)
-    reg_set_value_checked(ctx, "HKCU", "Control Panel\\Desktop", "MenuShowDelay", "0", value_type="REG_SZ")
+    try:
+        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                      "EnableTransparency", 0)
+        reg_set_value_checked(ctx, "HKCU", "Control Panel\\Desktop\\WindowMetrics", "MinAnimate", "0", value_type="REG_SZ")
+        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+                      "TaskbarAnimations", 0)
+        reg_set_value_checked(ctx, "HKCU", "Control Panel\\Desktop", "MenuShowDelay", "0", value_type="REG_SZ")
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("visual_effects")
+        raise
 
 
 def revert_visual_effects_perf(ctx: TaskContext):
@@ -1364,19 +1383,30 @@ def apply_local_search(ctx: TaskContext):
     """Make Start-menu search local-only and instant: no Bing, no web results,
     no cloud content (Sophia Script + privacy.sexy verified values)."""
     # M3: snapshot priors — the old revert deleted unconditionally.
+    # F09: best-effort (HKLM half needs admin; limited-mode keeps HKCU half).
+    from app.utils import reg_set_value as _set
     had_snapshot = bool(get_tweak_snapshot("local_search"))
     _snap_reg_values(ctx, "local_search", _LOCAL_SEARCH_SPECS)
-    try:
-        reg_set_value_checked(ctx, "HKCU", "Software\\Policies\\Microsoft\\Windows\\Explorer", "DisableSearchBoxSuggestions", 1)
-        reg_set_value_checked(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\Explorer", "DisableSearchBoxSuggestions", 1)
-        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Search", "BingSearchEnabled", 0)
-        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Search", "CortanaConsent", 0)
-        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\SearchSettings", "IsMSACloudSearchEnabled", 0)
-        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\SearchSettings", "IsAADCloudSearchEnabled", 0)
-    except Exception:
+    writes = [
+        ("HKCU", "Software\\Policies\\Microsoft\\Windows\\Explorer", "DisableSearchBoxSuggestions", 1),
+        ("HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\Explorer", "DisableSearchBoxSuggestions", 1),
+        ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Search", "BingSearchEnabled", 0),
+        ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Search", "CortanaConsent", 0),
+        ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\SearchSettings", "IsMSACloudSearchEnabled", 0),
+        ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\SearchSettings", "IsAADCloudSearchEnabled", 0),
+    ]
+    ok, skipped = 0, []
+    for hive, path, name, val in writes:
+        if _set(ctx, hive, path, name, val):
+            ok += 1
+        else:
+            skipped.append(f"{hive}\\{name}")
+    if ok == 0:
         if not had_snapshot:
             clear_tweak_snapshot("local_search")
-        raise
+        raise RuntimeError("Could not apply local-search settings (all writes blocked). Nothing was marked as applied.")
+    if skipped:
+        ctx.log(f"  (applied {ok} of {len(writes)}; skipped: {'; '.join(skipped)})")
     ctx.log("Search is now local-only — results appear instantly with no web/Bing content.")
 
 def revert_local_search(ctx: TaskContext):
@@ -1422,19 +1452,27 @@ def apply_stop_windows_ads(ctx: TaskContext):
     """The full ContentDeliveryManager sweep — every 'suggested content',
     auto-installed app, lock-screen ad and tip switch in one go."""
     # M3: snapshot priors — the old revert hardcoded 1s + deletes.
+    # F09: best-effort (HKLM CloudContent needs admin).
+    from app.utils import reg_set_value as _set
     cdm = _ADS_CDM
     had_snapshot = bool(get_tweak_snapshot("stop_windows_ads"))
     _snap_reg_values(ctx, "stop_windows_ads", _STOP_ADS_SPECS)
-    try:
-        for name in _ADS_CDM_NAMES:
-            reg_set_value_checked(ctx, "HKCU", cdm, name, 0)
-        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\UserProfileEngagement", "ScoobeSystemSettingEnabled", 0)
-        reg_set_value_checked(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\CloudContent", "DisableSoftLanding", 1)
-        reg_set_value_checked(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\CloudContent", "DisableCloudOptimizedContent", 1)
-    except Exception:
+    writes = [(("HKCU", cdm, n, 0)) for n in _ADS_CDM_NAMES]
+    writes += [("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\UserProfileEngagement", "ScoobeSystemSettingEnabled", 0),
+               ("HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\CloudContent", "DisableSoftLanding", 1),
+               ("HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\CloudContent", "DisableCloudOptimizedContent", 1)]
+    ok, skipped = 0, []
+    for hive, path, name, val in writes:
+        if _set(ctx, hive, path, name, val):
+            ok += 1
+        else:
+            skipped.append(f"{hive}\\{name}")
+    if ok == 0:
         if not had_snapshot:
             clear_tweak_snapshot("stop_windows_ads")
-        raise
+        raise RuntimeError("Could not disable Windows ads (all writes blocked). Nothing was marked as applied.")
+    if skipped:
+        ctx.log(f"  (applied {ok} of {len(writes)}; skipped: {'; '.join(skipped)})")
     ctx.log("Windows ads, suggestions, auto-installs and lock-screen tips disabled.")
 
 def revert_stop_windows_ads(ctx: TaskContext):
@@ -1476,25 +1514,36 @@ def apply_privacy_baseline(ctx: TaskContext):
     Windows itself exposes in Settings — fully reversible."""
     # M3: snapshot priors — the old revert deleted unconditionally, losing
     # any non-default priors (e.g. a user who had tailored experiences ON).
+    # F09: best-effort (two HKLM values need admin).
+    from app.utils import reg_set_value as _set
     had_snapshot = bool(get_tweak_snapshot("privacy_baseline"))
     _snap_reg_values(ctx, "privacy_baseline", _PRIVACY_BASELINE_SPECS)
-    try:
-        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\AdvertisingInfo", "Enabled", 0)
-        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Privacy", "TailoredExperiencesWithDiagnosticDataEnabled", 0)
-        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", "Start_TrackProgs", 0)
-        reg_set_value_checked(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\System", "EnableActivityFeed", 0)
-        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\humaninterfaceenterprise", "Value", "Deny", value_type="REG_SZ")
-        reg_set_value_checked(ctx, "HKCU", "Control Panel\\International\\User Profile", "HttpAcceptLanguageOptOut", 1)
-        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\OnlineSpeechPrivacy", "HasAccepted", 0)
-        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Siuf\\Rules", "NumberOfSIUFInPeriod", 0)
-        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Input\\TIPC", "Enabled", 0)
-        reg_set_value_checked(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Input\\TIPC", "Enabled", 0)
-        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Personalization\\Settings", "AcceptedPrivacyPolicy", 0)
-        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\InputPersonalization\\TrainedDataStore", "HarvestContacts", 0)
-    except Exception:
+    writes = [
+        ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\AdvertisingInfo", "Enabled", 0, "REG_DWORD"),
+        ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Privacy", "TailoredExperiencesWithDiagnosticDataEnabled", 0, "REG_DWORD"),
+        ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", "Start_TrackProgs", 0, "REG_DWORD"),
+        ("HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\System", "EnableActivityFeed", 0, "REG_DWORD"),
+        ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\humaninterfaceenterprise", "Value", "Deny", "REG_SZ"),
+        ("HKCU", "Control Panel\\International\\User Profile", "HttpAcceptLanguageOptOut", 1, "REG_DWORD"),
+        ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\OnlineSpeechPrivacy", "HasAccepted", 0, "REG_DWORD"),
+        ("HKCU", "Software\\Microsoft\\Siuf\\Rules", "NumberOfSIUFInPeriod", 0, "REG_DWORD"),
+        ("HKCU", "Software\\Microsoft\\Input\\TIPC", "Enabled", 0, "REG_DWORD"),
+        ("HKLM", "SOFTWARE\\Policies\\Microsoft\\Input\\TIPC", "Enabled", 0, "REG_DWORD"),
+        ("HKCU", "Software\\Microsoft\\Personalization\\Settings", "AcceptedPrivacyPolicy", 0, "REG_DWORD"),
+        ("HKCU", "Software\\Microsoft\\InputPersonalization\\TrainedDataStore", "HarvestContacts", 0, "REG_DWORD"),
+    ]
+    ok, skipped = 0, []
+    for hive, path, name, val, vtype in writes:
+        if _set(ctx, hive, path, name, val, value_type=vtype):
+            ok += 1
+        else:
+            skipped.append(f"{hive}\\{name}")
+    if ok == 0:
         if not had_snapshot:
             clear_tweak_snapshot("privacy_baseline")
-        raise
+        raise RuntimeError("Could not apply privacy baseline (all writes blocked). Nothing was marked as applied.")
+    if skipped:
+        ctx.log(f"  (applied {ok} of {len(writes)}; skipped: {'; '.join(skipped)})")
     # audit fix (AllowTelemetry coupling): this task used to ALSO write
     # AllowTelemetry=1 here and DELETE it in revert — the exact same value
     # limit_telemetry owns. Reverting Privacy Baseline silently undid
@@ -2487,12 +2536,16 @@ def _snap_reg_values(ctx: TaskContext, task_id: str, specs: "list[tuple]"):
     arg restored every value as one type).
     """
     from app.config_persist import save_tweak_snapshot
+    from app.utils import _REG_DENIED
     data: dict = {"specs": [list(s[:3]) for s in specs]}
     for i, spec in enumerate(specs):
         hive, path, name = spec[0], spec[1], spec[2]
         prior = reg_get_value(ctx, hive, path, name)
-        data[f"{i}:present"] = prior is not None
-        data[f"{i}:value"] = prior
+        # F13: denied reads are PRESENT-but-unreadable — never "absent"
+        # (absent made revert delete a value the user already had).
+        data[f"{i}:present"] = prior is not None and prior is not _REG_DENIED
+        data[f"{i}:denied"] = prior is _REG_DENIED
+        data[f"{i}:value"] = None if prior is _REG_DENIED else prior
         data[f"{i}:type"] = spec[3] if len(spec) > 3 else "REG_DWORD"
     save_tweak_snapshot(task_id, data)
 
@@ -2500,13 +2553,35 @@ def _snap_reg_values(ctx: TaskContext, task_id: str, specs: "list[tuple]"):
 def _restore_reg_values(ctx: TaskContext, task_id: str, value_type: str = "REG_DWORD"):
     """Restore a snapshot taken by _snap_reg_values (exact prior values;
     absent values are deleted back to Windows defaults). Per-value stored
-    types win; `value_type` is the fallback for pre-fix snapshots."""
+    types win; `value_type` is the fallback for pre-fix snapshots.
+    F15: snapshots live in user-writable config.json — validate the spec
+    triples before honoring them while elevated (fail-closed). Blocks
+    persistence targets (Run/RunOnce/Services/Winlogon/IFEO); full
+    per-task exact-match against code-side tables is the follow-up."""
     from app.config_persist import get_tweak_snapshot, clear_tweak_snapshot
     snap = get_tweak_snapshot(task_id)
     if not snap or "specs" not in snap:
         ctx.log("  (no snapshot found — nothing to restore)")
         return
+    _SENSITIVE = ("\\run", "\\runonce", "\\services", "winlogon",
+                  "image file execution options", "appinit_dlls", "userinit",
+                  "\\lsa", "\\sam", "credential")
     for i, (hive, path, name) in enumerate(snap["specs"]):
+        if hive not in ("HKCU", "HKLM", "HKCR") or not isinstance(path, str) or not path \
+                or not isinstance(name, str) or not name or "\x00" in path or "\x00" in name:
+            raise RuntimeError(f"Refusing to restore {task_id}: snapshot spec #{i} is malformed (config tampering?).")
+        if any(s in f"\\{path}\\".lower() + name.lower() for s in _SENSITIVE):
+            raise RuntimeError(f"Refusing to restore {task_id}: snapshot target is a persistence location (config tampering?).")
+        vtype = snap.get(f"{i}:type", value_type)
+        if vtype not in ("REG_DWORD", "REG_SZ", "REG_QWORD", "REG_BINARY", "REG_MULTI_SZ", "REG_EXPAND_SZ"):
+            raise RuntimeError(f"Refusing to restore {task_id}: bad value type (config tampering?).")
+    for i, (hive, path, name) in enumerate(snap["specs"]):
+        if snap.get(f"{i}:denied"):
+            # Prior existed but was unreadable — leave the current value in
+            # place and say so (deleting it would destroy user data we never
+            # saw; writing a guessed default would do the same).
+            ctx.log(f"  (kept {hive}\\{path}\\{name}: prior value was unreadable, leaving current)")
+            continue
         if snap.get(f"{i}:present"):
             vtype = snap.get(f"{i}:type", value_type)
             reg_set_value_checked(ctx, hive, path, name, snap.get(f"{i}:value"), value_type=vtype)
@@ -2521,9 +2596,15 @@ _ADV = "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced"
 
 def apply_file_extensions(ctx: TaskContext):
     """Show file extensions + hidden files (the modder's must-have)."""
+    had_snapshot = bool(get_tweak_snapshot("file_extensions"))
     _snap_reg_values(ctx, "file_extensions", [("HKCU", _ADV, "HideFileExt"), ("HKCU", _ADV, "Hidden")])
-    reg_set_value_checked(ctx, "HKCU", _ADV, "HideFileExt", 0)
-    reg_set_value_checked(ctx, "HKCU", _ADV, "Hidden", 1)
+    try:
+        reg_set_value_checked(ctx, "HKCU", _ADV, "HideFileExt", 0)
+        reg_set_value_checked(ctx, "HKCU", _ADV, "Hidden", 1)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("file_extensions")
+        raise
     ctx.log("File extensions and hidden files are now shown.")
 
 def revert_file_extensions(ctx: TaskContext):
@@ -2533,8 +2614,14 @@ def revert_file_extensions(ctx: TaskContext):
 
 def apply_menu_delay(ctx: TaskContext):
     """Menus pop in 100ms instead of 400ms."""
+    had_snapshot = bool(get_tweak_snapshot("menu_delay"))
     _snap_reg_values(ctx, "menu_delay", [("HKCU", "Control Panel\\Desktop", "MenuShowDelay")])
-    reg_set_value_checked(ctx, "HKCU", "Control Panel\\Desktop", "MenuShowDelay", "100", value_type="REG_SZ")
+    try:
+        reg_set_value_checked(ctx, "HKCU", "Control Panel\\Desktop", "MenuShowDelay", "100", value_type="REG_SZ")
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("menu_delay")
+        raise
     ctx.log("Menu delay set to 100ms.")
 
 def revert_menu_delay(ctx: TaskContext):
@@ -2551,8 +2638,14 @@ def revert_menu_delay(ctx: TaskContext):
 
 def apply_aero_shake_off(ctx: TaskContext):
     """Disable shake-to-minimize (no more nuked desktop mid-game)."""
+    had_snapshot = bool(get_tweak_snapshot("aero_shake"))
     _snap_reg_values(ctx, "aero_shake", [("HKCU", _ADV, "DisallowShaking")])
-    reg_set_value_checked(ctx, "HKCU", _ADV, "DisallowShaking", 1)
+    try:
+        reg_set_value_checked(ctx, "HKCU", _ADV, "DisallowShaking", 1)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("aero_shake")
+        raise
     ctx.log("Shake-to-minimize disabled.")
 
 def revert_aero_shake_off(ctx: TaskContext):
@@ -2562,9 +2655,15 @@ def revert_aero_shake_off(ctx: TaskContext):
 
 def apply_lock_screen_off(ctx: TaskContext):
     """Skip the lock screen — straight to login (admin, policy key)."""
+    had_snapshot = bool(get_tweak_snapshot("lock_screen"))
     _snap_reg_values(ctx, "lock_screen",
                      [("HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\Personalization", "NoLockScreen")])
-    reg_set_value_checked(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\Personalization", "NoLockScreen", 1)
+    try:
+        reg_set_value_checked(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\Personalization", "NoLockScreen", 1)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("lock_screen")
+        raise
     ctx.log("Lock screen skipped (takes effect at next sign-in).")
 
 def revert_lock_screen_off(ctx: TaskContext):
@@ -2575,11 +2674,17 @@ def revert_lock_screen_off(ctx: TaskContext):
 def apply_edge_preload_off(ctx: TaskContext):
     """Stop Edge's startup boost + background mode (admin; Edge updates may
     re-add these — rerun if Edge gets chatty again)."""
+    had_snapshot = bool(get_tweak_snapshot("edge_preload"))
     _snap_reg_values(ctx, "edge_preload",
                      [("HKLM", "SOFTWARE\\Policies\\Microsoft\\Edge", "StartupBoostEnabled"),
                       ("HKLM", "SOFTWARE\\Policies\\Microsoft\\Edge", "BackgroundModeEnabled")])
-    reg_set_value_checked(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Edge", "StartupBoostEnabled", 0)
-    reg_set_value_checked(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Edge", "BackgroundModeEnabled", 0)
+    try:
+        reg_set_value_checked(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Edge", "StartupBoostEnabled", 0)
+        reg_set_value_checked(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Edge", "BackgroundModeEnabled", 0)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("edge_preload")
+        raise
     ctx.log("Edge preloading disabled.")
 
 def revert_edge_preload_off(ctx: TaskContext):
@@ -2589,9 +2694,15 @@ def revert_edge_preload_off(ctx: TaskContext):
 
 def apply_dark_mode(ctx: TaskContext):
     """Prefer dark app themes."""
+    had_snapshot = bool(get_tweak_snapshot("dark_mode"))
     _snap_reg_values(ctx, "dark_mode",
                      [("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", "AppsUseLightTheme")])
-    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", "AppsUseLightTheme", 0)
+    try:
+        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", "AppsUseLightTheme", 0)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("dark_mode")
+        raise
     ctx.log("Dark app theme preferred.")
 
 def revert_dark_mode(ctx: TaskContext):
@@ -2601,9 +2712,15 @@ def revert_dark_mode(ctx: TaskContext):
 
 def apply_remote_assist_off(ctx: TaskContext):
     """Disable inbound Remote Assistance offers (admin)."""
+    had_snapshot = bool(get_tweak_snapshot("remote_assist"))
     _snap_reg_values(ctx, "remote_assist",
                      [("HKLM", "SYSTEM\\CurrentControlSet\\Control\\Terminal Server", "fAllowToGetHelp")])
-    reg_set_value_checked(ctx, "HKLM", "SYSTEM\\CurrentControlSet\\Control\\Terminal Server", "fAllowToGetHelp", 0)
+    try:
+        reg_set_value_checked(ctx, "HKLM", "SYSTEM\\CurrentControlSet\\Control\\Terminal Server", "fAllowToGetHelp", 0)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("remote_assist")
+        raise
     ctx.log("Remote Assistance disabled.")
 
 def revert_remote_assist_off(ctx: TaskContext):
@@ -2613,9 +2730,15 @@ def revert_remote_assist_off(ctx: TaskContext):
 
 def apply_verbose_boot(ctx: TaskContext):
     """Verbose boot/shutdown messages instead of the spinner (admin)."""
+    had_snapshot = bool(get_tweak_snapshot("verbose_boot"))
     _snap_reg_values(ctx, "verbose_boot",
                      [("HKLM", "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System", "VerboseStatus")])
-    reg_set_value_checked(ctx, "HKLM", "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System", "VerboseStatus", 1)
+    try:
+        reg_set_value_checked(ctx, "HKLM", "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System", "VerboseStatus", 1)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("verbose_boot")
+        raise
     ctx.log("Verbose boot messages on (visible at next restart).")
 
 def revert_verbose_boot(ctx: TaskContext):
@@ -2625,9 +2748,15 @@ def revert_verbose_boot(ctx: TaskContext):
 
 def apply_location_tracking_off(ctx: TaskContext):
     """Disable the location sensor via policy (admin)."""
+    had_snapshot = bool(get_tweak_snapshot("location_tracking"))
     _snap_reg_values(ctx, "location_tracking",
                      [("HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\LocationAndSensors", "DisableLocation")])
-    reg_set_value_checked(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\LocationAndSensors", "DisableLocation", 1)
+    try:
+        reg_set_value_checked(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\LocationAndSensors", "DisableLocation", 1)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("location_tracking")
+        raise
     ctx.log("Location tracking disabled.")
 
 def revert_location_tracking_off(ctx: TaskContext):
@@ -2638,11 +2767,17 @@ def revert_location_tracking_off(ctx: TaskContext):
 def apply_widgets_board_off(ctx: TaskContext):
     """Policy-level Widgets board off (goes further than hiding the taskbar
     icon: the board, news feed and its background activity stop entirely)."""
+    had_snapshot = bool(get_tweak_snapshot("widgets_board_off"))
     _snap_reg_values(ctx, "widgets_board_off",
                      [("HKLM", "SOFTWARE\\Policies\\Microsoft\\Dsh", "AllowNewsAndInterests"),
                       ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Feeds", "ShellFeedsTaskbarViewMode")])
-    reg_set_value_checked(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Dsh", "AllowNewsAndInterests", 0)
-    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Feeds", "ShellFeedsTaskbarViewMode", 2)
+    try:
+        reg_set_value_checked(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Dsh", "AllowNewsAndInterests", 0)
+        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Feeds", "ShellFeedsTaskbarViewMode", 2)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("widgets_board_off")
+        raise
     ctx.log("Widgets board disabled (icon hide + news feed off).")
 
 def revert_widgets_board_off(ctx: TaskContext):
@@ -2653,11 +2788,17 @@ def revert_widgets_board_off(ctx: TaskContext):
 def apply_autoplay_off(ctx: TaskContext):
     """Disable AutoPlay/AutoRun for USB sticks and discs (plugging in a
     drive never auto-launches anything — classic USB-malware vector)."""
+    had_snapshot = bool(get_tweak_snapshot("autoplay_off"))
     _snap_reg_values(ctx, "autoplay_off",
                      [("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\AutoplayHandlers", "DisableAutoplay"),
                       ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer", "NoDriveTypeAutoRun")])
-    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\AutoplayHandlers", "DisableAutoplay", 1)
-    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer", "NoDriveTypeAutoRun", 255)
+    try:
+        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\AutoplayHandlers", "DisableAutoplay", 1)
+        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer", "NoDriveTypeAutoRun", 255)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("autoplay_off")
+        raise
     ctx.log("AutoPlay disabled for all drives.")
 
 def revert_autoplay_off(ctx: TaskContext):
@@ -2668,9 +2809,15 @@ def revert_autoplay_off(ctx: TaskContext):
 def apply_snap_flyout_off(ctx: TaskContext):
     """Disable the Snap-layouts flyout that pops when hovering a window's
     maximize button mid-game (Win+arrows snapping keeps working)."""
+    had_snapshot = bool(get_tweak_snapshot("snap_flyout_off"))
     _snap_reg_values(ctx, "snap_flyout_off",
                      [("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", "EnableSnapAssistFlyout")])
-    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", "EnableSnapAssistFlyout", 0)
+    try:
+        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", "EnableSnapAssistFlyout", 0)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("snap_flyout_off")
+        raise
     ctx.log("Snap flyout off — maximize-hover no longer pops layouts.")
 
 def revert_snap_flyout_off(ctx: TaskContext):
@@ -2695,13 +2842,19 @@ def apply_storage_sense(ctx: TaskContext):
     someone's files; Sense keeps to temp/bin debris only.
 
     HKCU-only (per-user setting) — no admin needed, undoable."""
+    had_snapshot = bool(get_tweak_snapshot("storage_sense"))
     _snap_reg_values(ctx, "storage_sense",
                      [(_SENSE[0], _SENSE[1], "01"),
                       (_SENSE[0], _SENSE[1], "04"),
                       (_SENSE[0], _SENSE[1], "256")])
-    reg_set_value_checked(ctx, _SENSE[0], _SENSE[1], "01", 1)
-    reg_set_value_checked(ctx, _SENSE[0], _SENSE[1], "04", 1)
-    reg_set_value_checked(ctx, _SENSE[0], _SENSE[1], "256", 0)  # 0 = cadence picks default
+    try:
+        reg_set_value_checked(ctx, _SENSE[0], _SENSE[1], "01", 1)
+        reg_set_value_checked(ctx, _SENSE[0], _SENSE[1], "04", 1)
+        reg_set_value_checked(ctx, _SENSE[0], _SENSE[1], "256", 0)  # 0 = cadence picks default
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("storage_sense")
+        raise
     ctx.log("Storage Sense ON — Windows now auto-cleans temp junk (monthly, default cadence).")
 
 def revert_storage_sense(ctx: TaskContext):
@@ -2723,13 +2876,19 @@ def apply_fast_app_close(ctx: TaskContext):
 
     HKCU-only, snapshot + revert, no admin. These values only take
     effect at the next sign-out/shutdown."""
+    had_snapshot = bool(get_tweak_snapshot("fast_app_close"))
     _snap_reg_values(ctx, "fast_app_close",
                      [("HKCU", _DESKTOP, "WaitToKillAppTimeout"),
                       ("HKCU", _DESKTOP, "HungAppTimeout"),
                       ("HKCU", _DESKTOP, "AutoEndTasks")])
-    reg_set_value_checked(ctx, "HKCU", _DESKTOP, "WaitToKillAppTimeout", "2000", value_type="REG_SZ")
-    reg_set_value_checked(ctx, "HKCU", _DESKTOP, "HungAppTimeout", "1000", value_type="REG_SZ")
-    reg_set_value_checked(ctx, "HKCU", _DESKTOP, "AutoEndTasks", "1", value_type="REG_SZ")
+    try:
+        reg_set_value_checked(ctx, "HKCU", _DESKTOP, "WaitToKillAppTimeout", "2000", value_type="REG_SZ")
+        reg_set_value_checked(ctx, "HKCU", _DESKTOP, "HungAppTimeout", "1000", value_type="REG_SZ")
+        reg_set_value_checked(ctx, "HKCU", _DESKTOP, "AutoEndTasks", "1", value_type="REG_SZ")
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("fast_app_close")
+        raise
     ctx.log("Fast app close on: shutdown waits drop from 20s to 2s before apps are ended.")
 
 def revert_fast_app_close(ctx: TaskContext):
@@ -2757,11 +2916,17 @@ def apply_instant_alt_tab(ctx: TaskContext):
 
     HKCU-only, snapshot + revert, no admin, takes effect at next
     sign-in (Explorer reads it at logon)."""
+    had_snapshot = bool(get_tweak_snapshot("instant_alt_tab"))
     _snap_reg_values(ctx, "instant_alt_tab",
                      [("HKCU", _DESKTOP, "ForegroundLockTimeout"),
                       ("HKCU", _DESKTOP, "ForegroundFlashCount")])
-    reg_set_value_checked(ctx, "HKCU", _DESKTOP, "ForegroundLockTimeout", 0)   # REG_DWORD needs an int, not "0"
-    reg_set_value_checked(ctx, "HKCU", _DESKTOP, "ForegroundFlashCount", 0)
+    try:
+        reg_set_value_checked(ctx, "HKCU", _DESKTOP, "ForegroundLockTimeout", 0)   # REG_DWORD needs an int, not "0"
+        reg_set_value_checked(ctx, "HKCU", _DESKTOP, "ForegroundFlashCount", 0)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("instant_alt_tab")
+        raise
     ctx.log("Alt-tab focus delay removed — windows switch instantly at next sign-in.")
 
 def revert_instant_alt_tab(ctx: TaskContext):
@@ -2787,9 +2952,15 @@ def apply_numlock_boot(ctx: TaskContext):
 
     HKCU-only (per-user), REG_SZ, snapshot + revert, no admin.
     Takes effect at the next sign-in/boot."""
+    had_snapshot = bool(get_tweak_snapshot("numlock_boot"))
     _snap_reg_values(ctx, "numlock_boot",
                      [("HKCU", _DESKTOP, "InitialKeyboardIndicators")])
-    reg_set_value_checked(ctx, "HKCU", _DESKTOP, "InitialKeyboardIndicators", "2", value_type="REG_SZ")
+    try:
+        reg_set_value_checked(ctx, "HKCU", _DESKTOP, "InitialKeyboardIndicators", "2", value_type="REG_SZ")
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("numlock_boot")
+        raise
     ctx.log("NumLock will be ON at every boot from the next sign-in.")
 
 def revert_numlock_boot(ctx: TaskContext):
@@ -2814,11 +2985,17 @@ def apply_clipboard_sync_off(ctx: TaskContext):
     while leaving local Win+V history working.
 
     HKLM policy key (admin), snapshot + revert."""
+    had_snapshot = bool(get_tweak_snapshot("clipboard_sync_off"))
     _snap_reg_values(ctx, "clipboard_sync_off",
                      [("HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\System",
                        "AllowCrossDeviceClipboard")])
-    reg_set_value_checked(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\System",
-                          "AllowCrossDeviceClipboard", 1)
+    try:
+        reg_set_value_checked(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\System",
+                              "AllowCrossDeviceClipboard", 1)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("clipboard_sync_off")
+        raise
     ctx.log("Cloud clipboard sync disabled — Win+V keeps working, locally only.")
 
 def revert_clipboard_sync_off(ctx: TaskContext):

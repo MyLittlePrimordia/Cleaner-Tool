@@ -147,6 +147,7 @@ def _clean_many(ctx: TaskContext, folders, label):
 
 def _clean_files(ctx: TaskContext, files, label):
     """Remove individual files (e.g. launcher_log.txt) and count freed bytes."""
+    from app.utils import _is_reparse_point as _is_rp
     dry = bool(getattr(ctx, "dry_run", False))
     total = 0
     for f in files:
@@ -155,6 +156,13 @@ def _clean_files(ctx: TaskContext, files, label):
         if ctx.cancelled():
             break
         if not f or not os.path.isabs(f) or not os.path.isfile(f):
+            continue
+        # F04 guard: never delete through a reparse point (junction/symlink
+        # file behind an attacker-planted link).
+        try:
+            if _is_rp(f):
+                continue
+        except Exception:
             continue
         try:
             st = os.stat(f)
@@ -271,9 +279,20 @@ def clean_vrchat_cache(ctx: TaskContext):
             custom = (_json.load(f) or {}).get("cache_directory", "")
         if isinstance(custom, str) and custom.strip() and os.path.isabs(custom):
             norm = os.path.normpath(custom.strip())
-            if norm not in targets:
-                targets.append(norm)
-                ctx.log(f"VRChat uses a relocated cache: {norm}")
+            # F16: cache_directory is game-writable — refuse system roots
+            # (drive root / Windows / profile root); entry-junction guard
+            # in clean_folder_contents covers the symlink case.
+            try:
+                croot = os.path.splitdrive(norm)[0] + os.sep
+                cwindir = os.environ.get("WINDIR", "")
+                cprofile = os.environ.get("USERPROFILE", "")
+                if norm.lower() in (croot.lower(), cwindir.lower() if cwindir else "", cprofile.lower() if cprofile else ""):
+                    ctx.log(f"VRChat custom cache looks unsafe — skipping: {norm}")
+                elif norm not in targets:
+                    targets.append(norm)
+                    ctx.log(f"VRChat uses a relocated cache: {norm}")
+            except Exception:
+                pass
     except (OSError, ValueError):
         pass
     total = _clean_many(ctx, [t for t in targets if os.path.isdir(t)],
@@ -472,6 +491,22 @@ def clean_steam_stuck_downloads(ctx: TaskContext):
             steam_path = winreg.QueryValueEx(k, "SteamPath")[0]
     except OSError:
         ctx.log("Steam not found in the registry — nothing to do.")
+        return 0
+    # F16: HKCU SteamPath is user-writable — same fingerprint check as
+    # clean_tasks._steam_root before deleting through it while elevated.
+    try:
+        norm = os.path.normpath(steam_path or "")
+        root = os.path.splitdrive(norm)[0] + os.sep
+        windir = os.environ.get("WINDIR", "")
+        profile = os.environ.get("USERPROFILE", "")
+        bad = norm.lower() in (root.lower(), windir.lower() if windir else "", profile.lower() if profile else "")
+        looks = (os.path.isfile(os.path.join(norm, "steam.exe"))
+                 or os.path.isdir(os.path.join(norm, "steamapps")))
+        if bad or not looks:
+            ctx.log(f"Steam path looks invalid — skipping: {steam_path}")
+            return 0
+    except Exception:
+        ctx.log(f"Steam path looks invalid — skipping: {steam_path}")
         return 0
     total = 0
     for sub in ("downloading", "temp"):

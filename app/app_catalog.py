@@ -716,21 +716,29 @@ CATEGORY_ORDER = [
 
 def _validate():
     ids = [a["id"] for a in APP_CATALOG]
-    assert len(ids) == len(set(ids)), "duplicate winget ids in catalog"
+    if len(ids) != len(set(ids)):
+        raise RuntimeError("duplicate winget ids in catalog")
     for a in APP_CATALOG:
-        assert a["category"] in CATEGORY_ORDER, "unknown category: " + a["category"]
-        assert set(a) >= {"id", "name", "category", "description", "foss", "url"}, a["id"]
+        if a["category"] not in CATEGORY_ORDER:
+            raise RuntimeError("unknown category: " + a["category"])
+        if not set(a) >= {"id", "name", "category", "description", "foss", "url"}:
+            raise RuntimeError("bad catalog entry: " + a["id"])
     # retired categories must stay gone
-    assert "Runtimes & Dependencies" not in CATEGORY_ORDER
-    assert "FOSS Games & Source Ports" not in CATEGORY_ORDER
+    if "Runtimes & Dependencies" in CATEGORY_ORDER:
+        raise RuntimeError("retired category present: Runtimes & Dependencies")
+    if "FOSS Games & Source Ports" in CATEGORY_ORDER:
+        raise RuntimeError("retired category present: FOSS Games & Source Ports")
     # A-Z within each category (user request)
     for cat in CATEGORY_ORDER:
         names = [a["name"].lower() for a in APP_CATALOG if a["category"] == cat]
-        assert names == sorted(names), "category not alphabetical: " + cat
+        if names != sorted(names):
+            raise RuntimeError("category not alphabetical: " + cat)
     for m in MANUAL_ONLY_APPS:
-        assert m["category"] in CATEGORY_ORDER, "unknown manual category: " + m["category"]
+        if m["category"] not in CATEGORY_ORDER:
+            raise RuntimeError("unknown manual category: " + m["category"])
         if "fallback_url" in m:
-            assert m["fallback_url"] and m["fallback_url"] != m["url"], m["id"]
+            if not (m["fallback_url"] and m["fallback_url"] != m["url"]):
+                raise RuntimeError("bad manual fallback: " + m["id"])
 
 
 _validate()

@@ -35,11 +35,39 @@ def _get_elevation_token_path() -> str:
     return os.path.join(tempfile.gettempdir(), "CleanerTool_elevation_token")
 
 
+def _exclusive_write(path: str, data: str) -> None:
+    """F05: predictable %TEMP% names + plain open() let a same-user attacker
+    pre-create a symlink/file to force false-success/DoS. Unlink any
+    pre-existing entry (removes a planted symlink) then create exclusively
+    (O_CREAT|O_EXCL) with a restrictive mode — the create fails instead of
+    following a raced-in link. Best-effort: falls back to a plain write
+    only if exclusive create is unavailable on this platform."""
+    try:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        try:
+            fd = os.open(path, flags, 0o600)
+        except AttributeError:
+            raise
+        try:
+            os.write(fd, data.encode("utf-8"))
+        finally:
+            os.close(fd)
+    except Exception:
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(data)
+        except Exception:
+            pass
+
+
 def _write_elevation_cookie(pid: int, token: str = "") -> None:
     """Write the elevated process PID and token to the cookie file."""
     try:
-        with open(_get_elevation_cookie_path(), "w") as f:
-            f.write(f"{pid}:{token}" if token else str(pid))
+        _exclusive_write(_get_elevation_cookie_path(), f"{pid}:{token}" if token else str(pid))
     except Exception:
         pass
 
@@ -67,8 +95,7 @@ def _clear_elevation_cookie() -> None:
 
 def _write_pending_token(token: str) -> None:
     try:
-        with open(_get_elevation_token_path(), "w") as f:
-            f.write(token)
+        _exclusive_write(_get_elevation_token_path(), token)
     except Exception:
         pass
 

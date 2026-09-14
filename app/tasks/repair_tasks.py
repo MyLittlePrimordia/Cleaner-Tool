@@ -945,9 +945,24 @@ def repair_hosts_file(ctx: TaskContext):
         except Exception as exc:
             raise RuntimeError(f"Could not back up hosts file, aborting for safety: {exc}")
     try:
-        with open(_HOSTS_PATH, "w", encoding="utf-8", newline="") as f:
+        # F07: atomic write (same helper shape as tweak_tasks._write_hosts_file)
+        # — never truncate hosts in place; a mid-write crash bricked DNS.
+        hosts_dir = os.path.dirname(_HOSTS_PATH)
+        tmp_path = os.path.join(hosts_dir, "hosts.cleanertool.tmp")
+        with open(tmp_path, "w", encoding="utf-8", newline="") as f:
             f.write("\r\n".join(_STOCK_HOSTS_LINES))
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(tmp_path, _HOSTS_PATH)
     except Exception as exc:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
         raise RuntimeError(f"Could not write hosts file (need admin rights?): {exc}")
     run_cmd(ctx, "ipconfig /flushdns", timeout=30)
     if had_block:
@@ -974,7 +989,9 @@ def _repair_desktop_dir() -> str:
                             r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders") as k:
             raw, _ = winreg.QueryValueEx(k, "Desktop")
             resolved = os.path.expandvars(raw)
-            if resolved and os.path.isabs(resolved):
+            # F06: Desktop feeds shell strings (netsh/dism) while elevated —
+            # reject metachars/quotes so a tampered value can't break out.
+            if resolved and os.path.isabs(resolved) and not any(c in resolved for c in '"&|<>^%'):
                 return resolved
     except OSError:
         pass

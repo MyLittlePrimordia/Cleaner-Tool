@@ -33,17 +33,15 @@ GRADE_SCORES = {"A": 4, "B": 3, "C": 2, "D": 1, "F": 0}
 
 
 def grade_disk_space(free_ratio: float) -> str:
-    """Mirrors the drive-chip color bands (green/amber/red at 15%/5%)."""
+    """Mirrors the drive-chip color bands (red at <=5% free, amber <=15%)."""
     try:
         r = float(free_ratio)
     except Exception:
         return "?"
-    if r >= 0.20:
+    if r >= 0.15:
         return "A"
-    if r >= 0.10:
-        return "B"
     if r >= 0.05:
-        return "C"
+        return "B"
     return "F"
 
 
@@ -73,7 +71,10 @@ def overall_grade(grades: dict) -> str:
               if g in GRADE_SCORES]
     if not scores:
         return "?"
-    avg = round(sum(scores) / len(scores))
+    # L01: half-up (round() is banker's: round(2.5)==2) — grades must round
+    # the way users expect.
+    import math as _math
+    avg = int(_math.floor(sum(scores) / len(scores) + 0.5))
     for letter, score in GRADE_SCORES.items():
         if score == avg:
             return letter
@@ -133,22 +134,26 @@ def _collecting_ctx(log_list, set_status=None, cancelled=None) -> TaskContext:
 
 
 def sense_disk(ctx) -> tuple:
-    """C: free-space ratio + human numbers. Instant, no subprocess."""
+    """System-drive free-space ratio + human numbers. Instant, no subprocess."""
     try:
+        import os as _os
         import ctypes as _ct
+        sysdrive = _os.environ.get("SYSTEMDRIVE", "C:")
+        root = sysdrive if sysdrive.endswith("\\") else sysdrive + "\\"
         free = _ct.c_ulonglong(0)
         total = _ct.c_ulonglong(0)
         avail = _ct.c_ulonglong(0)
         ok = _ct.windll.kernel32.GetDiskFreeSpaceExW(
-            _ct.c_wchar_p("C:\\"), _ct.byref(avail),
+            _ct.c_wchar_p(root), _ct.byref(avail),
             _ct.byref(total), _ct.byref(free))
         if not ok or not total.value:
             return ("?", "Couldn't read disk", "Free-space query failed.", "")
         from app.utils import format_bytes as _fb
         ratio = free.value / total.value
+        letter = root[:2]
         return (grade_disk_space(ratio),
                 f"{_fb(free.value)} free of {_fb(total.value)}",
-                f"C: is {ratio * 100:.0f}% free.", "")
+                f"{letter} is {ratio * 100:.0f}% free.", "")
     except Exception as exc:
         return ("?", "Couldn't read disk", f"{exc}"[:120], "")
 
@@ -251,6 +256,10 @@ def sense_junk(ctx) -> tuple:
             total = measure_all_cached(
                 set_status=lambda m: ctx.set_status(m),
                 cancelled=ctx.cancelled)
+        # F11: None = unknown (busy/cancel) — never "A / already empty".
+        if total is None:
+            return ("?", "Junk scan busy",
+                    "Another scan is running — open Storage Insight for the full estimate.", "")
         return (grade_junk(total),
                 f"~{_fb(total)} reclaimable" if total > 0 else "Nothing to clean",
                 "Safe to clean." if total > 0

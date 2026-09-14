@@ -6,7 +6,7 @@ import datetime
 import os
 import sys
 import subprocess
-from app.config_persist import load_config, save_config
+from app.config_persist import load_config, save_config, update_config
 from app.elevation import is_admin
 
 TASK_NAME = "CleanerTool_AutoMaintenance"
@@ -64,7 +64,10 @@ def _build_schtasks_cmd(frequency, time_str, extra_args=None, today=None):
         "weekly": "WEEKLY",
         "monthly": "MONTHLY",
     }
-    sched = schedule_map.get(frequency, "WEEKLY")
+    # F14: validate instead of silently coercing typos to WEEKLY.
+    frequency = _validate_frequency(frequency)
+    time_str = _validate_time_str(time_str)
+    sched = schedule_map[frequency]
     task_run = subprocess.list2cmdline([exe] + args)
     task_name = TASK_NAME if not extra_args else TASK_NAME + "_" + extra_args[0].lstrip("-").replace("-", "_")
     cmd = [
@@ -105,6 +108,22 @@ def _schedule_day_args(sched: str, today: "datetime.date | None") -> "list[str]"
     return []
 
 
+def _validate_frequency(frequency) -> str:
+    """F14: unknown/typo frequencies used to silently become WEEKLY."""
+    f = str(frequency or "").strip().lower()
+    if f not in ("daily", "weekly", "monthly"):
+        raise ValueError(f"Unknown schedule frequency {frequency!r} (want daily/weekly/monthly).")
+    return f
+
+
+def _validate_time_str(time_str) -> str:
+    t = str(time_str or "").strip()
+    import re as _re
+    if not _re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", t):
+        raise ValueError(f"Bad schedule time {time_str!r} (want HH:MM, 24h).")
+    return t
+
+
 def _build_schtasks_cmd_str(frequency, time_str, extra_args=None) -> str:
     """Legacy string form for display / debugging (properly quoted)."""
     return subprocess.list2cmdline(_build_schtasks_cmd(frequency, time_str, extra_args))
@@ -114,18 +133,52 @@ def enable_schedule(frequency="weekly", time_str="03:00", extra_args=None):
     """Create or update the scheduled task. `extra_args=["--auto-update"]`
     schedules the Update Everything run instead of the clean/repair run
     (separate Task Scheduler entry so both can coexist)."""
+    # F14: validate before touching schtasks (fail fast, honest error).
+    try:
+        frequency = _validate_frequency(frequency)
+        time_str = _validate_time_str(time_str)
+    except ValueError as exc:
+        return False, str(exc)
+    # F14: skip the rewrite when the live task already matches (/TR drift
+    # detection) — avoids churning Task Scheduler on every dialog Apply.
+    try:
+        task_name = TASK_NAME if not extra_args else TASK_NAME + "_" + extra_args[0].lstrip("-").replace("-", "_")
+        ok, out = get_schedule_status(extra_args)
+        if ok:
+            exe, args = _get_executable_and_args(extra_args)
+            want_tr = subprocess.list2cmdline([exe] + args)
+            m = None
+            for line in (out or "").splitlines():
+                if line.strip().lower().startswith("task to run"):
+                    m = line.split(":", 1)[1].strip() if ":" in line else ""
+                    break
+            if m is not None and m.strip().strip('"') == want_tr.strip().strip('"'):
+                def _mut(extra_args=extra_args, frequency=frequency, time_str=time_str):
+                    def _m(cfg):
+                        if extra_args:
+                            cfg["schedule_update_enabled"] = True
+                        else:
+                            cfg["schedule_enabled"] = True
+                        cfg["schedule_frequency"] = frequency
+                        cfg["schedule_time"] = time_str
+                    return _m
+                update_config(_mut())
+                return True, "Schedule already up to date."
+    except Exception:
+        pass
     cmd = _build_schtasks_cmd(frequency, time_str, extra_args)
     try:
         result = subprocess.run(cmd, shell=False, capture_output=True, text=True, timeout=30)
         if result.returncode == 0:
-            config = load_config()
-            if extra_args:
-                config["schedule_update_enabled"] = True
-            else:
-                config["schedule_enabled"] = True
-            config["schedule_frequency"] = frequency
-            config["schedule_time"] = time_str
-            save_config(config)
+            # F08: single-lock RMW (was load; mutate; save with lock released).
+            def _mut(cfg, extra_args=extra_args, frequency=frequency, time_str=time_str):
+                if extra_args:
+                    cfg["schedule_update_enabled"] = True
+                else:
+                    cfg["schedule_enabled"] = True
+                cfg["schedule_frequency"] = frequency
+                cfg["schedule_time"] = time_str
+            update_config(_mut)
             return True, result.stdout or result.stderr
         return False, result.stdout or result.stderr
     except Exception as e:
@@ -140,12 +193,13 @@ def disable_schedule(extra_args=None):
     try:
         result = subprocess.run(cmd, shell=False, capture_output=True, text=True, timeout=30)
         if result.returncode == 0:
-            config = load_config()
-            if extra_args:
-                config["schedule_update_enabled"] = False
-            else:
-                config["schedule_enabled"] = False
-            save_config(config)
+            # F08: single-lock RMW.
+            def _mut(cfg, extra_args=extra_args):
+                if extra_args:
+                    cfg["schedule_update_enabled"] = False
+                else:
+                    cfg["schedule_enabled"] = False
+            update_config(_mut)
             return True, result.stdout or result.stderr
         return False, result.stdout or result.stderr
     except Exception as e:
@@ -161,6 +215,23 @@ def get_schedule_status(extra_args=None):
         return result.returncode == 0, result.stdout
     except Exception:
         return False, ""
+
+
+def resync_schedule_flag(extra_args=None) -> bool:
+    """F14: reconcile config with live Task Scheduler state (external
+    schtasks /Delete left config stale-True). Returns the live state and
+    persists it via a single-lock update so the dialog seeds honestly."""
+    ok, _ = get_schedule_status(extra_args)
+    def _mut(cfg, ok=ok, extra_args=extra_args):
+        if extra_args:
+            cfg["schedule_update_enabled"] = bool(ok)
+        else:
+            cfg["schedule_enabled"] = bool(ok)
+    try:
+        update_config(_mut)
+    except Exception:
+        pass
+    return ok
 
 
 def run_auto_update():
@@ -263,7 +334,12 @@ def run_auto_clean(selected_tasks_by_tab):
     try:
         from app.warnings import check_dangerous_combos, check_info_notices
         # check_dangerous_combos now supports List[str] keys
-        all_keys = [k for keys in selected_tasks_by_tab.values() for k in keys]
+        # F14: coerce hand-edited {tab: "singlekey"} strings (was char-scatter).
+        all_keys = []
+        for keys in selected_tasks_by_tab.values():
+            if isinstance(keys, str):
+                keys = [keys]
+            all_keys.extend(keys)
         warnings = check_dangerous_combos(all_keys)  # type: ignore[arg-type]
         try:
             warnings = list(warnings) + list(check_info_notices(all_keys))  # type: ignore[arg-type]
@@ -303,10 +379,18 @@ def run_auto_clean(selected_tasks_by_tab):
 
     # Show the scheduled-run toast (audit dead-code fix: notify_scheduled_run
     # existed with zero callers — a scheduled run was invisible unless the
-    # user happened to see a window)
+    # user happened to see a window). F14: fire-and-forget on a daemon
+    # thread — the sync powershell call can block ~30s and must never stall
+    # the headless run's task loop.
     try:
-        from app.toast import notify_scheduled_run
-        notify_scheduled_run()
+        import threading as _th
+        def _toast():
+            try:
+                from app.toast import notify_scheduled_run
+                notify_scheduled_run()
+            except Exception:
+                pass
+        _th.Thread(target=_toast, daemon=True).start()
     except Exception:
         pass
 

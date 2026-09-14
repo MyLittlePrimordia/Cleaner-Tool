@@ -5,7 +5,7 @@ Design goals:
   * One question answered in under 2 seconds: "which big button do I press?"
   * No console output, no command lines, no log window. A colored animated
     progress bar with plain-language status; the full log stays in memory
-    and is exportable to .txt via Quick Tools > Export Logs.
+    and is exportable to .txt via the 📋 corner icon.
   * Dark theme only (navy palette from user reference), accents per tab:
     mint = Clean, amber = Repair, violet = Tweak, red = Undo.
   * The 3 tabs are one pill-shaped switcher: a thumb slides between
@@ -1122,10 +1122,13 @@ class StorageInsightDialog(ThemedModal):
     # ---- scan worker ---------------------------------------------------- #
 
     def _ui(self, fn, *args):
-        """Marshal a paint hop to the Tk thread (worker-safe)."""
+        """Marshal a paint hop to the Tk thread (worker-safe).
+
+        F10: never touch Tk from the worker (even winfo_exists burns
+        ~1s off-thread) — schedule unconditionally; a destroyed dialog
+        raises inside after() and is swallowed below."""
         try:
-            if self._dlg.winfo_exists():
-                self._dlg.after(0, lambda: fn(*args))
+            self._dlg.after(0, lambda: fn(*args))
         except Exception:
             pass
 
@@ -1168,8 +1171,10 @@ class StorageInsightDialog(ThemedModal):
 
     def _scan_worker(self, token):
         def dead():
+            # F10: token-only — close handlers already set token on the Tk
+            # thread; winfo_exists here burned ~1s off-thread per call.
             try:
-                return bool(token[0]) or not self._dlg.winfo_exists()
+                return bool(token[0])
             except Exception:
                 return True
 
@@ -1540,10 +1545,13 @@ class DnsTesterDialog(ThemedModal):
     # ---- test orchestration -------------------------------------------- #
 
     def _ui(self, fn, *args):
-        """Marshal a paint hop to the Tk thread (worker-safe)."""
+        """Marshal a paint hop to the Tk thread (worker-safe).
+
+        F10: never touch Tk from the worker (even winfo_exists burns
+        ~1s off-thread) — schedule unconditionally; a destroyed dialog
+        raises inside after() and is swallowed below."""
         try:
-            if self._dlg.winfo_exists():
-                self._dlg.after(0, lambda: fn(*args))
+            self._dlg.after(0, lambda: fn(*args))
         except Exception:
             pass
 
@@ -1599,8 +1607,10 @@ class DnsTesterDialog(ThemedModal):
 
     def _test_worker(self, token, gen):
         def dead():
+            # F10: token-only — close handlers already set token on the Tk
+            # thread; winfo_exists here burned ~1s off-thread per call.
             try:
-                return bool(token[0]) or not self._dlg.winfo_exists()
+                return bool(token[0])
             except Exception:
                 return True
 
@@ -2294,13 +2304,13 @@ class PilotDialog(ThemedModal):
     # ---- behavior ------------------------------------------------------ #
 
     def _save(self, **kv):
+        # F08: single-lock RMW (was load; mutate; save with lock released).
         try:
-            from app.config_persist import load_config as _load
-            from app.config_persist import save_config as _save
-            cfg = _load()
-            for k, v in kv.items():
-                cfg[k] = v
-            _save(cfg)
+            from app.config_persist import update_config as _update
+            def _mut(cfg, kv=kv):
+                for k, v in kv.items():
+                    cfg[k] = v
+            _update(_mut)
         except Exception:
             pass
 
@@ -2462,16 +2472,16 @@ class PilotDialog(ThemedModal):
     def _remember_display_name(self, path, name):
         """Display-name map for path picks (config: dict path->name) so
         the watchlist shows 'Baldur's Gate 3', not a 90-char path."""
+        # F08: single-lock RMW.
         try:
-            from app.config_persist import load_config as _load
-            from app.config_persist import save_config as _save
-            cfg = _load()
-            m = cfg.get("session_pilot_names")
-            if not isinstance(m, dict):
-                m = {}
-            m[path] = name
-            cfg["session_pilot_names"] = m
-            _save(cfg)
+            from app.config_persist import update_config as _update
+            def _mut(cfg, path=path, name=name):
+                m = cfg.get("session_pilot_names")
+                if not isinstance(m, dict):
+                    m = {}
+                m[path] = name
+                cfg["session_pilot_names"] = m
+            _update(_mut)
         except Exception:
             pass
 
@@ -2827,10 +2837,13 @@ class HealthReportDialog(ThemedModal):
     # ---- scan worker ------------------------------------------------------ #
 
     def _ui(self, fn, *args):
-        """Marshal a paint hop to the Tk thread (worker-safe)."""
+        """Marshal a paint hop to the Tk thread (worker-safe).
+
+        F10: never touch Tk from the worker (even winfo_exists burns
+        ~1s off-thread) — schedule unconditionally; a destroyed dialog
+        raises inside after() and is swallowed below."""
         try:
-            if self._dlg.winfo_exists():
-                self._dlg.after(0, lambda: fn(*args))
+            self._dlg.after(0, lambda: fn(*args))
         except Exception:
             pass
 
@@ -2888,8 +2901,10 @@ class HealthReportDialog(ThemedModal):
 
     def _scan_worker(self, token):
         def dead():
+            # F10: token-only — close handlers already set token on the Tk
+            # thread; winfo_exists here burned ~1s off-thread per call.
             try:
-                return bool(token[0]) or not self._dlg.winfo_exists()
+                return bool(token[0])
             except Exception:
                 return True
 
@@ -3589,7 +3604,7 @@ class AnimatedButton(tk.Canvas):
                     messagebox.showerror(
                         "Unexpected Error",
                         f"Something went wrong running that button:\n\n{exc}\n\n"
-                        f"(Full details are in the exported log: Quick Tools > Export Logs)",
+                        f"(Full details are in the exported log: the 📋 corner icon)",
                     )
                 except Exception:
                     pass
@@ -6189,15 +6204,28 @@ class InstallTab(tk.Frame):
         installed-badges and Update-count callbacks NEVER ran: badges never
         appeared and the Update button sat at 'Update Apps…' forever.
         winfo_toplevel() resolves the real root window (the same trick
-        Tooltip._ensure_shared uses), which lives for the whole session."""
+        Tooltip._ensure_shared uses), which lives for the whole session.
+        F10: the toplevel is captured on the Tk thread by
+        _start_installed_badge_scan and held here — the worker never
+        calls winfo_* itself."""
         try:
-            self.winfo_toplevel().after(0, fn)
+            tk_root = getattr(self, "_tk_holder", None)
+            if tk_root is None:
+                tk_root = self.winfo_toplevel()
+                self._tk_holder = tk_root
+            tk_root.after(0, fn)
         except Exception:
             pass  # shutdown race — root already destroyed; nothing to paint
 
     def _start_installed_badge_scan(self):
         """winget list is slow (1-3s) — run it once in a worker thread and
         post the result back; badges paint in one pass on the Tk thread."""
+        # F10: capture the Tk holder on THIS (Tk) thread so the worker
+        # below never touches winfo_*.
+        try:
+            self._tk_holder = self.winfo_toplevel()
+        except Exception:
+            self._tk_holder = None
 
         def _scan():
             try:
@@ -7349,8 +7377,8 @@ class BorderlessChrome:
 
 class QuickToolsDialog(ThemedModal):
     """Quick Tools popup (6th Tools card): the exact shortcut box that
-    used to sit inline below the 4 cards — same 3 columns (Windows
-    tools / Windows Settings / App actions), same bullet rows. Same
+    used to sit inline below the 4 cards — same 2 columns (Windows
+    tools / Windows Settings), same bullet rows. Same
     popup dimensions as every other feature dialog (ThemedModal
     800x600 default — no custom size). Read-only launcher, no busy
     guard (mirrors card clicks, never touches the run engine)."""
@@ -7364,7 +7392,7 @@ class QuickToolsDialog(ThemedModal):
                          accent=TAB_ACCENTS["Tools"])
         body = self.body
         try:
-            tk.Label(body, text="Windows tools, settings and app actions.",
+            tk.Label(body, text="Windows tools and settings.",
                      font=(F, 9), bg=COLORS["bg"],
                      fg=COLORS["subtext"], wraplength=680,
                      justify="left").pack(anchor="w", pady=(0, 8))
@@ -7373,7 +7401,7 @@ class QuickToolsDialog(ThemedModal):
         try:
             cols = tk.Frame(body, bg=COLORS["bg"])
             cols.pack(fill="both", expand=True)
-            for ci in (0, 1, 2):
+            for ci in (0, 1):
                 cols.grid_columnconfigure(ci, weight=1, uniform="toolcols")
             for ci, (group, items) in enumerate(ToolsTab._SHORTCUTS):
                 self._build_column(cols, ci, group, items)
@@ -7847,9 +7875,9 @@ class SpeedTestDialog(ThemedModal):
     # ---- lifecycle (DnsTesterDialog skeleton, read-only) ---------------- #
 
     def _ui(self, fn, *args):
+        # F10: same as the other dialogs — no winfo_exists off-thread.
         try:
-            if self._dlg.winfo_exists():
-                self._dlg.after(0, lambda: fn(*args))
+            self._dlg.after(0, lambda: fn(*args))
         except Exception:
             pass
 
@@ -7940,8 +7968,10 @@ class SpeedTestDialog(ThemedModal):
 
     def _test_worker(self, token, gen):
         def dead():
+            # F10: token-only — close handlers already set token on the Tk
+            # thread; winfo_exists here burned ~1s off-thread per call.
             try:
-                return bool(token[0]) or not self._dlg.winfo_exists()
+                return bool(token[0])
             except Exception:
                 return True
 
@@ -8016,12 +8046,11 @@ class SpeedTestDialog(ThemedModal):
         import threading as _th
         import time as _time
         is_down = (direction == "download")
+        up_url = st.UPLOAD_URL
         if is_down:
             rounds = list(st.DOWNLOAD_ROUNDS)
-            up_url = st.UPLOAD_URL
         else:
             rounds = list(st.UPLOAD_ROUNDS)
-            up_url = st.UPLOAD_URL
         best = None
         for n in rounds:
             if dead():
@@ -8233,15 +8262,8 @@ class ToolsTab(tk.Frame):
           ("Bluetooth & Devices", "ms-settings:bluetooth"),
           ("Sound Settings", "ms-settings:sound"),
           ("App Volume", "ms-settings:apps-volume"),
-          ("Display Settings", "ms-settings:display"),
-          ("Graphics Settings", "ms-settings:display-advancedgraphics"))),
-        # App actions (Cleaner Tool's own tools) — header text is
-        # deliberately NOT the app name: the branding contract asserts
-        # "Cleaner Tool" appears ONLY on the window title bar
-        ("App actions",
-         (("Auto Maintenance", "app:maintenance"),
-          ("Export Logs", "app:exportlogs"),
-          ("About", "app:about"))),
+           ("Display Settings", "ms-settings:display"),
+           ("Graphics Settings", "ms-settings:display-advancedgraphics"))),
     )
 
     def __init__(self, parent, app):
@@ -8377,13 +8399,7 @@ class ToolsTab(tk.Frame):
 
     def _open_target(self, target):
         try:
-            if target == "app:maintenance":
-                self.app._show_schedule_dialog()
-            elif target == "app:exportlogs":
-                self.app.export_logs()
-            elif target == "app:about":
-                self.app._show_about()
-            elif target.startswith("ms-settings:"):
+            if target.startswith("ms-settings:"):
                 self.app._launch_settings(target)
             else:
                 self.app._launch(target)
@@ -8654,6 +8670,34 @@ class Application:
             padx=14, pady=6,
         )
         self.cancel_btn.set_enabled(False)
+
+        # Bottom-corner shortcuts (user request): Auto Maintenance and
+        # Export Logs live here as icon buttons instead of inside the
+        # Quick Tools popup. Click opens the dialog; hover names it.
+        corners = tk.Frame(host, bg=COLORS["bg"])
+        corners.pack(fill="x", padx=26, pady=(0, 8))
+        self._corner_maint = tk.Label(corners, text="🛠️", font=(F, 13),
+                                      bg=COLORS["bg"], fg=COLORS["subtext"],
+                                      cursor="hand2", bd=0, highlightthickness=0)
+        self._corner_maint.pack(side="left")
+        Tooltip(self._corner_maint, "Auto Maintenance")
+        self._corner_maint.bind("<Button-1>",
+                                lambda e: self._show_schedule_dialog(), add="+")
+        self._corner_maint.bind("<Enter>",
+                                lambda e: self._corner_maint.config(fg=COLORS["text"]), add="+")
+        self._corner_maint.bind("<Leave>",
+                                lambda e: self._corner_maint.config(fg=COLORS["subtext"]), add="+")
+        self._corner_logs = tk.Label(corners, text="📋", font=(F, 13),
+                                     bg=COLORS["bg"], fg=COLORS["subtext"],
+                                     cursor="hand2", bd=0, highlightthickness=0)
+        self._corner_logs.pack(side="right")
+        Tooltip(self._corner_logs, "Export Logs")
+        self._corner_logs.bind("<Button-1>",
+                               lambda e: self.export_logs(), add="+")
+        self._corner_logs.bind("<Enter>",
+                               lambda e: self._corner_logs.config(fg=COLORS["text"]), add="+")
+        self._corner_logs.bind("<Leave>",
+                               lambda e: self._corner_logs.config(fg=COLORS["subtext"]), add="+")
 
         self._build_log(bottom)
         self._start_disk_monitor()
@@ -9429,9 +9473,10 @@ class Application:
     def _pilot_on_detect(self, hits):
         """Watcher thread → hop to Tk. Records the session keys FIRST so
         a later exit always has something truthful to reconcile."""
+        # F10: no winfo_exists off-thread — after() on a dead root raises
+        # and is swallowed below.
         try:
-            if self.root.winfo_exists():
-                self.root.after(0, lambda: self._pilot_apply(list(hits or [])))
+            self.root.after(0, lambda: self._pilot_apply(list(hits or [])))
         except Exception:
             pass
 
@@ -9557,9 +9602,9 @@ class Application:
 
     def _pilot_on_exit(self):
         """Watcher thread → hop to Tk."""
+        # F10: no winfo_exists off-thread (see _pilot_on_detect).
         try:
-            if self.root.winfo_exists():
-                self.root.after(0, self._pilot_revert)
+            self.root.after(0, self._pilot_revert)
         except Exception:
             pass
 
@@ -9575,11 +9620,6 @@ class Application:
             fresh = list(getattr(self, "_pilot_fresh_keys", []) or [])
         except Exception:
             fresh = []
-        try:
-            self._pilot_applied_keys = []
-            self._pilot_fresh_keys = []
-        except Exception:
-            pass
         if not fresh:
             return
         # UI-freedom guard (user bug report + audit find): a revert that
@@ -9589,6 +9629,8 @@ class Application:
         # (possibly over a game) AND the revert would be lost. Skip with
         # an honest log line instead; Undo Tweaks restores manually and
         # the applied-badges stay truthful about what is still on.
+        # F01: intent is preserved (keys NOT cleared) so a later exit
+        # event can still revert; keys clear only on the runnable path.
         _busy = False
         try:
             with self._busy_lock:
@@ -9617,6 +9659,11 @@ class Application:
         keys = [k for k in fresh if k in current]
         if not keys:
             try:
+                self._pilot_applied_keys = []
+                self._pilot_fresh_keys = []
+            except Exception:
+                pass
+            try:
                 self.log("Game Session Auto-Pilot: session ended — settings already restored.")
             except Exception:
                 pass
@@ -9632,6 +9679,11 @@ class Application:
         except Exception:
             tasks = []
         if not tasks:
+            try:
+                self._pilot_applied_keys = []
+                self._pilot_fresh_keys = []
+            except Exception:
+                pass
             return
         try:
             self.log("Game Session Auto-Pilot: game closed — restoring session tweaks.")
@@ -9648,13 +9700,36 @@ class Application:
         except Exception:
             pass
         try:
+            self._pilot_applied_keys = []
+            self._pilot_fresh_keys = []
+        except Exception:
+            pass
+        try:
             self._pilot_sink("● Watching…", TAB_ACCENTS["Tweak"])
         except Exception:
             pass
 
+    # F02: exact allowlist — the old shell=True Popen ran every target
+    # through cmd.exe (latent injection if any caller ever passed
+    # non-constant input). Exes go via shell=False argv; documents
+    # (.cpl/.msc) via os.startfile; anything else is refused.
+    _LAUNCH_EXES = {
+        "taskmgr": ("taskmgr",),
+        "cleanmgr": ("cleanmgr",),
+        "perfmon /rel": ("perfmon", "/rel"),
+        "rstrui": ("rstrui",),
+        "msinfo32": ("msinfo32",),
+    }
+    _LAUNCH_DOCS = ("powercfg.cpl", "devmgmt.msc")
+
     def _launch(self, command):
         try:
-            subprocess.Popen(command, shell=True)
+            if command in self._LAUNCH_EXES:
+                subprocess.Popen(list(self._LAUNCH_EXES[command]), shell=False)
+            elif command in self._LAUNCH_DOCS:
+                os.startfile(command)  # noqa: S606 — allowlisted document only
+            else:
+                messagebox.showerror("Could Not Launch", f"Refusing to launch unknown target: {command!r}")
         except Exception as exc:
             messagebox.showerror("Could Not Launch", str(exc))
 
@@ -9664,12 +9739,6 @@ class Application:
             os.startfile(uri)  # noqa: S606 — shell-resolved URI, not an exe
         except Exception as exc:
             messagebox.showerror("Could Not Open", f"Couldn't open Windows Settings:\n{exc}")
-
-    def _show_about(self):
-        _themed_showinfo(self.root, "About",
-                             f"{APP_NAME} v{APP_VERSION}\n\n"
-                             "Safe, reversible Windows cleaning & tuning.",
-                             accent=COLORS["accent_blue"])
 
     # ---------------- Auto Maintenance dialog ---------------- #
 
@@ -9784,6 +9853,14 @@ class Application:
                  fg=COLORS["accent_blue"], font=(F, 9), wraplength=340, justify="left").pack(anchor="w", padx=16)
 
         def refresh_status():
+            # F14: reconcile live schtasks state into config (external
+            # /Delete no longer leaves the toggle stale-True).
+            try:
+                from app.scheduler import resync_schedule_flag as _resync
+                _resync()
+                _resync(["--auto-update"])
+            except Exception:
+                pass
             ok, out = get_schedule_status()
             ok_upd, _ = get_schedule_status(["--auto-update"])
             parts = []
@@ -10144,8 +10221,9 @@ class Application:
                     total = measure_all_cached(cancelled=lambda: token[0])
                     stamp = _ti.time()
                 try:
-                    if self.root.winfo_exists():
-                        self.root.after(0, lambda: self._land_nudge_estimate(total, stamp))
+                    # F10: no winfo_exists off-thread — landing on a dead
+                    # root raises inside after() and is swallowed.
+                    self.root.after(0, lambda: self._land_nudge_estimate(total, stamp))
                 except Exception:
                     pass
             except Exception:
@@ -10161,6 +10239,10 @@ class Application:
 
     def _land_nudge_estimate(self, total, stamp):
         """Tk-thread landing for the estimate: store + refresh tooltips."""
+        # F11: None = scan busy/cancelled — keep prior estimate, don't
+        # store a None that _fb() would choke on.
+        if total is None:
+            return
         try:
             self._nudge_estimate = (total, stamp)
             for letter, chip in (getattr(self, "_nudge_chips", {}) or {}).items():
@@ -10274,8 +10356,9 @@ class Application:
                 drives = self._query_drives()
             except Exception:
                 drives = []
+            # F10: flag-check only off-thread; dead root raises in after().
             try:
-                if getattr(self, "_disk_monitor_running", False) and self.root.winfo_exists():
+                if getattr(self, "_disk_monitor_running", False):
                     self.root.after(0, lambda: _apply_drives(drives))
             except Exception:
                 pass
@@ -10774,11 +10857,12 @@ class Application:
         # user's last manual Tweak pick with the Game Session preset, and the
         # next scheduled --auto-clean would apply session tweaks unattended.
         if mode == "run" and not quiet:
+            # F08: single-lock RMW.
             try:
-                from app.config_persist import load_config, save_config
-                config = load_config()
-                config.setdefault("selected_tasks", {})[tab_name] = [t.key for t in all_selected]
-                save_config(config)
+                from app.config_persist import update_config as _update
+                def _mut(cfg, tab_name=tab_name, all_selected=all_selected):
+                    cfg.setdefault("selected_tasks", {})[tab_name] = [t.key for t in all_selected]
+                _update(_mut)
             except Exception:
                 pass
 

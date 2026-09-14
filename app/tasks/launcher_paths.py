@@ -405,6 +405,11 @@ def _build_unity_player_logs() -> list[str]:
         for entry in entries:
             try:
                 if entry.is_dir(follow_symlinks=False):
+                    # F04 guard: is_dir(False) is True for junctions — never
+                    # descend into reparse points (mirrors clean_tasks guard).
+                    from app.utils import _is_reparse_point as _is_rp
+                    if _is_rp(entry.path):
+                        continue
                     stack.append((entry.path, depth + 1))
                 elif (entry.is_file(follow_symlinks=False)
                         and entry.name in _UNITY_PLAYER_LOG_NAMES):

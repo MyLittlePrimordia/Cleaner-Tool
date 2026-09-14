@@ -41,7 +41,7 @@ _EXE_DENYLIST = (
     "launch.exe", "launcher.exe", "start.exe", "setup.exe", "unins000.exe",
     "unins001.exe", "uninstall.exe", "crashreport.exe", "crashreporter.exe",
     "error.exe", "bugreporter.exe", "dxsetup.exe", "oalsetup", "vc_redist",
-    "dotnet", "repair.exe", "config.exe", "settings.exe", " updater.exe",
+    "dotnet", "repair.exe", "config.exe", "settings.exe", "updater.exe",
     "eula.exe", "redist.exe", "support.exe", "steamerrorreporter.exe",
     "steam_api", "cgs.exe", "cef", "unitycrashhandler64.exe",
     "unitycrashhandler32.exe", "crashhandler64.exe", "crashhandler32.exe",
@@ -113,7 +113,16 @@ def _likely_game_exe(folder, name_hint=""):
                             if not entry.is_file(follow_symlinks=False):
                                 continue
                             base = entry.name.lower()
-                            if any(bad in base for bad in _EXE_DENYLIST):
+                            # F12: extension-less tokens ("cef", "steam_api",
+                            # "dotnet"...) must not substring-match innocent
+                            # exes (cefquest.exe); require a boundary.
+                            def _denied(b: str) -> bool:
+                                if "." in b:
+                                    return b in base
+                                stem = base[:-4] if base.endswith(".exe") else base
+                                return (stem == b or stem.startswith(b + "_")
+                                        or stem.startswith(b + "-") or stem.startswith(b + "."))
+                            if any(_denied(bad) for bad in _EXE_DENYLIST):
                                 continue
                             size = entry.stat(follow_symlinks=False).st_size
                             if size < _MIN_EXE_BYTES:

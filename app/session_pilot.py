@@ -92,11 +92,15 @@ def normalize_exe(name: str) -> str:
 
 def normalize_path(path: str) -> str:
     """Canonical path form for comparison: lowercase, forward slashes,
-    no trailing slash. Returns '' for anything that isn't pathlike."""
+    no trailing slash. Returns '' for anything that isn't pathlike.
+    L03: UNC (\\\\server\\share\\game.exe) has no drive colon but is a
+    valid game path — accept it."""
     try:
         p = (path or "").strip().lower().replace("/", "\\")
         while p.endswith("\\"):
             p = p[:-1]
+        if p.startswith("\\\\"):
+            return p if "\\" in p[2:] else ""
         if "\\" not in p or ":" not in p:
             return ""
         return p
@@ -114,7 +118,7 @@ def default_get_processes(timeout: int = 10):
         import subprocess as _sp
         out = _sp.check_output(
             "tasklist /fo csv /nh", shell=True, text=True, timeout=timeout,
-            stderr=_sp.DEVNULL,
+            errors="replace", stderr=_sp.DEVNULL,
             creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
         )
     except Exception:
@@ -311,9 +315,19 @@ class SessionPilot:
             self._thread = None
             return False
 
-    def stop(self) -> None:
+    def stop(self, join_timeout: float = 2.0) -> None:
+        # L06: best-effort join under a small timeout (loop sleeps 0.1s
+        # slices, so it exits promptly); never block the Tk thread long.
+        # Lock-free: _stop is a plain bool flipped here, read by the loop
+        # (GIL-atomic); _thread is only ever started/stopped from the app
+        # thread, so no lock is needed for this handoff.
         self._stop = True
-        self._thread = None
+        th, self._thread = self._thread, None
+        try:
+            if th is not None and th.is_alive() and th is not threading.current_thread():
+                th.join(timeout=join_timeout)
+        except Exception:
+            pass
 
     def running(self) -> bool:
         try:

@@ -156,6 +156,14 @@ def _migrate_selected_tasks(data: dict) -> dict:
 # In-memory cache
 _config_cache: dict | None = None
 _config_lock = threading.RLock()
+_config_mtime: float | None = None
+
+
+def _disk_mtime():
+    try:
+        return os.path.getmtime(CONFIG_FILE)
+    except OSError:
+        return None
 
 
 def _quarantine_corrupt_config(exc: Exception) -> None:
@@ -265,16 +273,30 @@ def _load_config_from_disk() -> dict:
 
 def load_config() -> dict:
     """Load config, using cached version if available. Returns a fresh copy so caller mutations never touch the cache without save_config. Thread-safe."""
-    global _config_cache
+    global _config_cache, _config_mtime
     with _config_lock:
-        if _config_cache is None:
-            _config_cache = _load_config_from_disk()
+        # F08: re-stat the file — a long-lived GUI session must see
+        # external changes (scheduler, elevated twin process, hand edits)
+        # instead of serving a stale cache forever.
+        if _config_cache is not None:
+            try:
+                mt = _disk_mtime()
+                if mt is None or (_config_mtime is not None and mt != _config_mtime):
+                    if mt is None and not CONFIG_FILE.exists():
+                        return copy.deepcopy(_config_cache)
+                    _config_cache = _load_config_from_disk()
+                    _config_mtime = _disk_mtime()
+            except Exception:
+                pass
+            return copy.deepcopy(_config_cache)
+        _config_cache = _load_config_from_disk()
+        _config_mtime = _disk_mtime()
         return copy.deepcopy(_config_cache)
 
 
 def save_config(config: dict) -> None:
     """Save config to disk atomically (write to temp then replace). Thread-safe. Raises on failure."""
-    global _config_cache
+    global _config_cache, _config_mtime
     # (audit fix: the old `global` statement also named _config_dirty, a
     # variable that never existed anywhere else — removed.)
     with _config_lock:
@@ -320,6 +342,7 @@ def save_config(config: dict) -> None:
             pass
         # Store a deepcopy to avoid aliasing with caller's mutable dict
         _config_cache = copy.deepcopy(config)
+        _config_mtime = _disk_mtime()
 
 
 def update_config(mutate) -> dict:

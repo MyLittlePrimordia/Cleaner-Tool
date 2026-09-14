@@ -1746,8 +1746,8 @@ def main():
                 pass
             root.update()
         assert app._pilot_ui_free() is True, "released UI must read free"
-        # busy run: revert defers WITHOUT losing the user's setup path —
-        # keys clear (consume-once lifecycle) and the log says Undo
+        # busy run: revert defers WITHOUT losing intent (F01: keys are
+        # preserved so a later exit event still reverts; Undo stays backup)
         try:
             with app._busy_lock:
                 app._busy = True
@@ -1756,13 +1756,18 @@ def main():
             app._pilot_revert()
             root.update()
             assert not _ran, "revert ran during a busy run (Busy popup over game!)"
-            assert app._pilot_fresh_keys == [], "deferred revert must consume keys"
+            assert app._pilot_fresh_keys == ["game_mode"], "deferred revert must preserve keys"
         finally:
             try:
                 with app._busy_lock:
                     app._busy = False
             except Exception:
                 pass
+            root.update()
+        # UI free again: the preserved intent reconciles and keys clear
+        app._pilot_revert()
+        root.update()
+        assert app._pilot_fresh_keys == [], "free-UI revert must consume keys"
         # free UI: apply proceeds to the engine again
         app._pilot_apply(["cs2.exe"])
         root.update()
@@ -1896,12 +1901,12 @@ def main():
     # --- PC Health Report Card (user-approved feature 7, 2026-09) ------
     import app.health_scan as _hs
     GB = 1024 ** 3
-    # pure grading: boundaries + invalid input
+    # pure grading: boundaries + invalid input (bands mirror the drive
+    # chips: green >=15% -> A, amber 5-15% -> B, red <5% -> F)
     assert _hs.grade_disk_space(0.20) == "A"
-    assert _hs.grade_disk_space(0.199) == "B"
-    assert _hs.grade_disk_space(0.10) == "B"
-    assert _hs.grade_disk_space(0.099) == "C"
-    assert _hs.grade_disk_space(0.05) == "C"
+    assert _hs.grade_disk_space(0.15) == "A"
+    assert _hs.grade_disk_space(0.149) == "B"
+    assert _hs.grade_disk_space(0.05) == "B"
     assert _hs.grade_disk_space(0.049) == "F"
     assert _hs.grade_disk_space(0.0) == "F"
     assert _hs.grade_disk_space("junk") == "?"
@@ -2200,14 +2205,19 @@ def main():
                 _collect_labels(c, acc)
         _collect_labels(_qd._dlg, shortcut_texts)
         for want in ("Task Manager", "Device Manager", "Windows Update",
-                     "Storage Sense", "Auto Maintenance", "Export Logs", "About"):
+                     "Storage Sense"):
             assert want in shortcut_texts, f"Quick Tools popup missing {want}"
+        for gone in ("Auto Maintenance", "Export Logs", "About"):
+            assert gone not in shortcut_texts, f"Quick Tools popup still lists {gone}"
     finally:
         try:
             _qd._close()
         except Exception:
             pass
         root.update()
+    # bottom-corner shortcuts live on the main window (not in the popup)
+    assert str(app._corner_maint.cget("text")) == "🛠️", "corner maintenance icon missing"
+    assert str(app._corner_logs.cget("text")) == "📋", "corner export-logs icon missing"
     print("  tools tab: cards launch popups + shortcuts OK")
 
     # --- run-engine tab contract (A-1/A-2 regression cover) --------------

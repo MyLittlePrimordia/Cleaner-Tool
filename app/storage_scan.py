@@ -44,13 +44,17 @@ from app.utils import TaskContext
 # touches NOTHING but clean_folder_contents / _clean_many / _clean_files
 # (all dry_run-aware) plus read-only probes. Anything else is excluded —
 # see the module docstring for the excluded list and why.
+# F17: game_captures EXCLUDED by design (user ruling: default-OFF) — Xbox
+# Game Bar clips are user-created content, not junk. The Clean-tab task
+# stays as an explicit opt-in (default=False); Storage/Health estimates
+# must never count or delete them behind the default-ON categories.
 SCAN_ALLOWLIST = frozenset({
     "shader_cache", "launcher_cache", "engine_cache", "driver_junk",
     "user_temp_files", "system_temp_files", "inet_cache", "error_reports",
     "gpu_watchdog_dumps", "old_logs", "browser_cache", "office_cache",
     "uwp_cache", "winget_cache", "dev_caches", "pkg_caches",
     "update_leftovers", "defender_history", "prefetch",
-    "game_files", "game_captures",
+    "game_files",
 })
 
 # Display groups: (title, member keys in measure order, tooltip text).
@@ -59,9 +63,9 @@ SCAN_ALLOWLIST = frozenset({
 SCAN_CATEGORIES = (
     ("Game files & caches",
      ("shader_cache", "launcher_cache", "engine_cache", "driver_junk",
-      "game_files", "game_captures"),
-     "Shader caches, launcher web caches, engine caches, driver leftovers, "
-     "per-game logs/dumps and Game Bar captures."),
+      "game_files"),
+     "Shader caches, launcher web caches, engine caches, driver leftovers "
+     "and per-game logs/dumps. (Game Bar captures are opt-in on the Clean tab.)"),
     ("Windows temp & logs",
      ("user_temp_files", "system_temp_files", "old_logs", "error_reports",
       "gpu_watchdog_dumps", "prefetch"),
@@ -141,16 +145,14 @@ def validate_allowlist() -> "tuple[bool, list[str]]":
 #     cache lets Health/Nudge quote a fresh walk instead of re-walking.
 # --------------------------------------------------------------------------- #
 
-_SCAN_MUTEX = None          # lazy: module import stays cheap for tests
+import threading as _threading
+
+_SCAN_MUTEX = _threading.Lock()  # L08: eager — no lazy double-init race
 _ESTIMATE_CACHE = None      # (total_bytes, timestamp) or None
 _ESTIMATE_TTL_S = 300.0
 
 
 def _scan_mutex():
-    global _SCAN_MUTEX
-    if _SCAN_MUTEX is None:
-        import threading
-        _SCAN_MUTEX = threading.Lock()
     return _SCAN_MUTEX
 
 
@@ -213,16 +215,16 @@ def measure_all_cached(set_status=None, cancelled=None):
     """Full-allowlist estimate with cache + coordination (Health/Nudge
     path). Fresh cache hit: instant, zero disk. Otherwise: takes the
     scan slot (brief wait, honest give-up), walks once, publishes the
-    cache, releases. Returns total bytes (0 when it couldn't run — the
-    honest 'unknown', never a stale number dressed as fresh)."""
+    cache, releases. Returns total bytes, or None when it couldn't run
+    (F11: 0-vs-None — give-up/cancel must not grade as 'A / empty')."""
     hit = cached_estimate()
     if hit is not None:
         return hit[0]
     if not acquire_scan(cancelled=cancelled):
-        return 0
+        return None
     try:
         if cancelled is not None and cancelled():
-            return 0
+            return None
         ctx = make_measure_ctx(set_status=set_status, cancelled=cancelled)
         total = sum(measure_clean_tasks(ctx, sorted(SCAN_ALLOWLIST)).values())
         store_estimate(total)
@@ -253,11 +255,12 @@ def _is_link(path: str) -> bool:
         return False
 
 
-def measure_folder_tree(path: str, cancelled=None, _budget: int = 0) -> int:
+def measure_folder_tree(path: str, cancelled=None) -> int:
     """Sum of file bytes under path (iterative, no recursion limit risk).
-    Skips reparse points; checks cancelled() every 256 dirs to stay
-    responsive without per-file overhead. Returns the partial total on
-    cancel — the dialog labels partial scans honestly."""
+    Skips reparse points; checks cancelled() every 256 files AND every
+    directory (L07: a single flat dir with 100k files used to stall Stop).
+    Returns the partial total on cancel — the dialog labels partial scans
+    honestly."""
     total = 0
     if not path or not os.path.isdir(path) or _is_link(path):
         return 0
@@ -265,14 +268,16 @@ def measure_folder_tree(path: str, cancelled=None, _budget: int = 0) -> int:
     stack = [path]
     checked = 0
     while stack:
-        if checked % 256 == 0 and is_cancelled():
+        if is_cancelled():
             break
-        checked += 1
         cur = stack.pop()
         try:
             with os.scandir(cur) as it:
                 for entry in it:
                     try:
+                        checked += 1
+                        if checked % 256 == 0 and is_cancelled():
+                            break
                         if entry.is_symlink():
                             continue
                         if entry.is_dir(follow_symlinks=False):

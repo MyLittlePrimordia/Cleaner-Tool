@@ -1437,6 +1437,10 @@ _ADS_CDM_NAMES = (
     "SystemPaneSuggestionsEnabled",
     "RotatingLockScreenOverlayEnabled",
     "SoftLandingEnabled",
+    # Winhance-audit additions: timeline suggestions + welcome
+    # experience slots, same safety shape as the rest (HKCU CDM DWORDs).
+    "SubscribedContent-353698Enabled",
+    "SubscribedContent-310093Enabled",
 )
 _ADS_CDM = "Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager"
 _STOP_ADS_SPECS = (
@@ -2545,7 +2549,13 @@ def _snap_reg_values(ctx: TaskContext, task_id: str, specs: "list[tuple]"):
         # (absent made revert delete a value the user already had).
         data[f"{i}:present"] = prior is not None and prior is not _REG_DENIED
         data[f"{i}:denied"] = prior is _REG_DENIED
-        data[f"{i}:value"] = None if prior is _REG_DENIED else prior
+        # config.json can't hold bytes (REG_BINARY priors) — hex-encode
+        # with a marker; restore decodes. Without this the save below
+        # throws TypeError and the tweak wrongly reports failure.
+        if isinstance(prior, bytes):
+            data[f"{i}:value"] = {"__bytes_hex__": prior.hex()}
+        else:
+            data[f"{i}:value"] = None if prior is _REG_DENIED else prior
         data[f"{i}:type"] = spec[3] if len(spec) > 3 else "REG_DWORD"
     save_tweak_snapshot(task_id, data)
 
@@ -2584,7 +2594,14 @@ def _restore_reg_values(ctx: TaskContext, task_id: str, value_type: str = "REG_D
             continue
         if snap.get(f"{i}:present"):
             vtype = snap.get(f"{i}:type", value_type)
-            reg_set_value_checked(ctx, hive, path, name, snap.get(f"{i}:value"), value_type=vtype)
+            _val = snap.get(f"{i}:value")
+            # hex-encoded REG_BINARY priors (see _snap_reg_values)
+            if isinstance(_val, dict) and isinstance(_val.get("__bytes_hex__"), str):
+                try:
+                    _val = bytes.fromhex(_val["__bytes_hex__"])
+                except Exception:
+                    raise RuntimeError(f"Refusing to restore {task_id}: corrupt snapshot value (config tampering?).")
+            reg_set_value_checked(ctx, hive, path, name, _val, value_type=vtype)
         else:
             if not reg_delete_value(ctx, hive, path, name):
                 raise RuntimeError(f"Could not remove {hive}\\{path}\\{name} during revert.")
@@ -3003,6 +3020,314 @@ def revert_clipboard_sync_off(ctx: TaskContext):
     ctx.log("Cloud clipboard sync restored to its prior setting.")
 
 
+_TaskbarDevSettings = "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced\\TaskbarDeveloperSettings"
+
+
+def apply_taskbar_endtask(ctx: TaskContext):
+    """Right-click any taskbar icon to End Task — kill a frozen game in
+    two clicks instead of opening Task Manager. Windows 11 23H2+ only
+    (the value is inert on Win10); per-user, instant, no reboot."""
+    had_snapshot = bool(get_tweak_snapshot("taskbar_endtask"))
+    _snap_reg_values(ctx, "taskbar_endtask", [("HKCU", _TaskbarDevSettings, "TaskbarEndTask")])
+    try:
+        reg_set_value_checked(ctx, "HKCU", _TaskbarDevSettings, "TaskbarEndTask", 1)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("taskbar_endtask")
+        raise
+    ctx.log("Taskbar End Task on: right-click any app to force-close it.")
+
+def revert_taskbar_endtask(ctx: TaskContext):
+    _restore_reg_values(ctx, "taskbar_endtask")
+    ctx.log("Taskbar End Task restored to its prior setting.")
+
+def verify_taskbar_endtask() -> "bool | None":
+    return _verify_value("HKCU", _TaskbarDevSettings, "TaskbarEndTask", 1)
+
+
+_MIC_CONSENT = "Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\microphone"
+
+
+def apply_mic_privacy_allow(ctx: TaskContext):
+    """Let games and chat apps use the microphone again — flips the
+    user-level mic privacy consent back to Allow (the classic 'nobody
+    can hear me in Discord/VALORANT' fix when Windows revoked it).
+    Per-user, snapshot + revert; app-level blocks are left alone."""
+    had_snapshot = bool(get_tweak_snapshot("mic_privacy_allow"))
+    _snap_reg_values(ctx, "mic_privacy_allow", [("HKCU", _MIC_CONSENT, "Value", "REG_SZ")])
+    try:
+        reg_set_value_checked(ctx, "HKCU", _MIC_CONSENT, "Value", "Allow", value_type="REG_SZ")
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("mic_privacy_allow")
+        raise
+    ctx.log("Microphone access allowed for apps — check in-game voice settings too.")
+
+def revert_mic_privacy_allow(ctx: TaskContext):
+    _restore_reg_values(ctx, "mic_privacy_allow", value_type="REG_SZ")
+    ctx.log("Microphone privacy consent restored to its prior setting.")
+
+def verify_mic_privacy_allow() -> "bool | None":
+    return _verify_value("HKCU", _MIC_CONSENT, "Value", "Allow")
+
+
+def apply_clock_seconds(ctx: TaskContext):
+    """Show seconds in the taskbar clock — handy for cooldown and queue
+    timers. Per-user, instant, snapshot + revert."""
+    had_snapshot = bool(get_tweak_snapshot("clock_seconds"))
+    _snap_reg_values(ctx, "clock_seconds",
+                     [("HKCU", _ADV, "ShowSecondsInSystemClock")])
+    try:
+        reg_set_value_checked(ctx, "HKCU", _ADV, "ShowSecondsInSystemClock", 1)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("clock_seconds")
+        raise
+    ctx.log("Taskbar clock now shows seconds.")
+
+def revert_clock_seconds(ctx: TaskContext):
+    _restore_reg_values(ctx, "clock_seconds")
+    ctx.log("Taskbar clock restored to its prior setting.")
+
+def verify_clock_seconds() -> "bool | None":
+    return _verify_value("HKCU", _ADV, "ShowSecondsInSystemClock", 1)
+
+
+def apply_taskbar_left(ctx: TaskContext):
+    """Left-align the taskbar Start button (classic feel) instead of
+    centered. Per-user, instant, snapshot + revert."""
+    had_snapshot = bool(get_tweak_snapshot("taskbar_left"))
+    _snap_reg_values(ctx, "taskbar_left", [("HKCU", _ADV, "TaskbarAl")])
+    try:
+        reg_set_value_checked(ctx, "HKCU", _ADV, "TaskbarAl", 0)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("taskbar_left")
+        raise
+    ctx.log("Taskbar aligned left — classic Start position.")
+
+def revert_taskbar_left(ctx: TaskContext):
+    _restore_reg_values(ctx, "taskbar_left")
+    ctx.log("Taskbar alignment restored to its prior setting.")
+
+def verify_taskbar_left() -> "bool | None":
+    return _verify_value("HKCU", _ADV, "TaskbarAl", 0)
+
+
+# --- Round 7 tasks (user request: Winhance-audit picks) --- #
+# All snapshot + revert (+verify), Custom-only, presets untouched.
+
+
+def apply_alt_tab_windows_only(ctx: TaskContext):
+    """Alt+Tab flips between real windows and games only — no Microsoft
+    Edge tabs crowding the switcher mid-game. Per-user, snapshot + revert."""
+    had_snapshot = bool(get_tweak_snapshot("alt_tab_windows_only"))
+    _snap_reg_values(ctx, "alt_tab_windows_only",
+                     [("HKCU", _ADV, "MultiTaskingAltTabFilter")])
+    try:
+        reg_set_value_checked(ctx, "HKCU", _ADV, "MultiTaskingAltTabFilter", 3)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("alt_tab_windows_only")
+        raise
+    ctx.log("Alt+Tab now shows windows only — no browser tabs in the way.")
+
+def revert_alt_tab_windows_only(ctx: TaskContext):
+    _restore_reg_values(ctx, "alt_tab_windows_only")
+    ctx.log("Alt+Tab filter restored to its prior setting.")
+
+def verify_alt_tab_windows_only() -> "bool | None":
+    return _verify_value("HKCU", _ADV, "MultiTaskingAltTabFilter", 3)
+
+
+def apply_taskbar_never_combine(ctx: TaskContext):
+    """Every open window keeps its own labeled taskbar button instead of
+    piling up under one icon. Per-user, snapshot + revert (takes effect
+    after Explorer restarts)."""
+    had_snapshot = bool(get_tweak_snapshot("taskbar_never_combine"))
+    _snap_reg_values(ctx, "taskbar_never_combine",
+                     [("HKCU", _ADV, "TaskbarGlomLevel")])
+    try:
+        reg_set_value_checked(ctx, "HKCU", _ADV, "TaskbarGlomLevel", 2)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("taskbar_never_combine")
+        raise
+    ctx.log("Taskbar buttons never combine now (restart Explorer to see it).")
+
+def revert_taskbar_never_combine(ctx: TaskContext):
+    _restore_reg_values(ctx, "taskbar_never_combine")
+    ctx.log("Taskbar combining restored to its prior setting.")
+
+def verify_taskbar_never_combine() -> "bool | None":
+    return _verify_value("HKCU", _ADV, "TaskbarGlomLevel", 2)
+
+
+def apply_discord_no_ducking(ctx: TaskContext):
+    """Discord calls stop auto-lowering game and media volume (Windows
+    'ducking' off = do nothing). Per-user, snapshot + revert."""
+    had_snapshot = bool(get_tweak_snapshot("discord_no_ducking"))
+    _snap_reg_values(ctx, "discord_no_ducking",
+                     [("HKCU", "Software\\Microsoft\\Multimedia\\Audio",
+                       "UserDuckingPreference")])
+    try:
+        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Multimedia\\Audio",
+                              "UserDuckingPreference", 3)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("discord_no_ducking")
+        raise
+    ctx.log("Windows no longer ducks game audio during voice calls.")
+
+def revert_discord_no_ducking(ctx: TaskContext):
+    _restore_reg_values(ctx, "discord_no_ducking")
+    ctx.log("Audio ducking preference restored to its prior setting.")
+
+def verify_discord_no_ducking() -> "bool | None":
+    return _verify_value("HKCU", "Software\\Microsoft\\Multimedia\\Audio",
+                         "UserDuckingPreference", 3)
+
+
+_CDM_POL = "Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager"
+
+
+def apply_ads_master_off(ctx: TaskContext):
+    """One master flick for the whole suggestions/ads engine (the three
+    ContentDelivery master switches off). Sits above the per-value ad
+    sweep; per-user, snapshot + revert."""
+    had_snapshot = bool(get_tweak_snapshot("ads_master_off"))
+    _snap_reg_values(ctx, "ads_master_off",
+                     [("HKCU", _CDM_POL, "ContentDeliveryAllowed"),
+                      ("HKCU", _CDM_POL, "SubscribedContentEnabled"),
+                      ("HKCU", _CDM_POL, "FeatureManagementEnabled")])
+    try:
+        reg_set_value_checked(ctx, "HKCU", _CDM_POL, "ContentDeliveryAllowed", 0)
+        reg_set_value_checked(ctx, "HKCU", _CDM_POL, "SubscribedContentEnabled", 0)
+        reg_set_value_checked(ctx, "HKCU", _CDM_POL, "FeatureManagementEnabled", 0)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("ads_master_off")
+        raise
+    ctx.log("Content Delivery master switches off — suggestions engine quiet.")
+
+def revert_ads_master_off(ctx: TaskContext):
+    _restore_reg_values(ctx, "ads_master_off")
+    ctx.log("Content Delivery switches restored to their prior settings.")
+
+def verify_ads_master_off() -> "bool | None":
+    return _verify_all_values([
+        ("HKCU", _CDM_POL, "ContentDeliveryAllowed", 0),
+        ("HKCU", _CDM_POL, "SubscribedContentEnabled", 0),
+        ("HKCU", _CDM_POL, "FeatureManagementEnabled", 0),
+    ])
+
+
+_SEARCH_SETTINGS = "Software\\Microsoft\\Windows\\CurrentVersion\\SearchSettings"
+
+
+def apply_device_search_history_off(ctx: TaskContext):
+    """Windows stops remembering what you searched for on this PC.
+    Per-user, snapshot + revert."""
+    had_snapshot = bool(get_tweak_snapshot("device_search_history_off"))
+    _snap_reg_values(ctx, "device_search_history_off",
+                     [("HKCU", _SEARCH_SETTINGS, "IsDeviceSearchHistoryEnabled")])
+    try:
+        reg_set_value_checked(ctx, "HKCU", _SEARCH_SETTINGS,
+                              "IsDeviceSearchHistoryEnabled", 0)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("device_search_history_off")
+        raise
+    ctx.log("On-device search history off — searches stay in the moment.")
+
+def revert_device_search_history_off(ctx: TaskContext):
+    _restore_reg_values(ctx, "device_search_history_off")
+    ctx.log("Search history setting restored to its prior value.")
+
+def verify_device_search_history_off() -> "bool | None":
+    return _verify_value("HKCU", _SEARCH_SETTINGS, "IsDeviceSearchHistoryEnabled", 0)
+
+
+def apply_long_paths(ctx: TaskContext):
+    """Let games and mods use very long file and folder names without
+    errors (32,767 chars instead of 260). Machine-wide, needs admin and
+    a reboot to fully take effect. Snapshot + revert."""
+    had_snapshot = bool(get_tweak_snapshot("long_paths"))
+    _snap_reg_values(ctx, "long_paths",
+                     [("HKLM", "SYSTEM\\CurrentControlSet\\Control\\FileSystem",
+                       "LongPathsEnabled")])
+    try:
+        reg_set_value_checked(ctx, "HKLM", "SYSTEM\\CurrentControlSet\\Control\\FileSystem",
+                              "LongPathsEnabled", 1)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("long_paths")
+        raise
+    ctx.log("Long file paths on — reboots to fully take effect for all apps.")
+
+def revert_long_paths(ctx: TaskContext):
+    _restore_reg_values(ctx, "long_paths")
+    ctx.log("Long paths setting restored (reboot to fully apply).")
+
+def verify_long_paths() -> "bool | None":
+    return _verify_value("HKLM", "SYSTEM\\CurrentControlSet\\Control\\FileSystem",
+                         "LongPathsEnabled", 1)
+
+
+_LINK_PATH = "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer"
+_SHELL_ICONS = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Shell Icons"
+
+
+def apply_classic_shortcut_icons(ctx: TaskContext):
+    """Clean desktop icons: no arrow overlay, no ' - Shortcut' suffix.
+    Best-effort (the HKLM arrow half needs admin); the HKCU suffix half
+    works everywhere. Snapshot + revert restores exact prior bytes."""
+    from app.utils import reg_set_value as _set
+    had_snapshot = bool(get_tweak_snapshot("classic_shortcut_icons"))
+    _snap_reg_values(ctx, "classic_shortcut_icons",
+                     [("HKLM", _SHELL_ICONS, "29", "REG_SZ"),
+                      ("HKCU", _LINK_PATH, "link", "REG_BINARY")])
+    ok, skipped = 0, []
+    if _set(ctx, "HKLM", _SHELL_ICONS, "29", "", value_type="REG_SZ"):
+        ok += 1
+    else:
+        skipped.append("HKLM arrow")
+    try:
+        from app.utils import reg_get_value as _get
+        prior = _get(ctx, "HKCU", _LINK_PATH, "link")
+        blank = bytes(len(prior)) if isinstance(prior, bytes) else bytes(16)
+    except Exception:
+        blank = bytes(16)
+    if _set(ctx, "HKCU", _LINK_PATH, "link", blank, value_type="REG_BINARY"):
+        ok += 1
+    else:
+        skipped.append("HKCU suffix")
+    if ok == 0:
+        if not had_snapshot:
+            clear_tweak_snapshot("classic_shortcut_icons")
+        raise RuntimeError("Could not clean shortcut icons (all writes blocked). Nothing was marked as applied.")
+    if skipped:
+        ctx.log(f"  (partially applied; skipped: {'; '.join(skipped)})")
+    ctx.log("Shortcut icons cleaned — no arrows, no ' - Shortcut' suffix.")
+
+def revert_classic_shortcut_icons(ctx: TaskContext):
+    _restore_reg_values(ctx, "classic_shortcut_icons")
+    ctx.log("Shortcut icons restored to their prior setting.")
+
+def verify_classic_shortcut_icons() -> "bool | None":
+    # applied state = all-zero bytes of whatever length Windows uses
+    # here (4 on some builds, 16 on others) — compare content, not length
+    try:
+        v = __verify_read("HKCU", _LINK_PATH, "link")
+        if v is None:
+            return None
+        if isinstance(v, bytes) and len(v) and all(b == 0 for b in v):
+            return True
+        return False
+    except Exception:
+        return None
+
+
 def apply_reserved_storage_off(ctx: TaskContext):
     """Free ~7 GB: Windows sets aside a chunk of your drive ('reserved
     storage') so future updates always have room. If your drive is
@@ -3379,4 +3704,19 @@ TASKS = [
     Task("numlock_boot", "NumLock at Boot", "Keeps the numpad ready at every boot for MMO and RPG muscle memory", apply_numlock_boot, default=False, revert=revert_numlock_boot, admin_required=False, column=0),
     Task("clipboard_sync_off", "Stop Cloud Clipboard Sync", "Stops copied text being uploaded to Microsoft's cloud — Win+V stays local", apply_clipboard_sync_off, default=False, revert=revert_clipboard_sync_off, admin_required=True, column=0),
     Task("reserved_storage_off", "Free Reserved Storage", "Releases the ~7 GB Windows locks away for updates — back when you undo", apply_reserved_storage_off, default=False, revert=revert_reserved_storage_off, admin_required=True, column=0),
+    # --- Round 6 tasks (user request: taskbar usability + mic privacy) --- #
+    # All HKCU-only (no admin), all snapshot + revert, all Custom-only.
+    Task("taskbar_endtask", "Taskbar End Task Button", "Right-click any taskbar icon to force-close a frozen game, no Task Manager", apply_taskbar_endtask, default=False, revert=revert_taskbar_endtask, verify=verify_taskbar_endtask, admin_required=False, column=0),
+    Task("mic_privacy_allow", "Allow Microphone For Apps", "Fixes 'nobody hears me in game/chat' when Windows revoked mic access", apply_mic_privacy_allow, default=False, revert=revert_mic_privacy_allow, verify=verify_mic_privacy_allow, admin_required=False, column=0),
+    Task("clock_seconds", "Clock Shows Seconds", "Taskbar clock shows seconds — handy for cooldown and queue timers", apply_clock_seconds, default=False, revert=revert_clock_seconds, verify=verify_clock_seconds, admin_required=False, column=0),
+    Task("taskbar_left", "Left-Align Taskbar", "Moves Start back to the left corner, classic style", apply_taskbar_left, default=False, revert=revert_taskbar_left, verify=verify_taskbar_left, admin_required=False, column=0),
+    # --- Round 7 tasks (user request: Winhance-audit picks) --- #
+    # All snapshot + revert (+verify), all Custom-only, presets untouched.
+    Task("alt_tab_windows_only", "Alt+Tab Windows Only", "Alt+Tab flips between real windows and games, no Edge tabs in the way", apply_alt_tab_windows_only, default=False, revert=revert_alt_tab_windows_only, verify=verify_alt_tab_windows_only, admin_required=False, column=0),
+    Task("taskbar_never_combine", "Never Combine Taskbar Buttons", "Every open window keeps its own labeled button instead of piling up", apply_taskbar_never_combine, default=False, revert=revert_taskbar_never_combine, verify=verify_taskbar_never_combine, admin_required=False, column=0),
+    Task("discord_no_ducking", "Stop Discord Lowering Game Sound", "Calls no longer auto-lower your game and media volume", apply_discord_no_ducking, default=False, revert=revert_discord_no_ducking, verify=verify_discord_no_ducking, admin_required=False, column=0),
+    Task("ads_master_off", "Master Switch: No Windows Ads", "One flick turns off the whole suggestions and ads engine at the source", apply_ads_master_off, default=False, revert=revert_ads_master_off, verify=verify_ads_master_off, admin_required=False, column=0),
+    Task("device_search_history_off", "No On-Device Search History", "Windows stops remembering what you searched for on this PC", apply_device_search_history_off, default=False, revert=revert_device_search_history_off, verify=verify_device_search_history_off, admin_required=False, column=0),
+    Task("long_paths", "Allow Long File Paths", "Lets games and mods use very long file names without errors", apply_long_paths, default=False, revert=revert_long_paths, verify=verify_long_paths, admin_required=True, column=0),
+    Task("classic_shortcut_icons", "Classic Shortcut Icons", "Clean desktop icons: no arrow overlay, no ' - Shortcut' text", apply_classic_shortcut_icons, default=False, revert=revert_classic_shortcut_icons, verify=verify_classic_shortcut_icons, admin_required=False, column=0),
 ]

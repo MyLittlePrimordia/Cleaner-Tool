@@ -113,7 +113,7 @@ BATTLENET_CACHE_PATHS = [
     _join(LOCALAPPDATA, "Battle.net", "Logs"),
 ]
 
-# Riot Client + Valorant (logs only — saves/configs excluded)
+# Riot Client + VALORANT (logs only — saves/configs excluded)
 RIOT_CACHE_PATHS = [
     _join(LOCALAPPDATA, "Riot Games", "Riot Client", "Cache"),
     _join(LOCALAPPDATA, "Riot Games", "Riot Client", "Logs"),
@@ -295,7 +295,7 @@ _TOP_GAME_JUNK = [
     ("LOCALAPPDATA", "Larian Studios", "Baldur's Gate 3", "CrashDumps"),  # BG3
     ("LOCALAPPDATA", "Larian Studios", "Baldur's Gate 3", "Logs"),
     ("LOCALAPPDATA", "CD Projekt Red", "Cyberpunk 2077", "ShaderCache"),  # Cyberpunk
-    ("LOCALAPPDATA", "VALORANT", "Saved", "Logs"),                # Valorant
+    ("LOCALAPPDATA", "VALORANT", "Saved", "Logs"),                # VALORANT
     ("LOCALAPPDATA", "Stalker2", "Saved", "Crashes"),
     ("APPDATA", "Battlestate Games", "Escape from Tarkov", "logs"),        # EFT (Settings excluded)
     ("APPDATA", "The Creative Assembly", "Warhammer3", "logs"),    # TWWH3 (save_games excluded)

@@ -61,6 +61,10 @@ DEFAULT_CONFIG = {
     # display names for path picks (path -> "Baldur's Gate 3"): pure UI
     # sugar, never consulted by matching. Dict coerced like the others.
     "session_pilot_names": {},
+    # Game Server Ping custom targets ("hostname" = ICMP ping,
+    # "hostname:port" = TCP handshake). Same coercion contract as the
+    # pilot path picks above.
+    "gameping_hosts": [],
 }
 
 # Phase 2 (#12): mapping used to migrate configs saved by the old 5-tab UI.
@@ -256,6 +260,12 @@ def _load_config_from_disk() -> dict:
                     DEFAULT_CONFIG["session_pilot_watch_all"])
             if not isinstance(data.get("session_pilot_names"), dict):
                 data["session_pilot_names"] = {}
+            if not isinstance(data.get("gameping_hosts"), list):
+                data["gameping_hosts"] = []
+            else:
+                data["gameping_hosts"] = [
+                    h for h in data["gameping_hosts"]
+                    if isinstance(h, str) and h.strip()][:64]
             if not isinstance(data.get("tweak_snapshots"), dict):
                 data["tweak_snapshots"] = {}
             return data

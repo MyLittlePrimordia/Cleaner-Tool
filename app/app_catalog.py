@@ -151,7 +151,7 @@ MANUAL_ONLY_APPS = [
      "description": 'HoYoverse launcher for Genshin Impact, Star Rail and ZZZ', "foss": False,
      "url": 'https://hoyoplay.hoyoverse.com/'},
     {"id": 'manual:riot-client', "name": 'Riot Client', "category": 'Game Launchers, Stores & Mod Managers',
-     "description": 'Riot launcher for Valorant and League of Legends', "foss": False,
+     "description": 'Riot launcher for VALORANT and League of Legends', "foss": False,
      "url": 'https://www.riotgames.com/'},
     {"id": 'manual:borderless-gaming', "name": 'Borderless Gaming', "category": 'Gaming Tools & Emulators',
      "description": 'Forces older games into borderless fullscreen mode', "foss": True,

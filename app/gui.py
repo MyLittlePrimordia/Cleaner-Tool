@@ -6386,6 +6386,10 @@ class InstallTab(tk.Frame):
                                 fg=COLORS["text"], activebackground=COLORS["bg_alt"],
                                 selectcolor=COLORS["surface"], onvalue=True, offvalue=False)
             cb.pack(side="left")
+            # task icons (user bug: Essentials/LTSC rows never called
+            # _row_icon — same helper + filename convention as the
+            # catalog/bundle rows, keyed off the task label).
+            self._row_icon(row, task.label)
             name_lbl = tk.Label(row, text=task.label, font=(F, 9, "bold"),
                                 bg=COLORS["bg_alt"], fg=COLORS["text"])
             name_lbl.pack(side="left", padx=(6, 4))
@@ -8223,10 +8227,1883 @@ class SpeedTestDialog(ThemedModal):
             pass
 
 
+# --------------------------------------------------------------------------- #
+# Gamepad tester + mic check (user-requested Tools features): the mic
+# side is strictly read-only (registry/MMS reads only). The gamepad side
+# polls read-only, plus an explicit user-pressed rumble test that vibrates
+# the controller briefly (device output only — no system state is touched,
+# motors auto-stop and are cut on dialog close).
+# Polling math + rumble-test concept adapted from zoltcode/Gamepad_Tester
+# (Apache-2.0): packet-number deltas over a 128-sample window give the
+# report rate in Hz + peak. The white-outline pad look is drawn fresh in
+# code (no third-party artwork) in the same visual language.
+# --------------------------------------------------------------------------- #
+
+_XINPUT_BUTTONS = (
+    ("A", 0x1000), ("B", 0x2000), ("X", 0x4000), ("Y", 0x8000),
+    ("LB", 0x0100), ("RB", 0x0200), ("Back", 0x0020), ("Start", 0x0010),
+    ("L-Stick", 0x0040), ("R-Stick", 0x0080),
+    ("Up", 0x0001), ("Down", 0x0002), ("Left", 0x0004), ("Right", 0x0008),
+)
+_XINPUT_STICK_DEADZONE = 7849
+_XINPUT_TRIGGER_THRESHOLD = 30
+_XINPUT_RUMBLE_MS = 1000
+
+
+def _xinput_lib():
+    """Loaded XInput DLL or None (resolved once, shared by poll+rumble)."""
+    cached = getattr(_xinput_lib, "_dll", "unset")
+    if cached != "unset":
+        return cached
+    dll = None
+    try:
+        import ctypes as _ct
+        for _name in ("xinput1_4.dll", "xinput9_1_0.dll", "xinput1_3.dll"):
+            try:
+                dll = _ct.windll.LoadLibrary(_name)
+                break
+            except Exception:
+                continue
+    except Exception:
+        dll = None
+    _xinput_lib._dll = dll
+    return dll
+
+
+def _xinput_state_fn():
+    """XInputGetState callable(slot) -> state dict (with packet number)
+    or None (no XInput on this machine).
+
+    Read-only by construction — only GetState is ever bound here."""
+    cached = getattr(_xinput_state_fn, "_fn", "unset")
+    if cached != "unset":
+        return cached
+    fn = None
+    try:
+        import ctypes as _ct
+        from ctypes import wintypes as _wt
+
+        class _Pad(_ct.Structure):
+            _fields_ = [("wButtons", _wt.WORD),
+                        ("bLeftTrigger", _ct.c_ubyte),
+                        ("bRightTrigger", _ct.c_ubyte),
+                        ("sThumbLX", _ct.c_short),
+                        ("sThumbLY", _ct.c_short),
+                        ("sThumbRX", _ct.c_short),
+                        ("sThumbRY", _ct.c_short)]
+
+        class _State(_ct.Structure):
+            _fields_ = [("dwPacketNumber", _wt.DWORD),
+                        ("Gamepad", _Pad)]
+
+        dll = _xinput_lib()
+        if dll is not None and hasattr(dll, "XInputGetState"):
+            _raw = dll.XInputGetState
+            _raw.argtypes = [_wt.DWORD, _ct.POINTER(_State)]
+            _raw.restype = _wt.DWORD
+
+            def fn(slot):  # noqa: F811
+                st = _State()
+                try:
+                    rc = _raw(_wt.DWORD(slot), _ct.byref(st))
+                except Exception:
+                    return None
+                if rc != 0:  # 1167 = not connected; anything else: no data
+                    return None
+                g = st.Gamepad
+                return {"packet": int(st.dwPacketNumber),
+                        "buttons": int(g.wButtons),
+                        "lt": int(g.bLeftTrigger), "rt": int(g.bRightTrigger),
+                        "lx": int(g.sThumbLX), "ly": int(g.sThumbLY),
+                        "rx": int(g.sThumbRX), "ry": int(g.sThumbRY)}
+    except Exception:
+        fn = None
+    _xinput_state_fn._fn = fn
+    return fn
+
+
+def _xinput_rumble(slot, weak, strong):
+    """Vibrate (weak/strong 0.0..1.0) or stop (0,0). Returns True if the
+    device accepted it. Device output only — user-initiated test path."""
+    try:
+        import ctypes as _ct
+        from ctypes import wintypes as _wt
+
+        class _Vib(_ct.Structure):
+            _fields_ = [("wLeftMotorSpeed", _wt.WORD),
+                        ("wRightMotorSpeed", _wt.WORD)]
+
+        dll = _xinput_lib()
+        if dll is None or not hasattr(dll, "XInputSetState"):
+            return False
+        _raw = dll.XInputSetState
+        _raw.argtypes = [_wt.DWORD, _ct.POINTER(_Vib)]
+        _raw.restype = _wt.DWORD
+        vib = _Vib(int(max(0.0, min(1.0, weak)) * 65535),
+                   int(max(0.0, min(1.0, strong)) * 65535))
+        return _raw(_wt.DWORD(slot), _ct.byref(vib)) == 0
+    except Exception:
+        return False
+
+
+class _PadReportStats:
+    """Packet-delta report-rate tracker (mirrors GamepadStats from the
+    reference): deltas between consecutive *changed* packets over a
+    128-sample window give avg interval ms, Hz and peak Hz. Quiet
+    controller = no samples = honestly 'no data', never a fake 0 Hz."""
+
+    _MAX = 128
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self._last_packet = None
+        self._last_ns = 0
+        self._deltas = []
+        self.avg_ms = 0.0
+        self.hz = 0.0
+        self.peak_hz = 0.0
+        self.packets = 0
+
+    def update(self, packet):
+        try:
+            import time as _time
+            now = _time.perf_counter_ns()
+            if self._last_packet is None:
+                self._last_packet, self._last_ns = packet, now
+                self.packets += 1
+                return
+            if packet == self._last_packet:
+                return
+            self._last_packet = packet
+            self.packets += 1
+            if now > self._last_ns:
+                dt = (now - self._last_ns) / 1_000_000.0
+                if 0.0 < dt < 500.0:
+                    self._deltas.append(dt)
+                    if len(self._deltas) > self._MAX:
+                        self._deltas.pop(0)
+                    self.avg_ms = sum(self._deltas) / len(self._deltas)
+                    if self.avg_ms > 0:
+                        self.hz = 1000.0 / self.avg_ms
+                        if self.hz > self.peak_hz:
+                            self.peak_hz = self.hz
+            self._last_ns = now
+        except Exception:
+            pass
+
+
+def _mm_guid(s):
+    """GUID struct instance from a registry-format string."""
+    import ctypes as _ct
+    from ctypes import wintypes as _wt
+    import uuid as _uuid
+
+    class _GUID(_ct.Structure):
+        _fields_ = [("Data1", _wt.DWORD), ("Data2", _wt.WORD),
+                    ("Data3", _wt.WORD), ("Data4", _ct.c_ubyte * 8)]
+
+    u = _uuid.UUID(s)
+    return _GUID(u.time_low, u.time_mid, u.time_hi_version,
+                 (_ct.c_ubyte * 8)(*u.bytes[8:]))
+
+
+def _mm_vfn(ct, iface, index, restype, *argtypes):
+    """Dereferenced COM vtable call (iface -> vtbl -> slot); the pattern
+    proven live during the WASAPI probing (direct indexing faulted)."""
+    vt = ct.c_void_p.from_address(iface).value
+    addr = (ct.c_void_p * (index + 1)).from_address(vt)[index]
+    return ct.WINFUNCTYPE(restype, ct.c_void_p, *argtypes)(addr)
+
+
+_MM_CLSID_ENUM = "BCDE0395-E52F-467C-8E3D-C4579291692E"
+_MM_IID_ENUM = "A95664D2-9614-4F35-A746-DE8DB63617E6"
+_MM_IID_METER = "C02216F6-8C67-4B5B-9D00-D008E73E0064"
+_MM_IID_AUDIOCLIENT = "1CB9AD4C-DBFA-4C32-B178-C2F568A703B2"
+_MM_PKEY_FRIENDLY_FMT = "A45C254E-DF1C-4EFD-8020-67D146A850E0"
+_MM_PKEY_FRIENDLY_PID = 14
+_MM_STATE_NAMES = {1: "ready", 2: "off", 4: "not present", 8: "unplugged"}
+_MM_COM_INIT = {"done": False}
+
+
+def _mm_ensure_com(ct):
+    if _MM_COM_INIT["done"]:
+        return True
+    try:
+        ct.windll.ole32.CoInitialize(None)
+        _MM_COM_INIT["done"] = True
+        return True
+    except Exception:
+        return False
+
+
+class _InputMeter:
+    """Peak meter bound to ONE capture endpoint (not just the default).
+
+    Tk-thread only. read() -> 0.0..1.0 or None (sticky). close()
+    releases the COM refs (best-effort). Read-only: GetPeakValue never
+    touches device state."""
+
+    def __init__(self):
+        self._peak_fn = None
+        self._meter_ptr = None
+        self._dev_ptr = None
+        self._dead = False
+        self._ct = None
+
+    @classmethod
+    def open(cls, dev_ptr):
+        self = cls()
+        try:
+            import ctypes as _ct
+            if not _mm_ensure_com(_ct):
+                return None
+            self._ct = _ct
+        except Exception:
+            return None
+        return self._finish(dev_ptr)
+
+    def _finish(self, dev_ptr):
+        import ctypes as _ct
+        from ctypes import wintypes as _wt
+        try:
+            _activate = _mm_vfn(_ct, dev_ptr, 3, _ct.HRESULT,
+                                _ct.c_void_p, _wt.DWORD, _ct.c_void_p,
+                                _ct.POINTER(_ct.c_void_p))
+            _iid = _mm_guid(_MM_IID_METER)
+            _meter = _ct.c_void_p()
+            if _activate(dev_ptr, _ct.byref(_iid), 0x1, None,
+                         _ct.byref(_meter)) != 0:
+                raise OSError("no meter")
+            self._peak_fn = _mm_vfn(_ct, _meter.value, 3, _ct.HRESULT,
+                                    _ct.POINTER(_ct.c_float))
+            self._meter_ptr = _meter.value
+            self._dev_ptr = dev_ptr
+            self._float = _ct.c_float
+            self._byref = _ct.byref
+            return self
+        except Exception:
+            try:
+                _mm_vfn(_ct, dev_ptr, 2, _ct.c_ulong)(dev_ptr)
+            except Exception:
+                pass
+            return None
+
+    def read(self):
+        if self._dead or self._peak_fn is None:
+            return None
+        try:
+            peak = self._float()
+            if self._peak_fn(self._meter_ptr, self._byref(peak)) != 0:
+                return 0.0
+            return max(0.0, min(1.0, float(peak.value)))
+        except Exception:
+            self._dead = True
+            return None
+
+    def start_stream(self, endpoint_id=""):
+        """Open a shared-mode capture stream and drain it on a worker
+        thread (packets discarded). Why: some USB drivers only push
+        audio — and only feed the peak meter — while a capture stream
+        is open (Windows' own Sound panel does exactly this to light
+        its level bars). Read-only: data is never stored or played.
+
+        The whole stream (COM init included) lives on the worker
+        thread — STA objects must never cross threads. The Tk thread
+        keeps only the peak meter. Returns True when pumping."""
+        try:
+            import threading as _th
+            if getattr(self, "_pump_token", None) is not None:
+                return True
+            if not endpoint_id:
+                return False
+            _token = [False]
+            self._pump_token = _token
+            try:
+                _th.Thread(target=_pump_capture,
+                           args=(str(endpoint_id), _token),
+                           daemon=True, name="MicCheckPump").start()
+            except Exception:
+                self._pump_token = None
+                return False
+            return True
+        except Exception:
+            try:
+                self._pump_token = None
+            except Exception:
+                pass
+            return False
+
+    def _stop_stream(self):
+        try:
+            _token = getattr(self, "_pump_token", None)
+            self._pump_token = None
+            if _token is not None:
+                _token[0] = True
+        except Exception:
+            pass
+
+    def close(self):
+        self._dead = True
+        self._stop_stream()
+        try:
+            _ct = self._ct
+            if _ct is None:
+                return
+            _release = _mm_vfn(_ct, self._meter_ptr, 2, _ct.c_ulong) \
+                if self._meter_ptr else None
+            if _release is not None:
+                try:
+                    _release(self._meter_ptr)
+                except Exception:
+                    pass
+            if self._dev_ptr:
+                try:
+                    _mm_vfn(_ct, self._dev_ptr, 2, _ct.c_ulong)(self._dev_ptr)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        finally:
+            self._peak_fn = None
+            self._meter_ptr = None
+            self._dev_ptr = None
+
+
+def _pump_capture(endpoint_id, token):
+    """Worker-thread capture keepalive: full COM chain (init included)
+    runs HERE so STA objects never cross threads. Opens the endpoint's
+    mix format in shared mode and STARTs it — a running stream is what
+    makes drivers push audio to the peak meter (Windows' own Sound
+    panel does exactly this to light its level bars). No capture
+    client is opened: packets are never read, stored, or played, so
+    the GetService surface (and its per-build vtable risk) is avoided
+    entirely. Stops + releases on the token. Never raises; never
+    touches Tk."""
+    try:
+        import ctypes as _ct
+        from ctypes import wintypes as _wt
+        import time as _time
+        _ole = _ct.windll.ole32
+        try:
+            _ole.CoInitialize(None)
+        except Exception:
+            pass
+        try:
+            _enum = _ct.c_void_p()
+            if _ole.CoCreateInstance(
+                    _ct.byref(_mm_guid(_MM_CLSID_ENUM)), None, 0x1,
+                    _ct.byref(_mm_guid(_MM_IID_ENUM)),
+                    _ct.byref(_enum)) != 0:
+                return
+            try:
+                _get_device = _mm_vfn(_ct, _enum.value, 5, _ct.HRESULT,
+                                      _ct.c_wchar_p,
+                                      _ct.POINTER(_ct.c_void_p))
+                _dev = _ct.c_void_p()
+                if _get_device(_enum.value, str(endpoint_id),
+                               _ct.byref(_dev)) != 0:
+                    return
+                try:
+                    _activate = _mm_vfn(_ct, _dev.value, 3, _ct.HRESULT,
+                                        _ct.c_void_p, _wt.DWORD,
+                                        _ct.c_void_p,
+                                        _ct.POINTER(_ct.c_void_p))
+                    _client = _ct.c_void_p()
+                    if _activate(_dev.value,
+                                 _ct.byref(_mm_guid(_MM_IID_AUDIOCLIENT)),
+                                 0x1, None, _ct.byref(_client)) != 0:
+                        return
+                    try:
+                        _get_mix = _mm_vfn(_ct, _client.value, 8, _ct.HRESULT,
+                                           _ct.POINTER(_ct.c_void_p))
+                        _fmt = _ct.c_void_p()
+                        if _get_mix(_client.value, _ct.byref(_fmt)) != 0:
+                            return
+                        try:
+                            _init = _mm_vfn(
+                                _ct, _client.value, 3, _ct.HRESULT, _wt.DWORD,
+                                _wt.DWORD, _ct.c_int64, _ct.c_int64,
+                                _ct.c_void_p, _ct.c_void_p)
+                            if _init(_client.value, 0, 0, 10000000, 0,
+                                     _fmt, None) != 0:
+                                return
+                        finally:
+                            try:
+                                _ole.CoTaskMemFree(_fmt)
+                            except Exception:
+                                pass
+                        _get_service = None
+                        _cap = None
+                        _start = _mm_vfn(_ct, _client.value, 10,
+                                         _ct.HRESULT)
+                        if _start(_client.value) != 0:
+                            return
+                        try:
+                            while not token[0]:
+                                _time.sleep(0.05)
+                        finally:
+                            try:
+                                _mm_vfn(_ct, _client.value, 11,
+                                        _ct.HRESULT)(_client.value)
+                            except Exception:
+                                pass
+                    finally:
+                        try:
+                            _mm_vfn(_ct, _client.value, 2,
+                                    _ct.c_ulong)(_client.value)
+                        except Exception:
+                            pass
+                finally:
+                    try:
+                        _mm_vfn(_ct, _dev.value, 2,
+                                _ct.c_ulong)(_dev.value)
+                    except Exception:
+                        pass
+            finally:
+                try:
+                    _mm_vfn(_ct, _enum.value, 2,
+                            _ct.c_ulong)(_enum.value)
+                except Exception:
+                    pass
+        finally:
+            try:
+                _ole.CoUninitialize()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _default_capture_id():
+    """Endpoint-ID string of the Windows default capture device (console
+    role) or '' — for preselecting what the user actually talks into.
+    Read-only; never raises."""
+    try:
+        import ctypes as _ct
+        from ctypes import wintypes as _wt
+        if not _mm_ensure_com(_ct):
+            return ""
+        _ole = _ct.windll.ole32
+        _enum = _ct.c_void_p()
+        if _ole.CoCreateInstance(
+                _ct.byref(_mm_guid(_MM_CLSID_ENUM)), None, 0x1,
+                _ct.byref(_mm_guid(_MM_IID_ENUM)),
+                _ct.byref(_enum)) != 0:
+            return ""
+        try:
+            _get_default = _mm_vfn(_ct, _enum.value, 4, _ct.HRESULT, _ct.c_int,
+                                   _ct.c_int, _ct.POINTER(_ct.c_void_p))
+            _dev = _ct.c_void_p()
+            if _get_default(_enum.value, 1, 0, _ct.byref(_dev)) != 0:
+                return ""
+            try:
+                _get_id = _mm_vfn(_ct, _dev.value, 5, _ct.HRESULT,
+                                  _ct.POINTER(_ct.c_void_p))
+                _pid = _ct.c_void_p()
+                if _get_id(_dev.value, _ct.byref(_pid)) != 0 or not _pid.value:
+                    return ""
+                try:
+                    return str(_ct.wstring_at(_pid.value) or "")
+                finally:
+                    try:
+                        _ole.CoTaskMemFree(_pid)
+                    except Exception:
+                        pass
+            finally:
+                try:
+                    _mm_vfn(_ct, _dev.value, 2, _ct.c_ulong)(_dev.value)
+                except Exception:
+                    pass
+        finally:
+            try:
+                _mm_vfn(_ct, _enum.value, 2, _ct.c_ulong)(_enum.value)
+            except Exception:
+                pass
+    except Exception:
+        return ""
+    return ""
+
+
+def _capture_inputs():
+    """[{name, state_int, dev_ptr_or_None, id_str}, ...] for every
+    capture endpoint, COM-enumerated (names via the property store, so
+    they match what Sound settings shows).
+
+    dev_ptr is kept alive for meter binding — pass it to
+    _InputMeter.open(), which owns (and releases) it. id_str is the
+    endpoint ID for stream binding + default matching. Never raises;
+    [] means none found / COM unavailable. Tk-thread only."""
+    out = []
+    try:
+        import ctypes as _ct
+        from ctypes import wintypes as _wt
+        if not _mm_ensure_com(_ct):
+            return []
+        _ole = _ct.windll.ole32
+        _enum = _ct.c_void_p()
+        if _ole.CoCreateInstance(
+                _ct.byref(_mm_guid(_MM_CLSID_ENUM)), None, 0x1,
+                _ct.byref(_mm_guid(_MM_IID_ENUM)),
+                _ct.byref(_enum)) != 0:
+            return []
+        try:
+            _enum_audio = _mm_vfn(_ct, _enum.value, 3, _ct.HRESULT, _ct.c_int,
+                                  _wt.DWORD, _ct.POINTER(_ct.c_void_p))
+            _coll = _ct.c_void_p()
+            if _enum_audio(_enum.value, 1, 0xB, _ct.byref(_coll)) != 0:
+                return []
+            try:
+                _get_count = _mm_vfn(_ct, _coll.value, 3, _ct.HRESULT,
+                                     _ct.POINTER(_wt.UINT))
+                _n = _wt.UINT()
+                if _get_count(_coll.value, _ct.byref(_n)) != 0:
+                    return []
+                _get_item = _mm_vfn(_ct, _coll.value, 4, _ct.HRESULT, _wt.UINT,
+                                    _ct.POINTER(_ct.c_void_p))
+                for _i in range(int(_n.value)):
+                    _dev = _ct.c_void_p()
+                    try:
+                        if _get_item(_coll.value, _i, _ct.byref(_dev)) != 0:
+                            continue
+                    except Exception:
+                        continue
+                    _state = 0
+                    try:
+                        _get_state = _mm_vfn(_ct, _dev.value, 6, _ct.HRESULT,
+                                             _ct.POINTER(_wt.DWORD))
+                        _st = _wt.DWORD()
+                        if _get_state(_dev.value, _ct.byref(_st)) == 0:
+                            _state = int(_st.value)
+                    except Exception:
+                        pass
+                    _epid = ""
+                    try:
+                        _get_id = _mm_vfn(_ct, _dev.value, 5, _ct.HRESULT,
+                                          _ct.POINTER(_ct.c_void_p))
+                        _pid = _ct.c_void_p()
+                        if _get_id(_dev.value, _ct.byref(_pid)) == 0 \
+                                and _pid.value:
+                            try:
+                                _epid = str(_ct.wstring_at(_pid.value) or "")
+                            finally:
+                                try:
+                                    _ole.CoTaskMemFree(_pid)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                    _name = f"Input {_i + 1}"
+                    try:
+                        _open_ps = _mm_vfn(_ct, _dev.value, 4, _ct.HRESULT,
+                                           _wt.DWORD,
+                                           _ct.POINTER(_ct.c_void_p))
+                        _ps = _ct.c_void_p()
+                        if _open_ps(_dev.value, 0, _ct.byref(_ps)) == 0:
+                            try:
+                                _get_value = _mm_vfn(
+                                    _ct, _ps.value, 5, _ct.HRESULT, _ct.c_void_p,
+                                    _ct.c_void_p)
+
+                                class _PKEY(_ct.Structure):
+                                    _fields_ = [("fmtid", _ct.c_ubyte * 16),
+                                                ("pid", _wt.DWORD)]
+
+                                class _PV(_ct.Structure):
+                                    _fields_ = [("vt", _wt.USHORT),
+                                                ("r1", _wt.WORD),
+                                                ("r2", _wt.WORD),
+                                                ("r3", _wt.WORD),
+                                                ("ptr", _ct.c_void_p),
+                                                ("rest", _ct.c_ubyte * 4)]
+
+                                import uuid as _uuid
+                                _u = _uuid.UUID(_MM_PKEY_FRIENDLY_FMT)
+                                _fmt = (_ct.c_ubyte * 16).from_buffer_copy(
+                                    _u.bytes_le)
+                                _pk = _PKEY(_fmt, _MM_PKEY_FRIENDLY_PID)
+                                _pv = _PV()
+                                if _get_value(_ps.value, _ct.byref(_pk),
+                                              _ct.byref(_pv)) == 0 \
+                                        and _pv.vt == 31 and _pv.ptr:
+                                    try:
+                                        _name = _ct.wstring_at(_pv.ptr) or _name
+                                    finally:
+                                        try:
+                                            _ole.PropVariantClear(_ct.byref(_pv))
+                                        except Exception:
+                                            pass
+                            finally:
+                                try:
+                                    _mm_vfn(_ct, _ps.value, 2,
+                                            _ct.c_ulong)(_ps.value)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                    _devnum = int(_dev.value)
+                    if _state != 1:
+                        # only the tested (active) device keeps its ref —
+                        # inactive entries release immediately, no leak
+                        try:
+                            _mm_vfn(_ct, _devnum, 2, _ct.c_ulong)(_devnum)
+                        except Exception:
+                            pass
+                        _devnum = None
+                    out.append({"name": str(_name), "state": _state,
+                                "dev": _devnum, "id": _epid})
+            finally:
+                try:
+                    _mm_vfn(_ct, _coll.value, 2, _ct.c_ulong)(_coll.value)
+                except Exception:
+                    pass
+        finally:
+            try:
+                _mm_vfn(_ct, _enum.value, 2, _ct.c_ulong)(_enum.value)
+            except Exception:
+                pass
+    except Exception:
+        return []
+    return out
+
+
+class GamepadDialog(ThemedModal):
+    """Gamepad Tester (user-requested Tools feature): live view of the
+    first connected XInput controller — buttons, triggers, both sticks.
+
+    Strictly read-only (GetState polls only; rumble/remap APIs are never
+    bound). Polls on the Tk thread via after() — no worker threads, so no
+    threading rules to break. Fits the shared 800x600 card."""
+
+    _TICK_MS = 60
+
+    def __init__(self, parent, app):
+        self.app = app
+        self._tick_after = None
+        self._pad_btns = {}
+        self._stats = _PadReportStats()
+        self._slot = -1
+        self._rest = None        # drift-calibration center (lx,ly,rx,ry)
+        self._rest_samples = []  # gathering buffer (hands off!)
+        self._weak_var = None
+        self._strong_var = None
+        self._rumble_after = None
+        super().__init__(parent, title="Gamepad Tester",
+                         accent=TAB_ACCENTS["Clean"])
+        body = self.body
+        self._status_lbl = tk.Label(body, text="Looking for a controller…",
+                                    font=(F, 10, "bold"), bg=COLORS["bg"],
+                                    fg=COLORS["subtext"], anchor="w")
+        self._status_lbl.pack(fill="x", pady=(0, 2))
+        # Center piece: the pad artwork with horizontal trigger bars
+        # drawn right above the shoulders (LT left, RT right). Artwork is
+        # the white-outline Xbox stock (Noun Project, CC BY — credited in
+        # code) at app/assets/gamepad_outline.png, 1200x1200, shown
+        # subsampled /4 (300px). Button zones were measured off the
+        # artwork's pixel clusters.
+        self._trig_views = []  # (fill_id, track_tuple, pct_item, canvas)
+        self._pad_cv = tk.Canvas(body, width=300, height=300,
+                                 bg=COLORS["bg"], bd=0, highlightthickness=0)
+        self._pad_cv.pack(pady=(0, 2))
+        self._overlay_triggers()
+        self._pad_btns = {}   # name -> (shape_id, None); paint floods green
+        self._stick_l = None
+        self._stick_r = None
+        # stats strip: three evenly spaced blocks + re-zero cell
+        stats = tk.Frame(body, bg=COLORS["bg"])
+        stats.pack(fill="x", pady=(4, 0))
+        for c in range(3):
+            stats.grid_columnconfigure(c, weight=1, uniform="padstats")
+        self._stat_rate_val, _ = self._stat_block(stats, 0, "POLLING")
+        self._stat_ms_val, _ = self._stat_block(stats, 1, "INTERVAL")
+        self._stat_drift_val, _drift_cell = self._stat_block(stats, 2, "DRIFT")
+        _rez = AnimatedButton(_drift_cell, text="Re-zero",
+                              command=self._calibrate,
+                              bg=COLORS["surface"], fg=COLORS["text"],
+                              font=(F, 8, "bold"), padx=10, pady=3)
+        _rez.pack(pady=(2, 0))
+        Tooltip(_rez, "Learns the sticks' rest position to measure drift — "
+                      "take your thumbs off first.")
+        # rumble row: themed sliders + test share one line
+        rumble = tk.Frame(body, bg=COLORS["bg"])
+        rumble.pack(fill="x", pady=(6, 0))
+        tk.Label(rumble, text="Rumble", font=(F, 9, "bold"),
+                 bg=COLORS["bg"], fg=COLORS["text"],
+                 anchor="w").pack(side="left", padx=(0, 8))
+        self._weak_var = tk.DoubleVar(value=0.5)
+        self._strong_var = tk.DoubleVar(value=0.5)
+        self._sliders = []
+        self._slider_row(rumble, "Weak", self._weak_var)
+        self._slider_row(rumble, "Strong", self._strong_var)
+        self._rumble_btn = AnimatedButton(
+            rumble, text="Test Rumble", command=self._test_rumble,
+            bg=COLORS["surface"], fg=COLORS["text"],
+            font=(F, 9, "bold"), padx=18, pady=6)
+        self._rumble_btn.pack(side="left", padx=(12, 0))
+        self._rumble_btn.set_enabled(False)
+        self._pad_img = None
+        try:
+            self._load_pad_artwork()
+        except Exception:
+            self._pad_img = None
+        if self._pad_img is None:
+            try:
+                self._status_lbl.config(
+                    text="Controller artwork missing — metrics below still work.")
+            except Exception:
+                pass
+        self.on_close(self._stop_all)
+        self._tick()
+
+    def _stat_block(self, parent, col, title):
+        """One airy stat cell: small title + big value. Returns (value, cell)."""
+        try:
+            cell = tk.Frame(parent, bg=COLORS["bg"])
+            cell.grid(row=0, column=col, sticky="nsew", padx=12)
+            tk.Label(cell, text=title, font=(F, 8), bg=COLORS["bg"],
+                     fg=COLORS["subtext"]).pack()
+            val = tk.Label(cell, text="—", font=(F, 11, "bold"),
+                           bg=COLORS["bg"], fg=COLORS["text"])
+            val.pack()
+            return val, cell
+        except Exception:
+            return None, None
+
+    def _load_pad_artwork(self):
+        """Image + highlight overlays. Raises if the asset is missing."""
+        import tkinter as _tk
+        path = None
+        try:
+            for cand in self.app._asset_candidates("gamepad_outline.png"):
+                if cand.is_file():
+                    path = cand
+                    break
+        except Exception:
+            path = None
+        if path is None:
+            raise FileNotFoundError("gamepad_outline.png")
+        img = _tk.PhotoImage(file=str(path)).subsample(4, 4)
+        self._pad_img = img  # kept: Tk unmaps otherwise
+        self._pad_cv.create_image(0, 0, anchor="nw", image=img)
+        # overlays: transparent idle, green press (coords = orig/4)
+        for cx, cy, name in ((229, 84, "Y"), (209, 104, "X"),
+                             (249, 104, "B"), (229, 124, "A")):
+            self._ov_circle(cx, cy, 12, name)
+        for x0, y0, x1, y1, name in ((105, 129, 124, 141, "Up"),
+                                     (105, 163, 124, 175, "Down"),
+                                     (91, 143, 103, 161, "Left"),
+                                     (126, 143, 137, 161, "Right"),
+                                     (124, 96, 139, 112, "Back"),
+                                     (168, 96, 183, 112, "Start")):
+            self._ov_rect(x0, y0, x1, y1, name)
+        self._ov_poly(((68, 50), (89, 50), (98, 56), (98, 61),
+                       (63, 66), (49, 66), (44, 61), (46, 55)), "LB")
+        self._ov_poly(((233, 50), (211, 50), (202, 56), (202, 61),
+                       (238, 66), (252, 66), (256, 61), (254, 55)), "RB")
+        self._stick_l = self._ov_nub(78, 104)
+        self._stick_r = self._ov_nub(191, 149)
+        # stick-click flashes use the nub rings
+        self._ov_circle(78, 104, 11, "L-Stick")
+        self._ov_circle(191, 149, 11, "R-Stick")
+
+    def _ov_circle(self, cx, cy, r, name):
+        try:
+            shape = self._pad_cv.create_oval(cx - r, cy - r, cx + r, cy + r,
+                                             fill="", outline="", width=0)
+            self._pad_btns[name] = (shape, None)
+        except Exception:
+            pass
+
+    def _ov_rect(self, x0, y0, x1, y1, name):
+        try:
+            shape = self._pad_cv.create_rectangle(x0, y0, x1, y1, fill="",
+                                                  outline="", width=0)
+            self._pad_btns[name] = (shape, None)
+        except Exception:
+            pass
+
+    def _ov_poly(self, points, name):
+        try:
+            flat = [c for pt in points for c in pt]
+            shape = self._pad_cv.create_polygon(flat, fill="", outline="",
+                                                width=0)
+            self._pad_btns[name] = (shape, None)
+        except Exception:
+            pass
+
+    def _ov_nub(self, cx, cy):
+        try:
+            nub = self._pad_cv.create_oval(cx - 8, cy - 8, cx + 8, cy + 8,
+                                           fill=COLORS["accent_green"], outline="")
+            return (cx, cy, nub)
+        except Exception:
+            return None
+
+    def _overlay_triggers(self):
+        """Horizontal LT/RT bars above the shoulders, drawn on the pad
+        canvas itself: title + % share one caption row, fill sweeps
+        left-to-right with pressure."""
+        cv = self._pad_cv
+        for title, x0, x1 in (("LT", 44, 140), ("RT", 160, 256)):
+            try:
+                cv.create_text(x0, 13, text=title, font=(F, 9, "bold"),
+                               fill=COLORS["subtext"], anchor="w")
+                pct = cv.create_text(x1, 13, text="0%", font=(F, 9),
+                                     fill=COLORS["subtext"], anchor="e")
+                cv.create_rectangle(x0, 22, x1, 30, fill=COLORS["surface"],
+                                    outline="")
+                fill = cv.create_rectangle(x0, 22, x0, 30,
+                                           fill=COLORS["accent_green"], outline="")
+                self._trig_views.append((fill, (x0, 22, x1, 30), pct, cv))
+            except Exception:
+                continue
+
+    def _slider_row(self, parent, title, var):
+        """Theme-native slider: dark track, green fill, light knob —
+        drag (or click) to set. Same look language as the app's pills."""
+        row = tk.Frame(parent, bg=COLORS["bg"])
+        row.pack(side="left", padx=(0, 12))
+        tk.Label(row, text=title, font=(F, 9), bg=COLORS["bg"],
+                 fg=COLORS["subtext"], anchor="w").pack(fill="x")
+        box = tk.Frame(row, bg=COLORS["bg"])
+        box.pack(fill="x")
+        cv = tk.Canvas(box, width=150, height=18, bg=COLORS["bg"],
+                       bd=0, highlightthickness=0)
+        cv.pack(side="left")
+        track = cv.create_rectangle(0, 4, 150, 14, fill=COLORS["surface"],
+                                    outline="")
+        fill = cv.create_rectangle(0, 4, 75, 14, fill=COLORS["accent_green"],
+                                   outline="")
+        knob = cv.create_rectangle(70, 1, 80, 17, fill=COLORS["text"],
+                                   outline="")
+        val = tk.Label(box, text="0.50", font=(F, 9), bg=COLORS["bg"],
+                       fg=COLORS["text"], width=5, anchor="e")
+        val.pack(side="left", padx=(6, 0))
+        state = {"drag": False}
+
+        def _paint(v):
+            try:
+                v = max(0.0, min(1.0, float(v)))
+                x = v * 150.0
+                cv.coords(fill, 0, 4, x, 14)
+                cv.coords(knob, x - 5, 1, x + 5, 17)
+                val.config(text=f"{v:.2f}")
+            except Exception:
+                pass
+
+        def _set_from_x(x):
+            try:
+                var.set(round(max(0.0, min(1.0, x / 150.0)), 2))
+                _paint(var.get())
+            except Exception:
+                pass
+
+        def _down(e):
+            state["drag"] = True
+            _set_from_x(e.x)
+
+        def _move(e):
+            if state["drag"]:
+                _set_from_x(e.x)
+
+        def _up(_e):
+            state["drag"] = False
+
+        try:
+            cv.bind("<Button-1>", _down)
+            cv.bind("<B1-Motion>", _move)
+            cv.bind("<ButtonRelease-1>", _up)
+            var.trace_add("write", lambda *_: _paint(var.get()))
+        except Exception:
+            pass
+        _paint(var.get())
+        try:
+            self._sliders.append((cv, var, val))
+        except Exception:
+            pass
+
+    def _calibrate(self):
+        """Restart drift rest-center sampling (user lifts thumbs first)."""
+        try:
+            self._rest = None
+            self._rest_samples = []
+            self._set_stat(self._stat_drift_val, "learning…")
+        except Exception:
+            pass
+
+    def _set_stat(self, lbl, text, fg=None):
+        try:
+            if lbl is not None:
+                lbl.config(text=text, fg=fg or COLORS["text"])
+        except Exception:
+            pass
+
+    def _test_rumble(self):
+        """User-pressed rumble burst (~1s), then motors cut. Close cuts too."""
+        try:
+            if self._slot < 0:
+                return
+            try:
+                weak = float(self._weak_var.get())
+            except Exception:
+                weak = 0.5
+            try:
+                strong = float(self._strong_var.get())
+            except Exception:
+                strong = 0.5
+            try:
+                if self._rumble_after is not None:
+                    self._dlg.after_cancel(self._rumble_after)
+            except Exception:
+                pass
+            self._rumble_after = None
+            if _xinput_rumble(self._slot, weak, strong):
+                try:
+                    self._rumble_after = self._dlg.after(
+                        _XINPUT_RUMBLE_MS, self._stop_rumble)
+                except Exception:
+                    _xinput_rumble(self._slot, 0, 0)
+        except Exception:
+            pass
+
+    def _stop_rumble(self):
+        try:
+            if self._rumble_after is not None:
+                try:
+                    self._dlg.after_cancel(self._rumble_after)
+                except Exception:
+                    pass
+            self._rumble_after = None
+        except Exception:
+            pass
+        try:
+            if self._slot >= 0:
+                _xinput_rumble(self._slot, 0, 0)
+        except Exception:
+            pass
+
+    # -- image-pad overlays (see _load_pad_artwork above) -------------------- #
+    # _paint_btn/_paint_trigger/_paint_stick below are shared by both pad
+    # modes and operate purely on the registries.
+
+    def _paint_btn(self, name, on):
+        try:
+            shape, text = self._pad_btns[name]
+            self._pad_cv.itemconfig(shape,
+                                    fill=COLORS["accent_green"] if on else "")
+            if text is not None:
+                self._pad_cv.itemconfig(text,
+                                        fill=COLORS["black"] if on else COLORS["subtext"])
+        except Exception:
+            pass
+
+    def _paint_pad_idle(self):
+        for name in self._pad_btns:
+            self._paint_btn(name, False)
+        for _fill, _track, _pct, _cv in list(getattr(self, "_trig_views", []) or []):
+            self._paint_trigger((_fill, _track, _pct, _cv), 0.0)
+        if getattr(self, "_stick_l", None) is not None:
+            self._paint_stick(self._stick_l, 0, 0)
+        if getattr(self, "_stick_r", None) is not None:
+            self._paint_stick(self._stick_r, 0, 0)
+
+    def _paint_trigger(self, view, frac):
+        """Paint one trigger view (fill, track, pct_item, canvas): the
+        fill sweeps left-to-right with pressure (horizontal bars get
+        horizontal meters)."""
+        try:
+            fill, track, pct, cv = view
+            x0, y0, x1, y1 = track
+            frac = max(0.0, min(1.0, frac))
+            cv.coords(fill, x0, y0, x0 + (x1 - x0) * frac, y1)
+            if pct is not None:
+                try:
+                    cv.itemconfig(pct, text=f"{int(round(frac * 100))}%")
+                except Exception:
+                    try:
+                        pct.config(text=f"{int(round(frac * 100))}%")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _paint_stick(self, view, x, y):
+        try:
+            cx, cy, nub = view
+            nx = max(-1.0, min(1.0, x / 32768.0)) * 10
+            ny = max(-1.0, min(1.0, y / 32768.0)) * 10
+            self._pad_cv.coords(nub, cx + nx - 8, cy - ny - 8,
+                                cx + nx + 8, cy - ny + 8)
+        except Exception:
+            pass
+
+    def _stop_all(self):
+        """Close path: stop the poll tick AND cut the rumble motors."""
+        try:
+            if self._tick_after is not None:
+                self._dlg.after_cancel(self._tick_after)
+        except Exception:
+            pass
+        self._tick_after = None
+        self._stop_rumble()
+        try:
+            self._slot = -1
+        except Exception:
+            pass
+
+    def _stop_tick(self):
+        self._stop_all()
+
+    def _tick(self):
+        self._tick_after = None
+        try:
+            fn = _xinput_state_fn()
+            state = None
+            slot = -1
+            if fn is not None:
+                for s in range(4):
+                    try:
+                        state = fn(s)
+                    except Exception:
+                        state = None
+                    if state is not None:
+                        slot = s
+                        break
+            if state is None:
+                if self._slot >= 0:
+                    self._stop_rumble()
+                self._slot = -1
+                self._stats.reset()
+                self._rest = None
+                self._rest_samples = []
+                self._status_lbl.config(
+                    text="No controller detected — connect one and press any button.",
+                    fg=COLORS["subtext"])
+                self._paint_pad_idle()
+                self._set_stat(self._stat_rate_val, "—")
+                self._set_stat(self._stat_ms_val, "—")
+                self._set_stat(self._stat_drift_val, "—")
+                try:
+                    self._rumble_btn.set_enabled(False)
+                except Exception:
+                    pass
+            else:
+                self._slot = slot
+                try:
+                    self._rumble_btn.set_enabled(True)
+                except Exception:
+                    pass
+                self._status_lbl.config(
+                    text=f"Controller {slot + 1} connected — live.",
+                    fg=COLORS["accent_green"])
+                pressed = state["buttons"]
+                for name, mask in _XINPUT_BUTTONS:
+                    self._paint_btn(name, bool(pressed & mask))
+                _views = list(getattr(self, "_trig_views", []) or [])
+                _fracs = (state["lt"] / 255.0, state["rt"] / 255.0)
+                for _view, _frac in zip(_views, _fracs):
+                    self._paint_trigger(_view, _frac)
+                if getattr(self, "_stick_l", None) is not None:
+                    self._paint_stick(self._stick_l, state["lx"], state["ly"])
+                if getattr(self, "_stick_r", None) is not None:
+                    self._paint_stick(self._stick_r, state["rx"], state["ry"])
+                # report-rate stats from packet deltas (reference math)
+                self._stats.update(state.get("packet", 0))
+                # drift rest-center: 30 still samples (inside the deadzone
+                # = thumbs off). Any moved sample restarts the count, so a
+                # bad calibration is impossible — hold still and it learns.
+                lx, ly, rx, ry = state["lx"], state["ly"], state["rx"], state["ry"]
+                if self._rest is None:
+                    if max(abs(lx), abs(ly), abs(rx), abs(ry)) <= _XINPUT_STICK_DEADZONE:
+                        self._rest_samples.append((lx, ly, rx, ry))
+                    else:
+                        self._rest_samples = []
+                    if len(self._rest_samples) >= 30:
+                        n = len(self._rest_samples)
+                        self._rest = tuple(
+                            sum(s[i] for s in self._rest_samples) / n
+                            for i in range(4))
+                if self._rest is None:
+                    drift_l = drift_r = None
+                else:
+                    drift_l = max(abs(lx - self._rest[0]),
+                                  abs(ly - self._rest[1])) / 327.68
+                    drift_r = max(abs(rx - self._rest[2]),
+                                  abs(ry - self._rest[3])) / 327.68
+                # stats strip paint (short values only)
+                if self._stats.hz > 0:
+                    hz = self._stats.hz
+                    fg = COLORS["accent_green"] if hz >= 500 else (
+                        COLORS["accent_yellow"] if hz >= 240 else COLORS["accent_red"])
+                    self._set_stat(self._stat_rate_val, f"{hz:.0f} Hz", fg)
+                    self._set_stat(self._stat_ms_val, f"{self._stats.avg_ms:.1f} ms")
+                else:
+                    self._set_stat(self._stat_rate_val, "—")
+                    self._set_stat(self._stat_ms_val, "—")
+                if drift_l is None:
+                    n = len(self._rest_samples)
+                    self._set_stat(self._stat_drift_val, f"hold still {n}/30…")
+                else:
+                    bad = drift_l > 5.0 or drift_r > 5.0
+                    self._set_stat(
+                        self._stat_drift_val,
+                        f"L {drift_l:.1f}% · R {drift_r:.1f}%",
+                        COLORS["accent_red"] if bad else None)
+        except Exception:
+            pass
+        try:
+            self._tick_after = self._dlg.after(self._TICK_MS, self._tick)
+        except Exception:
+            self._tick_after = None
+
+
+class MicCheckDialog(ThemedModal):
+    """Mic Check (user-requested Tools feature): one-glance
+    verdict, the working microphones, the mic permission, and a live
+    input-level bar. Strictly read-only — the fix path is the
+    'Allow Microphone For Apps' tweak, linked below, never applied here."""
+
+    _TICK_MS = 120
+
+    def __init__(self, parent, app):
+        self.app = app
+        self._tick_after = None
+        self._inputs = []
+        self._meter = None
+        self._needle = 0.0
+        self._pick_var = tk.StringVar(value="")
+        self._pick_busy = False
+        try:
+            self._pick_var.trace_add("write", self._pick_input)
+        except Exception:
+            pass
+        super().__init__(parent, title="Mic Check",
+                         accent=TAB_ACCENTS["Tweak"])
+        body = self.body
+        tk.Label(body, text="Pick a mic, speak, watch the dial.",
+                 font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
+                 anchor="w").pack(fill="x")
+        self._verdict_lbl = tk.Label(body, text="", font=(F, 12, "bold"),
+                                     bg=COLORS["bg"], fg=COLORS["text"],
+                                     anchor="w")
+        self._verdict_lbl.pack(fill="x", pady=(8, 2))
+        drow = tk.Frame(body, bg=COLORS["bg"])
+        drow.pack(fill="x", pady=(2, 0))
+        tk.Label(drow, text="Microphone:", font=(F, 9, "bold"),
+                 bg=COLORS["bg"], fg=COLORS["text"],
+                 anchor="w").pack(side="left")
+        self._pick_box = tk.Frame(drow, bg=COLORS["bg"])
+        self._pick_box.pack(side="left", padx=(8, 0))
+        self._other_note = tk.Label(body, text="", font=(F, 8),
+                                    bg=COLORS["bg"], fg=COLORS["subtext"],
+                                    anchor="w")
+        self._other_note.pack(fill="x")
+        self._listen_lbl = tk.Label(body, text="", font=(F, 9, "bold"),
+                                    bg=COLORS["bg"], fg=COLORS["text"],
+                                    anchor="w")
+        self._listen_lbl.pack(fill="x", pady=(4, 0))
+        grow = tk.Frame(body, bg=COLORS["bg"])
+        grow.pack(pady=(4, 0))
+        self._gauge_cv = tk.Canvas(grow, width=220, height=132,
+                                   bg=COLORS["bg"], bd=0,
+                                   highlightthickness=0)
+        self._gauge_cv.pack()
+        self._draw_gauge()
+        # level bar
+        tk.Label(body, text="Input level — speak into your mic:",
+                 font=(F, 9, "bold"), bg=COLORS["bg"], fg=COLORS["text"],
+                 anchor="w").pack(fill="x", pady=(10, 2))
+        self._level_cv = tk.Canvas(body, height=14, bg=COLORS["surface"],
+                                   bd=0, highlightthickness=0)
+        self._level_cv.pack(fill="x")
+        self._level_item = self._level_cv.create_rectangle(
+            0, 0, 0, 14, fill=COLORS["accent_green"], outline="")
+        self._level_note = tk.Label(body, text="", font=(F, 9),
+                                    bg=COLORS["bg"], fg=COLORS["subtext"],
+                                    anchor="w")
+        self._level_note.pack(fill="x")
+        # actions row
+        brow = tk.Frame(body, bg=COLORS["bg"])
+        brow.pack(fill="x", pady=(12, 6))
+        AnimatedButton(brow, text="Open Sound settings",
+                       command=self._open_sound,
+                       bg=COLORS["surface"], fg=COLORS["text"],
+                       font=(F, 9, "bold"), padx=18, pady=7).pack(side="left")
+        AnimatedButton(brow, text="Refresh",
+                       command=self._refresh,
+                       bg=COLORS["surface"], fg=COLORS["text"],
+                       font=(F, 9, "bold"), padx=18, pady=7).pack(side="right")
+        tk.Label(body, text="Mic blocked? Tweak tab → Custom → "
+                            "Allow Microphone For Apps (reversible).",
+                 font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
+                 wraplength=680, justify="left").pack(anchor="w")
+        self._rebuild_inputs()
+        self.on_close(self._stop_tick)
+        self._tick()
+
+    def _draw_gauge(self):
+        """Static dial furniture (Tk thread, once): zone arcs, ticks,
+        labels. The needle (_needle item) moves in _tick."""
+        try:
+            cv = self._gauge_cv
+            cx, cy, r = 110, 115, 85
+            cv.create_arc(cx - r, cy - r, cx + r, cy + r, start=80,
+                          extent=100, style="arc", outline=COLORS["accent_green"],
+                          width=7)
+            cv.create_arc(cx - r, cy - r, cx + r, cy + r, start=38,
+                          extent=42, style="arc", outline=COLORS["accent_yellow"],
+                          width=7)
+            cv.create_arc(cx - r, cy - r, cx + r, cy + r, start=0,
+                          extent=38, style="arc", outline=COLORS["accent_red"],
+                          width=7)
+            import math as _math
+            for frac, label in ((0.0, "0"), (0.5, "50"), (1.0, "100")):
+                deg = 180.0 - frac * 180.0
+                rad = _math.radians(deg)
+                x1, y1 = cx + 72 * _math.cos(rad), cy - 72 * _math.sin(rad)
+                x2, y2 = cx + 85 * _math.cos(rad), cy - 85 * _math.sin(rad)
+                cv.create_line(x1, y1, x2, y2, fill=COLORS["subtext"], width=2)
+                cv.create_text(cx + 58 * _math.cos(rad), cy - 58 * _math.sin(rad),
+                               text=label, font=(F, 8), fill=COLORS["subtext"])
+            self._needle = cv.create_line(cx, cy, cx - 68, cy,
+                                          fill=COLORS["accent_green"], width=3)
+            cv.create_oval(cx - 6, cy - 6, cx + 6, cy + 6,
+                           fill=COLORS["text"], outline="")
+        except Exception:
+            self._needle = None
+
+    def _paint_needle(self, peak):
+        try:
+            import math as _math
+            cx, cy = 110, 115
+            deg = 180.0 - max(0.0, min(1.0, peak)) * 180.0
+            rad = _math.radians(deg)
+            self._gauge_cv.coords(self._needle, cx, cy,
+                                  cx + 68 * _math.cos(rad),
+                                  cy - 68 * _math.sin(rad))
+            color = COLORS["accent_green"] if peak < 0.7 else (
+                COLORS["accent_yellow"] if peak < 0.9 else COLORS["accent_red"])
+            self._gauge_cv.itemconfig(self._needle, fill=color)
+        except Exception:
+            pass
+
+    def _drop_inputs(self):
+        """Release enumerated COM refs not owned by the live meter."""
+        try:
+            live = getattr(getattr(self, "_meter", None), "_dev_ptr", None)
+        except Exception:
+            live = None
+        try:
+            for e in getattr(self, "_inputs", []) or []:
+                try:
+                    d = (e or {}).get("dev")
+                    if d is not None and d != live:
+                        import ctypes as _ct
+                        _mm_vfn(_ct, d, 2, _ct.c_ulong)(d)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _rebuild_inputs(self):
+        """Fresh enumerate + picker + verdict + meter for the pick."""
+        try:
+            if self._meter is not None:
+                try:
+                    self._meter.close()
+                except Exception:
+                    pass
+            self._meter = None
+            self._drop_inputs()
+            self._inputs = _capture_inputs()
+        except Exception:
+            self._inputs = []
+        try:
+            from app.tasks.repair_tasks import read_mic_consent
+            _consent, _apps = read_mic_consent()
+        except Exception:
+            _consent = None
+        actives = [e for e in self._inputs if (e or {}).get("state") == 1]
+        others = [e for e in self._inputs
+                  if (e or {}).get("state") not in (1, 4)]
+        try:
+            for w in list(self._pick_box.winfo_children()):
+                try:
+                    w.destroy()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        names = [(e or {}).get("name", "") for e in actives]
+        # preselect the Windows default capture endpoint (what the user
+        # actually talks into), not just the first enumerated input
+        try:
+            _defid = _default_capture_id()
+        except Exception:
+            _defid = ""
+        _defname = ""
+        if _defid:
+            for e in actives:
+                try:
+                    if (e or {}).get("id", "") == _defid:
+                        _defname = (e or {}).get("name", "")
+                        break
+                except Exception:
+                    continue
+        try:
+            if len(names) > 1:
+                self._pick_var.set(_defname or names[0])
+                _om = tk.OptionMenu(self._pick_box, self._pick_var, *names)
+                try:
+                    _om.config(bg=COLORS["surface"], fg=COLORS["text"],
+                               activebackground=COLORS["surface_hover"],
+                               highlightthickness=0, bd=0, font=(F, 9))
+                except Exception:
+                    pass
+                _om.pack(side="left")
+            elif len(names) == 1:
+                self._pick_var.set(names[0])
+                tk.Label(self._pick_box, text=names[0][:52],
+                         font=(F, 9, "bold"), bg=COLORS["bg"],
+                         fg=COLORS["text"], anchor="w").pack(side="left")
+            else:
+                self._pick_var.set("")
+                tk.Label(self._pick_box, text="none found",
+                         font=(F, 9, "bold"), bg=COLORS["bg"],
+                         fg=COLORS["subtext"], anchor="w").pack(side="left")
+        except Exception:
+            pass
+        try:
+            if _consent is not None and _consent != "Allow":
+                self._verdict_lbl.config(
+                    text="🔇 Mic is blocked — turn permission on below.",
+                    fg=COLORS["accent_red"])
+            elif not actives:
+                self._verdict_lbl.config(
+                    text="⚠️ No working mic found — check the cable.",
+                    fg=COLORS["accent_yellow"])
+            else:
+                self._verdict_lbl.config(text="🎙️ Mic ready — pick one and speak.",
+                                         fg=COLORS["accent_green"])
+            _notes = []
+            for e in others:
+                _word = _MM_STATE_NAMES.get((e or {}).get("state"), "unknown")
+                _notes.append(f"{(e or {}).get('name', '')} ({_word})")
+            self._other_note.config(
+                text=("Also present (not usable): " + "; ".join(_notes))
+                if _notes else "")
+        except Exception:
+            pass
+        self._pick_input()
+
+    def _pick_input(self, *_a):
+        """Bind the live meter to the dropdown pick (idempotent — a
+        re-pick of the same input is a no-op so the rebuild's explicit
+        call can't kill the trace-fired binding)."""
+        if getattr(self, "_pick_busy", False):
+            return
+        self._pick_busy = True
+        try:
+            want = (self._pick_var.get() or "").strip()
+            if self._meter is not None \
+                    and getattr(self, "_meter_name", "") == want:
+                return
+            if self._meter is not None:
+                try:
+                    self._meter.close()
+                except Exception:
+                    pass
+            self._meter = None
+            self._meter_name = ""
+            for e in self._inputs:
+                try:
+                    if (e or {}).get("name") == want \
+                            and (e or {}).get("state") == 1 \
+                            and (e or {}).get("dev") is not None:
+                        m = _InputMeter.open(e["dev"])
+                        if m is not None:
+                            e["dev"] = None  # ownership transferred
+                            self._meter = m
+                            self._meter_name = want
+                            try:
+                                m.start_stream((e or {}).get("id", ""))
+                            except Exception:
+                                pass
+                            try:
+                                self._listen_lbl.config(
+                                    text=f"Listening to: {want[:52]}")
+                            except Exception:
+                                pass
+                        break
+                except Exception:
+                    continue
+            if self._meter is None:
+                try:
+                    self._listen_lbl.config(text="")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        finally:
+            self._pick_busy = False
+
+    def _refresh(self):
+        try:
+            self._rebuild_inputs()
+        except Exception:
+            pass
+
+    def _open_sound(self):
+        try:
+            self.app._launch_settings("ms-settings:sound")
+        except Exception:
+            pass
+
+    def _stop_tick(self):
+        try:
+            if self._tick_after is not None:
+                self._dlg.after_cancel(self._tick_after)
+        except Exception:
+            pass
+        self._tick_after = None
+        try:
+            if self._meter is not None:
+                try:
+                    self._meter.close()
+                except Exception:
+                    pass
+            self._meter = None
+            self._drop_inputs()
+        except Exception:
+            pass
+
+    def _tick(self):
+        self._tick_after = None
+        try:
+            level = None
+            try:
+                if self._meter is not None:
+                    level = self._meter.read()
+            except Exception:
+                level = None
+            try:
+                self._needle_val = getattr(self, "_needle_val", 0.0)
+                target = level if level is not None else 0.0
+                self._needle_val += (target - self._needle_val) * 0.45
+                self._paint_needle(self._needle_val)
+            except Exception:
+                pass
+            if level is None:
+                self._level_note.config(text="Level meter unavailable on this PC.")
+                try:
+                    self._level_cv.coords(self._level_item, 0, 0, 0, 14)
+                except Exception:
+                    pass
+            else:
+                try:
+                    w = max(1, int(self._level_cv.winfo_width() or 400))
+                    self._level_cv.coords(self._level_item, 0, 0, w * level, 14)
+                    self._level_note.config(
+                        text=f"{int(round(level * 100))}% — " + (
+                            "Listening…" if level < 0.02
+                            else "Signal OK — your mic hears you."))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            self._tick_after = self._dlg.after(self._TICK_MS, self._tick)
+        except Exception:
+            self._tick_after = None
+
+
+class GameServerPingDialog(ThemedModal):
+    """Game Server Ping (user-approved Tools feature): ping before you
+    queue. Fortnite regions go to Epic's official per-region endpoints
+    (ICMP echo); company rows measure the TCP path to each publisher's
+    edge, honestly labeled as such; Custom covers anything else
+    (`hostname` = ping, `hostname:port` = TCP).
+
+    Workers never touch Tk (F10): each probe posts its row via after();
+    a token cancels stale rounds; close stops everything. Read-only
+    measurement — no busy-guard needed, same rationale as DNS/Speed."""
+
+    def __init__(self, parent, app):
+        self.app = app
+        self._token = [False]
+        self._rows = {}
+        self._results = {}
+        self._inbox = []       # worker postings (token, key, avg) — plain
+        self._landed = [0]     # painted this round (Tk thread only)
+        self._total = [0]
+        self._poll_after = None
+        try:
+            from app import gameping as _gp0
+            _games = tuple(t for t, _k in _gp0.GAME_TABS)
+        except Exception:
+            _games = ("Fortnite",)
+        self._game_var = tk.StringVar(value=_games[0])
+        super().__init__(parent, title="Game Server Ping",
+                         accent=TAB_ACCENTS["Clean"])
+        body = self.body
+        tk.Label(body, text="Test before you queue — lower is better. "
+                            "In-game ping usually reads a bit lower.",
+                 font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
+                 anchor="w").pack(fill="x")
+        top = tk.Frame(body, bg=COLORS["bg"])
+        top.pack(fill="x", pady=(8, 2))
+        try:
+            _om = tk.OptionMenu(top, self._game_var, *_games)
+            _om.config(bg=COLORS["surface"], fg=COLORS["text"],
+                       activebackground=COLORS["surface_hover"],
+                       highlightthickness=0, bd=0, font=(F, 9))
+            _om.pack(side="left")
+        except Exception:
+            pass
+        try:
+            self._game_var.trace_add("write", lambda *_a: self._start_test())
+        except Exception:
+            pass
+        AnimatedButton(top, text="Test", command=self._start_test,
+                       bg=COLORS["accent_green"], fg=COLORS["black"],
+                       font=(F, 9, "bold"), padx=18, pady=6).pack(side="right")
+        self._method_lbl = tk.Label(body, text="", font=(F, 8),
+                                    bg=COLORS["bg"], fg=COLORS["subtext"],
+                                    anchor="w")
+        self._method_lbl.pack(fill="x")
+        self._custom_row = tk.Frame(body, bg=COLORS["bg"])
+        self._rows_body = tk.Frame(body, bg=COLORS["bg"])
+        self._rows_body.pack(fill="x", pady=(4, 0))
+        self._verdict_lbl = tk.Label(body, text="", font=(F, 11, "bold"),
+                                     bg=COLORS["bg"], fg=COLORS["text"],
+                                     anchor="w")
+        self._verdict_lbl.pack(fill="x", pady=(8, 0))
+        self.on_close(self._cancel)
+        self._start_test()
+
+    # ---- target lists ------------------------------------------------- #
+
+    def _tab_key(self):
+        try:
+            from app import gameping as _gp
+            want = self._game_var.get()
+            for title, key in _gp.GAME_TABS:
+                if title == want:
+                    return key
+        except Exception:
+            pass
+        return "fortnite"
+
+    def _targets(self):
+        """[(key, title, kind, host, port_or_None)] for the picked game."""
+        try:
+            from app import gameping as _gp
+            from app.config_persist import load_config as _load
+            key = self._tab_key()
+            try:
+                self._method_lbl.config(text=_gp.GAME_METHODS.get(key, ""))
+            except Exception:
+                pass
+            if key == "custom":
+                return _gp.targets_for(key, (_load().get("gameping_hosts") or []))
+            return _gp.targets_for(key)
+        except Exception:
+            return []
+
+    def _refresh_custom_row(self, show):
+        try:
+            for w in list(self._custom_row.winfo_children()):
+                try:
+                    w.destroy()
+                except Exception:
+                    pass
+            try:
+                self._custom_row.pack_forget()
+            except Exception:
+                pass
+            if not show:
+                return
+            self._custom_row.pack(fill="x", pady=(4, 0))
+            self._custom_entry = tk.Entry(
+                self._custom_row, bg=COLORS["surface"], fg=COLORS["text"],
+                insertbackground=COLORS["text"], font=(F, 9), bd=0,
+                highlightthickness=1, highlightbackground=COLORS["hairline"],
+                width=34)
+            self._custom_entry.pack(side="left")
+            AnimatedButton(self._custom_row, text="Add",
+                           command=self._add_custom,
+                           bg=COLORS["surface"], fg=COLORS["text"],
+                           font=(F, 9, "bold"), padx=14,
+                           pady=4).pack(side="left", padx=(8, 0))
+        except Exception:
+            pass
+
+    def _add_custom(self):
+        try:
+            from app import gameping as _gp
+            from app.config_persist import update_config as _update
+            raw = (self._custom_entry.get() or "").strip()
+            host, port = _gp.split_custom(raw)
+            if not host:
+                try:
+                    self._verdict_lbl.config(
+                        text="That doesn't look like a hostname.",
+                        fg=COLORS["accent_yellow"])
+                except Exception:
+                    pass
+                return
+            saved = port if port is not None else host
+
+            def _mut(cfg, saved=saved):
+                hosts = cfg.get("gameping_hosts")
+                if not isinstance(hosts, list):
+                    hosts = cfg["gameping_hosts"] = []
+                if saved not in hosts and len(hosts) < 64:
+                    hosts.append(saved)
+            _update(_mut)
+            try:
+                self._custom_entry.delete(0, "end")
+            except Exception:
+                pass
+            self._start_test()
+        except Exception:
+            pass
+
+    def _remove_custom(self, raw):
+        try:
+            from app.config_persist import update_config as _update
+
+            def _mut(cfg, raw=raw):
+                hosts = cfg.get("gameping_hosts")
+                if isinstance(hosts, list) and raw in hosts:
+                    hosts.remove(raw)
+            _update(_mut)
+            self._start_test()
+        except Exception:
+            pass
+
+    # ---- test orchestration (inbox pattern) ------------------------- #
+    # Python 3.14 forbids Tk calls off the creating thread
+    # (RuntimeError: main thread is not in main loop) — so workers
+    # NEVER touch Tk, not even after(). They append plain tuples to
+    # _inbox; the Tk-thread poller below drains and paints. Thread
+    # safety comes from single ops under the GIL (append, swap).
+
+    def _cancel(self):
+        try:
+            self._token[0] = True
+        except Exception:
+            pass
+        try:
+            if self._poll_after is not None:
+                self._dlg.after_cancel(self._poll_after)
+        except Exception:
+            pass
+        self._poll_after = None
+        try:
+            if self._poll_after is not None:
+                self._dlg.after_cancel(self._poll_after)
+        except Exception:
+            pass
+        self._poll_after = None
+
+    def _poll(self):
+        """Tk thread: drain worker postings, paint, reschedule while live."""
+        self._poll_after = None
+        try:
+            inbox, self._inbox = self._inbox, []
+        except Exception:
+            inbox = []
+        for tok, key, avg in inbox:
+            try:
+                if tok is self._token:
+                    self._land_one(tok, key, avg)
+            except Exception:
+                pass
+        try:
+            if not self._token[0] and (self._landed[0] or 0) < (self._total[0] or 0):
+                self._poll_after = self._dlg.after(80, self._poll)
+        except Exception:
+            self._poll_after = None
+
+    def _start_test(self):
+        try:
+            self._token[0] = True
+        except Exception:
+            pass
+        token = self._token = [False]
+        targets = self._targets()
+        custom = self._game_var.get() == "Custom"
+        self._refresh_custom_row(custom)
+        try:
+            for w in list(self._rows_body.winfo_children()):
+                try:
+                    w.destroy()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self._rows = {}
+        self._results = {}
+        for key, title, _kind, _host, _port in targets:
+            try:
+                row = tk.Frame(self._rows_body, bg=COLORS["bg"])
+                row.pack(fill="x", pady=1)
+                tk.Label(row, text=title, font=(F, 9, "bold"),
+                         bg=COLORS["bg"], fg=COLORS["text"],
+                         anchor="w").pack(side="left")
+                if custom:
+                    _rm = tk.Label(row, text="✕", font=(F, 9),
+                                   bg=COLORS["bg"], fg=COLORS["subtext"],
+                                   cursor="hand2")
+                    _rm.pack(side="left", padx=(6, 0))
+                    _rm.bind("<Button-1>",
+                             lambda _e, raw=key: self._remove_custom(raw),
+                             add="+")
+                ms = tk.Label(row, text="…", font=(F, 9),
+                              bg=COLORS["bg"], fg=COLORS["subtext"],
+                              anchor="e")
+                ms.pack(side="right")
+                self._rows[key] = {"ms": ms, "row": row}
+            except Exception:
+                pass
+        try:
+            self._verdict_lbl.config(text="Testing…", fg=COLORS["subtext"])
+        except Exception:
+            pass
+        if not targets:
+            try:
+                self._verdict_lbl.config(
+                    text="Add a host above, then Test." if custom else "Nothing to test.",
+                    fg=COLORS["subtext"])
+            except Exception:
+                pass
+            return
+        self._results = {}
+        self._inbox = []
+        self._landed = [0]
+        self._total = [len(targets)]
+        try:
+            import threading as _th
+            for key, title, kind, host, port in targets:
+                _th.Thread(target=self._probe_one,
+                           args=(token, key, kind, host, port),
+                           daemon=True).start()
+        except Exception:
+            pass
+        try:
+            self._poll_after = self._dlg.after(80, self._poll)
+        except Exception:
+            self._poll_after = None
+
+    def _probe_one(self, token, key, kind, host, port):
+        """Worker thread: probe, then post a plain tuple. No Tk here —
+        not even after() (3.14 forbids it off-thread)."""
+        try:
+            from app import gameping as _gp
+            try:
+                dead = bool(token[0])
+            except Exception:
+                dead = True
+            if dead:
+                return
+            cancelled = lambda: bool(token[0])
+            if kind == "tcp":
+                _sent, _ok, avg = _gp.probe_tcp(host, port or 443,
+                                                cancelled=cancelled)
+            else:
+                _sent, _ok, avg = _gp.probe_icmp(host, cancelled=cancelled)
+            try:
+                self._inbox.append((token, key, avg))
+            except Exception:
+                pass
+        except Exception:
+            try:
+                self._inbox.append((token, key, None))
+            except Exception:
+                pass
+
+    def _poll(self):
+        """Tk thread: drain postings, paint, reschedule while live."""
+        self._poll_after = None
+        try:
+            inbox, self._inbox = self._inbox, []
+        except Exception:
+            inbox = []
+        for tok, key, avg in inbox:
+            try:
+                if tok is self._token:
+                    self._land_one(tok, key, avg)
+            except Exception:
+                pass
+        try:
+            if not self._token[0] and (self._landed[0] or 0) < (self._total[0] or 0):
+                self._poll_after = self._dlg.after(80, self._poll)
+        except Exception:
+            self._poll_after = None
+
+    def _land_one(self, token, key, avg):
+        """Tk thread: paint one row; crown the best when all landed."""
+        try:
+            if token is not self._token:
+                return
+        except Exception:
+            return
+        try:
+            from app import gameping as _gp
+            self._results[key] = avg
+            slot = self._rows.get(key)
+            if slot is not None:
+                if avg is None:
+                    slot["ms"].config(text="no reply", fg=COLORS["subtext"])
+                else:
+                    word, good = _gp.verdict(avg)
+                    slot["ms"].config(
+                        text=f"{avg:.0f} ms · {word}",
+                        fg=COLORS["accent_green"] if good else (
+                            COLORS["accent_yellow"] if (avg or 0) < 100
+                            else COLORS["accent_red"]))
+            try:
+                self._landed[0] += 1
+            except Exception:
+                pass
+            if (self._landed[0] or 0) >= (self._total[0] or 0):
+                self._crown_best()
+        except Exception:
+            pass
+
+    def _crown_best(self):
+        try:
+            from app import gameping as _gp
+            ranked = sorted(((k, v) for k, v in self._results.items()
+                             if v is not None), key=lambda kv: kv[1])
+            if not ranked:
+                self._verdict_lbl.config(text="No reply from anywhere — "
+                                              "check your connection.",
+                                         fg=COLORS["accent_red"])
+                return
+            best, ms = ranked[0]
+            word, _good = _gp.verdict(ms)
+            slot = self._rows.get(best)
+            if slot is not None:
+                try:
+                    for w in list(slot["row"].winfo_children()):
+                        if isinstance(w, tk.Label) and w is not slot["ms"]:
+                            w.config(text="★ " + str(w.cget("text")))
+                            break
+                except Exception:
+                    pass
+            self._verdict_lbl.config(text=f"Best: {best} — {ms:.0f} ms ({word}).",
+                                     fg=COLORS["accent_green"])
+        except Exception:
+            pass
+
+
 class ToolsTab(tk.Frame):
     """Tools tab (user redesign 2026-09): the 5th tab — pink accent.
 
-    Six feature cards in a 3+3 grid — the exact same card size,
+    Nine feature cards in a 3x3 grid — the exact same card size,
     gaps and grid as the Tweak tab's 6 preset cards (PER_ROW=3,
     same pack/grid/pad). The old inline shortcuts box now lives in
     the 6th card's Quick Tools popup, so the tab itself is cards
@@ -8245,6 +10122,12 @@ class ToolsTab(tk.Frame):
          "Check download, upload + ping", TAB_ACCENTS["Clean"]),
         ("quick", "🧰", "Quick Tools",
          "Windows tools + settings", TAB_ACCENTS["Tools"]),
+        ("gamepad", "🕹️", "Gamepad Tester",
+         "Test buttons, sticks + triggers", TAB_ACCENTS["Clean"]),
+        ("miccheck", "🎙️", "Mic Check",
+         "Mics, permission + live level", TAB_ACCENTS["Tweak"]),
+        ("gameping", "📶", "Server Ping",
+         "Ping game servers before you queue", TAB_ACCENTS["Clean"]),
     )
 
     _SHORTCUTS = (
@@ -8426,6 +10309,12 @@ class ToolsTab(tk.Frame):
                 self.app._open_speed_test()
             elif key == "quick":
                 self.app._open_quick_tools()
+            elif key == "gamepad":
+                self.app._open_gamepad_tester()
+            elif key == "miccheck":
+                self.app._open_mic_check()
+            elif key == "gameping":
+                self.app._open_game_server_ping()
         except Exception:
             pass
 
@@ -9189,6 +11078,33 @@ class Application:
             if open_target is None:
                 return
             QuickToolsDialog(self.root, self, open_target).wait()
+        except Exception:
+            pass
+
+    def _open_gamepad_tester(self):
+        """Gamepad Tester entry (Tools tab card). Opens the tester
+        popup (read-only XInput polls, no busy-guard needed — same
+        rationale as the speed popup)."""
+        try:
+            GamepadDialog(self.root, self).wait()
+        except Exception:
+            pass
+
+    def _open_mic_check(self):
+        """Mic Check entry (Tools tab card). Opens the check
+        popup (read-only device/consent reads + meter, no busy-guard
+        needed — same rationale as the speed popup)."""
+        try:
+            MicCheckDialog(self.root, self).wait()
+        except Exception:
+            pass
+
+    def _open_game_server_ping(self):
+        """Game Server Ping entry (Tools tab card). Opens the ping
+        popup (read-only measurement, no busy-guard needed — same
+        rationale as the speed popup)."""
+        try:
+            GameServerPingDialog(self.root, self).wait()
         except Exception:
             pass
 

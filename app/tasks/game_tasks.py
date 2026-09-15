@@ -461,6 +461,132 @@ def clean_starcitizen_cache(ctx: TaskContext):
     return total
 
 
+def _localappdata() -> str:
+    """%LOCALAPPDATA% with a profile-relative fallback (same shape as the
+    VRChat helper below — env-var-first, never a hardcoded profile)."""
+    la = os.environ.get("LOCALAPPDATA", "")
+    if la:
+        return la
+    up = os.environ.get("USERPROFILE", "")
+    return os.path.join(up, "AppData", "Local") if up else ""
+
+
+def clean_riot_logs(ctx: TaskContext):
+    """Clear VALORANT + Riot Client diagnostic logs (Unreal crash logs,
+    ShooterGame.log archives, timestamped Riot Client logs — GBs of
+    append-only text the games rewrite on every launch).
+
+    Sources: Riot support's log-collection paths
+    (%LOCALAPPDATA%\\VALORANT\\Saved\\Logs, %LOCALAPPDATA%\\Riot Games\\
+    Riot Client\\Logs). Only *.log/*.dmp inside those log folders —
+    Saved\\Config (keybinds, crosshair, settings) and
+    RiotGamesPrivateSettings.yaml (login tokens) are never touched."""
+    ctx.set_status("Cleaning Riot Games logs...")
+    la = _localappdata()
+    if not la:
+        ctx.log("LocalAppData not found — nothing to do.")
+        return 0
+    roots = [
+        os.path.join(la, "VALORANT", "Saved", "Logs"),
+        os.path.join(la, "VALORANT", "Saved", "Crashes"),
+        os.path.join(la, "Riot Games", "Riot Client", "Logs"),
+    ]
+    total = 0
+    found = False
+    for folder in roots:
+        if os.path.isdir(folder):
+            found = True
+            ctx.log(f"Cleaning Riot logs: {folder}")
+            total += clean_folder_contents(ctx, folder, extensions=[".log", ".dmp"])
+    if not found:
+        ctx.log("No Riot Games logs found — nothing to do.")
+    elif total:
+        ctx.log("Riot logs cleared — launchers rewrite fresh ones next start.")
+    return total
+
+
+def clean_hoyoverse_logs(ctx: TaskContext):
+    """Clear HoYoverse crash/output logs (output_log.txt + crash dumps
+    under the vendors' LocalLow folders — HoYoverse support's own
+    requested files when Genshin crashes; the game rewrites them).
+
+    Only those exact log/dump names — screenshots, configs and game
+    data next to them are never touched. (Player.log here is already
+    covered by the Unity sweep; this adds output_log.txt + dumps.)"""
+    import glob as _glob
+    ctx.set_status("Cleaning HoYoverse logs...")
+    userprofile = os.environ.get("USERPROFILE", "")
+    low = os.path.join(userprofile, "AppData", "LocalLow") if userprofile else ""
+    if not low or not os.path.isdir(low):
+        ctx.log("LocalLow folder not found — nothing to do.")
+        return 0
+    found: list[str] = []
+    for vendor in ("miHoYo", "Cognosphere", "HoYoverse"):
+        vdir = os.path.join(low, vendor)
+        if not os.path.isdir(vdir):
+            continue
+        for pat in ("output_log*.txt", "*.dmp", "crash*.log"):
+            try:
+                for hit in _glob.glob(os.path.join(vdir, "**", pat), recursive=True):
+                    if os.path.isfile(hit):
+                        found.append(hit)
+            except Exception:
+                continue
+    found = list(dict.fromkeys(f for f in found if f))
+    if not found:
+        ctx.log("No HoYoverse logs found — nothing to do.")
+        return 0
+    return _clean_files(ctx, found, "HoYoverse logs")
+
+
+def clean_rockstar_logs(ctx: TaskContext):
+    """Clear Rockstar Games Launcher web cache + logs (%LOCALAPPDATA%\\
+    Rockstar Games\\Launcher\\{cache,logs} — Chromium/HTTP/web-asset
+    debris plus append-only launcher logs; the launcher rebuilds them).
+
+    Only those two subfolders — settings_*.dat (account/launcher
+    settings), CrashLogs state and game installs are never touched.
+    Documents\\Rockstar Games is deliberately excluded (game settings
+    live there)."""
+    ctx.set_status("Cleaning Rockstar Launcher cache...")
+    la = _localappdata()
+    if not la:
+        ctx.log("LocalAppData not found — nothing to do.")
+        return 0
+    base = os.path.join(la, "Rockstar Games", "Launcher")
+    if not os.path.isdir(base):
+        ctx.log("Rockstar Games Launcher data not found — nothing to do.")
+        return 0
+    total = _clean_many(ctx, [os.path.join(base, "cache"),
+                              os.path.join(base, "logs")],
+                        "Rockstar Launcher cache")
+    if total:
+        ctx.log("Rockstar Launcher cache cleared — it rebuilds on next launch.")
+    return total
+
+
+def clean_roblox_logs(ctx: TaskContext):
+    """Clear Roblox client logs (%LOCALAPPDATA%\\Roblox\\logs\\*.log —
+    famously chatty per-session logs; the client opens fresh ones).
+
+    Only *.log inside logs\\ — versions\\ (player executables) and
+    LocalStorage (login/session data) are never touched."""
+    ctx.set_status("Cleaning Roblox logs...")
+    la = _localappdata()
+    if not la:
+        ctx.log("LocalAppData not found — nothing to do.")
+        return 0
+    folder = os.path.join(la, "Roblox", "logs")
+    if not os.path.isdir(folder):
+        ctx.log("Roblox logs not found — nothing to do.")
+        return 0
+    ctx.log(f"Cleaning Roblox logs: {folder}")
+    total = clean_folder_contents(ctx, folder, extensions=[".log"])
+    if total:
+        ctx.log("Roblox logs cleared — fresh ones open with the next session.")
+    return total
+
+
 def clean_steam_stuck_downloads(ctx: TaskContext):
     """Remove Steam's orphaned staging files from failed/paused/cancelled
     updates (steamapps\\downloading + steamapps\\temp). These can pile up
@@ -534,4 +660,11 @@ TASKS = [
     Task("vrchat_cache", "Clear VRChat Cache", "Frees gigabytes of downloaded avatars and worlds; they redownload as you visit them", clean_vrchat_cache, default=False, admin_required=False, column=1),
     Task("fivem_cache", "Clear FiveM Cache", "Fixes broken textures and loading loops on roleplay servers; servers resend their files on next join", clean_fivem_cache, default=False, admin_required=False, column=1),
     Task("starcitizen_cache", "Clean Star Citizen Files", "Clears shader and user caches behind patch-day crashes; keeps keybindings, settings, characters and screenshots", clean_starcitizen_cache, default=False, admin_required=True, column=0),
+    # Log-only sweeps for the biggest free-to-play launchers (user request):
+    # diagnostics the games rewrite every launch; saves, configs, tokens
+    # and executables are never touched. All default=False (opt-in).
+    Task("riot_logs", "Clear Riot Games Logs", "Removes VALORANT + Riot Client diagnostic logs that pile up for gigabytes", clean_riot_logs, default=False, admin_required=False, column=1),
+    Task("hoyoverse_logs", "Clear HoYoverse Logs", "Removes Genshin/Star Rail/ZZZ crash and output logs; games rewrite them", clean_hoyoverse_logs, default=False, admin_required=False, column=1),
+    Task("rockstar_logs", "Clear Rockstar Launcher Cache", "Removes launcher web cache and logs; settings and games untouched", clean_rockstar_logs, default=False, admin_required=False, column=1),
+    Task("roblox_logs", "Clear Roblox Logs", "Removes chatty per-session client logs; fresh ones open next launch", clean_roblox_logs, default=False, admin_required=False, column=1),
 ]

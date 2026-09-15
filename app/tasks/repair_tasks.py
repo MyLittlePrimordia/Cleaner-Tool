@@ -1211,6 +1211,131 @@ def audit_startup_impact(ctx: TaskContext):
     return None
 
 
+def read_mic_consent() -> tuple:
+    """(consent_value_or_None, [(last_used_filetime, app_key), ...]).
+
+    Shared by the repair audit and the Tools mic dialog — one reader so
+    both surfaces agree. Read-only; never raises."""
+    try:
+        import winreg as _wr
+        try:
+            with _wr.OpenKey(_wr.HKEY_CURRENT_USER,
+                             r"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone") as k:
+                try:
+                    value, _ = _wr.QueryValueEx(k, "Value")
+                except OSError:
+                    value = None
+                apps: list = []
+                i = 0
+                while True:
+                    try:
+                        sub = _wr.EnumKey(k, i)
+                    except OSError:
+                        break
+                    i += 1
+                    try:
+                        with _wr.OpenKey(k, sub) as sk:
+                            try:
+                                last, _ = _wr.QueryValueEx(sk, "LastUsedTimeStop")
+                            except OSError:
+                                last = 0
+                            apps.append((int(last or 0), sub))
+                    except OSError:
+                        continue
+                apps.sort(reverse=True)
+                return value, apps
+        except OSError:
+            return None, []
+    except Exception:
+        return None, []
+
+
+def list_capture_devices() -> list:
+    """[(friendly_label, state_int), ...] for every capture endpoint.
+
+    state: 1 = active, 2 = disabled, 4 = not present, 8 = unplugged
+    (anything else = unknown). Read-only; never raises."""
+    out: list = []
+    try:
+        import winreg as _wr2
+        with _wr2.OpenKey(_wr2.HKEY_LOCAL_MACHINE,
+                          r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Capture") as ck:
+            n = _wr2.QueryInfoKey(ck)[0]
+            for i in range(n):
+                try:
+                    sub = _wr2.EnumKey(ck, i)
+                    with _wr2.OpenKey(ck, sub) as ek:
+                        try:
+                            state, _ = _wr2.QueryValueEx(ek, "DeviceState")
+                        except OSError:
+                            state = -1
+                        name, iface = sub, ""
+                        try:
+                            with _wr2.OpenKey(ek, "Properties") as pk:
+                                try:
+                                    name, _ = _wr2.QueryValueEx(
+                                        pk, "{a45c254e-df1c-4efd-8020-67d146a850e0},2")
+                                except OSError:
+                                    pass
+                                try:
+                                    iface, _ = _wr2.QueryValueEx(
+                                        pk, "{b3f8fa53-0004-438e-9003-51a46e139bfc},6")
+                                except OSError:
+                                    pass
+                        except OSError:
+                            pass
+                        label = name if not iface or iface == name else f"{name} ({iface})"
+                        out.append((label, int(state)))
+                except OSError:
+                    continue
+    except Exception:
+        pass
+    return out
+
+
+def audit_mic_consent(ctx: TaskContext):
+    """Report-only microphone audit: the classic 'nobody hears me in
+    Discord/VALORANT' is usually revoked Windows mic privacy, not a
+    driver. Reads the user-level mic consent, which apps used the mic
+    last, and which capture devices Windows sees right now. Changes
+    NOTHING — read-only by design (the fix is the 'Allow Microphone
+    For Apps' tweak, which snapshots + reverts)."""
+    ctx.set_status("Checking microphone access...")
+    lines: list = []
+    blocked = False
+    value, apps = read_mic_consent()
+    if value is None and not apps:
+        lines.append("Microphone consent store not found (very old Windows?)")
+    else:
+        lines.append(f"Microphone privacy for this user: {value}")
+        if isinstance(value, str) and value != "Allow":
+            blocked = True
+        for _last, sub in apps[:5]:
+            lines.append(f"  mic app on file: {sub}")
+    # capture devices Windows sees (read-only MMDevices scan)
+    live = 0
+    try:
+        devs = list_capture_devices()
+    except Exception as exc:
+        devs = []
+        lines.append(f"Could not list capture devices: {exc}")
+    for label, state in devs:
+        if state == 1:
+            live += 1
+            lines.append(f"  mic ready: {label}")
+    if devs and live == 0:
+        lines.append("  no active capture device seen (mic unplugged or disabled)")
+    for line in lines:
+        ctx.log(line)
+    if blocked:
+        raise RuntimeError("Microphone access is OFF for this Windows user — "
+                           "no game or chat app can hear you. Fix: Settings > "
+                           "Privacy & security > Microphone > turn on 'Microphone "
+                           "access', or run the 'Allow Microphone For Apps' tweak.")
+    ctx.log("Audit only — nothing was changed.")
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # Installer tasks MOVED to app/tasks/install_tasks.py (Install tab) — every
 # internet-required task lives there now, per the user's 4th-tab request.
@@ -1265,4 +1390,5 @@ TASKS = [
     Task("registry_backup", "Back Up Registry", "Saves a copy of your system settings to the Desktop as a safety net", backup_registry_hives, default=False, admin_required=True, column=0),
     Task("driver_export", "Back Up Drivers", "Saves copies of your working drivers to the Desktop before reinstalling any", backup_drivers, default=False, admin_required=True, column=1),
     Task("startup_audit", "Check Startup Programs", "Shows what slows your boot; changes nothing, removes nothing", audit_startup_impact, default=False, admin_required=False, column=0),
+    Task("micfix_audit", "Why Can't They Hear Me?", "Diagnoses mic-not-heard in games/chat from privacy + device state; changes nothing", audit_mic_consent, default=False, admin_required=False, column=0),
 ]

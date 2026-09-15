@@ -65,13 +65,15 @@ A free Windows 10/11 utility for gamers: cleans junk, fixes common Windows probl
 **Tools**
 - Storage Insight, PC Health report, fastest-DNS test, and game session Auto-Pilot
 - Internet Speed Test with folk-friendly ratings (browsing, gaming, streaming, calls)
-- Quick Tools shortcuts: system utilities, settings pages, maintenance, logs
+- Gamepad Tester (buttons, sticks, triggers) and Mic Check (devices, permission, live level)
+- Quick Tools shortcuts: system utilities and settings pages
+- Auto Maintenance (🛠️) and Export Logs (📋) live as corner icons on the main window
 
 **Also included**
 - Safety checkpoint (restore point) before changes
 - Works without admin for cleanups; asks for elevation only when needed
 - Auto Maintenance scheduler (daily/weekly/monthly)
-- Dark mode UI, log export via Quick Tools
+- Dark mode UI, log export via the 📋 corner icon
 
 ---
 

@@ -110,6 +110,35 @@ def run_checks():
         tweak_keys = {t.key for t in _tp.TABS["Tweak"]}
         assert {"eee_disable", "ntfs_8dot3", "dynamic_tick_off"} <= tweak_keys
     check("new tasks registered", _task_lists)
+    def _essentials_icons():
+        # every Essentials/LTSC task label must resolve to an icon file
+        # via _row_icon's normalization (spacer-only rows regressed once)
+        import os, re
+        from app.tasks import install_tasks as _it
+        missing = []
+        for t in _it.TASKS:
+            base = re.sub(r"\s*\(.*?\)", "", str(t.label))
+            base = re.sub(r"[^a-z0-9]", "", base.lower()) + ".png"
+            if not os.path.isfile(os.path.join("app/assets/apps", base)):
+                missing.append((t.label, base))
+        assert not missing, f"Essentials tasks without icons: {missing}"
+    check("essentials icons resolve", _essentials_icons)
+    def _com_call_shape():
+        # _mm_vfn(ct, iface, ...) — a dropped leading _ct once turned
+        # every vtable call into garbage reads (silent [] everywhere).
+        # Static audit: every call site must pass _ct first (same or
+        # next line — multi-line calls put it after the paren).
+        import re
+        src = open("app/gui.py", encoding="utf-8").read()
+        bad = []
+        for m in re.finditer(r"_mm_vfn\(", src):
+            if src[max(0, m.start() - 4):m.start()] == "def ":
+                continue
+            tail = src[m.end():m.end() + 120].lstrip()
+            if not (tail.startswith("_ct,") or tail.startswith("_ct)")):
+                bad.append(src[:m.start()].count("\n") + 1)
+        assert not bad, f"_mm_vfn calls missing _ct at lines {bad}"
+    check("COM vtable call shape", _com_call_shape)
     def _junction_guard():
         # re-execute the audit's empirical probe, read-only this time:
         # _is_reparse_point must at least identify real junctions
@@ -250,9 +279,10 @@ def main():
     # so rows stay compact; PhotoImages cached (no GC thinning, no reloads)
     _icons = getattr(ipage, "_icon_cache", {})
     _got = [k for k, v in _icons.items() if v is not None]
-    # every catalog + manual + embedded-bundle row carries its logo
-    # (166 + 13 + 4); a miss means a wrong filename or bad image bytes
-    assert len(_got) == len(_icons) == 166 + 13 + 4, \
+    # every catalog + manual + embedded-bundle + Essentials row carries
+    # its logo (166 + 13 + 4 + 13); a miss means a wrong filename or bad
+    # image bytes
+    assert len(_got) == len(_icons) == 166 + 13 + 4 + 13, \
         f"{len(_got)}/{len(_icons)} row icons loaded"
     for _img in _icons.values():
         if _img is not None:
@@ -2157,33 +2187,42 @@ def main():
         _hs.run_health_scan = _orig_rhs
     print("  health dialog: cards + overall + fix routing OK")
 
-    # --- Tools tab (6 cards 3+3, Tweak geometry; Quick Tools popup) ---
-    # The 6 feature cards open the X-button popups (800x600 modals).
+    # --- Tools tab (9 cards 3x3, Tweak geometry; Quick Tools popup) ---
+    # The 9 feature cards open the X-button popups (800x600 modals).
     # Shortcuts moved from the inline box into the Quick Tools popup —
     # assert tab/cards exist, each card routes, and the popup carries
     # the classic rows.
     tools_page = app.tabs["Tools"]
     assert isinstance(tools_page, gui.ToolsTab), type(tools_page).__name__
-    assert sorted(tools_page._card_frames) == ["dns", "health", "pilot", "quick", "speed", "storage"], \
+    assert sorted(tools_page._card_frames) == ["dns", "gamepad", "gameping", "health",
+                                               "miccheck", "pilot", "quick",
+                                               "speed", "storage"], \
         sorted(tools_page._card_frames)
-    # 3+3 geometry matches Tweak preset cards (same pads/uniform)
+    # 3x3 geometry matches Tweak preset cards (same pads/uniform)
     _pos = {k: (v[0].grid_info()["row"], v[0].grid_info()["column"])
             for k, v in tools_page._card_frames.items()}
-    assert sorted(_pos.values()) == [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)], _pos
+    assert sorted(_pos.values()) == [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2),
+                                     (2, 0), (2, 1), (2, 2)], _pos
     app._switch_to("Tools")
     root.update()
     _opened = []
     _o_storage, _o_dns = app._open_storage_insight, app._open_dns_tester
     _o_health, _o_pilot = app._open_health_report, app._open_pilot_dialog
     _o_speed, _o_quick = app._open_speed_test, app._open_quick_tools
+    _o_gamepad, _o_mic = app._open_gamepad_tester, app._open_mic_check
+    _o_gameping = app._open_game_server_ping
     app._open_storage_insight = lambda: _opened.append("storage")
     app._open_dns_tester = lambda: _opened.append("dns")
     app._open_health_report = lambda: _opened.append("health")
     app._open_pilot_dialog = lambda: _opened.append("pilot")
     app._open_speed_test = lambda: _opened.append("speed")
     app._open_quick_tools = lambda: _opened.append("quick")
+    app._open_gamepad_tester = lambda: _opened.append("gamepad")
+    app._open_mic_check = lambda: _opened.append("miccheck")
+    app._open_game_server_ping = lambda: _opened.append("gameping")
     try:
-        for key in ("storage", "health", "dns", "pilot", "speed", "quick"):
+        for key in ("storage", "health", "dns", "pilot", "speed", "quick",
+                    "gamepad", "miccheck", "gameping"):
             tools_page._mount(key)
             root.update()
             assert _opened and _opened[-1] == key, \
@@ -2192,6 +2231,8 @@ def main():
         app._open_storage_insight, app._open_dns_tester = _o_storage, _o_dns
         app._open_health_report, app._open_pilot_dialog = _o_health, _o_pilot
         app._open_speed_test, app._open_quick_tools = _o_speed, _o_quick
+        app._open_gamepad_tester, app._open_mic_check = _o_gamepad, _o_mic
+        app._open_game_server_ping = _o_gameping
     # shortcuts present inside the Quick Tools popup (same dimensions)
     _qd = gui.QuickToolsDialog(root, app, lambda t: None)
     try:
@@ -2218,6 +2259,176 @@ def main():
     # bottom-corner shortcuts live on the main window (not in the popup)
     assert str(app._corner_maint.cget("text")) == "🛠️", "corner maintenance icon missing"
     assert str(app._corner_logs.cget("text")) == "📋", "corner export-logs icon missing"
+    # new Tools dialogs: real construction, 800x600, ticks run, clean close
+    _gd = gui.GamepadDialog(root, app)
+    try:
+        root.update()
+        assert (_gd._modal_w, _gd._modal_h) == (800, 600), (_gd._modal_w, _gd._modal_h)
+        assert len(_gd._pad_btns) == 14, len(_gd._pad_btns)
+        _gd._paint_pad_idle()
+        _shape, _text = _gd._pad_btns["A"]
+        assert _gd._pad_cv.itemcget(_shape, "fill") == "", "overlay must idle transparent"
+        assert _gd._pad_img is not None, "controller artwork must load"
+        assert (_gd._pad_img.width(), _gd._pad_img.height()) == (300, 300), \
+            (_gd._pad_img.width(), _gd._pad_img.height())
+        assert len(_gd._trig_views) == 2, len(_gd._trig_views)
+        for _lbl in (_gd._stat_rate_val, _gd._stat_ms_val, _gd._stat_drift_val):
+            assert _lbl is not None and str(_lbl.cget("text")) != "", "stat block missing"
+        # themed sliders drive their vars
+        assert len(_gd._sliders) == 2, len(_gd._sliders)
+        _gd._weak_var.set(0.75)
+        assert abs(_gd._weak_var.get() - 0.75) < 1e-9
+        _gd._tick()
+        root.update()
+        assert "connected" in str(_gd._status_lbl.cget("text")).lower() or \
+            "no controller" in str(_gd._status_lbl.cget("text")).lower()
+        if "no controller" in str(_gd._status_lbl.cget("text")).lower():
+            assert _gd._rumble_btn._enabled is False, "rumble must gate on no pad"
+    finally:
+        try:
+            _gd._close()
+        except Exception:
+            pass
+        root.update()
+    # report-rate math unit check (reference formula, synthetic packets)
+    _st = gui._PadReportStats()
+    import time as _t1
+    for _i in range(10):
+        _st.update(_i + 1)
+        _t1.sleep(0.005)
+    assert _st.packets == 10 and _st.hz > 0 and _st.peak_hz >= _st.hz, \
+        (_st.packets, _st.hz, _st.peak_hz)
+    _st.reset()
+    assert _st.packets == 0 and _st.hz == 0, "stats reset broken"
+    # rumble path with a fake pad: burst motors then cut (incl. close)
+    _had_fn = hasattr(gui._xinput_state_fn, "_fn")
+    _old_fn = getattr(gui._xinput_state_fn, "_fn", None)
+    _old_rumble = gui._xinput_rumble
+    _rcalls = []
+    _fstate = {"packet": 0}
+    try:
+        gui._xinput_state_fn._fn = lambda s: dict(
+            packet=_fstate.__setitem__("packet", _fstate["packet"] + 1) or _fstate["packet"],
+            buttons=0, lt=0, rt=0, lx=0, ly=0, rx=0, ry=0) if s == 0 else None
+        gui._xinput_rumble = lambda slot, w, st: _rcalls.append((slot, w, st)) or True
+        _gr = gui.GamepadDialog(root, app)
+        try:
+            _gr._dlg.after = lambda ms, fn, *a: "tX"
+            root.update()
+            for _i in range(32):
+                _gr._tick()
+                _t1.sleep(0.004)
+            assert _gr._stats.hz > 0, "no Hz from synthetic packets"
+            assert "L " in str(_gr._stat_drift_val.cget("text")) and "%" in str(
+                _gr._stat_drift_val.cget("text")), _gr._stat_drift_val.cget("text")
+            assert "Hz" in str(_gr._stat_rate_val.cget("text")), \
+                _gr._stat_rate_val.cget("text")
+            _gr._weak_var.set(0.5)
+            _gr._strong_var.set(1.0)
+            _gr._test_rumble()
+            assert _rcalls and _rcalls[-1][1:] == (0.5, 1.0), _rcalls
+            _gr._stop_rumble()
+            assert _rcalls[-1][1:] == (0, 0), _rcalls
+            _gr._test_rumble()
+            _gr._stop_all()
+            assert _rcalls[-1][1:] == (0, 0), "close must cut motors"
+        finally:
+            try:
+                _gr._close()
+            except Exception:
+                pass
+            root.update()
+    finally:
+        if _had_fn:
+            gui._xinput_state_fn._fn = _old_fn
+        else:
+            try:
+                delattr(gui._xinput_state_fn, "_fn")
+            except Exception:
+                pass
+        gui._xinput_rumble = _old_rumble
+        root.update()
+    _md = gui.MicCheckDialog(root, app)
+    try:
+        root.update()
+        assert (_md._modal_w, _md._modal_h) == (800, 600), (_md._modal_w, _md._modal_h)
+        _md._tick()
+        root.update()
+        _mic_texts = []
+        _collect_labels(_md._dlg, _mic_texts)
+        assert any("Microphone" in t for t in _mic_texts), "mic dialog missing devices"
+        assert not any("not present" in t for t in _mic_texts), "ghost endpoints leaked into UI"
+        assert not any("Mic app on file" in t for t in _mic_texts), "raw registry rows leaked into UI"
+        assert str(_md._verdict_lbl.cget("text")) != "", "verdict line missing"
+        # per-device meter bound (not just enumerated)
+        assert getattr(_md, "_meter", None) is not None or \
+            not [e for e in getattr(_md, "_inputs", []) if e.get("state") == 1], \
+            "active input present but no meter bound"
+        # picker offers a real choice on multi-mic machines
+        _actives = [e for e in getattr(_md, "_inputs", []) if e.get("state") == 1]
+        if len(_actives) > 1:
+            assert any(w.winfo_class() == "Menubutton"
+                       for w in _md._pick_box.winfo_children()), \
+                "multi-mic machine must show the device dropdown"
+    finally:
+        try:
+            _md._close()
+        except Exception:
+            pass
+        root.update()
+    assert gui.ThemedModal.any_open() is False, "new dialogs leaked a modal"
+    # game server ping: tables sane, dialog paints stubbed rows, drains
+    from app import gameping as _gp
+    assert len(_gp.FORTNITE_REGIONS) == 8 and len(_gp.COMPANY_EDGES) == 8
+    assert len(_gp.VALORANT_REGIONS) == 10 and len(_gp.APEX_REGIONS) == 9
+    assert len(_gp.PUBG_REGIONS) == 10
+    assert len(_gp.MINECRAFT_SERVERS) == 2 and len(_gp.ROBLOX_EDGES) == 2
+    assert len(_gp.GAME_TABS) == 8
+    assert all(h.endswith(".ds.on.epicgames.com") for _n, h in _gp.FORTNITE_REGIONS)
+    assert all(_gp.targets_for(k) for _t, k in _gp.GAME_TABS if k != "custom")
+    assert _gp.verdict(12)[0] == "Tournament" and _gp.verdict(125)[0] == "Poor"
+    assert _gp.split_custom("a;b") == ("", None)
+    from app.config_persist import load_config as _lc, update_config as _uc
+    _uc(lambda cfg: cfg.update({"gameping_hosts": ["example.com", "example.com:25565"]}))
+    assert _lc().get("gameping_hosts") == ["example.com", "example.com:25565"]
+    _uc(lambda cfg: cfg.update({"gameping_hosts": []}))
+    _o_icmp, _o_tcp = _gp.probe_icmp, _gp.probe_tcp
+    try:
+        _gp.probe_icmp = lambda *a, **k: (3, 3, 24.0)
+        _gp.probe_tcp = lambda *a, **k: (3, 3, 41.0)
+        _pd = gui.GameServerPingDialog(root, app)
+        try:
+            root.update()
+            assert (_pd._modal_w, _pd._modal_h) == (800, 600)
+            for _ in range(60):
+                root.update()
+                import time as _t5
+                _t5.sleep(0.02)
+                if _pd._landed[0] >= _pd._total[0] > 0:
+                    break
+            root.update()
+            assert "Europe" in str(_pd._verdict_lbl.cget("text")) or \
+                "Best:" in str(_pd._verdict_lbl.cget("text")), \
+                _pd._verdict_lbl.cget("text")
+        finally:
+            try:
+                _pd._close()
+            except Exception:
+                pass
+            root.update()
+    finally:
+        _gp.probe_icmp, _gp.probe_tcp = _o_icmp, _o_tcp
+    assert gui.ThemedModal.any_open() is False, "ping dialog leaked a modal"
+    # new tasks resolve on their tabs (groups validated at import)
+    from app.tab_presets import TABS as _TABS
+    _clean_keys = {t.key for t in _TABS["Clean"]}
+    _tweak_keys = {t.key for t in _TABS["Tweak"]}
+    _repair_keys = {t.key for t in _TABS["Repair"]}
+    for _k in ("riot_logs", "hoyoverse_logs", "rockstar_logs", "roblox_logs"):
+        assert _k in _clean_keys, f"clean task missing: {_k}"
+    for _k in ("taskbar_endtask", "mic_privacy_allow", "clock_seconds", "taskbar_left"):
+        assert _k in _tweak_keys, f"tweak missing: {_k}"
+    assert "micfix_audit" in _repair_keys, "repair task missing: micfix_audit"
     print("  tools tab: cards launch popups + shortcuts OK")
 
     # --- run-engine tab contract (A-1/A-2 regression cover) --------------

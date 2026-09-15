@@ -456,9 +456,35 @@ def clean_font_cache(ctx: TaskContext):
     return total
 
 
+def _wait_and_close_store_app(ctx: TaskContext, attempts: int = 10,
+                              interval: float = 0.5):
+    """wsreset.exe launches the Store app itself once the reset lands —
+    that's by design (no switch suppresses it), and the exact moment it
+    appears on screen isn't deterministic. Poll quietly for the process
+    (no per-attempt log noise) and close it the instant it shows up,
+    instead of leaving it sitting open over the scan."""
+    import subprocess as _sp
+    import time as _time
+    image = "WinStore.App.exe"
+    for _ in range(attempts):
+        try:
+            out = _sp.check_output(
+                f'tasklist /fi "imagename eq {image}" /fo csv /nh',
+                shell=True, text=True, timeout=5, stderr=_sp.DEVNULL,
+                creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
+            )
+            if image.lower() in (out or "").lower():
+                run_cmd(ctx, f"taskkill /f /im {image}", timeout=10)
+                return
+        except Exception:
+            pass
+        _time.sleep(interval)
+
+
 def clean_store_cache(ctx: TaskContext):
     ctx.log("Resetting Microsoft Store cache...")
     run_cmd(ctx, "wsreset.exe", timeout=60)
+    _wait_and_close_store_app(ctx)
     return 0
 
 
@@ -687,15 +713,47 @@ def clean_webview_caches(ctx: TaskContext):
 
 
 # Cleans disk via cleanmgr (no ResetBase — keeps your ability to roll back updates) #
+
+# Arbitrary, unused sageset slot reserved for Cleaner Tool's own profile
+# (0-65535; Microsoft doesn't reserve any range, so any free number works).
+_CLEANMGR_SAGE_NUM = 65432
+
+# Old Windows update / servicing leftovers only — the stuff plain file
+# deletion can't safely reach because it's tracked by the component store.
+# Recycle Bin / temp files are already handled by our own direct-delete
+# tasks elsewhere, so they're deliberately left off this list.
+_CLEANMGR_SAGE_CATEGORIES = (
+    "Windows Update Cleanup",
+    "Windows Upgrade Log Files",
+    "Windows ESD installation files",
+    "Delivery Optimization Files",
+    "Previous Installations",
+    "Service Pack Cleanup",
+)
+
+
 def run_disk_cleanup(ctx: TaskContext):
     ctx.log("[Clean] Disk Cleanup - Run")
-    _sd = os.environ.get("SYSTEMDRIVE", "C:")
-    if len(_sd) == 2 and _sd[1] == ":":
-        _sd_root = _sd + "\\"
-    else:
-        _sd_root = _sd if _sd.endswith("\\") else _sd + "\\"
-    ctx.log(f"$ cleanmgr.exe /d {_sd_root[:-1]} /VERYLOWDISK")
-    run_cmd(ctx, f"cleanmgr.exe /d {_sd_root[:-1]} /VERYLOWDISK", timeout=120)
+    # cleanmgr's /VERYLOWDISK switch is meant for the OS's own low-disk
+    # nudge, not scripted use — it can still land a completion dialog
+    # that needs a manual OK. /sagerun is Microsoft's documented silent
+    # path instead: flag the categories we want once via the registry
+    # (StateFlags under each VolumeCaches handler), then /sagerun applies
+    # them with zero UI, every time. reg add creates the key path if a
+    # given handler isn't present on this edition, so this is safe to run
+    # unconditionally on any Windows version.
+    key_base = (r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer"
+                r"\VolumeCaches")
+    state_flag = f"StateFlags{_CLEANMGR_SAGE_NUM:04d}"
+    for cat in _CLEANMGR_SAGE_CATEGORIES:
+        run_cmd(
+            ctx,
+            f'reg add "{key_base}\\{cat}" /v {state_flag} '
+            f'/t REG_DWORD /d 2 /f',
+            timeout=15,
+        )
+    ctx.log(f"$ cleanmgr.exe /sagerun:{_CLEANMGR_SAGE_NUM}")
+    run_cmd(ctx, f"cleanmgr.exe /sagerun:{_CLEANMGR_SAGE_NUM}", timeout=900)
     ctx.log("Disk Cleanup complete.")
     return 0
 

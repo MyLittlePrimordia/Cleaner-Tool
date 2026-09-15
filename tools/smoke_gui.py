@@ -2367,7 +2367,7 @@ def main():
         # picker offers a real choice on multi-mic machines
         _actives = [e for e in getattr(_md, "_inputs", []) if e.get("state") == 1]
         if len(_actives) > 1:
-            assert any(w.winfo_class() == "TCombobox"
+            assert any(w.winfo_class() == "Menubutton"
                        for w in _md._pick_box.winfo_children()), \
                 "multi-mic machine must show the device dropdown"
     finally:

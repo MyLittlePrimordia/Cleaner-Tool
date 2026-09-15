@@ -728,25 +728,6 @@ GAME_METHODS = {
 }
 
 
-def picker_lists():
-    """Split GAME_TABS for the two-combobox picker (user-approved
-    design): games A-Z with Internet Baseline + Custom appended at the
-    end, and companies A-Z on their own box. Derived from GAME_TABS
-    (the single source of truth) so the two stay in sync with it —
-    companies keep their individual company_N keys, so picking one
-    still measures just that company's edge."""
-    _games = [(t, k) for t, k in GAME_TABS
-              if not k.startswith("company_")
-              and k not in ("companies", "baseline", "custom")]
-    _games.sort(key=lambda r: r[0].casefold())
-    _tail = [(t, k) for t, k in GAME_TABS if k in ("baseline", "custom")]
-    _tail.sort(key=lambda r: 0 if r[1] == "baseline" else 1)
-    _games.extend(_tail)
-    _companies = [(t, k) for t, k in GAME_TABS if k.startswith("company_")]
-    _companies.sort(key=lambda r: r[0].casefold())
-    return tuple(_games), tuple(_companies)
-
-
 def targets_for(key, custom_hosts=()):
     """[(row_key, title, kind, host, port_or_None)] for a tab key."""
     # ICMP-endpoint games

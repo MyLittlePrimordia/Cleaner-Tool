@@ -9720,16 +9720,10 @@ class GameServerPingDialog(ThemedModal):
         self._poll_after = None
         try:
             from app import gameping as _gp0
-            _games, _companies = _gp0.picker_lists()
+            _games = tuple(t for t, _k in sorted(_gp0.GAME_TABS, key=lambda r: r[0].casefold()))
         except Exception:
-            _games, _companies = (("Fortnite", "fortnite"),), ()
-        self._games_tabs = _games
-        self._company_tabs = _companies
-        self._game_var = tk.StringVar(value=_games[0][0] if _games else "")
-        self._company_var = tk.StringVar(value="")
-        # which combo is authoritative for _tab_key() — set by whichever
-        # box the user (or the initial default) last picked from
-        self._active_kind = "game"
+            _games = ("Fortnite",)
+        self._game_var = tk.StringVar(value=_games[0])
         super().__init__(parent, title="Game Server Ping",
                          accent=TAB_ACCENTS["Clean"])
         body = self.body
@@ -9739,49 +9733,26 @@ class GameServerPingDialog(ThemedModal):
                  anchor="w").pack(fill="x")
         top = tk.Frame(body, bg=COLORS["bg"])
         top.pack(fill="x", pady=(8, 2))
-        row1 = tk.Frame(top, bg=COLORS["bg"])
-        row1.pack(fill="x")
-        tk.Label(row1, text="Game:", font=(F, 9), bg=COLORS["bg"],
-                 fg=COLORS["subtext"]).pack(side="left", padx=(0, 6))
         try:
-            # Two comboboxes (user-approved split): games A-Z (Internet
-            # Baseline + Custom appended at the end) and companies A-Z
-            # in their own box below. Both readonly Comboboxes — a flat
-            # OptionMenu spilled 50+ games past the bottom of the screen;
-            # a Combobox scrolls its popdown and gives typeahead (type
-            # "for" -> Fortnite). Mirrors the preset picker above.
+            # Option A (user-approved): the flat OptionMenu spread all 50
+            # games into one menu taller than most screens — it spilled past
+            # the bottom edge. A readonly Combobox scrolls its popdown and
+            # gives typeahead (type "for" → Fortnite), so it always fits and
+            # is far easier to navigate. Mirrors the preset picker above.
             self._game_combo = ttk.Combobox(
-                row1, textvariable=self._game_var,
-                values=[t for t, _k in self._games_tabs],
+                top, textvariable=self._game_var, values=_games,
                 state="readonly", width=42 if tk.TkVersion >= 8.6 else 38,
                 font=(F, 9))
             self._game_combo.pack(side="left")
         except Exception:
             pass
-        AnimatedButton(row1, text="Test", command=self._start_test,
+        try:
+            self._game_var.trace_add("write", lambda *_a: self._start_test())
+        except Exception:
+            pass
+        AnimatedButton(top, text="Test", command=self._start_test,
                        bg=COLORS["accent_green"], fg=COLORS["black"],
                        font=(F, 9, "bold"), padx=18, pady=6).pack(side="right")
-        row2 = tk.Frame(top, bg=COLORS["bg"])
-        row2.pack(fill="x", pady=(4, 0))
-        tk.Label(row2, text="Company:", font=(F, 9), bg=COLORS["bg"],
-                 fg=COLORS["subtext"]).pack(side="left", padx=(0, 6))
-        try:
-            self._company_combo = ttk.Combobox(
-                row2, textvariable=self._company_var,
-                values=[t for t, _k in self._company_tabs],
-                state="readonly", width=42 if tk.TkVersion >= 8.6 else 38,
-                font=(F, 9))
-            self._company_combo.pack(side="left")
-        except Exception:
-            pass
-        try:
-            self._game_var.trace_add("write", self._on_game_pick)
-        except Exception:
-            pass
-        try:
-            self._company_var.trace_add("write", self._on_company_pick)
-        except Exception:
-            pass
         self._method_lbl = tk.Label(body, text="", font=(F, 8),
                                     bg=COLORS["bg"], fg=COLORS["subtext"],
                                     anchor="w")
@@ -9798,21 +9769,11 @@ class GameServerPingDialog(ThemedModal):
 
     # ---- target lists ------------------------------------------------- #
 
-    def _on_game_pick(self, *_a):
-        self._active_kind = "game"
-        self._start_test()
-
-    def _on_company_pick(self, *_a):
-        self._active_kind = "company"
-        self._start_test()
-
     def _tab_key(self):
         try:
-            tabs = (self._company_tabs if self._active_kind == "company"
-                    else self._games_tabs)
-            want = (self._company_var if self._active_kind == "company"
-                    else self._game_var).get()
-            for title, key in tabs:
+            from app import gameping as _gp
+            want = self._game_var.get()
+            for title, key in _gp.GAME_TABS:
                 if title == want:
                     return key
         except Exception:
@@ -9958,7 +9919,7 @@ class GameServerPingDialog(ThemedModal):
             pass
         token = self._token = [False]
         targets = self._targets()
-        custom = self._tab_key() == "custom"
+        custom = self._game_var.get() == "Custom"
         self._refresh_custom_row(custom)
         try:
             for w in list(self._rows_body.winfo_children()):

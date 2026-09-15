@@ -23,7 +23,6 @@ class Task:
     admin_required: bool = True
     risk: str = "SAFE"             # SAFE / ADVANCED / REBOOT REQUIRED (see config.py)
     revert: Optional[Callable[[TaskContext], None]] = None  # tweaks only
-    column: int = 0                # deprecated: layout is auto-balanced round-robin in gui.py (kept for backward compat)
     group: str = "Essentials"      # Install-tab Essentials section this task renders under
                                    # ("Essentials" or "LTSC Missing Components"); ignored elsewhere
     verify: Optional[Callable[[], "bool | None"]] = None

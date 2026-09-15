@@ -1069,7 +1069,7 @@ def main():
     assert len(_t) == 5 and _s == []
     # AdGuard pair resolves + applies together
     assert ("AdGuard", "94.140.14.14") in [(n, ip) for n, ip, _c in _dt.build_targets([])[0]]
-    assert _dt.DNS_SECONDARY["94.140.14.14"] == "94.140.15.15"
+    assert _dt.get_dns_pair("94.140.14.14") == ("94.140.14.14", "94.140.15.15")
     print("  dns targets: router holdback + dedupe + flagging OK")
     # entry (user redesign 2026-09): the toolbar button is gone — the
     # tester lives in the Tools tab (asserted in the Tools section); the
@@ -2367,7 +2367,7 @@ def main():
         # picker offers a real choice on multi-mic machines
         _actives = [e for e in getattr(_md, "_inputs", []) if e.get("state") == 1]
         if len(_actives) > 1:
-            assert any(w.winfo_class() == "Menubutton"
+            assert any(w.winfo_class() == "TCombobox"
                        for w in _md._pick_box.winfo_children()), \
                 "multi-mic machine must show the device dropdown"
     finally:
@@ -2379,11 +2379,12 @@ def main():
     assert gui.ThemedModal.any_open() is False, "new dialogs leaked a modal"
     # game server ping: tables sane, dialog paints stubbed rows, drains
     from app import gameping as _gp
-    assert len(_gp.FORTNITE_REGIONS) == 8 and len(_gp.COMPANY_EDGES) == 8
+    assert len(_gp.FORTNITE_REGIONS) == 8 and len(_gp.COMPANY_EDGES) == 23
     assert len(_gp.VALORANT_REGIONS) == 10 and len(_gp.APEX_REGIONS) == 9
     assert len(_gp.PUBG_REGIONS) == 10
     assert len(_gp.MINECRAFT_SERVERS) == 2 and len(_gp.ROBLOX_EDGES) == 2
-    assert len(_gp.GAME_TABS) == 8
+    assert len(_gp.VALVE_REGIONS) == 10 and len(_gp.COD_REGIONS) == 10
+    assert len(_gp.GAME_TABS) == 72
     assert all(h.endswith(".ds.on.epicgames.com") for _n, h in _gp.FORTNITE_REGIONS)
     assert all(_gp.targets_for(k) for _t, k in _gp.GAME_TABS if k != "custom")
     assert _gp.verdict(12)[0] == "Tournament" and _gp.verdict(125)[0] == "Poor"

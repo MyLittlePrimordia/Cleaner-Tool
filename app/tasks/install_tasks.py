@@ -815,8 +815,10 @@ def install_apo_peace_bundle(ctx: TaskContext):
             except OSError:
                 pass
         if ctx.cancelled():
-            ctx.log("Stopped — remaining parts were skipped.")
-            return
+            # P6-01: bundle stop must never report success — same fix as
+            # update_all_apps (the old bare `return` was counted complete).
+            raise TaskCancelled(
+                "APO + Peace stopped by user — parts already installed remain installed.")
     ctx.log("APO + Peace complete — reboot to finish the audio driver, then open Peace and pick your output device.")
 
 
@@ -994,8 +996,10 @@ def install_apo_fluideq_bundle(ctx: TaskContext):
             except OSError:
                 pass
         if ctx.cancelled():
-            ctx.log("Stopped — FluidEQ was skipped.")
-            return
+            # P6-01: same bundle-stop contract as the Peace bundle — a
+            # stopped install must surface as Stopped, not Complete.
+            raise TaskCancelled(
+                "APO + FluidEQ stopped by user — the APO engine stage (if it ran) is installed.")
     # 2) FluidEQ GUI, resolved 'latest' from the developer's own feed
     resolved = _resolve_electron_latest_yml(
         ctx, "https://github.com/StartSWest/FluidEQ/releases/latest/download/latest.yml",
@@ -1197,9 +1201,25 @@ def get_installed_ids(refresh: bool = False) -> "set[str] | None":
 
 # cached upgradable-app count for the Install tab's "Update Apps (N)"
 # button (winget upgrade is slow, so it is computed once per process in a
-# worker thread, TTL-guarded; `refresh=True` recomputes)
+# worker thread, TTL-guarded; `refresh=True` recomputes).
+# F5-4: the list-of-two trades a tuple because the writer REPLACES element 0
+# (then element 1) instead of rebinding the name — the GUI's reader thread
+# never races a half-rebound tuple. Documented here so nobody "cleans it up"
+# back into a tuple and reintroduces the race.
 _UPGRADE_CACHE: list = [None, 0.0]   # [count-or-None, monotonic-timestamp]
 _UPGRADE_TTL = 300.0
+
+
+def _is_upgrade_footer_line(low: str) -> bool:
+    # F2-3: explicit grouping of the old `and`/`or` mixture. The math is
+    # UNCHANGED — `or` binds looser than `and`, so the original was
+    # `startswith("no ") or ("upgrade" in low and low[0].isdigit()) or
+    # startswith("the following")` — but the parenthesized form can't be
+    # misread (or re-ordered by a future edit into `(A or B) and C`).
+    # low[0] is safe: callers only pass non-empty stripped lines.
+    return (low.startswith("no ")
+            or ("upgrade" in low and low[0].isdigit())
+            or low.startswith("the following"))
 
 
 def get_upgradable_count(refresh: bool = False) -> "int | None":
@@ -1252,8 +1272,8 @@ def get_upgradable_count(refresh: bool = False) -> "int | None":
             continue
         low = s.lower()
         # footers: "2 upgrades available.", "No installed package found ...",
-        # "No applicable update found."
-        if low.startswith("no ") or "upgrade" in low and low[0].isdigit() or low.startswith("the following"):
+        # "No applicable update found." (F2-3: predicate extracted, explicit)
+        if _is_upgrade_footer_line(low):
             # "N upgrades available" terminates the table — stop, don't count it
             if "available" in low:
                 break
@@ -1430,22 +1450,22 @@ from app.tasks import Task  # noqa: E402
 # an Essentials checkbox): the Install tab's "Update Apps (N)" button and
 # the scheduler's "Update Everything Now" both run this through
 # install_selected_mixed. Single source of truth for label/description/run.
-UPDATE_ALL_TASK = Task("update_all", "Update Everything", "winget upgrade --all — one click to bring every installed app current", update_all_apps, default=False, admin_required=False, column=0)
+UPDATE_ALL_TASK = Task("update_all", "Update Everything", "winget upgrade --all — one click to bring every installed app current", update_all_apps, default=False, admin_required=False)
 
 TASKS = [
-    Task("install_store", "Install Microsoft Store", "Adds the Store to stripped Windows like LTSC (takes several minutes)", install_microsoft_store, default=False, admin_required=True, column=0, group="LTSC Missing Components"),
-    Task("install_winget_unigetui", "Install winget + UniGetUI", "Bootstraps winget if missing, then adds the UniGetUI update GUI — no terminal needed", install_winget_unigetui, default=False, admin_required=False, column=0, group="LTSC Missing Components"),
-    Task("install_xbox_stack", "Install Xbox & Game Pass", "Adds Xbox app, Gaming Services and sign-in needed for Game Pass games", install_xbox_stack, default=False, admin_required=True, column=0, group="LTSC Missing Components"),
-    Task("install_game_bar", "Install Game Bar (Win+G)", "Adds the Win+G overlay for clips, screenshots and performance info", install_game_bar, default=False, admin_required=True, column=0, group="LTSC Missing Components"),
-    Task("install_codecs_bundle", "Install Windows Codecs (AV1, VP9 + Web Media)", "One click for the codecs behind broken or black in-game cutscenes", install_codecs_bundle, default=False, admin_required=False, column=0, group="LTSC Missing Components"),
-    Task("install_webview2", "Install WebView2 Runtime", "Evergreen runtime required by EA App, CurseForge, Battle.net and more", install_webview2, default=False, admin_required=False, column=0, group="LTSC Missing Components"),
-    Task("install_vc_bundle", "Install ALL VC++ Runtimes (2005-2022)", "One click for every Visual C++ runtime — x64 + x86, all years; no guessing which one a game needs", task_install_vc_redists, default=False, admin_required=True, column=0),
-    Task("install_vc_allinone", "Install Microsoft Visual C++ All-in-One", "The single latest VC++ 2015-2022 x64 runtime modern games and apps ask for", install_vcredist_allinone, default=False, admin_required=False, column=0),
-    Task("install_directx_bundle", "Install ALL DirectX Runtimes", "One click for d3dx9/d3dx10/d3dx11, XAudio, XInput — fixes missing-DLL game errors", install_directx_bundle, default=False, admin_required=True, column=0),
-    Task("install_directx_runtimes", "Install DirectX End-User Runtimes", "Microsoft's winget package for the legacy d3dx9/d3dx10/d3dx11 libraries behind missing-DLL game errors", install_directx_runtimes_winget, default=False, admin_required=False, column=0),
-    Task("install_dotnet_bundle", "Install ALL .NET Runtimes", "One click for .NET 8 + .NET 6 (+ .NET 3.5 & DirectPlay with admin)", install_dotnet_bundle, default=False, admin_required=False, column=0),
-    Task("install_java_bundle", "Install ALL Java Runtimes", "One click for Java 17 JRE + JDK and legacy Java 8 — every Minecraft era covered", install_java_bundle, default=False, admin_required=False, column=0),
-    Task("install_classic_runtimes", "Install Classic Game Runtimes (OpenAL, XNA, PhysX)", "One click for OpenAL 3D audio, XNA 4.0 and legacy PhysX — S.T.A.L.K.E.R., Terraria, Mirror's Edge", install_classic_runtimes, default=False, admin_required=True, column=0),
+    Task("install_store", "Install Microsoft Store", "Adds the Store to stripped Windows like LTSC (takes several minutes)", install_microsoft_store, default=False, admin_required=True, group="LTSC Missing Components"),
+    Task("install_winget_unigetui", "Install winget + UniGetUI", "Bootstraps winget if missing, then adds the UniGetUI update GUI — no terminal needed", install_winget_unigetui, default=False, admin_required=False, group="LTSC Missing Components"),
+    Task("install_xbox_stack", "Install Xbox & Game Pass", "Adds Xbox app, Gaming Services and sign-in needed for Game Pass games", install_xbox_stack, default=False, admin_required=True, group="LTSC Missing Components"),
+    Task("install_game_bar", "Install Game Bar (Win+G)", "Adds the Win+G overlay for clips, screenshots and performance info", install_game_bar, default=False, admin_required=True, group="LTSC Missing Components"),
+    Task("install_codecs_bundle", "Install Windows Codecs (AV1, VP9 + Web Media)", "One click for the codecs behind broken or black in-game cutscenes", install_codecs_bundle, default=False, admin_required=False, group="LTSC Missing Components"),
+    Task("install_webview2", "Install WebView2 Runtime", "Evergreen runtime required by EA App, CurseForge, Battle.net and more", install_webview2, default=False, admin_required=False, group="LTSC Missing Components"),
+    Task("install_vc_bundle", "Install ALL VC++ Runtimes (2005-2022)", "One click for every Visual C++ runtime — x64 + x86, all years; no guessing which one a game needs", task_install_vc_redists, default=False, admin_required=True),
+    Task("install_vc_allinone", "Install Microsoft Visual C++ All-in-One", "The single latest VC++ 2015-2022 x64 runtime modern games and apps ask for", install_vcredist_allinone, default=False, admin_required=False),
+    Task("install_directx_bundle", "Install ALL DirectX Runtimes", "One click for d3dx9/d3dx10/d3dx11, XAudio, XInput — fixes missing-DLL game errors", install_directx_bundle, default=False, admin_required=True),
+    Task("install_directx_runtimes", "Install DirectX End-User Runtimes", "Microsoft's winget package for the legacy d3dx9/d3dx10/d3dx11 libraries behind missing-DLL game errors", install_directx_runtimes_winget, default=False, admin_required=False),
+    Task("install_dotnet_bundle", "Install ALL .NET Runtimes", "One click for .NET 8 + .NET 6 (+ .NET 3.5 & DirectPlay with admin)", install_dotnet_bundle, default=False, admin_required=False),
+    Task("install_java_bundle", "Install ALL Java Runtimes", "One click for Java 17 JRE + JDK and legacy Java 8 — every Minecraft era covered", install_java_bundle, default=False, admin_required=False),
+    Task("install_classic_runtimes", "Install Classic Game Runtimes (OpenAL, XNA, PhysX)", "One click for OpenAL 3D audio, XNA 4.0 and legacy PhysX — S.T.A.L.K.E.R., Terraria, Mirror's Edge", install_classic_runtimes, default=False, admin_required=True),
 ]
 
 # Equalizer APO + Peace GUI, bundled as ONE install (user request): it
@@ -1454,14 +1474,14 @@ TASKS = [
 # UPDATE_ALL_TASK. Label renamed per user request (was "APO + Peace Audio EQ").
 APO_PEACE_TASK = Task("install_apo_peace", "Equalizer APO + Peace GUI",
                       "One click for system-wide EQ (hear footsteps) with the Peace interface — reboot finishes it",
-                      install_apo_peace_bundle, default=False, admin_required=True, column=0)
+                      install_apo_peace_bundle, default=False, admin_required=True)
 
 # Equalizer APO + FluidEQ (round-8, user request: a second GUI choice for
 # the same engine — the user picks Peace OR FluidEQ, both bundles live in
 # the Media category). Same embedded-row pattern as APO_PEACE_TASK.
 APO_FLUIDEQ_TASK = Task("install_apo_fluideq", "Equalizer APO + FluidEQ",
                         "Same EQ engine with the modern FluidEQ interface (per-output profiles, headphone correction) — bigger download",
-                        install_apo_fluideq_bundle, default=False, admin_required=True, column=0)
+                        install_apo_fluideq_bundle, default=False, admin_required=True)
 
 # RustDesk + FreeFileSync (round-8): the APO+Peace download method applied
 # to two former MANUAL_ONLY_APPS (both verified NOT on winget). They render
@@ -1469,10 +1489,10 @@ APO_FLUIDEQ_TASK = Task("install_apo_fluideq", "Equalizer APO + FluidEQ",
 # link-only manual rows.
 RUSTDESK_TASK = Task("install_rustdesk", "RustDesk",
                      "FOSS remote desktop (TeamViewer replacement) — installed from the official GitHub release, hash-verified",
-                     install_rustdesk, default=False, admin_required=False, column=0)
+                     install_rustdesk, default=False, admin_required=False)
 FREEFILESYNC_TASK = Task("install_freefilesync", "FreeFileSync",
                          "1-click folder/drive backup mirror — installed from the author's signed official installer",
-                         install_freefilesync, default=False, admin_required=False, column=0)
+                         install_freefilesync, default=False, admin_required=False)
 
 # Embedded per-category task rows (round-8): maps a catalog category to the
 # standalone tasks that render as checkbox rows at the END of that

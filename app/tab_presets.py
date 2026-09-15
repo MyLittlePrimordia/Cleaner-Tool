@@ -36,13 +36,13 @@ CUT_TASK_KEYS = {"adv_memory_integrity", "adv_vmp", "wpbt_disable"}
 # The dedup rule: keep the CLEAN-tab twin (it's already referenced by saved
 # configs and the scheduler), absorb the unique Games tasks into Clean.
 
-_GAMES_TO_CLEAN_DEDUPE = {"gamer_launchers": "launcher_cache", "gpu_shader_caches": "shader_cache"}
+GAMES_TO_CLEAN_DEDUPE = {"gamer_launchers": "launcher_cache", "gpu_shader_caches": "shader_cache"}
 
 def _merge_clean():
     merged = list(clean_tasks.TASKS)  # Phase-1 list, M2/M5 dedupe already applied
     seen = {t.key for t in merged}
     for t in game_tasks.TASKS:
-        if t.key in _GAMES_TO_CLEAN_DEDUPE:
+        if t.key in GAMES_TO_CLEAN_DEDUPE:
             continue
         if t.key not in seen:
             merged.append(t)

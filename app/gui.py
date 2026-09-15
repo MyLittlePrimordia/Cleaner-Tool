@@ -1636,7 +1636,7 @@ class DnsTesterDialog(ThemedModal):
         try:
             targets, skipped = build_targets(current)
         except Exception:
-            targets, skipped = ([(n, ip, False) for n, ip in DNS_RESOLVERS], [])
+            targets, skipped = ([(n, ip, False) for n, ip, _s in DNS_RESOLVERS], [])
         self._expected = len(targets)
         self._ui(self._build_rows, targets, skipped, gen)
         import threading as _th
@@ -2259,11 +2259,7 @@ class PilotDialog(ThemedModal):
         _wa_lbl.pack(side="left", padx=(10, 0))
         try:
             Tooltip(_wa_lbl,
-                    "Every game found on this PC (Steam, Epic, GOG, Ubisoft,\n"
-                    "Riot, Xbox, EA) is watched automatically — newly installed\n"
-                    "games are picked up on the next app start. Matches are\n"
-                    "path-verified, so a same-named exe elsewhere never fires.\n"
-                    "Turn this off to watch only the list below.")
+                    "Watch games on this PC automatically. Turn off to use the list below.")
         except Exception:
             pass
         try:
@@ -4984,9 +4980,7 @@ class TaskTab(tk.Frame):
             # real scan workers mid-suite); its behavior is covered by the
             # dedicated dns tests instead
             test_btn._harness_skip = True
-            Tooltip(test_btn, "Find My Fastest DNS — tests Cloudflare, Google, "
-                              "Quad9, OpenDNS and AdGuard on YOUR connection, then offers "
-                              "to apply the winner with one click.")
+            Tooltip(test_btn, "Tests DNS providers on your connection.")
 
         # subtle hover (user request: NO outline, NO background wash — both
         # read as a square box around the pill toggle). Only the switch
@@ -9552,26 +9546,12 @@ class MicCheckDialog(ThemedModal):
                 except Exception:
                     continue
         try:
-            if len(names) > 1:
-                self._pick_var.set(_defname or names[0])
-                _om = tk.OptionMenu(self._pick_box, self._pick_var, *names)
-                try:
-                    _om.config(bg=COLORS["surface"], fg=COLORS["text"],
-                               activebackground=COLORS["surface_hover"],
-                               highlightthickness=0, bd=0, font=(F, 9))
-                except Exception:
-                    pass
-                _om.pack(side="left")
-            elif len(names) == 1:
-                self._pick_var.set(names[0])
-                tk.Label(self._pick_box, text=names[0][:52],
-                         font=(F, 9, "bold"), bg=COLORS["bg"],
-                         fg=COLORS["text"], anchor="w").pack(side="left")
-            else:
-                self._pick_var.set("")
-                tk.Label(self._pick_box, text="none found",
-                         font=(F, 9, "bold"), bg=COLORS["bg"],
-                         fg=COLORS["subtext"], anchor="w").pack(side="left")
+            self._pick_var.set(_defname or (names[0] if names else ""))
+            _om = ttk.Combobox(
+                self._pick_box, textvariable=self._pick_var,
+                values=names, state="readonly",
+                width=42 if tk.TkVersion >= 8.6 else 38, font=(F, 9))
+            _om.pack(side="left")
         except Exception:
             pass
         try:
@@ -9740,10 +9720,16 @@ class GameServerPingDialog(ThemedModal):
         self._poll_after = None
         try:
             from app import gameping as _gp0
-            _games = tuple(t for t, _k in _gp0.GAME_TABS)
+            _games, _companies = _gp0.picker_lists()
         except Exception:
-            _games = ("Fortnite",)
-        self._game_var = tk.StringVar(value=_games[0])
+            _games, _companies = (("Fortnite", "fortnite"),), ()
+        self._games_tabs = _games
+        self._company_tabs = _companies
+        self._game_var = tk.StringVar(value=_games[0][0] if _games else "")
+        self._company_var = tk.StringVar(value="")
+        # which combo is authoritative for _tab_key() — set by whichever
+        # box the user (or the initial default) last picked from
+        self._active_kind = "game"
         super().__init__(parent, title="Game Server Ping",
                          accent=TAB_ACCENTS["Clean"])
         body = self.body
@@ -9753,21 +9739,49 @@ class GameServerPingDialog(ThemedModal):
                  anchor="w").pack(fill="x")
         top = tk.Frame(body, bg=COLORS["bg"])
         top.pack(fill="x", pady=(8, 2))
+        row1 = tk.Frame(top, bg=COLORS["bg"])
+        row1.pack(fill="x")
+        tk.Label(row1, text="Game:", font=(F, 9), bg=COLORS["bg"],
+                 fg=COLORS["subtext"]).pack(side="left", padx=(0, 6))
         try:
-            _om = tk.OptionMenu(top, self._game_var, *_games)
-            _om.config(bg=COLORS["surface"], fg=COLORS["text"],
-                       activebackground=COLORS["surface_hover"],
-                       highlightthickness=0, bd=0, font=(F, 9))
-            _om.pack(side="left")
+            # Two comboboxes (user-approved split): games A-Z (Internet
+            # Baseline + Custom appended at the end) and companies A-Z
+            # in their own box below. Both readonly Comboboxes — a flat
+            # OptionMenu spilled 50+ games past the bottom of the screen;
+            # a Combobox scrolls its popdown and gives typeahead (type
+            # "for" -> Fortnite). Mirrors the preset picker above.
+            self._game_combo = ttk.Combobox(
+                row1, textvariable=self._game_var,
+                values=[t for t, _k in self._games_tabs],
+                state="readonly", width=42 if tk.TkVersion >= 8.6 else 38,
+                font=(F, 9))
+            self._game_combo.pack(side="left")
         except Exception:
             pass
-        try:
-            self._game_var.trace_add("write", lambda *_a: self._start_test())
-        except Exception:
-            pass
-        AnimatedButton(top, text="Test", command=self._start_test,
+        AnimatedButton(row1, text="Test", command=self._start_test,
                        bg=COLORS["accent_green"], fg=COLORS["black"],
                        font=(F, 9, "bold"), padx=18, pady=6).pack(side="right")
+        row2 = tk.Frame(top, bg=COLORS["bg"])
+        row2.pack(fill="x", pady=(4, 0))
+        tk.Label(row2, text="Company:", font=(F, 9), bg=COLORS["bg"],
+                 fg=COLORS["subtext"]).pack(side="left", padx=(0, 6))
+        try:
+            self._company_combo = ttk.Combobox(
+                row2, textvariable=self._company_var,
+                values=[t for t, _k in self._company_tabs],
+                state="readonly", width=42 if tk.TkVersion >= 8.6 else 38,
+                font=(F, 9))
+            self._company_combo.pack(side="left")
+        except Exception:
+            pass
+        try:
+            self._game_var.trace_add("write", self._on_game_pick)
+        except Exception:
+            pass
+        try:
+            self._company_var.trace_add("write", self._on_company_pick)
+        except Exception:
+            pass
         self._method_lbl = tk.Label(body, text="", font=(F, 8),
                                     bg=COLORS["bg"], fg=COLORS["subtext"],
                                     anchor="w")
@@ -9784,11 +9798,21 @@ class GameServerPingDialog(ThemedModal):
 
     # ---- target lists ------------------------------------------------- #
 
+    def _on_game_pick(self, *_a):
+        self._active_kind = "game"
+        self._start_test()
+
+    def _on_company_pick(self, *_a):
+        self._active_kind = "company"
+        self._start_test()
+
     def _tab_key(self):
         try:
-            from app import gameping as _gp
-            want = self._game_var.get()
-            for title, key in _gp.GAME_TABS:
+            tabs = (self._company_tabs if self._active_kind == "company"
+                    else self._games_tabs)
+            want = (self._company_var if self._active_kind == "company"
+                    else self._game_var).get()
+            for title, key in tabs:
                 if title == want:
                     return key
         except Exception:
@@ -9934,7 +9958,7 @@ class GameServerPingDialog(ThemedModal):
             pass
         token = self._token = [False]
         targets = self._targets()
-        custom = self._game_var.get() == "Custom"
+        custom = self._tab_key() == "custom"
         self._refresh_custom_row(custom)
         try:
             for w in list(self._rows_body.winfo_children()):
@@ -12536,6 +12560,45 @@ class Application:
         except Exception:
             pass
 
+    @staticmethod
+    def _invoke_single_task(ctx, task, mode: str = "run", strict_ok: bool = True):
+        """Run ONE Task object (worker thread) and normalize its outcome
+        to (status, task_bytes, exc) with status in ok|skip|stop|fail.
+
+        F2-1/F2-2: this is the single place the five outcomes are derived —
+        both the run_tasks worker and the install Essentials worker call it,
+        so a new outcome (or a changed reading of a return value) can never
+        be implemented in one path and forgotten in the other.
+
+        no run/revert function on the Task -> ('fail', 0, None): the callers
+        log "No revert/run for '<label>'". bool-int handling is explicit:
+        a non-bool int is freed bytes; a boolean False is a failure under
+        strict_ok=True (raises RuntimeError("Task returned False"), matching
+        the old run_tasks behavior) but a benign, task-speak result under
+        strict_ok=False (install Essentials tasks use booleans as their own
+        fine-grained outcome — invented failures would count them wrong)."""
+        if mode == "revert":
+            func = task.revert
+        else:
+            func = task.run
+        if func is None:
+            return "fail", 0, None
+        try:
+            result = func(ctx)
+            if isinstance(result, int) and not isinstance(result, bool):
+                return "ok", result, None
+            if isinstance(result, bool) and not result:
+                if strict_ok:
+                    raise RuntimeError("Task returned False")
+                return "ok", 0, None
+            return "ok", 0, None
+        except TaskSkipped as exc:
+            return "skip", 0, exc
+        except TaskCancelled as exc:
+            return "stop", 0, exc
+        except Exception as exc:
+            return "fail", 0, exc
+
     def install_selected_mixed(self, apps, tasks):
         """Install-tab runner: checked Essentials tasks FIRST (Store brings
         winget, bundles before individual apps), then catalog apps — one
@@ -12628,25 +12691,35 @@ class Application:
 
         def _worker():
             ok_n, fail_n, stopped = 0, 0, False
-            # 1) Essentials tasks (sequential, honest per-task errors)
+
+            def _record(task, status, exc):
+                # F2-2: same outcome contract as the run_tasks worker (via
+                # _invoke_single_task); the mapping to the install counters
+                # lives here only. A skip from an install task is counted
+                # as a failure row, matching the old generic-except catch.
+                nonlocal ok_n, fail_n, stopped
+                if status == "ok":
+                    ok_n += 1
+                elif status == "fail":
+                    fail_n += 1
+                    self.log(f"  ! {task.label} failed: {exc or 'no run available'}")
+                elif status == "stop":
+                    stopped = True
+                    self.log(f"  {task.label} was cancelled: {exc}")
+
+            # 1) Essentials tasks (sequential, honest per-task errors).
+            # strict_ok=False: Essentials install tasks read boolean results
+            # as their own outcome (a False here is NOT an invented failure).
             for task in tasks:
                 if ctx.cancelled():
                     stopped = True
                     break
                 self.set_status(f"Running {task.label}...")
                 self.log(f"--- {task.label} ---")
-                try:
-                    task.run(ctx)
-                    ok_n += 1
-                except TaskCancelled as exc:
-                    # audit minor 2: a cancelled update is stopped, not a
-                    # failure — don't count it in the error box
-                    stopped = True
-                    self.log(f"  {task.label} was cancelled: {exc}")
+                status, _bytes, exc = self._invoke_single_task(ctx, task, "run", strict_ok=False)
+                _record(task, status, exc)
+                if stopped:
                     break
-                except Exception as exc:
-                    fail_n += 1
-                    self.log(f"  ! {task.label} failed: {exc}")
             # 2) Catalog apps — per-app honesty (audit fix: the old code did
             # ok_n += len(apps) whenever install_selected_apps didn't raise,
             # counting failed apps as installed; the runner now reports the
@@ -12834,29 +12907,15 @@ class Application:
         if results is None:
             results = self._run_results = []
 
-        for idx, task in enumerate(tasks):
-            if ctx.cancelled():
-                self.log("Cancelled by user — remaining tasks were skipped.")
-                cancelled = True
-                break
-            self.set_status(f"{verb}: {task.label}...")
-            func = task.revert if mode == "revert" else task.run
-
-            if func is None:
-                self.log(f"  ! No {'revert' if mode=='revert' else 'run'} for '{task.label}'")
-                failed += 1
-                results.append((task.label, "fail", 0))
-                self._set_progress(idx + 1, len(tasks))
-                continue
-            task_bytes = 0
-            try:
-                result = func(ctx)
-                if isinstance(result, int) and not isinstance(result, bool):
-                    total_bytes += result
-                    task_bytes = result
-                elif isinstance(result, bool) and not result:
-                    raise RuntimeError("Task returned False")
+        def _record(idx, task, status, task_bytes, exc):
+            # F2-1: the single place mapping the shared helper's outcome to
+            # the scorecard rows + counters + applied-tweak bookkeeping
+            # (worker-thread locals only; one result row per attempted task,
+            # same as the old inline branches).
+            nonlocal total_bytes, completed, failed, skipped_n, cancelled
+            if status == "ok":
                 completed += 1
+                total_bytes += task_bytes
                 results.append((task.label, "ok", task_bytes))
                 # Phase 2 (#14): keep the applied-tweak registry truthful
                 if mode == "revert":
@@ -12864,7 +12923,7 @@ class Application:
                 else:
                     if task.revert is not None:  # it's a tweak
                         mark_tweak_applied(task.key)
-            except TaskSkipped as exc:
+            elif status == "skip":
                 # B5 audit fix: a skip means nothing changed on this
                 # machine — count it as completed-with-skip, log the
                 # reason, but do NOT record the tweak as applied (the
@@ -12872,25 +12931,33 @@ class Application:
                 skipped_n += 1
                 results.append((task.label, "skip", 0))
                 self.log(f"  (skipped) {task.label}: {exc}")
-            except TaskCancelled as exc:
+            elif status == "stop":
                 # F-2 audit fix: utils.run_cmd_checked deliberately raises
-                # TaskCancelled for a user Stop (its H6 contract), and
-                # install_selected_mixed already treats it as 'stopped' —
-                # but this loop's generic `except Exception` below counted
-                # the interrupted task as FAILED ("Running stopped early:
-                # 0 succeeded, 1 failed" with an 'ERROR' line saying
-                # 'cancelled by user'). Catch it first: the run was
-                # stopped, not failed; no tweak is marked applied/reverted,
-                # remaining tasks are skipped by the next iteration's
-                # cancelled() check, and the summary reports 'stopped'.
+                # TaskCancelled for a user Stop (its H6 contract) — the run
+                # was stopped, not failed; no tweak is marked applied/
+                # reverted, remaining tasks are skipped by the next
+                # iteration's cancelled() check, summary reports 'stopped'.
                 cancelled = True
                 results.append((task.label, "stop", 0))
                 self.log(f"  (stopped) {task.label}: {exc}")
-            except Exception as exc:
+            else:  # "fail"
                 failed += 1
                 results.append((task.label, "fail", 0))
-                self.log(f"  ! ERROR in '{task.label}': {exc}")
+                if exc is None:
+                    # helper reports no run/revert function on the Task
+                    self.log(f"  ! No {'revert' if mode == 'revert' else 'run'} for '{task.label}'")
+                else:
+                    self.log(f"  ! ERROR in '{task.label}': {exc}")
             self._set_progress(idx + 1, len(tasks))
+
+        for idx, task in enumerate(tasks):
+            if ctx.cancelled():
+                self.log("Cancelled by user — remaining tasks were skipped.")
+                cancelled = True
+                break
+            self.set_status(f"{verb}: {task.label}...")
+            status, task_bytes, exc = self._invoke_single_task(ctx, task, mode)
+            _record(idx, task, status, task_bytes, exc)
 
         # tasks never attempted (user Stop mid-run) show as 'stopped' rows
         # so the scorecard tells the whole story. Every attempted task

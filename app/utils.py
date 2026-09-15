@@ -43,6 +43,81 @@ def _is_reparse_point(path: str) -> bool:
         return False
 
 
+def known_folder(name: str, fallback: str = "", *, strict: bool = False) -> str:
+    """Resolve a Windows known folder from HKCU\\...\\User Shell Folders,
+    honoring OneDrive/known-folder redirection (the F-4 fix, shared by the
+    three formerly-duplicated resolvers in launcher_paths / game_tasks /
+    repair_tasks). Returns the expandvars'd value only when it is absolute;
+    otherwise the fallback. With strict=True the value must also be free of
+    cmd metacharacters (&|<>^%\" and friends) — used where the result is
+    embedded into a shell command string (netsh/dism) as a trusted path."""
+    if not IS_WINDOWS or winreg is None:
+        return fallback
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+        ) as key:
+            raw, _ = winreg.QueryValueEx(key, name)
+            resolved = os.path.expandvars(raw)
+            if resolved and os.path.isabs(resolved):
+                if strict and any(c in resolved for c in '"&|<>^%'):
+                    return fallback
+                return resolved
+    except OSError:
+        pass
+    except Exception:
+        pass
+    return fallback
+
+
+def atomic_write_text(dest: str, content: str, newline: str = "\n",
+                      *, restore_readonly: bool = False) -> None:
+    """Write `content` to `dest` atomically via a unique temp file in the
+    SAME directory + os.replace — readers never observe a half-written file,
+    and a crash/lock mid-write leaves the original untouched. Written with
+    explicit newline control (no open() translation surprises).
+
+    `restore_readonly` (hosts-file writers): the destination's read-only
+    attribute (flipped by some AV/security tools) is cleared so os.replace
+    can overwrite it, then re-applied to the new file — replicating the
+    hand-rolled dance the tweak tab used to do inline."""
+    import stat as _stat
+    import tempfile
+    dest = os.path.normpath(dest)
+    parent = os.path.dirname(dest) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".cleanertool.tmp.", dir=parent)
+    was_readonly = False
+    if restore_readonly:
+        try:
+            mode = os.stat(dest).st_mode
+            if not (mode & _stat.S_IWRITE):
+                was_readonly = True
+                os.chmod(dest, mode | _stat.S_IWRITE)
+        except Exception:
+            pass
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline=newline) as fh:
+            fh.write(content)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except Exception:
+                pass
+        os.replace(tmp, dest)
+        if was_readonly:
+            try:
+                os.chmod(dest, os.stat(dest).st_mode & ~_stat.S_IWRITE)
+            except Exception:
+                pass
+    except Exception:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        raise
+
+
 import threading
 import queue
 
@@ -159,6 +234,21 @@ class TaskCancelled(RuntimeError):
 # --------------------------------------------------------------------------- #
 # Subprocess helper — fixed timeout deadlock, proper wait
 # --------------------------------------------------------------------------- #
+
+def cmd_arg(value) -> str:
+    """Quote one token for use inside a run_cmd(command, shell=True) string.
+    Windows cmd.exe quoting is genuinely broken, so this uses
+    subprocess.list2cmdline — the same rules subprocess applies when given
+    a list — meaning `&`, `|`, `>`, `%`, spaces etc. inside a value travel
+    as data, never as command separators. Callers that embed user- or
+    registry-derived values into shell command strings should route them
+    through this (F5-1: shell=True stays the default everywhere for
+    backward compatibility; the helper makes it safe)."""
+    try:
+        return subprocess.list2cmdline([str(value)])
+    except Exception:
+        return str(value)
+
 
 def run_cmd(ctx: TaskContext, command: str, shell: bool = True, timeout: Optional[int] = None,
             collect: "list | None" = None) -> int:
@@ -411,6 +501,12 @@ def clean_folder_contents(ctx: TaskContext, folder_path: str, remove_root: bool 
                 st = os.stat(filepath)
                 size = st.st_size
                 if not dry:
+                    # F5-2: re-verify IMMEDIATELY before removal — a path
+                    # that became a junction/symlink since enumeration would
+                    # redirect os.remove through it into the target.
+                    if _is_reparse_point(filepath):
+                        skipped += 1
+                        continue
                     os.remove(filepath)
                 bytes_freed += size
             except (PermissionError, OSError, FileNotFoundError):
@@ -427,6 +523,10 @@ def clean_folder_contents(ctx: TaskContext, folder_path: str, remove_root: bool 
                 dirpath = os.path.join(root, d)
                 try:
                     if os.path.exists(dirpath) and not os.listdir(dirpath):
+                        # F5-2: re-check before rmdir — a junction planted
+                        # between enumeration and here must not be removed.
+                        if _is_reparse_point(dirpath):
+                            continue
                         os.rmdir(dirpath)
                 except OSError:
                     continue

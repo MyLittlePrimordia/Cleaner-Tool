@@ -17,37 +17,36 @@ from __future__ import annotations
 import socket
 import time
 
-# (display name, primary IPv4) — all anycast, all TCP-capable.
+# (display name, primary IPv4, secondary IPv4) — all anycast, all
+# TCP-capable. The secondary is shipped in the SAME tuple as its primary
+# (F4-1: it used to live in a separate DNS_SECONDARY dict keyed by IP, so
+# the pair could drift — e.g. a renamed index — and gui.py imported the
+# dict on its own; one row per provider now).
 DNS_RESOLVERS = (
-    ("Cloudflare", "1.1.1.1"),
-    ("Google", "8.8.8.8"),
-    ("Quad9", "9.9.9.9"),
-    ("OpenDNS", "208.67.222.222"),
-    ("AdGuard", "94.140.14.14"),
+    ("Cloudflare", "1.1.1.1", "1.0.0.1"),
+    ("Google", "8.8.8.8", "8.8.4.4"),
+    ("Quad9", "9.9.9.9", "149.112.112.112"),
+    ("OpenDNS", "208.67.222.222", "208.67.220.220"),
+    ("AdGuard", "94.140.14.14", "94.140.15.15"),
 )
 
 DNS_PORT = 53
 PROBE_TIMEOUT_S = 1.5
 PROBE_ATTEMPTS = 2
 
-# Secondary for each primary (applied together with the winner).
-DNS_SECONDARY = {
-    "1.1.1.1": "1.0.0.1",
-    "8.8.8.8": "8.8.4.4",
-    "9.9.9.9": "149.112.112.112",
-    "208.67.222.222": "208.67.220.220",
-    "94.140.14.14": "94.140.15.15",
-}
-
 
 def get_dns_pair(ip: str) -> tuple:
     """(primary, secondary) applied when the user picks `ip`.
 
-    Every known provider has a documented secondary (applied together
-    so failover still works); an unknown/custom IP falls back to
-    (ip, ip) — a single-address pair the setter accepts. Pure."""
+    Every known provider keeps its documented secondary in the same row
+    as its primary (F4-1: the pair cannot drift by construction); an
+    unknown/custom IP falls back to (ip, ip) — a single-address pair the
+    setter accepts. Pure."""
     primary = str(ip).strip()
-    return (primary, DNS_SECONDARY.get(primary, primary))
+    for _name, prim, sec in DNS_RESOLVERS:
+        if prim == primary:
+            return (primary, sec)
+    return (primary, primary)
 
 
 def time_resolver(ip: str, timeout: float = PROBE_TIMEOUT_S,
@@ -161,8 +160,8 @@ def build_targets(current) -> tuple:
     back. Public resolvers always; a current-DNS IP is added (flagged,
     deduped) only when publicly testable. Private/router IPs land in
     `skipped` for the dialog's honesty footnote. Pure — unit-tested."""
-    known = {ip for _n, ip in DNS_RESOLVERS}
-    targets = [(name, ip, False) for name, ip in DNS_RESOLVERS]
+    known = {ip for _n, ip, _s in DNS_RESOLVERS}
+    targets = [(name, ip, False) for name, ip, _s in DNS_RESOLVERS]
     skipped = []
     for ip in (current or []):
         if is_private_ip(ip):

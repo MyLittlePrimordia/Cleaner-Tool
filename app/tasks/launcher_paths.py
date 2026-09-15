@@ -27,19 +27,11 @@ def _shell_folder(name: str, fallback_parts: tuple) -> str:
     game that stores data there (junk cleaning) AND the saves backup's
     'My Games' source. Read the shell folder value (the same technique
     game_tasks._desktop_dir uses for Desktop) and expandvars it; fall back
-    to the profile-relative path when the value is missing/unreadable."""
+    to the profile-relative path when the value is missing/unreadable.
+    F3-1: thin wrapper over the single shared resolver in app.utils."""
+    from app.utils import known_folder
     fallback = os.path.join(USERPROFILE, *fallback_parts) if USERPROFILE else ""
-    try:
-        import winreg
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                            r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders") as k:
-            raw, _ = winreg.QueryValueEx(k, name)
-            resolved = os.path.expandvars(raw)
-            if resolved and os.path.isabs(resolved):
-                return resolved
-    except Exception:
-        pass
-    return fallback
+    return known_folder(name, fallback)
 
 
 DOCUMENTS = _shell_folder("Personal", ("Documents",))
@@ -419,7 +411,13 @@ def _build_unity_player_logs() -> list[str]:
     return found
 
 
-UNITY_PLAYER_LOGS = _build_unity_player_logs()
+# F1-1: the LocalLow discovery was a depth-4 recursive walk that ran at
+# IMPORT time (visible multi-100ms app start on Unity-heavy machines).
+# It is now lazy: refresh_dynamic_paths() fills this list in place before
+# every clean/game run, and both entry points (clean_tasks, game_tasks)
+# call that first — so the walk never runs at import, and game logs that
+# appeared while the app was open are still picked up.
+UNITY_PLAYER_LOGS: list = []
 
 _TOP_GAME_CACHE_PATHS = _build_top_game_paths()
 

@@ -7,8 +7,9 @@ import subprocess
 import time
 
 from app.utils import (
-    TaskContext, TaskSkipped, reg_set_value, reg_set_value_checked, reg_delete_value, reg_delete_key, reg_get_value, run_cmd, run_cmd_checked, create_restore_point, IS_WINDOWS,
+    TaskContext, TaskSkipped, TaskCancelled, reg_set_value, reg_set_value_checked, reg_delete_value, reg_delete_key, reg_get_value, run_cmd, run_cmd_checked, create_restore_point, IS_WINDOWS,
     resolve_asset_path, powercfg_query_indexes, sc_query_start_type, restart_explorer,
+    atomic_write_text,
 )
 from app.config_persist import save_tweak_snapshot, get_tweak_snapshot, clear_tweak_snapshot
 
@@ -1021,9 +1022,10 @@ def apply_ssd_last_access(ctx: TaskContext):
 
 
 def revert_ssd_last_access(ctx: TaskContext):
-    if not _has_ssd():
-        ctx.log("No SSD detected — skipping last access revert.")
-        return
+    # P7-01: no _has_ssd() gate — same contract as revert_ssd_prefetch /
+    # revert_ssd_superfetch / revert_ssd_trim: restore regardless of the
+    # current disk (the probe is cached, and the disk may have changed
+    # since apply). 0 = last-access updates ON — the safe Windows default.
     reg_set_value_checked(ctx, "HKLM", "SYSTEM\\CurrentControlSet\\Control\\FileSystem",
                   "NtfsDisableLastAccessUpdate", 0)
 
@@ -1850,52 +1852,19 @@ def _strip_adblock_block(content: str) -> str:
 
 
 def _write_hosts_file(content: str):
-    """Write hosts file content atomically — temp file in the SAME directory,
-    flush + fsync, then os.replace (the config_persist.py pattern). The old
-    truncate-and-write (open(path, "w")) left a corrupt, truncated hosts
-    file — breaking ALL DNS resolution — if the machine crashed, lost power,
-    or an AV tool locked the file mid-write, with no auto-recovery.
-
-    The read-only attribute is cleared first if set (some AV/security tools
-    flip it; os.replace also needs the destination writable) and restored
-    afterward on the replaced file."""
-    hosts_dir = os.path.dirname(_HOSTS_PATH)
-    tmp_path = os.path.join(hosts_dir, "hosts.cleanertool.tmp")
-    was_readonly = False
-    try:
-        import stat
-        mode = os.stat(_HOSTS_PATH).st_mode
-        if not (mode & stat.S_IWRITE):
-            was_readonly = True
-            os.chmod(_HOSTS_PATH, mode | stat.S_IWRITE)
-    except Exception:
-        pass
-    try:
-        with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
-            f.write(content)
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except Exception:
-                pass
-        # Atomic swap: the hosts path only ever sees a COMPLETE file. If this
-        # raises (AV lock, ACL), the original hosts file is untouched and the
-        # error propagates so the caller reports failure honestly.
-        os.replace(tmp_path, _HOSTS_PATH)
-    except Exception:
-        try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
-            pass
-        raise
-    finally:
-        if was_readonly:
-            try:
-                import stat
-                os.chmod(_HOSTS_PATH, os.stat(_HOSTS_PATH).st_mode & ~stat.S_IWRITE)
-            except Exception:
-                pass
+    """Write hosts file content atomically — unique temp file in the SAME
+    directory, flush + fsync, then os.replace (the config_persist.py
+    pattern). The old truncate-and-write (open(path, "w")) left a corrupt,
+    truncated hosts file — breaking ALL DNS resolution — if the machine
+    crashed, lost power, or an AV tool locked the file mid-write, with no
+    auto-recovery. restore_readonly clears the read-only attribute that some
+    AV/security tools flip (os.replace also needs the destination writable)
+    and re-applies it to the replaced file — the exact dance this function
+    used to hand-roll.
+    F3-2: the shared helper's unique temp name means a concurrent repair-tab
+    hosts restore can no longer clobber this write mid-flight (both used to
+    blindly reuse the fixed name hosts.cleanertool.tmp)."""
+    atomic_write_text(_HOSTS_PATH, content, newline="\n", restore_readonly=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -2046,6 +2015,11 @@ def apply_eee_disable(ctx: TaskContext):
     changed = 0
     try:
         for adapter, display, _value in props:
+            # P7-02: honor Stop between adapters — a cancel must surface as
+            # TaskCancelled, never as a half-applied 'success' or a bogus
+            # 'no adapter accepted the change' error.
+            if ctx.cancelled():
+                raise TaskCancelled("EEE disable stopped by user (Undo can restore the partial state).")
             # shell=False argv (no cmd.exe mangling) + ''-escaped names.
             rc = run_cmd(
                 ctx,
@@ -2061,6 +2035,10 @@ def apply_eee_disable(ctx: TaskContext):
         if not changed:
             # honest failure: nothing accepted the change — never claim success
             raise RuntimeError("No adapter accepted the change (NICs vary — check your adapter's own advanced tab).")
+    except TaskCancelled:
+        # keep the snapshot: a partial apply must stay undoable; the C5
+        # 'no false badge' cleanup only applies to real failures.
+        raise
     except Exception:
         if not had_snapshot:
             clear_tweak_snapshot("eee_disable")
@@ -2081,6 +2059,10 @@ def revert_eee_disable(ctx: TaskContext):
     restored = 0
     for adapter, props in adapters.items():
         for display, value in props.items():
+            # P7-02: honor Stop mid-revert — snapshot stays on file (only
+            # the 'nothing restored' path below decides the failure text).
+            if ctx.cancelled():
+                raise TaskCancelled("EEE restore stopped by user — snapshot kept for Undo.")
             rc = run_cmd(ctx,
                          ["powershell", "-NoProfile", "-Command",
                           f"Set-NetAdapterAdvancedProperty -Name '{_ps_sq(adapter)}' "
@@ -3624,99 +3606,99 @@ def verify_ssd_superfetch() -> "bool | None":
 
 
 TASKS = [
-    Task("restore_point_tweak", "Safety Checkpoint", "Saves a restore point so you can undo changes", create_restore_point, default=True, admin_required=True, column=0),
-    Task("ultimate_performance", "Max Performance Mode", "Turns on hidden fastest power plan for better FPS", apply_ultimate_performance, default=True, admin_required=True, revert=revert_ultimate_performance, verify=verify_ultimate_performance, column=0),
+    Task("restore_point_tweak", "Safety Checkpoint", "Saves a restore point so you can undo changes", create_restore_point, default=True, admin_required=True),
+    Task("ultimate_performance", "Max Performance Mode", "Turns on hidden fastest power plan for better FPS", apply_ultimate_performance, default=True, admin_required=True, revert=revert_ultimate_performance, verify=verify_ultimate_performance),
     # audit fix (12 mis-gated HKCU tweaks): these are pure HKCU in BOTH apply
     # and revert — the Task default admin_required=True needlessly skipped
     # them for every non-admin (limited-mode) user.
-    Task("classic_context_menu", "Full Right-Click Menu", "Shows full menu right away, no extra click", apply_classic_context_menu, default=True, admin_required=False, revert=revert_classic_context_menu, verify=verify_classic_context_menu, column=0),
-    Task("disable_game_dvr", "Stop Background Recording", "Stops Xbox recording games in background that slows you", apply_disable_game_dvr, default=True, admin_required=False, revert=revert_disable_game_dvr, verify=verify_disable_game_dvr, column=0),
-    Task("game_mode", "Turn On Game Mode", "Lets Windows focus on your game, not background apps", apply_game_mode, default=True, admin_required=False, revert=revert_game_mode, verify=verify_game_mode, column=0),
-    Task("windowed_optimize", "Smooth Windowed Games", "Makes games smoother when playing in a window", apply_windowed_optimize, default=True, admin_required=False, revert=revert_windowed_optimize, verify=verify_windowed_optimize, column=0),
-    Task("hags", "Faster Graphics (HAGS)", "Lets graphics card handle memory faster, needs restart", apply_hags, default=False, admin_required=True, revert=revert_hags, verify=verify_hags, risk="REBOOT REQUIRED", column=0),
-    Task("priority_separation", "Prioritize Your Game", "Gives your open game more CPU power", apply_priority_separation, default=False, admin_required=True, revert=revert_priority_separation, verify=verify_priority_separation, risk="REBOOT REQUIRED", column=0),
-    Task("power_throttling_off", "Disable CPU Power Throttling", "Stops Windows from slowing CPU to save power", apply_power_throttling_off, default=False, admin_required=True, revert=revert_power_throttling_off, verify=verify_power_throttling_off, risk="REBOOT REQUIRED", column=0),
-    Task("ssd_trim", "Enable SSD TRIM", "Keeps your SSD fast and healthy", apply_ssd_trim, default=False, admin_required=True, revert=revert_ssd_trim, risk="REBOOT REQUIRED", column=1),
-    Task("ssd_superfetch", "Disable SysMain (Superfetch)", "Turns off old hard drive helper not needed for SSD", apply_ssd_superfetch, default=False, admin_required=True, revert=revert_ssd_superfetch, verify=verify_ssd_superfetch, risk="REBOOT REQUIRED", column=1),
-    Task("ssd_last_access", "Disable Last Access Updates", "Stops Windows writing every time you open a file", apply_ssd_last_access, default=False, admin_required=True, revert=revert_ssd_last_access, risk="REBOOT REQUIRED", column=1),
-    Task("ssd_prefetch", "Disable Prefetcher", "Turns off extra loading helper for fast drives", apply_ssd_prefetch, default=False, admin_required=True, revert=revert_ssd_prefetch, risk="REBOOT REQUIRED", column=1),
-    Task("disable_nagle", "Lower Ping (Advanced)", "Makes online games respond faster", apply_disable_nagle, default=False, admin_required=True, revert=revert_disable_nagle, verify=verify_disable_nagle, risk="ADVANCED", column=1),
-    Task("startup_delay", "Faster Startup", "Removes small delay before startup apps open", apply_startup_delay, default=False, admin_required=False, revert=revert_startup_delay, verify=verify_startup_delay, column=0),
-    Task("max_cpu_power", "Max CPU Power", "Aggressive boost, no core parking, full speed while gaming", apply_max_cpu_power, default=False, admin_required=True, revert=revert_max_cpu_power, verify=verify_max_cpu_power, column=0),
-    Task("taskbar_cleanup", "Remove Taskbar Junk", "Turns off Widgets, Chat icon, search highlights and Explorer ads", apply_taskbar_cleanup, default=False, admin_required=False, revert=revert_taskbar_cleanup, column=0),
-    Task("local_search", "Fast Local Search", "Makes Start search instant with no Bing or web results", apply_local_search, default=False, admin_required=False, revert=revert_local_search, verify=verify_local_search, column=0),
-    Task("stop_windows_ads", "Stop Windows Ads & Tips", "Blocks every suggestion, auto-install and lock-screen ad", apply_stop_windows_ads, default=False, admin_required=False, revert=revert_stop_windows_ads, column=0),
-    Task("privacy_baseline", "Privacy Baseline", "One switch for ad ID, tracking, typing data and speech opt-outs", apply_privacy_baseline, default=False, admin_required=False, revert=revert_privacy_baseline, column=0),
-    Task("stop_telemetry", "Stop Telemetry", "Turns off diagnostic services and tracking tasks safely", apply_stop_telemetry, default=False, admin_required=True, revert=revert_stop_telemetry, column=0),
-    Task("nvidia_telemetry", "NVIDIA Telemetry Opt-Out", "Turns off NVIDIA's usage reports (driver untouched)", apply_nvidia_telemetry_optout, default=False, admin_required=True, revert=revert_nvidia_telemetry_optout, column=0),
-    Task("ad_blocker", "System-Wide Ad Blocker", "Blocks ~78,000 known ad/tracker domains via the hosts file", apply_ad_blocker, default=False, revert=revert_ad_blocker, admin_required=True, risk="ADVANCED", column=0),
-    Task("visual_effects", "Faster Animations", "Turns off transparency and animations for speed", apply_visual_effects_perf, default=False, admin_required=False, revert=revert_visual_effects_perf, verify=verify_visual_effects, column=1),
-    Task("mouse_accel", "1:1 Mouse Aim", "Turns off mouse speedup so aim is steady", apply_disable_mouse_accel, default=False, admin_required=False, revert=revert_disable_mouse_accel, verify=verify_mouse_accel, column=1),
-    Task("keyboard_tuning", "Faster Keyboard", "Makes keys repeat faster when you hold them", apply_keyboard_tuning, default=False, admin_required=False, revert=revert_keyboard_tuning, verify=verify_keyboard_tuning, column=1),
-    Task("network_throttling", "Faster Online Gaming", "Removes speed limit Windows uses for videos", apply_network_throttling, default=False, admin_required=True, revert=revert_network_throttling, verify=verify_network_throttling, column=1),
-    Task("games_priority", "Boost Game Priority", "Raises game priority for CPU and graphics", apply_games_priority, default=False, admin_required=True, revert=revert_games_priority, verify=verify_games_priority, column=1),
-    Task("usb_suspend", "Fix USB Dropouts", "Stops Windows pausing USB mics and controllers", apply_usb_suspend, default=False, admin_required=True, revert=revert_usb_suspend, column=1),
-    Task("disk_timeout", "Keep Drive Awake", "Stops drive from sleeping while you game", apply_disk_timeout, default=False, admin_required=True, revert=revert_disk_timeout, column=1),
-    Task("disable_fast_startup", "Fix Boot Issues", "Turns off fast boot to fix driver problems", apply_fast_startup_fix, default=False, admin_required=True, revert=revert_fast_startup_fix, column=1),
-    Task("limit_telemetry", "Limit Tracking", "Tells Windows to collect less info about you", apply_limit_telemetry, default=False, admin_required=True, revert=revert_limit_telemetry, verify=verify_limit_telemetry, column=1),
-    Task("activity_history", "Disable Activity History", "Stops Windows saving your recent files and history", apply_activity_history_disable, default=False, admin_required=True, revert=revert_activity_history_disable, column=0),
-    Task("consumer_features", "Disable Consumer Features", "Stops Windows installing suggested apps", apply_consumer_features_disable, default=False, admin_required=True, revert=revert_consumer_features_disable, column=0),
-    Task("tweak_delivery_optimization", "Disable Delivery Optimization", "Stops sharing updates with other PCs", apply_delivery_optimization_disable, default=False, admin_required=True, revert=revert_delivery_optimization_disable, column=1),
-    Task("end_task_taskbar", "Enable End Task on Taskbar", "Lets you right-click taskbar to close frozen apps", apply_end_task_on_taskbar, default=False, admin_required=False, revert=revert_end_task_on_taskbar, verify=verify_end_task_taskbar, column=1),
-    Task("explorer_auto_discovery", "No Explorer Auto Discovery", "Stops Explorer guessing folder types — IRREVERSIBLY clears all saved folder views/sorts (Undo cannot restore them)", apply_explorer_auto_discovery_disable, default=False, admin_required=False, revert=revert_explorer_auto_discovery_disable, column=0, risk="ADVANCED"),
-    Task("background_apps", "Disable Background Apps", "Stops apps running in background so games get more power", apply_background_apps_disable, default=False, admin_required=False, revert=revert_background_apps_disable, verify=verify_background_apps, column=0),
-    Task("shader_cache_10gb", "Shader Cache 10GB", "Sets shader cache to 10GB to stop stutter", apply_shader_cache_10gb, default=False, admin_required=False, revert=revert_shader_cache_10gb, verify=verify_shader_cache_10gb, column=1),
-    Task("max_performance_gpu", "Prefer Max Performance", "Tells GPU to use max power for games", apply_nvidia_max_performance, default=False, admin_required=True, revert=revert_nvidia_max_performance, column=1),
-    Task("fullscreen_opt", "Fullscreen Optimizations Off", "Fixes game lag in borderless window", apply_fullscreen_optimizations_disable, default=False, admin_required=False, revert=revert_fullscreen_optimizations_disable, verify=verify_fullscreen_opt, column=0),
-    Task("disable_sticky_keys", "Stop Sticky Keys Popups", "Stops Shift-spam popups/beeps interrupting games", apply_disable_sticky_keys, default=False, revert=revert_disable_sticky_keys, verify=verify_disable_sticky_keys, admin_required=False, column=0),
-    Task("suppress_crash_popups", "Stop Crash Popups", "Background app crashes no longer pause or cover your game", apply_suppress_crash_popups, default=False, revert=revert_suppress_crash_popups, verify=verify_suppress_crash_popups, admin_required=False, column=0),
-    Task("no_update_reboot", "Block Update Reboots", "Windows Update won't force-restart your PC while you're using it", apply_no_update_reboot, default=False, revert=revert_no_update_reboot, verify=verify_no_update_reboot, admin_required=True, column=0),
-    Task("mpo_fix", "Fix Monitor Flicker (MPO)", "Fixes black-screen flashes and stutter on multi-monitor setups", apply_mpo_fix, default=False, revert=revert_mpo_fix, verify=verify_mpo_fix, admin_required=True, risk="REBOOT REQUIRED", column=0),
+    Task("classic_context_menu", "Full Right-Click Menu", "Shows full menu right away, no extra click", apply_classic_context_menu, default=True, admin_required=False, revert=revert_classic_context_menu, verify=verify_classic_context_menu),
+    Task("disable_game_dvr", "Stop Background Recording", "Stops Xbox recording games in background that slows you", apply_disable_game_dvr, default=True, admin_required=False, revert=revert_disable_game_dvr, verify=verify_disable_game_dvr),
+    Task("game_mode", "Turn On Game Mode", "Lets Windows focus on your game, not background apps", apply_game_mode, default=True, admin_required=False, revert=revert_game_mode, verify=verify_game_mode),
+    Task("windowed_optimize", "Smooth Windowed Games", "Makes games smoother when playing in a window", apply_windowed_optimize, default=True, admin_required=False, revert=revert_windowed_optimize, verify=verify_windowed_optimize),
+    Task("hags", "Faster Graphics (HAGS)", "Lets graphics card handle memory faster, needs restart", apply_hags, default=False, admin_required=True, revert=revert_hags, verify=verify_hags, risk="REBOOT REQUIRED"),
+    Task("priority_separation", "Prioritize Your Game", "Gives your open game more CPU power", apply_priority_separation, default=False, admin_required=True, revert=revert_priority_separation, verify=verify_priority_separation, risk="REBOOT REQUIRED"),
+    Task("power_throttling_off", "Disable CPU Power Throttling", "Stops Windows from slowing CPU to save power", apply_power_throttling_off, default=False, admin_required=True, revert=revert_power_throttling_off, verify=verify_power_throttling_off, risk="REBOOT REQUIRED"),
+    Task("ssd_trim", "Enable SSD TRIM", "Keeps your SSD fast and healthy", apply_ssd_trim, default=False, admin_required=True, revert=revert_ssd_trim, risk="REBOOT REQUIRED"),
+    Task("ssd_superfetch", "Disable SysMain (Superfetch)", "Turns off old hard drive helper not needed for SSD", apply_ssd_superfetch, default=False, admin_required=True, revert=revert_ssd_superfetch, verify=verify_ssd_superfetch, risk="REBOOT REQUIRED"),
+    Task("ssd_last_access", "Disable Last Access Updates", "Stops Windows writing every time you open a file", apply_ssd_last_access, default=False, admin_required=True, revert=revert_ssd_last_access, risk="REBOOT REQUIRED"),
+    Task("ssd_prefetch", "Disable Prefetcher", "Turns off extra loading helper for fast drives", apply_ssd_prefetch, default=False, admin_required=True, revert=revert_ssd_prefetch, risk="REBOOT REQUIRED"),
+    Task("disable_nagle", "Lower Ping (Advanced)", "Makes online games respond faster", apply_disable_nagle, default=False, admin_required=True, revert=revert_disable_nagle, verify=verify_disable_nagle, risk="ADVANCED"),
+    Task("startup_delay", "Faster Startup", "Removes small delay before startup apps open", apply_startup_delay, default=False, admin_required=False, revert=revert_startup_delay, verify=verify_startup_delay),
+    Task("max_cpu_power", "Max CPU Power", "Aggressive boost, no core parking, full speed while gaming", apply_max_cpu_power, default=False, admin_required=True, revert=revert_max_cpu_power, verify=verify_max_cpu_power),
+    Task("taskbar_cleanup", "Remove Taskbar Junk", "Turns off Widgets, Chat icon, search highlights and Explorer ads", apply_taskbar_cleanup, default=False, admin_required=False, revert=revert_taskbar_cleanup),
+    Task("local_search", "Fast Local Search", "Makes Start search instant with no Bing or web results", apply_local_search, default=False, admin_required=False, revert=revert_local_search, verify=verify_local_search),
+    Task("stop_windows_ads", "Stop Windows Ads & Tips", "Blocks every suggestion, auto-install and lock-screen ad", apply_stop_windows_ads, default=False, admin_required=False, revert=revert_stop_windows_ads),
+    Task("privacy_baseline", "Privacy Baseline", "One switch for ad ID, tracking, typing data and speech opt-outs", apply_privacy_baseline, default=False, admin_required=False, revert=revert_privacy_baseline),
+    Task("stop_telemetry", "Stop Telemetry", "Turns off diagnostic services and tracking tasks safely", apply_stop_telemetry, default=False, admin_required=True, revert=revert_stop_telemetry),
+    Task("nvidia_telemetry", "NVIDIA Telemetry Opt-Out", "Turns off NVIDIA's usage reports (driver untouched)", apply_nvidia_telemetry_optout, default=False, admin_required=True, revert=revert_nvidia_telemetry_optout),
+    Task("ad_blocker", "System-Wide Ad Blocker", "Blocks ~78,000 known ad/tracker domains via the hosts file", apply_ad_blocker, default=False, revert=revert_ad_blocker, admin_required=True, risk="ADVANCED"),
+    Task("visual_effects", "Faster Animations", "Turns off transparency and animations for speed", apply_visual_effects_perf, default=False, admin_required=False, revert=revert_visual_effects_perf, verify=verify_visual_effects),
+    Task("mouse_accel", "1:1 Mouse Aim", "Turns off mouse speedup so aim is steady", apply_disable_mouse_accel, default=False, admin_required=False, revert=revert_disable_mouse_accel, verify=verify_mouse_accel),
+    Task("keyboard_tuning", "Faster Keyboard", "Makes keys repeat faster when you hold them", apply_keyboard_tuning, default=False, admin_required=False, revert=revert_keyboard_tuning, verify=verify_keyboard_tuning),
+    Task("network_throttling", "Faster Online Gaming", "Removes speed limit Windows uses for videos", apply_network_throttling, default=False, admin_required=True, revert=revert_network_throttling, verify=verify_network_throttling),
+    Task("games_priority", "Boost Game Priority", "Raises game priority for CPU and graphics", apply_games_priority, default=False, admin_required=True, revert=revert_games_priority, verify=verify_games_priority),
+    Task("usb_suspend", "Fix USB Dropouts", "Stops Windows pausing USB mics and controllers", apply_usb_suspend, default=False, admin_required=True, revert=revert_usb_suspend),
+    Task("disk_timeout", "Keep Drive Awake", "Stops drive from sleeping while you game", apply_disk_timeout, default=False, admin_required=True, revert=revert_disk_timeout),
+    Task("disable_fast_startup", "Fix Boot Issues", "Turns off fast boot to fix driver problems", apply_fast_startup_fix, default=False, admin_required=True, revert=revert_fast_startup_fix),
+    Task("limit_telemetry", "Limit Tracking", "Tells Windows to collect less info about you", apply_limit_telemetry, default=False, admin_required=True, revert=revert_limit_telemetry, verify=verify_limit_telemetry),
+    Task("activity_history", "Disable Activity History", "Stops Windows saving your recent files and history", apply_activity_history_disable, default=False, admin_required=True, revert=revert_activity_history_disable),
+    Task("consumer_features", "Disable Consumer Features", "Stops Windows installing suggested apps", apply_consumer_features_disable, default=False, admin_required=True, revert=revert_consumer_features_disable),
+    Task("tweak_delivery_optimization", "Disable Delivery Optimization", "Stops sharing updates with other PCs", apply_delivery_optimization_disable, default=False, admin_required=True, revert=revert_delivery_optimization_disable),
+    Task("end_task_taskbar", "Enable End Task on Taskbar", "Lets you right-click taskbar to close frozen apps", apply_end_task_on_taskbar, default=False, admin_required=False, revert=revert_end_task_on_taskbar, verify=verify_end_task_taskbar),
+    Task("explorer_auto_discovery", "No Explorer Auto Discovery", "Stops Explorer guessing folder types — IRREVERSIBLY clears all saved folder views/sorts (Undo cannot restore them)", apply_explorer_auto_discovery_disable, default=False, admin_required=False, revert=revert_explorer_auto_discovery_disable, risk="ADVANCED"),
+    Task("background_apps", "Disable Background Apps", "Stops apps running in background so games get more power", apply_background_apps_disable, default=False, admin_required=False, revert=revert_background_apps_disable, verify=verify_background_apps),
+    Task("shader_cache_10gb", "Shader Cache 10GB", "Sets shader cache to 10GB to stop stutter", apply_shader_cache_10gb, default=False, admin_required=False, revert=revert_shader_cache_10gb, verify=verify_shader_cache_10gb),
+    Task("max_performance_gpu", "Prefer Max Performance", "Tells GPU to use max power for games", apply_nvidia_max_performance, default=False, admin_required=True, revert=revert_nvidia_max_performance),
+    Task("fullscreen_opt", "Fullscreen Optimizations Off", "Fixes game lag in borderless window", apply_fullscreen_optimizations_disable, default=False, admin_required=False, revert=revert_fullscreen_optimizations_disable, verify=verify_fullscreen_opt),
+    Task("disable_sticky_keys", "Stop Sticky Keys Popups", "Stops Shift-spam popups/beeps interrupting games", apply_disable_sticky_keys, default=False, revert=revert_disable_sticky_keys, verify=verify_disable_sticky_keys, admin_required=False),
+    Task("suppress_crash_popups", "Stop Crash Popups", "Background app crashes no longer pause or cover your game", apply_suppress_crash_popups, default=False, revert=revert_suppress_crash_popups, verify=verify_suppress_crash_popups, admin_required=False),
+    Task("no_update_reboot", "Block Update Reboots", "Windows Update won't force-restart your PC while you're using it", apply_no_update_reboot, default=False, revert=revert_no_update_reboot, verify=verify_no_update_reboot, admin_required=True),
+    Task("mpo_fix", "Fix Monitor Flicker (MPO)", "Fixes black-screen flashes and stutter on multi-monitor setups", apply_mpo_fix, default=False, revert=revert_mpo_fix, verify=verify_mpo_fix, admin_required=True, risk="REBOOT REQUIRED"),
 
     # --- Round 2 feature tasks (user request) --- #
-    Task("gaming_dns", "Gaming DNS (Cloudflare)", "Switches DNS to Cloudflare 1.1.1.1/1.0.0.1 — often the fastest for game servers; fully undoable", apply_gaming_dns, default=False, revert=revert_gaming_dns, admin_required=True, column=0),
-    Task("refresh_rate_fix", "Max Refresh Rate", "Checks your monitor is running at its highest Hz — many 144Hz+ screens ship stuck at 60Hz", apply_refresh_rate_fix, default=False, revert=revert_refresh_rate_fix, admin_required=False, column=0),
-    Task("gpu_preference_high", "Prefer Dedicated GPU", "Tells Windows to always run games on the dedicated GPU instead of the power-saving one (laptops)", apply_gpu_preference_high, default=False, revert=revert_gpu_preference_high, admin_required=False, column=0),
+    Task("gaming_dns", "Gaming DNS (Cloudflare)", "Switches DNS to Cloudflare 1.1.1.1/1.0.0.1 — often the fastest for game servers; fully undoable", apply_gaming_dns, default=False, revert=revert_gaming_dns, admin_required=True),
+    Task("refresh_rate_fix", "Max Refresh Rate", "Checks your monitor is running at its highest Hz — many 144Hz+ screens ship stuck at 60Hz", apply_refresh_rate_fix, default=False, revert=revert_refresh_rate_fix, admin_required=False),
+    Task("gpu_preference_high", "Prefer Dedicated GPU", "Tells Windows to always run games on the dedicated GPU instead of the power-saving one (laptops)", apply_gpu_preference_high, default=False, revert=revert_gpu_preference_high, admin_required=False),
 
     # --- Round 3 tasks (user request) --- #
-    Task("eee_disable", "Fix NIC Disconnects (EEE)", "Stops network card power-saving that drops packets mid-game; restores your exact prior settings on undo", apply_eee_disable, default=False, revert=revert_eee_disable, admin_required=True, column=0),
-    Task("ntfs_8dot3", "Disable 8.3 Short Names", "Speeds up folders with huge numbers of files; restores your PC's prior setting on undo", apply_ntfs_8dot3_disable, default=False, revert=revert_ntfs_8dot3_disable, admin_required=True, column=0),
-    Task("dynamic_tick_off", "Disable Dynamic Tick", "Legacy latency tweak for benchmarkers — debatable gains on modern PCs; fully undoable", apply_disable_dynamic_tick, default=False, revert=revert_disable_dynamic_tick, admin_required=True, risk="REBOOT REQUIRED", column=0),
+    Task("eee_disable", "Fix NIC Disconnects (EEE)", "Stops network card power-saving that drops packets mid-game; restores your exact prior settings on undo", apply_eee_disable, default=False, revert=revert_eee_disable, admin_required=True),
+    Task("ntfs_8dot3", "Disable 8.3 Short Names", "Speeds up folders with huge numbers of files; restores your PC's prior setting on undo", apply_ntfs_8dot3_disable, default=False, revert=revert_ntfs_8dot3_disable, admin_required=True),
+    Task("dynamic_tick_off", "Disable Dynamic Tick", "Legacy latency tweak for benchmarkers — debatable gains on modern PCs; fully undoable", apply_disable_dynamic_tick, default=False, revert=revert_disable_dynamic_tick, admin_required=True, risk="REBOOT REQUIRED"),
 
     # --- Round 4 tasks (user request: everyday usability + quiet privacy) --- #
-    Task("file_extensions", "Show File Extensions", "Shows file extensions and hidden files — a must for editing configs and mods", apply_file_extensions, default=False, revert=revert_file_extensions, admin_required=False, column=0),
-    Task("menu_delay", "Snappier Menus", "Menus pop in 100ms instead of 400ms — instant-feeling Start menu", apply_menu_delay, default=False, revert=revert_menu_delay, admin_required=False, column=0),
-    Task("aero_shake", "No Shake-to-Minimize", "Stops windows minimizing everything when you grab and shake one mid-game", apply_aero_shake_off, default=False, revert=revert_aero_shake_off, admin_required=False, column=0),
-    Task("lock_screen", "Skip Lock Screen", "Boots straight to the login prompt instead of the pretty lock screen", apply_lock_screen_off, default=False, revert=revert_lock_screen_off, admin_required=True, column=0),
-    Task("edge_preload", "Stop Edge Preloading", "Stops Edge background boost processes if you never open Edge", apply_edge_preload_off, default=False, revert=revert_edge_preload_off, admin_required=True, column=0),
-    Task("dark_mode", "Prefer Dark Apps", "Asks apps to use their dark theme for a consistent look", apply_dark_mode, default=False, revert=revert_dark_mode, admin_required=False, column=0),
-    Task("remote_assist", "Disable Remote Assistance", "Closes the inbound-remote-help vector most gamers never use", apply_remote_assist_off, default=False, revert=revert_remote_assist_off, admin_required=True, column=0),
-    Task("verbose_boot", "Verbose Boot Messages", "Shows what Windows is doing at boot and shutdown instead of the spinner", apply_verbose_boot, default=False, revert=revert_verbose_boot, admin_required=True, column=0),
-    Task("location_tracking", "Disable Location Tracking", "Turns off the location sensor (breaks Find My Device and auto time-zone)", apply_location_tracking_off, default=False, revert=revert_location_tracking_off, admin_required=True, column=0),
-    Task("widgets_board_off", "Disable Widgets Board", "Kills the Widgets news board entirely, not just its taskbar icon", apply_widgets_board_off, default=False, revert=revert_widgets_board_off, admin_required=True, column=0),
-    Task("autoplay_off", "Disable USB AutoPlay", "Stops USB sticks auto-launching apps when plugged in", apply_autoplay_off, default=False, revert=revert_autoplay_off, admin_required=False, column=0),
-    Task("snap_flyout_off", "No Snap Popups", "Stops layout popups when hovering maximize mid-game", apply_snap_flyout_off, default=False, revert=revert_snap_flyout_off, admin_required=False, column=0),
+    Task("file_extensions", "Show File Extensions", "Shows file extensions and hidden files — a must for editing configs and mods", apply_file_extensions, default=False, revert=revert_file_extensions, admin_required=False),
+    Task("menu_delay", "Snappier Menus", "Menus pop in 100ms instead of 400ms — instant-feeling Start menu", apply_menu_delay, default=False, revert=revert_menu_delay, admin_required=False),
+    Task("aero_shake", "No Shake-to-Minimize", "Stops windows minimizing everything when you grab and shake one mid-game", apply_aero_shake_off, default=False, revert=revert_aero_shake_off, admin_required=False),
+    Task("lock_screen", "Skip Lock Screen", "Boots straight to the login prompt instead of the pretty lock screen", apply_lock_screen_off, default=False, revert=revert_lock_screen_off, admin_required=True),
+    Task("edge_preload", "Stop Edge Preloading", "Stops Edge background boost processes if you never open Edge", apply_edge_preload_off, default=False, revert=revert_edge_preload_off, admin_required=True),
+    Task("dark_mode", "Prefer Dark Apps", "Asks apps to use their dark theme for a consistent look", apply_dark_mode, default=False, revert=revert_dark_mode, admin_required=False),
+    Task("remote_assist", "Disable Remote Assistance", "Closes the inbound-remote-help vector most gamers never use", apply_remote_assist_off, default=False, revert=revert_remote_assist_off, admin_required=True),
+    Task("verbose_boot", "Verbose Boot Messages", "Shows what Windows is doing at boot and shutdown instead of the spinner", apply_verbose_boot, default=False, revert=revert_verbose_boot, admin_required=True),
+    Task("location_tracking", "Disable Location Tracking", "Turns off the location sensor (breaks Find My Device and auto time-zone)", apply_location_tracking_off, default=False, revert=revert_location_tracking_off, admin_required=True),
+    Task("widgets_board_off", "Disable Widgets Board", "Kills the Widgets news board entirely, not just its taskbar icon", apply_widgets_board_off, default=False, revert=revert_widgets_board_off, admin_required=True),
+    Task("autoplay_off", "Disable USB AutoPlay", "Stops USB sticks auto-launching apps when plugged in", apply_autoplay_off, default=False, revert=revert_autoplay_off, admin_required=False),
+    Task("snap_flyout_off", "No Snap Popups", "Stops layout popups when hovering maximize mid-game", apply_snap_flyout_off, default=False, revert=revert_snap_flyout_off, admin_required=False),
 
     # --- Round 5 tasks (user request: self-maintaining PC + responsiveness) --- #
-    Task("storage_sense", "Auto Cleanup (Storage Sense)", "Windows cleans its own temp junk monthly — the PC maintains itself", apply_storage_sense, default=False, revert=revert_storage_sense, admin_required=False, column=0),
-    Task("fast_app_close", "Fast App Close", "Shutdown stops waiting 20 seconds for frozen apps to close", apply_fast_app_close, default=False, revert=revert_fast_app_close, admin_required=False, column=0),
-    Task("instant_alt_tab", "Instant Alt-Tab Focus", "Removes the window-focus lockout delay when alt-tabbing back into games", apply_instant_alt_tab, default=False, revert=revert_instant_alt_tab, admin_required=False, column=0),
-    Task("numlock_boot", "NumLock at Boot", "Keeps the numpad ready at every boot for MMO and RPG muscle memory", apply_numlock_boot, default=False, revert=revert_numlock_boot, admin_required=False, column=0),
-    Task("clipboard_sync_off", "Stop Cloud Clipboard Sync", "Stops copied text being uploaded to Microsoft's cloud — Win+V stays local", apply_clipboard_sync_off, default=False, revert=revert_clipboard_sync_off, admin_required=True, column=0),
-    Task("reserved_storage_off", "Free Reserved Storage", "Releases the ~7 GB Windows locks away for updates — back when you undo", apply_reserved_storage_off, default=False, revert=revert_reserved_storage_off, admin_required=True, column=0),
+    Task("storage_sense", "Auto Cleanup (Storage Sense)", "Windows cleans its own temp junk monthly — the PC maintains itself", apply_storage_sense, default=False, revert=revert_storage_sense, admin_required=False),
+    Task("fast_app_close", "Fast App Close", "Shutdown stops waiting 20 seconds for frozen apps to close", apply_fast_app_close, default=False, revert=revert_fast_app_close, admin_required=False),
+    Task("instant_alt_tab", "Instant Alt-Tab Focus", "Removes the window-focus lockout delay when alt-tabbing back into games", apply_instant_alt_tab, default=False, revert=revert_instant_alt_tab, admin_required=False),
+    Task("numlock_boot", "NumLock at Boot", "Keeps the numpad ready at every boot for MMO and RPG muscle memory", apply_numlock_boot, default=False, revert=revert_numlock_boot, admin_required=False),
+    Task("clipboard_sync_off", "Stop Cloud Clipboard Sync", "Stops copied text being uploaded to Microsoft's cloud — Win+V stays local", apply_clipboard_sync_off, default=False, revert=revert_clipboard_sync_off, admin_required=True),
+    Task("reserved_storage_off", "Free Reserved Storage", "Releases the ~7 GB Windows locks away for updates — back when you undo", apply_reserved_storage_off, default=False, revert=revert_reserved_storage_off, admin_required=True),
     # --- Round 6 tasks (user request: taskbar usability + mic privacy) --- #
     # All HKCU-only (no admin), all snapshot + revert, all Custom-only.
-    Task("taskbar_endtask", "Taskbar End Task Button", "Right-click any taskbar icon to force-close a frozen game, no Task Manager", apply_taskbar_endtask, default=False, revert=revert_taskbar_endtask, verify=verify_taskbar_endtask, admin_required=False, column=0),
-    Task("mic_privacy_allow", "Allow Microphone For Apps", "Fixes 'nobody hears me in game/chat' when Windows revoked mic access", apply_mic_privacy_allow, default=False, revert=revert_mic_privacy_allow, verify=verify_mic_privacy_allow, admin_required=False, column=0),
-    Task("clock_seconds", "Clock Shows Seconds", "Taskbar clock shows seconds — handy for cooldown and queue timers", apply_clock_seconds, default=False, revert=revert_clock_seconds, verify=verify_clock_seconds, admin_required=False, column=0),
-    Task("taskbar_left", "Left-Align Taskbar", "Moves Start back to the left corner, classic style", apply_taskbar_left, default=False, revert=revert_taskbar_left, verify=verify_taskbar_left, admin_required=False, column=0),
+    Task("taskbar_endtask", "Taskbar End Task Button", "Right-click any taskbar icon to force-close a frozen game, no Task Manager", apply_taskbar_endtask, default=False, revert=revert_taskbar_endtask, verify=verify_taskbar_endtask, admin_required=False),
+    Task("mic_privacy_allow", "Allow Microphone For Apps", "Fixes 'nobody hears me in game/chat' when Windows revoked mic access", apply_mic_privacy_allow, default=False, revert=revert_mic_privacy_allow, verify=verify_mic_privacy_allow, admin_required=False),
+    Task("clock_seconds", "Clock Shows Seconds", "Taskbar clock shows seconds — handy for cooldown and queue timers", apply_clock_seconds, default=False, revert=revert_clock_seconds, verify=verify_clock_seconds, admin_required=False),
+    Task("taskbar_left", "Left-Align Taskbar", "Moves Start back to the left corner, classic style", apply_taskbar_left, default=False, revert=revert_taskbar_left, verify=verify_taskbar_left, admin_required=False),
     # --- Round 7 tasks (user request: Winhance-audit picks) --- #
     # All snapshot + revert (+verify), all Custom-only, presets untouched.
-    Task("alt_tab_windows_only", "Alt+Tab Windows Only", "Alt+Tab flips between real windows and games, no Edge tabs in the way", apply_alt_tab_windows_only, default=False, revert=revert_alt_tab_windows_only, verify=verify_alt_tab_windows_only, admin_required=False, column=0),
-    Task("taskbar_never_combine", "Never Combine Taskbar Buttons", "Every open window keeps its own labeled button instead of piling up", apply_taskbar_never_combine, default=False, revert=revert_taskbar_never_combine, verify=verify_taskbar_never_combine, admin_required=False, column=0),
-    Task("discord_no_ducking", "Stop Discord Lowering Game Sound", "Calls no longer auto-lower your game and media volume", apply_discord_no_ducking, default=False, revert=revert_discord_no_ducking, verify=verify_discord_no_ducking, admin_required=False, column=0),
-    Task("ads_master_off", "Master Switch: No Windows Ads", "One flick turns off the whole suggestions and ads engine at the source", apply_ads_master_off, default=False, revert=revert_ads_master_off, verify=verify_ads_master_off, admin_required=False, column=0),
-    Task("device_search_history_off", "No On-Device Search History", "Windows stops remembering what you searched for on this PC", apply_device_search_history_off, default=False, revert=revert_device_search_history_off, verify=verify_device_search_history_off, admin_required=False, column=0),
-    Task("long_paths", "Allow Long File Paths", "Lets games and mods use very long file names without errors", apply_long_paths, default=False, revert=revert_long_paths, verify=verify_long_paths, admin_required=True, column=0),
-    Task("classic_shortcut_icons", "Classic Shortcut Icons", "Clean desktop icons: no arrow overlay, no ' - Shortcut' text", apply_classic_shortcut_icons, default=False, revert=revert_classic_shortcut_icons, verify=verify_classic_shortcut_icons, admin_required=False, column=0),
+    Task("alt_tab_windows_only", "Alt+Tab Windows Only", "Alt+Tab flips between real windows and games, no Edge tabs in the way", apply_alt_tab_windows_only, default=False, revert=revert_alt_tab_windows_only, verify=verify_alt_tab_windows_only, admin_required=False),
+    Task("taskbar_never_combine", "Never Combine Taskbar Buttons", "Every open window keeps its own labeled button instead of piling up", apply_taskbar_never_combine, default=False, revert=revert_taskbar_never_combine, verify=verify_taskbar_never_combine, admin_required=False),
+    Task("discord_no_ducking", "Stop Discord Lowering Game Sound", "Calls no longer auto-lower your game and media volume", apply_discord_no_ducking, default=False, revert=revert_discord_no_ducking, verify=verify_discord_no_ducking, admin_required=False),
+    Task("ads_master_off", "Master Switch: No Windows Ads", "One flick turns off the whole suggestions and ads engine at the source", apply_ads_master_off, default=False, revert=revert_ads_master_off, verify=verify_ads_master_off, admin_required=False),
+    Task("device_search_history_off", "No On-Device Search History", "Windows stops remembering what you searched for on this PC", apply_device_search_history_off, default=False, revert=revert_device_search_history_off, verify=verify_device_search_history_off, admin_required=False),
+    Task("long_paths", "Allow Long File Paths", "Lets games and mods use very long file names without errors", apply_long_paths, default=False, revert=revert_long_paths, verify=verify_long_paths, admin_required=True),
+    Task("classic_shortcut_icons", "Classic Shortcut Icons", "Clean desktop icons: no arrow overlay, no ' - Shortcut' text", apply_classic_shortcut_icons, default=False, revert=revert_classic_shortcut_icons, verify=verify_classic_shortcut_icons, admin_required=False),
 ]

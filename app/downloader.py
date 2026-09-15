@@ -360,6 +360,11 @@ def _norm_winget_rc(rc: int) -> int:
 
 
 _network_probe_cache: list = [None, 0.0]  # [result, timestamp monotonic]
+# F5-4: the cache is a list-of-two, written by REPLACING elements (not by
+# rebinding the name) — GUI worker threads read it on the main/other
+# thread, and a list never exposes a half-rebound tuple. GIL makes each
+# element store atomic; do NOT "clean this up" into `cached, stamp = result,
+# now` rebinding.
 _NETWORK_PROBE_TTL = 30.0
 
 

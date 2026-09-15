@@ -67,16 +67,17 @@ def clean_engine_cache(ctx: TaskContext):
 
 
 def _is_driver_leftover_folder(folder_path: str) -> bool:
-    """Check if a driver folder appears to be leftover installation files."""
+    """True if the folder is safe to delete as a leftover driver install.
+
+    Safety gate (the only thing inspected is the folder ROOT): an actively
+    referenced driver keeps its .sys/.dll/.inf/.cat binaries at the root of
+    these staging folders (C:\\NVIDIA, C:\\AMD, C:\\ATI, C:\\Intel\\Driver) —
+    if ANY driver binary appears at root level we refuse and the folder is
+    skipped. Logs, temp files, and version-numbered subfolders are all
+    disposable install debris; clean_folder_contents walks them safely."""
     if not os.path.isdir(folder_path):
         return False
     try:
-        # Check if folder contains only safe-to-delete content:
-        # - Log files (*.log, *.txt)
-        # - Temp files (*.tmp, *.temp)
-        # - Old version folders (e.g., 390.77, 460.89)
-        # - Installer caches
-        # If it has executable drivers (.sys, .dll in root), it might be active
         for entry in os.listdir(folder_path):
             entry_path = os.path.join(folder_path, entry)
             if os.path.isfile(entry_path):
@@ -84,8 +85,6 @@ def _is_driver_leftover_folder(folder_path: str) -> bool:
                 # Skip if there are driver binaries in root (might be active)
                 if ext in (".sys", ".dll", ".inf", ".cat"):
                     return False
-            # Subdirectories are inspected only for name pattern; version folders (e.g., "390.77") are safe
-            # No extra check needed — top-level .sys/.dll guard is the safety gate
         return True
     except OSError:
         return False
@@ -927,41 +926,41 @@ def clean_terminal_history(ctx: TaskContext):
 from app.tasks import Task  # noqa: E402
 
 TASKS = [
-    Task("shader_cache", "Clear Shader Cache", "Removes temp graphics files that help fix stutter", clean_shader_cache, default=True, admin_required=False, column=0),
-    Task("launcher_cache", "Clean Launchers & Chat", "Clears every game store plus Discord, Slack, Teams, Spotify junk", clean_launcher_cache, default=True, admin_required=False, column=0),
-    Task("engine_cache", "Clean Engine Cache", "Removes leftover Unreal/Unity build files", clean_engine_cache, default=True, admin_required=False, column=0),
-    Task("driver_junk", "Remove Old Drivers", "Deletes old NVIDIA/AMD installer leftovers", clean_driver_junk, default=True, admin_required=True, column=0),
-    Task("user_temp_files", "Empty User Temp Files", "Deletes leftover temp files Windows left behind", clean_user_temp_files, default=True, admin_required=False, column=0),
-    Task("system_temp_files", "Empty System Temp Files", "Cleans system temp files no longer needed", clean_system_temp_files, default=True, admin_required=True, column=0),
-    Task("win_update_cache", "Fix Update Cache", "Fixes Windows Update when downloads get stuck", clean_windows_update_cache, default=True, admin_required=True, column=0),
-    Task("delivery_optimization", "Clear Update Share Cache", "Removes update copies kept to share with other PCs", clean_delivery_optimization, default=True, admin_required=True, column=0),
-    Task("inet_cache", "Clear Internet Cache", "Clears old internet temp files", clean_inet_cache, default=True, admin_required=False, column=0),
-    Task("recycle_bin", "Empty Bin & Crash Reports", "Empties trash and removes old crash dumps", clean_recycle_bin_and_dumps, default=True, admin_required=True, column=1),
-    Task("error_reports", "Clear Error Reports", "Deletes old Windows error reports", clean_error_reports, default=True, admin_required=False, column=1),
-    Task("gpu_watchdog_dumps", "Clean GPU Watchdog Dumps", "Removes multi-GB driver-hang dumps that pile up after black-screen flashes", clean_gpu_watchdog_dumps, default=False, admin_required=True, column=1),
-    Task("thumbnail_cache", "Fix Blurry Icons", "Rebuilds icons, fixes missing thumbnails", clean_thumbnail_icon_cache, default=True, admin_required=False, column=1),
-    Task("chk_fragments", "Remove Disk Fragments", "Deletes leftover files from disk checks", clean_chk_fragments, default=True, admin_required=True, column=1),
-    Task("old_logs", "Clear System Logs", "Removes old Windows logs", clean_old_logs, default=True, admin_required=True, column=1),
-    Task("dns_flush", "Fix Internet (DNS)", "Clears internet cache to fix sites not loading", flush_dns, default=True, admin_required=False, column=1),
-    Task("ram_purge", "Free Up RAM", "Asks Windows to free unused memory", purge_ram_working_sets, default=False, admin_required=False, column=1),
-    Task("update_leftovers", "Clear Update Leftovers", "Run this only once your PC has been running fine for a few days after a big Windows update", clean_windows_update_leftovers, default=False, admin_required=True, risk="ADVANCED", column=0),
-    Task("activity_traces", "Clear Activity Traces", "Clears recent-files and jump-list history for privacy", clean_activity_traces, default=False, admin_required=False, column=0),
-    Task("prefetch", "Clear Prefetch Files", "Clears prefetch data, usually not needed", clean_prefetch, default=False, admin_required=True, risk="ADVANCED", column=1),
-    Task("disk_cleanup_deep", "Deep Disk Cleanup", "Deep cleans old Windows update files", run_disk_cleanup, default=False, admin_required=True, risk="ADVANCED", column=0),
-    Task("browser_cache", "Clear Browser Cache", "Clears browser temp files, keeps passwords", clean_browser_caches, default=False, admin_required=False, column=1),
-    Task("office_cache", "Clear Office Cache", "Removes Office temporary files", clean_office_cache, default=False, admin_required=False, column=1),
-    Task("uwp_cache", "Clear UWP App Caches", "Clears Windows apps temp files like Photos", clean_uwp_cache, default=False, admin_required=False, column=1),
-    Task("font_cache", "Fix Broken Fonts", "Rebuilds fonts to fix garbled text", clean_font_cache, default=False, admin_required=True, column=1),
-    Task("store_cache", "Fix Store", "Resets Store if apps won't download", clean_store_cache, default=False, admin_required=False, column=1),
-    Task("temp_deep_clean", "Deep Temp Clean", "Deep cleans temp files with PowerShell", remove_temp_files_deep, default=False, admin_required=True, column=0),
-    Task("remove_bloat", "Remove Windows Bloat", "Removes Clipchamp, MSN apps, TikTok and other preinstalled junk", remove_windows_bloat, default=False, admin_required=True, column=1),
-    Task("winget_cache", "Clear WinGet Cache", "Removes leftover installer files and logs from Windows' app downloader", clean_winget_cache, default=False, admin_required=False, column=1),
-    Task("event_logs", "Clear Event Viewer Logs", "Wipes old Windows diagnostic logs so they start fresh", clean_event_logs, default=False, admin_required=True, column=1),
-    Task("defender_history", "Clear Defender History", "Removes stale protection-history entries that haunt the Security app", clean_defender_history, default=False, admin_required=True, column=1),
-    Task("steam_depot", "Clean Steam Download Cache", "Clears Steam's manifest cache that causes phantom update states", clean_steam_download_cache, default=False, admin_required=False, column=0),
-    Task("dev_caches", "Clean Dev Caches", "Clears VS Code, npm and pip caches for modders and AI tinkerers", clean_dev_caches, default=False, admin_required=False, column=1),
-    Task("pkg_caches", "Clean Package Caches", "Clears NuGet, Cargo and Gradle download caches; projects untouched", clean_package_manager_caches, default=False, admin_required=False, column=1),
-    Task("terminal_history", "Clear Terminal History", "Clears PowerShell command history for privacy; settings untouched", clean_terminal_history, default=False, admin_required=False, column=0),
-    Task("onedrive_logs", "Clear OneDrive Logs", "Removes diagnostic logs OneDrive leaves behind; files and settings untouched", clean_onedrive_logs, default=False, admin_required=False, column=1),
-    Task("webview_cache", "Clear WebView App Caches", "Clears embedded-browser junk from EA App, CurseForge and similar launchers; logins kept", clean_webview_caches, default=False, admin_required=False, column=1),
+    Task("shader_cache", "Clear Shader Cache", "Removes temp graphics files that help fix stutter", clean_shader_cache, default=True, admin_required=False),
+    Task("launcher_cache", "Clean Launchers & Chat", "Clears every game store plus Discord, Slack, Teams, Spotify junk", clean_launcher_cache, default=True, admin_required=False),
+    Task("engine_cache", "Clean Engine Cache", "Removes leftover Unreal/Unity build files", clean_engine_cache, default=True, admin_required=False),
+    Task("driver_junk", "Remove Old Drivers", "Deletes old NVIDIA/AMD installer leftovers", clean_driver_junk, default=True, admin_required=True),
+    Task("user_temp_files", "Empty User Temp Files", "Deletes leftover temp files Windows left behind", clean_user_temp_files, default=True, admin_required=False),
+    Task("system_temp_files", "Empty System Temp Files", "Cleans system temp files no longer needed", clean_system_temp_files, default=True, admin_required=True),
+    Task("win_update_cache", "Fix Update Cache", "Fixes Windows Update when downloads get stuck", clean_windows_update_cache, default=True, admin_required=True),
+    Task("delivery_optimization", "Clear Update Share Cache", "Removes update copies kept to share with other PCs", clean_delivery_optimization, default=True, admin_required=True),
+    Task("inet_cache", "Clear Internet Cache", "Clears old internet temp files", clean_inet_cache, default=True, admin_required=False),
+    Task("recycle_bin", "Empty Bin & Crash Reports", "Empties trash and removes old crash dumps", clean_recycle_bin_and_dumps, default=True, admin_required=True),
+    Task("error_reports", "Clear Error Reports", "Deletes old Windows error reports", clean_error_reports, default=True, admin_required=False),
+    Task("gpu_watchdog_dumps", "Clean GPU Watchdog Dumps", "Removes multi-GB driver-hang dumps that pile up after black-screen flashes", clean_gpu_watchdog_dumps, default=False, admin_required=True),
+    Task("thumbnail_cache", "Fix Blurry Icons", "Rebuilds icons, fixes missing thumbnails", clean_thumbnail_icon_cache, default=True, admin_required=False),
+    Task("chk_fragments", "Remove Disk Fragments", "Deletes leftover files from disk checks", clean_chk_fragments, default=True, admin_required=True),
+    Task("old_logs", "Clear System Logs", "Removes old Windows logs", clean_old_logs, default=True, admin_required=True),
+    Task("dns_flush", "Fix Internet (DNS)", "Clears internet cache to fix sites not loading", flush_dns, default=True, admin_required=False),
+    Task("ram_purge", "Free Up RAM", "Asks Windows to free unused memory", purge_ram_working_sets, default=False, admin_required=False),
+    Task("update_leftovers", "Clear Update Leftovers", "Run this only once your PC has been running fine for a few days after a big Windows update", clean_windows_update_leftovers, default=False, admin_required=True, risk="ADVANCED"),
+    Task("activity_traces", "Clear Activity Traces", "Clears recent-files and jump-list history for privacy", clean_activity_traces, default=False, admin_required=False),
+    Task("prefetch", "Clear Prefetch Files", "Clears prefetch data, usually not needed", clean_prefetch, default=False, admin_required=True, risk="ADVANCED"),
+    Task("disk_cleanup_deep", "Deep Disk Cleanup", "Deep cleans old Windows update files", run_disk_cleanup, default=False, admin_required=True, risk="ADVANCED"),
+    Task("browser_cache", "Clear Browser Cache", "Clears browser temp files, keeps passwords", clean_browser_caches, default=False, admin_required=False),
+    Task("office_cache", "Clear Office Cache", "Removes Office temporary files", clean_office_cache, default=False, admin_required=False),
+    Task("uwp_cache", "Clear UWP App Caches", "Clears Windows apps temp files like Photos", clean_uwp_cache, default=False, admin_required=False),
+    Task("font_cache", "Fix Broken Fonts", "Rebuilds fonts to fix garbled text", clean_font_cache, default=False, admin_required=True),
+    Task("store_cache", "Fix Store", "Resets Store if apps won't download", clean_store_cache, default=False, admin_required=False),
+    Task("temp_deep_clean", "Deep Temp Clean", "Deep cleans temp files with PowerShell", remove_temp_files_deep, default=False, admin_required=True),
+    Task("remove_bloat", "Remove Windows Bloat", "Removes Clipchamp, MSN apps, TikTok and other preinstalled junk", remove_windows_bloat, default=False, admin_required=True),
+    Task("winget_cache", "Clear WinGet Cache", "Removes leftover installer files and logs from Windows' app downloader", clean_winget_cache, default=False, admin_required=False),
+    Task("event_logs", "Clear Event Viewer Logs", "Wipes old Windows diagnostic logs so they start fresh", clean_event_logs, default=False, admin_required=True),
+    Task("defender_history", "Clear Defender History", "Removes stale protection-history entries that haunt the Security app", clean_defender_history, default=False, admin_required=True),
+    Task("steam_depot", "Clean Steam Download Cache", "Clears Steam's manifest cache that causes phantom update states", clean_steam_download_cache, default=False, admin_required=False),
+    Task("dev_caches", "Clean Dev Caches", "Clears VS Code, npm and pip caches for modders and AI tinkerers", clean_dev_caches, default=False, admin_required=False),
+    Task("pkg_caches", "Clean Package Caches", "Clears NuGet, Cargo and Gradle download caches; projects untouched", clean_package_manager_caches, default=False, admin_required=False),
+    Task("terminal_history", "Clear Terminal History", "Clears PowerShell command history for privacy; settings untouched", clean_terminal_history, default=False, admin_required=False),
+    Task("onedrive_logs", "Clear OneDrive Logs", "Removes diagnostic logs OneDrive leaves behind; files and settings untouched", clean_onedrive_logs, default=False, admin_required=False),
+    Task("webview_cache", "Clear WebView App Caches", "Clears embedded-browser junk from EA App, CurseForge and similar launchers; logins kept", clean_webview_caches, default=False, admin_required=False),
 ]

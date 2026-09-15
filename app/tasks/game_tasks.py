@@ -12,7 +12,7 @@ Tasks:
 
 import os
 
-from app.utils import TaskContext, clean_folder_contents
+from app.utils import TaskContext, TaskCancelled, clean_folder_contents, known_folder
 from app.tasks import launcher_paths as _lp
 from app.tasks.launcher_paths import (
     GAMER_LAUNCHER_ALL,
@@ -28,33 +28,17 @@ from app.tasks.launcher_paths import (
 def _desktop_dir() -> str:
     """Real Desktop path, respecting OneDrive/known-folder redirection.
     USERPROFILE\\Desktop is wrong on OneDrive-redirected machines — read the
-    shell folder value and expandvars it instead."""
-    import winreg
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                            r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders") as k:
-            raw, _ = winreg.QueryValueEx(k, "Desktop")
-            return os.path.expandvars(raw)
-    except OSError:
-        return os.path.join(os.environ.get("USERPROFILE", ""), "Desktop")
+    shell folder value and expandvars it instead. F3-1: shared resolver."""
+    return known_folder("Desktop",
+                        os.path.join(os.environ.get("USERPROFILE", ""), "Desktop"))
 
 
 def _shell_dir(name: str, fallback: str) -> str:
     """Known-folder path with OneDrive redirection (F-4): Documents is
     OneDrive-redirected by default on new Win11 profiles, so a saves backup
-    built from USERPROFILE\\Documents would silently miss My Games. Same
-    technique as _desktop_dir, with the given profile-relative fallback."""
-    try:
-        import winreg
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                            r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders") as k:
-            raw, _ = winreg.QueryValueEx(k, name)
-            resolved = os.path.expandvars(raw)
-            if resolved and os.path.isabs(resolved):
-                return resolved
-    except OSError:
-        pass
-    return fallback
+    built from USERPROFILE\\Documents would silently miss My Games. F3-1:
+    shared resolver; `fallback` is a full path to return when unreadable."""
+    return known_folder(name, fallback)
 
 
 def backup_game_saves(ctx: TaskContext):
@@ -88,15 +72,25 @@ def backup_game_saves(ctx: TaskContext):
     if not sources:
         raise RuntimeError("No save folders found — nothing to back up.")
 
-    # 1) size estimate + free-space guard (uncompressed size = safe upper bound)
+    # 1) single walk: collect the file list AND sum the free-space guard in
+    #    one pass (F1-2/F4-2: the second walk is gone, so a directory that
+    #    changes between the estimate and the zip can no longer leave the
+    #    guard and the archive disagreeing; the ZIP reader only ever touches
+    #    files this function has already seen).
+    files_to_zip = []
     total = 0
-    for path, _tag in sources:
+    for path, tag in sources:
         for root, _dirs, files in os.walk(path):
+            if ctx.cancelled():
+                # Nothing has been written yet — never leave a partial zip.
+                raise TaskCancelled("Cancelled before backup — no file was written.")
             for f in files:
+                fp = os.path.join(root, f)
                 try:
-                    total += os.path.getsize(os.path.join(root, f))
+                    total += os.path.getsize(fp)
                 except OSError:
-                    pass
+                    continue
+                files_to_zip.append((fp, os.path.join(tag, os.path.relpath(fp, path))))
     desktop = _desktop_dir()
     try:
         free = shutil.disk_usage(desktop).free
@@ -109,25 +103,22 @@ def backup_game_saves(ctx: TaskContext):
             f"have {format_bytes(free)})."
         )
 
-    # 2) zip
+    # 2) zip straight from the collected in-memory list. A cancel here keeps
+    #    the existing partial-zip semantics (the archive already exists).
     stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     dest = os.path.join(desktop, f"GameSavesBackup_{stamp}.zip")
     ctx.set_status(f"Backing up game saves to {os.path.basename(dest)}...")
     count, skipped = 0, 0
     with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as zf:
-        for path, tag in sources:
-            ctx.log(f"  Adding: {path}")
-            for root, _dirs, files in os.walk(path):
-                if ctx.cancelled():
-                    ctx.log("  ! Cancelled — partial zip kept on Desktop.")
-                    return None
-                for f in files:
-                    fp = os.path.join(root, f)
-                    try:
-                        zf.write(fp, os.path.join(tag, os.path.relpath(fp, path)))
-                        count += 1
-                    except OSError:
-                        skipped += 1
+        for fp, arcname in files_to_zip:
+            if ctx.cancelled():
+                ctx.log("  ! Cancelled — partial zip kept on Desktop.")
+                return None
+            try:
+                zf.write(fp, arcname)
+                count += 1
+            except OSError:
+                skipped += 1
     if skipped:
         ctx.log(f"  (skipped {skipped} locked/inaccessible files — close running games for a full backup)")
     ctx.log(f"Backup complete: {count} files -> {dest}")
@@ -167,6 +158,11 @@ def _clean_files(ctx: TaskContext, files, label):
         try:
             st = os.stat(f)
             if not dry:
+                # F5-2: re-verify IMMEDIATELY before removal — a file cannot
+                # become a junction between the first check and here, but the
+                # guard sits beside the destructive call for defense in depth.
+                if _is_rp(f):
+                    continue
                 os.remove(f)
             total += st.st_size
             if not dry:
@@ -646,25 +642,25 @@ def clean_steam_stuck_downloads(ctx: TaskContext):
 from app.tasks import Task  # noqa: E402
 
 TASKS = [
-    Task("gamer_launchers", "Clean Launchers & Chat", "Clears every game store + Discord, Slack, Teams, Spotify web junk; keeps logins", clean_gamer_launchers, default=True, admin_required=False, column=0),
-    Task("game_files", "Clean Game Files", "Removes logs, crashes and junk from top games like Fortnite, PUBG, BG3 plus a Unity log sweep for indies; keeps saves", clean_game_files, default=True, admin_required=False, column=1),
-    Task("steam_stuck", "Clear Stuck Steam Downloads", "Removes huge leftover files from failed Steam updates; frees lots of space", clean_steam_stuck_downloads, default=False, admin_required=False, column=1),
-    Task("gpu_shader_caches", "Clean Shader Caches", "Rebuilds DirectX/NVIDIA/AMD/Intel shader caches to fix game stutter", clean_gpu_shader_caches, default=False, admin_required=False, column=0),
-    Task("game_captures", "Clean Game Captures", "Removes old Xbox Game Bar clips to free disk space", clean_game_captures, default=False, admin_required=False, column=1),
+    Task("gamer_launchers", "Clean Launchers & Chat", "Clears every game store + Discord, Slack, Teams, Spotify web junk; keeps logins", clean_gamer_launchers, default=True, admin_required=False),
+    Task("game_files", "Clean Game Files", "Removes logs, crashes and junk from top games like Fortnite, PUBG, BG3 plus a Unity log sweep for indies; keeps saves", clean_game_files, default=True, admin_required=False),
+    Task("steam_stuck", "Clear Stuck Steam Downloads", "Removes huge leftover files from failed Steam updates; frees lots of space", clean_steam_stuck_downloads, default=False, admin_required=False),
+    Task("gpu_shader_caches", "Clean Shader Caches", "Rebuilds DirectX/NVIDIA/AMD/Intel shader caches to fix game stutter", clean_gpu_shader_caches, default=False, admin_required=False),
+    Task("game_captures", "Clean Game Captures", "Removes old Xbox Game Bar clips to free disk space", clean_game_captures, default=False, admin_required=False),
     # default=False ON PURPOSE: an always-on backup in the weekly scheduler
     # would pile up timestamped zips on the Desktop forever.
-    Task("backup_saves", "Back Up Game Saves", "Zips your save folders (Saved Games, My Games, Minecraft) to a timestamped file on your Desktop", backup_game_saves, default=False, admin_required=False, column=0),
+    Task("backup_saves", "Back Up Game Saves", "Zips your save folders (Saved Games, My Games, Minecraft) to a timestamped file on your Desktop", backup_game_saves, default=False, admin_required=False),
     # Per-game mega-caches (user request 2026-09-12): separate opt-in rows so
     # a layman sees WHAT will redownload. All default=False (redownload cost
     # or game-specific), all skip honestly when the game isn't installed.
-    Task("vrchat_cache", "Clear VRChat Cache", "Frees gigabytes of downloaded avatars and worlds; they redownload as you visit them", clean_vrchat_cache, default=False, admin_required=False, column=1),
-    Task("fivem_cache", "Clear FiveM Cache", "Fixes broken textures and loading loops on roleplay servers; servers resend their files on next join", clean_fivem_cache, default=False, admin_required=False, column=1),
-    Task("starcitizen_cache", "Clean Star Citizen Files", "Clears shader and user caches behind patch-day crashes; keeps keybindings, settings, characters and screenshots", clean_starcitizen_cache, default=False, admin_required=True, column=0),
+    Task("vrchat_cache", "Clear VRChat Cache", "Frees gigabytes of downloaded avatars and worlds; they redownload as you visit them", clean_vrchat_cache, default=False, admin_required=False),
+    Task("fivem_cache", "Clear FiveM Cache", "Fixes broken textures and loading loops on roleplay servers; servers resend their files on next join", clean_fivem_cache, default=False, admin_required=False),
+    Task("starcitizen_cache", "Clean Star Citizen Files", "Clears shader and user caches behind patch-day crashes; keeps keybindings, settings, characters and screenshots", clean_starcitizen_cache, default=False, admin_required=True),
     # Log-only sweeps for the biggest free-to-play launchers (user request):
     # diagnostics the games rewrite every launch; saves, configs, tokens
     # and executables are never touched. All default=False (opt-in).
-    Task("riot_logs", "Clear Riot Games Logs", "Removes VALORANT + Riot Client diagnostic logs that pile up for gigabytes", clean_riot_logs, default=False, admin_required=False, column=1),
-    Task("hoyoverse_logs", "Clear HoYoverse Logs", "Removes Genshin/Star Rail/ZZZ crash and output logs; games rewrite them", clean_hoyoverse_logs, default=False, admin_required=False, column=1),
-    Task("rockstar_logs", "Clear Rockstar Launcher Cache", "Removes launcher web cache and logs; settings and games untouched", clean_rockstar_logs, default=False, admin_required=False, column=1),
-    Task("roblox_logs", "Clear Roblox Logs", "Removes chatty per-session client logs; fresh ones open next launch", clean_roblox_logs, default=False, admin_required=False, column=1),
+    Task("riot_logs", "Clear Riot Games Logs", "Removes VALORANT + Riot Client diagnostic logs that pile up for gigabytes", clean_riot_logs, default=False, admin_required=False),
+    Task("hoyoverse_logs", "Clear HoYoverse Logs", "Removes Genshin/Star Rail/ZZZ crash and output logs; games rewrite them", clean_hoyoverse_logs, default=False, admin_required=False),
+    Task("rockstar_logs", "Clear Rockstar Launcher Cache", "Removes launcher web cache and logs; settings and games untouched", clean_rockstar_logs, default=False, admin_required=False),
+    Task("roblox_logs", "Clear Roblox Logs", "Removes chatty per-session client logs; fresh ones open next launch", clean_roblox_logs, default=False, admin_required=False),
 ]

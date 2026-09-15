@@ -108,16 +108,24 @@ def normalize_path(path: str) -> str:
         return ""
 
 
-def default_get_processes(timeout: int = 10):
+def default_get_processes(timeout: int = 10, wanted=None):
     """Live [(image name, full path)] pairs, via tasklist CSV + a
     per-process QueryFullProcessImageNameW resolution (batched through
     tasklist's PID column — one subprocess, then fast ctypes calls; no
     per-process spawning). Never raises: [] on any failure (a failed
-    poll is a missed poll, never a crash)."""
+    poll is a missed poll, never a crash).
+
+    F5-3: tasklist is invoked as an argv list with shell=False — no cmd.exe
+    parsing of the command line at all.
+    F1-3: when `wanted` (a set of lowercase invocable basenames) is given,
+    candidates are pre-filtered BY BASENAME before any OpenProcess/ctypes
+    resolution — when none of the watched exes are even running, this is
+    just one tasklist and no ctypes loop at all. `wanted=None` keeps the
+    legacy resolve-everything behavior."""
     try:
         import subprocess as _sp
         out = _sp.check_output(
-            "tasklist /fo csv /nh", shell=True, text=True, timeout=timeout,
+            ["tasklist", "/fo", "csv", "/nh"], text=True, timeout=timeout,
             errors="replace", stderr=_sp.DEVNULL,
             creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
         )
@@ -132,9 +140,13 @@ def default_get_processes(timeout: int = 10):
             name = parts[0].lower()
             if not name.endswith(".exe"):
                 continue
+            if wanted is not None and name not in wanted:
+                continue
             pid = parts[1]
             procs.append((name, int(pid) if pid.isdigit() else 0))
     except Exception:
+        return []
+    if not procs:
         return []
     # resolve full paths in one pass (OpenProcess+QueryFullProcessImageName
     # are cheap; 0-PID entries just keep name-only matching)
@@ -174,7 +186,6 @@ class SessionPilot:
     def __init__(self, get_processes=None, watched=None,
                  on_apply=None, on_revert=None,
                  stable_polls: int = EXIT_STABLE_POLLS):
-        self._get_processes = get_processes or default_get_processes
         self._on_apply = on_apply or (lambda _hits: None)
         self._on_revert = on_revert or (lambda: None)
         self._stable_polls = max(1, stable_polls)
@@ -186,6 +197,23 @@ class SessionPilot:
         # matching state: basenames always; path-verified dirs per basename
         self._watched_names = set()
         self._watched_dirs = {}   # basename -> {normparent, ...}
+        if get_processes is None:
+            # F1-3: resolve the module-global at CALL time, not construction.
+            # The sync tests/harness swap session_pilot.default_get_processes
+            # AFTER __init__ (smoke_async does exactly that), and a patched
+            # source shaped like `lambda timeout=10:` must keep working —
+            # hence the TypeError fallback to the legacy call signature.
+            def _default_source(timeout: int = 10):
+                fn = globals().get("default_get_processes")
+                if fn is None:
+                    return []
+                try:
+                    return fn(timeout=timeout, wanted=set(self._watched_names))
+                except TypeError:
+                    return fn(timeout=timeout)
+            self._get_processes = _default_source
+        else:
+            self._get_processes = get_processes
         self.set_watched(watched or [])
 
     # -- introspection (dialog status line + tests) -------------------- #

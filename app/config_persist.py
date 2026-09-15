@@ -69,16 +69,14 @@ DEFAULT_CONFIG = {
 
 # Phase 2 (#12): mapping used to migrate configs saved by the old 5-tab UI.
 # Games-tab twins -> the Clean-tab task that cleans the identical paths
-# (see tab_presets._GAMES_TO_CLEAN_DEDUPE); unique Games tasks move to
+# (see tab_presets.GAMES_TO_CLEAN_DEDUPE); unique Games tasks move to
 # Clean as-is. Advanced tasks move to Tweak; the three cut tasks
-# (punch-list #13) are dropped, not migrated. Duplicated here instead of
-# importing from tab_presets to avoid a circular import
-# (tab_presets -> tweak_tasks -> config_persist).
-_LEGACY_GAMES_TO_CLEAN = {
-    "gamer_launchers": "launcher_cache",
-    "gpu_shader_caches": "shader_cache",
-}
-_LEGACY_CUT_KEYS = {"adv_memory_integrity", "adv_vmp", "wpbt_disable"}
+# (punch-list #13) are dropped, not migrated.
+# F3-4: the rules are tab_presets' PUBLIC constants — imported lazily in
+# _migrate_selected_tasks below, never duplicated here (a private copy
+# could drift out of sync with the tabs). Lazy because config_persist is
+# imported by tweak_tasks and tab_presets imports tweak_tasks, so a
+# module-level import would be circular.
 
 
 def _legacy_key_resolves(key: str) -> "bool | None":
@@ -102,6 +100,11 @@ def _migrate_selected_tasks(data: dict) -> dict:
     st = data.get("selected_tasks")
     if not isinstance(st, dict):
         return data
+    # F3-4: the migration rules are the SAME public constants tab_presets
+    # uses to build the live tabs — one source of truth, no private copies.
+    # Lazy import: config_persist must stay import-light (it is imported by
+    # tweak_tasks, and tab_presets imports tweak_tasks).
+    from app.tab_presets import CUT_TASK_KEYS as _cut_keys, GAMES_TO_CLEAN_DEDUPE as _dedupe_map
     clean = st.setdefault("Clean", [])
     tweak = st.setdefault("Tweak", [])
     # audit fix (probe-confirmed): a hand-edited config could store a task
@@ -132,12 +135,12 @@ def _migrate_selected_tasks(data: dict) -> dict:
             keys = [keys]
         if legacy_tab == "Games":
             for key in keys:
-                mapped = _LEGACY_GAMES_TO_CLEAN.get(key, key)
+                mapped = _dedupe_map.get(key, key)
                 if mapped not in clean:
                     clean.append(mapped)
         else:
             for key in keys:
-                if key in _LEGACY_CUT_KEYS:
+                if key in _cut_keys:
                     continue
                 if key not in tweak:
                     tweak.append(key)

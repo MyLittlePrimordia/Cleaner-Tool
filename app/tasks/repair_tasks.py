@@ -6,7 +6,7 @@ Fixed: search index path, return-code checking, added safe new tasks.
 import os
 import shutil
 
-from app.utils import TaskContext, run_cmd, run_cmd_checked, create_restore_point, clean_folder_contents, restart_explorer, reg_get_value, reg_delete_value
+from app.utils import TaskContext, run_cmd, run_cmd_checked, create_restore_point, clean_folder_contents, restart_explorer, reg_get_value, reg_delete_value, known_folder, atomic_write_text
 
 _WINDIR = os.environ.get("WINDIR", "C:\\Windows")
 
@@ -73,6 +73,32 @@ def repair_chkdsk_scan(ctx: TaskContext):
     )
 
 
+def _wsus_folder_has_content(folder: str) -> bool:
+    # F2-4: extracted from the inline branch soup below. The five panes are
+    # preserved EXACTLY:
+    #   >1 top-level entry        -> True
+    #   exactly 1 entry (M11 stub guard):
+    #       not a file OR larger than 1MB -> True; else False
+    #   stat failure on the paine -> True (can't tell — be safe, don't skip)
+    #   scandir failure           -> True (can't tell — be safe, don't skip)
+    #   0 entries (M4 stub)       -> False (a just-recreated EMPTY live
+    #                                  folder must never clobber the backup)
+    try:
+        with os.scandir(folder) as it:
+            entries = list(it)
+    except Exception:
+        return True
+    if len(entries) > 1:
+        return True
+    if len(entries) == 1:
+        try:
+            e = entries[0]
+            return (not e.is_file()) or (e.stat().st_size > 1048576)
+        except Exception:
+            return True
+    return False
+
+
 def repair_windows_update_reset(ctx: TaskContext):
     ctx.set_status("Resetting Windows Update components...")
     services = ["wuauserv", "cryptSvc", "bits", "msiserver"]
@@ -107,21 +133,10 @@ def repair_windows_update_reset(ctx: TaskContext):
                 # placeholder) also counts as "content" for any() — and
                 # would still clobber a good backup. Require SUBSTANTIAL
                 # content: >1 top-level entry, or one entry larger than 1MB.
-                try:
-                    with os.scandir(folder) as it:
-                        entries = list(it)
-                    if len(entries) > 1:
-                        has_content = True
-                    elif len(entries) == 1:
-                        try:
-                            e = entries[0]
-                            has_content = (not e.is_file()) or (e.stat().st_size > 1048576)
-                        except Exception:
-                            has_content = True  # can't tell — be safe, don't skip
-                    else:
-                        has_content = False
-                except Exception:
-                    has_content = True  # can't tell — be safe, don't skip
+                # F2-4: the five-pane check now lives in the named helper
+                # (it never raises — every failure pane resolves to True so
+                # the "can't tell — be safe, don't skip" stance is intact).
+                has_content = _wsus_folder_has_content(folder)
                 if not has_content and os.path.exists(backup):
                     ctx.log(f"  {folder} holds only a stub — keeping existing backup at {backup} untouched.")
                     continue
@@ -521,23 +536,35 @@ def restart_bluetooth_stack(ctx: TaskContext):
     (desktop PCs without Bluetooth)."""
     ctx.set_status("Restarting Bluetooth...")
     started = []
+    core_failed = False
     for svc in ("bthHFSrv", "bthserv"):
         rc = run_cmd(ctx, f"net stop {svc} /y", timeout=60)
         if rc == 2:
             ctx.log(f"  {svc} not installed on this PC — skipped.")
     for svc in ("bthserv", "bthHFSrv"):
         rc = run_cmd(ctx, f"net start {svc}", timeout=60)
-        if rc == 0:
+        # rc 1 = "already running" — a legitimate success on a restart
+        if rc in (0, 1):
             started.append(svc)
         elif rc == 2:
             ctx.log(f"  {svc} not installed — nothing to start.")
         else:
             ctx.log(f"  ! could not start {svc} (code {rc})")
+            if svc == "bthserv":
+                core_failed = True
     if not started:
         # honest failure (repair_smart_verdict pattern): a Bluetooth-less
         # PC must not report "restarted successfully"
         raise RuntimeError(
             "No Bluetooth services found — this PC may not have Bluetooth."
+        )
+    if core_failed:
+        # P5-02: bthHFSrv (handsfree) depends on bthserv (the Bluetooth
+        # support service) — if the core did not come up, reporting success
+        # would be a false positive. The stack is still down.
+        raise RuntimeError(
+            "bthserv (Bluetooth support) did not come back up — Bluetooth "
+            "will not work until it does. Check Services.msc for its state."
         )
     ctx.log(f"Bluetooth restarted ({', '.join(started)}). Reconnect your controller/headset if needed.")
 
@@ -668,10 +695,18 @@ def repair_icon_cache(ctx: TaskContext):
             ctx.log(f"  (kept {path}: {exc})")
     if removed == 0:
         ctx.log("  ! Icon-cache files reappeared or stayed locked — restarting Explorer anyway.")
+    # P5-01: never leave the machine without a shell AND never report
+    # success when the shell did not come back — same contract as
+    # repair_restart_explorer / repair_tray_icons (they raise too).
     if not restart_explorer(ctx):
-        ctx.log("  ! Explorer did not come back on its own — press Ctrl+Shift+Esc, File > Run, type explorer.exe")
-    else:
-        ctx.log(f"Icon cache rebuilt ({removed} database(s) cleared).")
+        if ctx.cancelled():
+            ctx.log("  ! cancelled — leaving the Explorer restart to you.")
+            return
+        raise RuntimeError(
+            "Explorer did not come back after the icon-cache rebuild. Press "
+            "Ctrl+Shift+Esc, click File > Run new task, type explorer.exe."
+        )
+    ctx.log(f"Icon cache rebuilt ({removed} database(s) cleared).")
 
 
 def repair_store_cache_reset(ctx: TaskContext):
@@ -945,24 +980,13 @@ def repair_hosts_file(ctx: TaskContext):
         except Exception as exc:
             raise RuntimeError(f"Could not back up hosts file, aborting for safety: {exc}")
     try:
-        # F07: atomic write (same helper shape as tweak_tasks._write_hosts_file)
-        # — never truncate hosts in place; a mid-write crash bricked DNS.
-        hosts_dir = os.path.dirname(_HOSTS_PATH)
-        tmp_path = os.path.join(hosts_dir, "hosts.cleanertool.tmp")
-        with open(tmp_path, "w", encoding="utf-8", newline="") as f:
-            f.write("\r\n".join(_STOCK_HOSTS_LINES))
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except Exception:
-                pass
-        os.replace(tmp_path, _HOSTS_PATH)
+        # F07/F3-2: atomic write via the shared helper — never truncate
+        # hosts in place; a mid-write crash bricked DNS. The helper's unique
+        # temp name also can't collide with an ad-block write mid-flight
+        # (the tweak tab previously reused the same fixed tmp name).
+        atomic_write_text(_HOSTS_PATH, "\r\n".join(_STOCK_HOSTS_LINES),
+                          newline="")
     except Exception as exc:
-        try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
-            pass
         raise RuntimeError(f"Could not write hosts file (need admin rights?): {exc}")
     run_cmd(ctx, "ipconfig /flushdns", timeout=30)
     if had_block:
@@ -980,22 +1004,12 @@ def repair_hosts_file(ctx: TaskContext):
 
 def _repair_desktop_dir() -> str:
     """Real Desktop path honoring OneDrive/known-folder redirection (backups
-    below must land where the user actually sees them). Same shell-folder
-    technique as game_tasks._desktop_dir; local copy keeps this module's
-    imports light (the _clean_many precedent: small helpers live per module)."""
-    try:
-        import winreg
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                            r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders") as k:
-            raw, _ = winreg.QueryValueEx(k, "Desktop")
-            resolved = os.path.expandvars(raw)
-            # F06: Desktop feeds shell strings (netsh/dism) while elevated —
-            # reject metachars/quotes so a tampered value can't break out.
-            if resolved and os.path.isabs(resolved) and not any(c in resolved for c in '"&|<>^%'):
-                return resolved
-    except OSError:
-        pass
-    return os.path.join(os.environ.get("USERPROFILE", ""), "Desktop")
+    below must land where the user actually sees them). F3-1: shared resolver
+    with strict=True — Desktop feeds shell strings (netsh/dism) while
+    elevated, so register values carrying cmd metachars are rejected."""
+    return known_folder("Desktop",
+                        os.path.join(os.environ.get("USERPROFILE", ""), "Desktop"),
+                        strict=True)
 
 
 def _repair_stamp() -> str:
@@ -1344,51 +1358,51 @@ def audit_mic_consent(ctx: TaskContext):
 # --------------------------------------------------------------------------- #
 
 TASKS = [
-    Task("restore_point", "Safety Checkpoint", "Saves a restore point you can go back to", create_restore_point, default=True, column=0),
-    Task("xbox_apps", "Fix Xbox / Game Pass Apps", "Repairs the Xbox app and Game Pass sign-in without reinstalling", repair_xbox_game_apps, default=False, column=0),
-    Task("ssd_maintenance", "SSD Maintenance", "Retrims your SSD and checks drive health", repair_ssd_maintenance, default=False, column=0),
-    Task("vss_repair", "Fix Restore Points (VSS)", "Restarts the shadow-copy service so checkpoints work again", repair_vss_restore_points, default=False, column=0),
-    Task("network_reset", "Fix Internet Connection", "Resets internet settings to defaults, repairs bad tweaks", repair_network_stack_defaults, default=False, risk="REBOOT REQUIRED", column=1),
-    Task("sfc_scan", "Fix System Files", "Scans and fixes broken Windows files that crash games", repair_sfc_scan, default=False, column=0),
-    Task("dism_restorehealth", "Repair Windows Image", "Downloads fresh Windows files to fix a broken image", repair_dism_restorehealth, default=False, column=0),
-    Task("dism_cleanup", "Cleanup Update Storage", "Cleans old update leftovers but keeps uninstall option", repair_dism_component_cleanup, default=False, column=0),
-    Task("dism_scanhealth", "Scan Image Health", "Scans Windows image for corruption", repair_dism_scanhealth, default=False, column=0),
-    Task("dism_checkhealth", "Check Image Health", "Quick check if image needs repair", repair_dism_checkhealth, default=False, column=0),
-    Task("chkdsk_scan", "Check Disk (Read-Only)", "Checks your drive for errors without restarting", repair_chkdsk_scan, default=False, column=1),
-    Task("wu_reset", "Fix Stuck Updates", "Fixes Windows Update when it’s stuck or failing", repair_windows_update_reset, default=False, column=1),
-    Task("bits_reset", "Fix Download Queue", "Clears stuck download jobs that block updates", repair_bits_reset, default=False, column=1),
-    Task("time_sync", "Fix Clock Sync", "Fixes wrong clock that breaks updates and logins", repair_time_sync, default=False, column=1),
-    Task("gpupdate", "Fix Blocked Settings", "Refreshes Windows rules that may block Game Mode", repair_gpupdate, default=False, column=1),
-    Task("search_index", "Fix Search Not Working", "Rebuilds Windows search that finds files and apps", repair_search_index, default=False, column=1),
-    Task("print_spooler", "Fix Stuck Printing", "Clears stuck print jobs and restarts printer", repair_print_spooler, default=False, column=1),
-    Task("wmi_repair", "Fix Game Services (WMI)", "Fixes system database many games rely on", repair_wmi_repository, default=False, column=1),
-    Task("store_apps_reregister", "Fix Missing Apps / Start Menu", "Fixes missing apps or Start menu without reinstall", repair_reregister_store_apps, default=False, column=1),
-    Task("restart_audio", "Restart Sound / Mic", "Fixes dead audio or mic instantly without a reboot", restart_audio_engine, default=False, admin_required=True, column=1),
-    Task("firewall_reset", "Reset Firewall", "Fixes multiplayer/anti-cheat connection errors by resetting firewall rules", repair_firewall_reset, default=False, admin_required=True, risk="ADVANCED", column=1),
-    Task("smart_verdict", "Drive Health Verdict (SMART)", "Plain-language check: is your SSD/HDD healthy, or time to back up?", repair_smart_verdict, default=False, admin_required=False, column=1),
-    Task("gpu_driver_age", "GPU Driver Freshness", "Checks your graphics driver's age and nudges you to update if it's stale", repair_gpu_driver_age, default=False, admin_required=False, column=1),
-    Task("restart_bluetooth", "Restart Bluetooth", "Fixes wireless controller and headset drops without rebooting", restart_bluetooth_stack, default=False, admin_required=True, column=1),
-    Task("arp_flush", "Fix IP Conflicts (ARP)", "Clears stuck network address entries that break router talk", flush_arp_cache, default=False, admin_required=True, column=1),
-    Task("gpu_reset", "Restart Graphics Driver", "Fixes black screens and resolution bugs instantly, no reboot", reset_graphics_driver, default=False, admin_required=False, column=1),
-    Task("anticheat_repair", "Fix Anti-Cheat Errors", "Resets EasyAntiCheat and BattlEye to fix launch errors like 30005", repair_anticheat_services, default=False, admin_required=True, column=1),
-    Task("icon_cache", "Fix Blank Icons", "Rebuilds the icon cache that causes blank or white desktop icons", repair_icon_cache, default=False, admin_required=False, column=1),
-    Task("restart_explorer", "Restart Explorer", "Fixes a frozen taskbar, desktop or Start menu without rebooting", repair_restart_explorer, default=False, admin_required=False, column=1),
-    Task("restart_camera", "Restart Camera (Webcam)", "Power-cycles your webcam to fix black feeds and 'camera in use' errors", restart_camera_devices, default=False, admin_required=True, column=1),
-    Task("defender_quick_scan", "Run Security Scan", "Quick Defender virus scan for the malware behind game crashes", run_defender_quick_scan, default=False, admin_required=False, column=0),
-    Task("power_drains", "Find Power Drains (Laptops)", "Finds what's draining your battery and blocking sleep — opens a report", find_power_drains, default=False, admin_required=True, column=0),
-    Task("wsreset_store", "Reset Store Downloads", "Resets the Store cache when app downloads fail or hang", repair_store_cache_reset, default=False, admin_required=False, column=1),
-    Task("enable_restore", "Turn On System Protection", "Re-enables restore points on C: if something turned them off", repair_enable_system_restore, default=False, admin_required=True, column=0),
-    Task("power_plans", "Reset Power Plans", "Restores Microsoft's default power plans when optimizers break them", repair_power_plans, default=False, admin_required=True, column=0),
-    Task("teredo_fix", "Fix Xbox Multiplayer (Teredo)", "Resets Teredo tunneling to fix Xbox party and matchmaking errors", repair_teredo, default=False, admin_required=True, column=1),
-    Task("hosts_restore", "Restore Hosts File", "Restores the stock hosts file when blockers break sites or logins", repair_hosts_file, default=False, admin_required=True, column=1),
+    Task("restore_point", "Safety Checkpoint", "Saves a restore point you can go back to", create_restore_point, default=True),
+    Task("xbox_apps", "Fix Xbox / Game Pass Apps", "Repairs the Xbox app and Game Pass sign-in without reinstalling", repair_xbox_game_apps, default=False),
+    Task("ssd_maintenance", "SSD Maintenance", "Retrims your SSD and checks drive health", repair_ssd_maintenance, default=False),
+    Task("vss_repair", "Fix Restore Points (VSS)", "Restarts the shadow-copy service so checkpoints work again", repair_vss_restore_points, default=False),
+    Task("network_reset", "Fix Internet Connection", "Resets internet settings to defaults, repairs bad tweaks", repair_network_stack_defaults, default=False, risk="REBOOT REQUIRED"),
+    Task("sfc_scan", "Fix System Files", "Scans and fixes broken Windows files that crash games", repair_sfc_scan, default=False),
+    Task("dism_restorehealth", "Repair Windows Image", "Downloads fresh Windows files to fix a broken image", repair_dism_restorehealth, default=False),
+    Task("dism_cleanup", "Cleanup Update Storage", "Cleans old update leftovers but keeps uninstall option", repair_dism_component_cleanup, default=False),
+    Task("dism_scanhealth", "Scan Image Health", "Scans Windows image for corruption", repair_dism_scanhealth, default=False),
+    Task("dism_checkhealth", "Check Image Health", "Quick check if image needs repair", repair_dism_checkhealth, default=False),
+    Task("chkdsk_scan", "Check Disk (Read-Only)", "Checks your drive for errors without restarting", repair_chkdsk_scan, default=False),
+    Task("wu_reset", "Fix Stuck Updates", "Fixes Windows Update when it’s stuck or failing", repair_windows_update_reset, default=False),
+    Task("bits_reset", "Fix Download Queue", "Clears stuck download jobs that block updates", repair_bits_reset, default=False),
+    Task("time_sync", "Fix Clock Sync", "Fixes wrong clock that breaks updates and logins", repair_time_sync, default=False),
+    Task("gpupdate", "Fix Blocked Settings", "Refreshes Windows rules that may block Game Mode", repair_gpupdate, default=False),
+    Task("search_index", "Fix Search Not Working", "Rebuilds Windows search that finds files and apps", repair_search_index, default=False),
+    Task("print_spooler", "Fix Stuck Printing", "Clears stuck print jobs and restarts printer", repair_print_spooler, default=False),
+    Task("wmi_repair", "Fix Game Services (WMI)", "Fixes system database many games rely on", repair_wmi_repository, default=False),
+    Task("store_apps_reregister", "Fix Missing Apps / Start Menu", "Fixes missing apps or Start menu without reinstall", repair_reregister_store_apps, default=False),
+    Task("restart_audio", "Restart Sound / Mic", "Fixes dead audio or mic instantly without a reboot", restart_audio_engine, default=False, admin_required=True),
+    Task("firewall_reset", "Reset Firewall", "Fixes multiplayer/anti-cheat connection errors by resetting firewall rules", repair_firewall_reset, default=False, admin_required=True, risk="ADVANCED"),
+    Task("smart_verdict", "Drive Health Verdict (SMART)", "Plain-language check: is your SSD/HDD healthy, or time to back up?", repair_smart_verdict, default=False, admin_required=False),
+    Task("gpu_driver_age", "GPU Driver Freshness", "Checks your graphics driver's age and nudges you to update if it's stale", repair_gpu_driver_age, default=False, admin_required=False),
+    Task("restart_bluetooth", "Restart Bluetooth", "Fixes wireless controller and headset drops without rebooting", restart_bluetooth_stack, default=False, admin_required=True),
+    Task("arp_flush", "Fix IP Conflicts (ARP)", "Clears stuck network address entries that break router talk", flush_arp_cache, default=False, admin_required=True),
+    Task("gpu_reset", "Restart Graphics Driver", "Fixes black screens and resolution bugs instantly, no reboot", reset_graphics_driver, default=False, admin_required=False),
+    Task("anticheat_repair", "Fix Anti-Cheat Errors", "Resets EasyAntiCheat and BattlEye to fix launch errors like 30005", repair_anticheat_services, default=False, admin_required=True),
+    Task("icon_cache", "Fix Blank Icons", "Rebuilds the icon cache that causes blank or white desktop icons", repair_icon_cache, default=False, admin_required=False),
+    Task("restart_explorer", "Restart Explorer", "Fixes a frozen taskbar, desktop or Start menu without rebooting", repair_restart_explorer, default=False, admin_required=False),
+    Task("restart_camera", "Restart Camera (Webcam)", "Power-cycles your webcam to fix black feeds and 'camera in use' errors", restart_camera_devices, default=False, admin_required=True),
+    Task("defender_quick_scan", "Run Security Scan", "Quick Defender virus scan for the malware behind game crashes", run_defender_quick_scan, default=False, admin_required=False),
+    Task("power_drains", "Find Power Drains (Laptops)", "Finds what's draining your battery and blocking sleep — opens a report", find_power_drains, default=False, admin_required=True),
+    Task("wsreset_store", "Reset Store Downloads", "Resets the Store cache when app downloads fail or hang", repair_store_cache_reset, default=False, admin_required=False),
+    Task("enable_restore", "Turn On System Protection", "Re-enables restore points on C: if something turned them off", repair_enable_system_restore, default=False, admin_required=True),
+    Task("power_plans", "Reset Power Plans", "Restores Microsoft's default power plans when optimizers break them", repair_power_plans, default=False, admin_required=True),
+    Task("teredo_fix", "Fix Xbox Multiplayer (Teredo)", "Resets Teredo tunneling to fix Xbox party and matchmaking errors", repair_teredo, default=False, admin_required=True),
+    Task("hosts_restore", "Restore Hosts File", "Restores the stock hosts file when blockers break sites or logins", repair_hosts_file, default=False, admin_required=True),
     # User-requested additions 2026-09-12 (layman-safe only): instant fixes
     # without rebooting, safety-net backups, and a report-only startup audit.
     # All default=False (Custom-only); presets untouched by design.
-    Task("restart_startmenu", "Restart Start Menu & Search", "Fixes a frozen Start button or dead search box instantly, no reboot", restart_startmenu_search, default=False, admin_required=False, column=1),
-    Task("tray_icons", "Fix Missing Tray Icons", "Rebuilds the taskbar corner icons that disappear or turn blank", repair_tray_icons, default=False, admin_required=False, column=1),
-    Task("firewall_backup", "Back Up Firewall Rules", "Saves your firewall rules to the Desktop before you ever reset them", backup_firewall_rules, default=False, admin_required=True, column=1),
-    Task("registry_backup", "Back Up Registry", "Saves a copy of your system settings to the Desktop as a safety net", backup_registry_hives, default=False, admin_required=True, column=0),
-    Task("driver_export", "Back Up Drivers", "Saves copies of your working drivers to the Desktop before reinstalling any", backup_drivers, default=False, admin_required=True, column=1),
-    Task("startup_audit", "Check Startup Programs", "Shows what slows your boot; changes nothing, removes nothing", audit_startup_impact, default=False, admin_required=False, column=0),
-    Task("micfix_audit", "Why Can't They Hear Me?", "Diagnoses mic-not-heard in games/chat from privacy + device state; changes nothing", audit_mic_consent, default=False, admin_required=False, column=0),
+    Task("restart_startmenu", "Restart Start Menu & Search", "Fixes a frozen Start button or dead search box instantly, no reboot", restart_startmenu_search, default=False, admin_required=False),
+    Task("tray_icons", "Fix Missing Tray Icons", "Rebuilds the taskbar corner icons that disappear or turn blank", repair_tray_icons, default=False, admin_required=False),
+    Task("firewall_backup", "Back Up Firewall Rules", "Saves your firewall rules to the Desktop before you ever reset them", backup_firewall_rules, default=False, admin_required=True),
+    Task("registry_backup", "Back Up Registry", "Saves a copy of your system settings to the Desktop as a safety net", backup_registry_hives, default=False, admin_required=True),
+    Task("driver_export", "Back Up Drivers", "Saves copies of your working drivers to the Desktop before reinstalling any", backup_drivers, default=False, admin_required=True),
+    Task("startup_audit", "Check Startup Programs", "Shows what slows your boot; changes nothing, removes nothing", audit_startup_impact, default=False, admin_required=False),
+    Task("micfix_audit", "Why Can't They Hear Me?", "Diagnoses mic-not-heard in games/chat from privacy + device state; changes nothing", audit_mic_consent, default=False, admin_required=False),
 ]

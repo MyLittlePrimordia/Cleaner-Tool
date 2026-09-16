@@ -555,24 +555,36 @@ def clean_windows_update_leftovers(ctx: TaskContext):
     safe to delete AFTER an upgrade completed (Windows itself offers to remove
     most of them via Storage Sense after 10 days).
     """
-    folders = [
+    # F02: upgrade debris (Windows.old, $Windows.~*, $WinREAgent,
+    # $GetCurrent, $SysReset) are whole staged installs — removing the
+    # root is correct. ESD/Intel/PerfLogs are vendor/system containers
+    # Windows and tools expect to exist, so empty them but keep the dir.
+    remove_root_folders = [
         os.path.join(_SYSTEMDRIVE_ROOT, "Windows.old"),
         os.path.join(_SYSTEMDRIVE_ROOT, "$Windows.~BT"),
         os.path.join(_SYSTEMDRIVE_ROOT, "$Windows.~WS"),
         os.path.join(_SYSTEMDRIVE_ROOT, "$WinREAgent"),
         os.path.join(_SYSTEMDRIVE_ROOT, "$GetCurrent"),
         os.path.join(_SYSTEMDRIVE_ROOT, "$SysReset"),
+    ]
+    keep_root_folders = [
         os.path.join(_SYSTEMDRIVE_ROOT, "ESD"),
         os.path.join(_SYSTEMDRIVE_ROOT, "Intel"),
         os.path.join(_SYSTEMDRIVE_ROOT, "PerfLogs"),
     ]
     total = 0
-    for folder in folders:
+    for folder in remove_root_folders:
         if not folder or not os.path.isabs(folder):
             continue
         if os.path.exists(folder):
             ctx.log(f"Cleaning update leftover: {folder}")
             total += clean_folder_contents(ctx, folder, remove_root=True)
+    for folder in keep_root_folders:
+        if not folder or not os.path.isabs(folder):
+            continue
+        if os.path.exists(folder):
+            ctx.log(f"Cleaning update leftover (keeping folder): {folder}")
+            total += clean_folder_contents(ctx, folder, remove_root=False)
     if total > 0:
         ctx.log(f"Removed {total / 1024 / 1024:.0f} MB of Windows Update leftovers.")
     else:
@@ -823,7 +835,9 @@ def remove_windows_bloat(ctx: TaskContext):
 
 def clean_event_logs(ctx: TaskContext):
     """Clear Windows Event Viewer logs (diagnostic history only — the logs
-    start fresh; fixes bloated evtx files, admin)."""
+    start fresh; fixes bloated evtx files, admin).
+    F04: the Security channel is never touched (audit/forensic trail);
+    failures log the real exit code instead of claiming 'in-use'."""
     collected: "list[str]" = []
     # shell=False argv lists: channel names are system output and must never
     # be interpolated into a shell=True string (injection via crafted
@@ -840,11 +854,14 @@ def clean_event_logs(ctx: TaskContext):
         name = name.strip()
         if not name:
             continue
+        if name.lower() == "security":
+            ctx.log("  (skipped Security log — audit trail preserved; clear it only from Event Viewer.)")
+            continue
         rc = run_cmd(ctx, ["wevtutil", "cl", name], shell=False, timeout=30)
         if rc == 0:
             cleared += 1
         else:
-            ctx.log(f"  (skipped in-use log: {name})")
+            ctx.log(f"  (skipped {name}: wevtutil cl exited {rc} — in use or access denied)")
     ctx.log(f"Cleared {cleared} event logs.")
     return 0
 
@@ -1013,7 +1030,7 @@ TASKS = [
     Task("temp_deep_clean", "Deep Temp Clean", "Deep cleans temp files with PowerShell", remove_temp_files_deep, default=False, admin_required=True),
     Task("remove_bloat", "Remove Windows Bloat", "Removes Clipchamp, MSN apps, TikTok and other preinstalled junk", remove_windows_bloat, default=False, admin_required=True),
     Task("winget_cache", "Clear WinGet Cache", "Removes leftover installer files and logs from Windows' app downloader", clean_winget_cache, default=False, admin_required=False),
-    Task("event_logs", "Clear Event Viewer Logs", "Wipes old Windows diagnostic logs so they start fresh", clean_event_logs, default=False, admin_required=True),
+    Task("event_logs", "Clear Event Viewer Logs", "Wipes old Windows diagnostic logs so they start fresh (Security log always kept)", clean_event_logs, default=False, admin_required=True, risk="ADVANCED"),
     Task("defender_history", "Clear Defender History", "Removes stale protection-history entries that haunt the Security app", clean_defender_history, default=False, admin_required=True),
     Task("steam_depot", "Clean Steam Download Cache", "Clears Steam's manifest cache that causes phantom update states", clean_steam_download_cache, default=False, admin_required=False),
     Task("dev_caches", "Clean Dev Caches", "Clears VS Code, npm and pip caches for modders and AI tinkerers", clean_dev_caches, default=False, admin_required=False),

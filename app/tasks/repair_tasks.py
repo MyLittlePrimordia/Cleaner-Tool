@@ -6,7 +6,7 @@ Fixed: search index path, return-code checking, added safe new tasks.
 import os
 import shutil
 
-from app.utils import TaskContext, run_cmd, run_cmd_checked, create_restore_point, clean_folder_contents, restart_explorer, reg_get_value, reg_delete_value, known_folder, atomic_write_text
+from app.utils import TaskContext, run_cmd, run_cmd_checked, create_restore_point, clean_folder_contents, restart_explorer, reg_get_value, reg_delete_value, known_folder, atomic_write_text, cmd_arg
 
 _WINDIR = os.environ.get("WINDIR", "C:\\Windows")
 
@@ -52,7 +52,10 @@ def repair_chkdsk_scan(ctx: TaskContext):
     # contract); chkdsk now does the same with a plain-language verdict.
     # rc 0 = clean. rc 3 = errors found by the read-only scan. Anything
     # else (or -1 cancel/timeout) is surfaced honestly below.
-    rc = run_cmd(ctx, f"chkdsk {_sd_root} /scan", timeout=900)
+    # F06: _sd_root derives from %SYSTEMDRIVE% (user-writable env) — route
+    # it through cmd_arg so metacharacters travel as data, never as command
+    # separators when elevated.
+    rc = run_cmd(ctx, f"chkdsk {cmd_arg(_sd_root)} /scan", timeout=900)
     if ctx.cancelled():
         from app.utils import TaskCancelled
         raise TaskCancelled(f"chkdsk scan of {_sd_root} was cancelled by user.")
@@ -168,9 +171,30 @@ def repair_windows_update_reset(ctx: TaskContext):
         # the original folder yet, and deleting the only copy would destroy the
         # user's entire WU download store. Leave the .bak for the next run to
         # clean up (the rename-backup at the top of the next run handles it).
+        # F03: surface the orphan cost — log each .bak path + size so the
+        # disk waste is visible, with the manual-delete path. No new
+        # deletion timing (safety invariant unchanged).
         if renamed:
-            ctx.log("Backups kept as .bak (Windows rebuilds folders on next update check).")
-            ctx.log("They will be cleaned automatically on the next run of this task.")
+            for _orig, _bak in renamed:
+                try:
+                    _size = 0
+                    for _root, _dirs, _files in os.walk(_bak):
+                        if ctx.cancelled():
+                            break
+                        for _f in _files:
+                            try:
+                                _size += os.path.getsize(os.path.join(_root, _f))
+                            except OSError:
+                                continue
+                    from app.utils import format_bytes as _fmt
+                    ctx.log(f"Backup kept: {_bak} ({_fmt(_size)}) — Windows rebuilds "
+                            f"the live folder on next update check.")
+                except Exception:
+                    ctx.log(f"Backup kept: {_bak} (size unknown).")
+            ctx.log("These .bak folders are removed automatically on the next run of "
+                    "this task (once the live folder has real content again).")
+            ctx.log("To reclaim the space sooner, delete the .bak folder(s) manually "
+                    "only after Windows Update succeeds again.")
 
 
 def repair_search_index(ctx: TaskContext):

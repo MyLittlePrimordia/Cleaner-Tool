@@ -104,10 +104,14 @@ PRESETS = {
             # run user_temp_files+system_temp_files, and temp_deep_clean's PS
             # pass + fallbacks walked both SAME dirs a second time (5/5 path
             # overlap verified); it stays available in Custom.
+            # F01: ram_purge + prefetch removed — both are anti-performance
+            # in an everyday preset (working-set trim causes page-in stalls;
+            # Prefetch is a boot/app-launch optimizer Windows re-learns).
+            # Both stay available in Custom for rare diagnostics.
             "shader_cache", "launcher_cache", "engine_cache", "driver_junk",
             "user_temp_files", "system_temp_files", "win_update_cache",
             "delivery_optimization", "inet_cache", "recycle_bin", "error_reports",
-            "thumbnail_cache", "chk_fragments", "old_logs", "dns_flush", "ram_purge",
+            "thumbnail_cache", "chk_fragments", "old_logs", "dns_flush",
             "game_files", "game_captures",
             # user request 2026-09-12: the big per-game caches live here too
             # (each skips honestly when its game isn't installed; Star Citizen
@@ -115,7 +119,7 @@ PRESETS = {
             "vrchat_cache", "fivem_cache", "starcitizen_cache",
             "update_leftovers", "activity_traces",
             "browser_cache", "office_cache", "uwp_cache", "font_cache", "store_cache",
-            "remove_bloat", "prefetch", "disk_cleanup_deep",
+            "remove_bloat", "disk_cleanup_deep",
         ],
     },
     "Repair": {

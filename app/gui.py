@@ -1476,8 +1476,11 @@ class DnsTesterDialog(ThemedModal):
         body = self.body
 
         # plain-language intro (title row carries the accent dot + name)
+        # F09: honest methodology — TCP:53 handshake ranking (stdlib-only),
+        # a good proxy for, but not a real UDP DNS query.
         tk.Label(body, text="Tests which DNS server responds fastest for YOUR "
-                            "connection — then applies it.",
+                            "connection (TCP handshake to port 53 — a close "
+                            "proxy for real DNS speed) — then applies it.",
                  font=(F, 9), bg=COLORS["bg"],
                  fg=COLORS["subtext"], wraplength=680,
                  justify="left").pack(anchor="w")
@@ -7677,8 +7680,12 @@ class SpeedTestDialog(ThemedModal):
                          accent=TAB_ACCENTS["Tools"])
         body = self.body
 
+        # F08: data-cost transparency — fast links run the full
+        # multi-stream rounds (≈160MB worst case, see ESTIMATED_MAX_MB).
+        # No logic change.
         tk.Label(body, text="Tests your connection speed — download, "
-                            "upload and ping.",
+                            "upload and ping. Uses up to ~160MB on fast "
+                            "connections (avoid on metered/mobile data).",
                  font=(F, 9), bg=COLORS["bg"],
                  fg=COLORS["subtext"], wraplength=680,
                  justify="left").pack(anchor="w")
@@ -12472,10 +12479,15 @@ class Application:
                                "(restart the app as Administrator for the full run).")
 
         # network when a task is an internet task (Install tab always is;
-        # repair DISM RestoreHealth downloads too)
+        # repair DISM RestoreHealth downloads too; time_sync/gaming_dns/
+        # update_all/xbox_apps/store re-register also need the network —
+        # F10: the old two-pattern check let those fail mid-run offline
+        # instead of warning up front. Non-blocking notice only.
         _net_keys = {t.key for t in tasks}
         _needs_net = any(k.startswith("install_") for k in _net_keys) \
-                     or "dism_restorehealth" in _net_keys
+                     or bool(_net_keys & {"dism_restorehealth", "time_sync",
+                                          "gaming_dns", "update_all",
+                                          "xbox_apps", "store_apps_reregister"})
         if _needs_net:
             try:
                 from app.downloader import has_network

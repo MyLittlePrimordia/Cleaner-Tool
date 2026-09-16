@@ -801,7 +801,9 @@ def install_apo_peace_bundle(ctx: TaskContext):
             except RuntimeError as exc:
                 raise RuntimeError(f"{exc} Manual download: {part['manual']}")
             ctx.log(f"Running silent install: {part['label']}...")
-            rc = run_cmd(ctx, f'"{dest}" {part["silent"]}', shell=True, timeout=900)
+            # F07: shell=False argv — no cmd.exe parsing for elevated
+            # installer exec (silent flags are space-separated literals).
+            rc = run_cmd(ctx, [dest] + str(part["silent"]).split(), shell=False, timeout=900)
             if rc not in (0, 3010, 1638):  # 3010=reboot-needed success, 1638=already installed
                 raise RuntimeError(
                     f"{part['label']} installer exited with code {rc}. "
@@ -941,7 +943,9 @@ def _run_verified_installer(ctx: TaskContext, label: str, dest: str, silent: str
     temp file always removed. Raises RuntimeError pointing at the manual
     link on failure."""
     ctx.log(f"Running silent install: {label}...")
-    rc = run_cmd(ctx, f'"{dest}" {silent}', shell=True, timeout=1200)
+    # F07: shell=False argv — no cmd.exe parsing for elevated installer
+    # exec (silent is space-separated literals like "/quiet /norestart").
+    rc = run_cmd(ctx, [dest] + str(silent).split(), shell=False, timeout=1200)
     if rc not in ok_codes:
         raise RuntimeError(f"{label} installer exited with code {rc}. "
                            f"Manual download: {manual}")

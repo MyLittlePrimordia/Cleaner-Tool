@@ -254,7 +254,8 @@ def install_directx_runtimes(ctx: TaskContext):
     try:
         _log(ctx, "Running silent install (this takes a minute or two)...")
         # 3010 = success, reboot recommended — dxsetup treats it as success
-        rc = run_cmd(ctx, f'"{dest}" {info["silent_args"]}', timeout=1800)
+        # F07: shell=False argv — no cmd.exe parsing for elevated exec.
+        rc = run_cmd(ctx, [dest] + str(info["silent_args"]).split(), shell=False, timeout=1800)
         if rc not in (0, 3010, 1638):  # 1638 = already installed per MSI semantics
             raise RuntimeError(f"DirectX installer exited with code {rc}.")
         # M7: exit 0 alone never proved the runtimes landed (the /Q wrapper

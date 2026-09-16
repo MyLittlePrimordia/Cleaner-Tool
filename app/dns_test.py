@@ -7,6 +7,13 @@ compliant resolver answers TCP, RFC 7766). No raw sockets, no admin,
 stdlib socket only. Median of N probes per resolver; unreachable
 resolvers report None instead of a fake number.
 
+F09: this ranks TCP-connection latency to port 53, not UDP query
+latency (real DNS is usually UDP). TCP is used deliberately to stay
+stdlib-only with no admin/raw sockets; the winner is the lowest-
+handshake-latency resolver — a good but not protocol-exact proxy.
+The dialog copy states this plainly.
+
+
 The dialog (gui.py) runs these in worker threads and paints results
 live; applying the winner reuses tweak_tasks.apply_gaming_dns with an
 explicit server pair, so the snapshot/undo contract is untouched.
@@ -54,7 +61,8 @@ def time_resolver(ip: str, timeout: float = PROBE_TIMEOUT_S,
                   cancelled=None) -> "float | None":
     """Median TCP-connect latency to ip:53 in milliseconds, or None when
     unreachable. Each attempt opens + closes a fresh socket (no state);
-    cancelled() aborts between attempts (dialog-close path)."""
+    cancelled() aborts between attempts (dialog-close path).
+    F09: TCP handshake only — see module docstring (not a UDP DNS query)."""
     is_cancelled = cancelled or (lambda: False)
     samples = []
     for _ in range(max(1, attempts)):

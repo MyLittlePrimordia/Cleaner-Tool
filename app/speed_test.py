@@ -47,6 +47,10 @@ LEG_TIMEOUT_S = 10.0
 PARALLEL_STREAMS = 4
 DOWNLOAD_ROUNDS = (2_000_000, 10_000_000, 25_000_000)  # per stream
 UPLOAD_ROUNDS = (512_000, 2_000_000)                   # per stream
+# F08: worst-case data budget surfaced in the Tools dialog copy
+# ((2+10+25)MB x4 down + (0.5+2)MB x4 up ≈ 160MB on a fast link).
+ESTIMATED_MAX_MB = (sum(DOWNLOAD_ROUNDS) * PARALLEL_STREAMS
+                    + sum(UPLOAD_ROUNDS) * PARALLEL_STREAMS) / 1_000_000
 ROUND_MIN_MBPS = 25.0    # run the next download round above this…
 ROUND_FAST_MBPS = 250.0  # …and the jumbo round above this (else save data)
 STREAM_TIMEOUT_S = 20.0

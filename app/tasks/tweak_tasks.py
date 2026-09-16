@@ -1737,6 +1737,10 @@ def apply_ad_blocker(ctx: TaskContext):
     apply) and the revert function simply strips the marked block back out.
     Takes effect after a DNS flush; a reboot is not required but is a safe
     way to make sure all apps pick it up.
+
+    F05: the block is ~2MB. Windows resolves hosts linearly, so first-visit
+    lookups can cost extra milliseconds on slow disks — if browsing feels
+    slower after applying, Undo Tweaks restores the original file.
     """
     ctx.set_status("Applying system-wide ad blocker (hosts file)...")
 
@@ -1800,7 +1804,15 @@ def apply_ad_blocker(ctx: TaskContext):
         raise RuntimeError(f"Could not write hosts file (need admin rights?): {exc}")
 
     run_cmd(ctx, "ipconfig /flushdns", timeout=30)
-    ctx.log(f"Ad blocker applied: {domain_count} domains now blocked system-wide.")
+    try:
+        _block_bytes = len(block_lines.encode("utf-8", "ignore"))
+        from app.utils import format_bytes as _fmt2
+        _size_note = f" (~{_fmt2(_block_bytes)} added to hosts)"
+    except Exception:
+        _size_note = ""
+    ctx.log(f"Ad blocker applied: {domain_count} domains now blocked system-wide{_size_note}.")
+    ctx.log("Note: a multi-MB hosts file can slow first-visit lookups on slow disks — "
+            "Undo Tweaks restores the original file if browsing feels slower.")
 
 
 def revert_ad_blocker(ctx: TaskContext):
@@ -3631,7 +3643,7 @@ TASKS = [
     Task("privacy_baseline", "Privacy Baseline", "One switch for ad ID, tracking, typing data and speech opt-outs", apply_privacy_baseline, default=False, admin_required=False, revert=revert_privacy_baseline),
     Task("stop_telemetry", "Stop Telemetry", "Turns off diagnostic services and tracking tasks safely", apply_stop_telemetry, default=False, admin_required=True, revert=revert_stop_telemetry),
     Task("nvidia_telemetry", "NVIDIA Telemetry Opt-Out", "Turns off NVIDIA's usage reports (driver untouched)", apply_nvidia_telemetry_optout, default=False, admin_required=True, revert=revert_nvidia_telemetry_optout),
-    Task("ad_blocker", "System-Wide Ad Blocker", "Blocks ~78,000 known ad/tracker domains via the hosts file", apply_ad_blocker, default=False, revert=revert_ad_blocker, admin_required=True, risk="ADVANCED"),
+    Task("ad_blocker", "System-Wide Ad Blocker", "Blocks ~78,000 ad/tracker domains via hosts (~2MB — may slow first-visit lookups on slow disks)", apply_ad_blocker, default=False, revert=revert_ad_blocker, admin_required=True, risk="ADVANCED"),
     Task("visual_effects", "Faster Animations", "Turns off transparency and animations for speed", apply_visual_effects_perf, default=False, admin_required=False, revert=revert_visual_effects_perf, verify=verify_visual_effects),
     Task("mouse_accel", "1:1 Mouse Aim", "Turns off mouse speedup so aim is steady", apply_disable_mouse_accel, default=False, admin_required=False, revert=revert_disable_mouse_accel, verify=verify_mouse_accel),
     Task("keyboard_tuning", "Faster Keyboard", "Makes keys repeat faster when you hold them", apply_keyboard_tuning, default=False, admin_required=False, revert=revert_keyboard_tuning, verify=verify_keyboard_tuning),

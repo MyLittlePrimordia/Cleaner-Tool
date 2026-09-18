@@ -272,6 +272,11 @@ def _wait_for_elevated_process(timeout: float = 60.0) -> bool:
                                 # verification.
                                 _clear_elevation_cookie()
                                 _clear_pending_token()
+                                try:
+                                    from app.config_persist import log_security_event
+                                    log_security_event("elevation", f"Elevation succeeded (pid {pid}).")
+                                except Exception:
+                                    pass
                                 return True
                     finally:
                         ctypes.windll.kernel32.CloseHandle(handle)
@@ -285,6 +290,11 @@ def _wait_for_elevated_process(timeout: float = 60.0) -> bool:
     # as if it were this one. Clear both on timeout so a give-up is final.
     _clear_pending_token()
     _clear_elevation_cookie()
+    try:
+        from app.config_persist import log_security_event
+        log_security_event("elevation", "Elevation timed out or was cancelled.")
+    except Exception:
+        pass
     return False
 
 

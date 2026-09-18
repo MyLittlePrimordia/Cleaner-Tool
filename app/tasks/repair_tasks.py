@@ -949,6 +949,24 @@ _HOSTS_PATH = os.path.join(
 # would destroy the Ad Blocker's undo. This repair keeps its own backup.
 _HOSTS_REPAIR_BACKUP = _HOSTS_PATH + ".cleanertool_repair_bak"
 
+
+def _prune_hosts_repair_backups(keep: int = 3) -> None:
+    """Keep only the `keep` most recent versioned hosts repair backups
+    (DATA-001) — old-format single _HOSTS_REPAIR_BACKUP files, if any,
+    are left alone rather than deleted."""
+    try:
+        folder = os.path.dirname(_HOSTS_REPAIR_BACKUP)
+        prefix = os.path.basename(_HOSTS_REPAIR_BACKUP) + "-"
+        matches = [f for f in os.listdir(folder) if f.startswith(prefix)]
+        matches.sort(reverse=True)  # timestamp suffix sorts lexically = chronologically
+        for stale in matches[keep:]:
+            try:
+                os.remove(os.path.join(folder, stale))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
 _STOCK_HOSTS_LINES = [
     "# Copyright (c) 1993-2009 Microsoft Corp.",
     "#",
@@ -997,13 +1015,27 @@ def repair_hosts_file(ctx: TaskContext):
             current.strip() == "\n".join(_STOCK_HOSTS_LINES).strip():
         ctx.log("Hosts file is already stock — nothing to fix.")
         return
-    if not os.path.isfile(_HOSTS_REPAIR_BACKUP):
+    # DATA-001 fix: this used to be write-once (`if not isfile(...)`), so
+    # only the very first repair ever got backed up. Any hosts entries the
+    # user added after that (work VPN, self-hosted DNS block, etc.) were
+    # destroyed on a second repair with no fresh copy to recover from —
+    # the repair tool becoming the very damage it claims to fix. Now backs
+    # up every run with a timestamp, keeping the last 3.
+    try:
+        import time as _time
+        stamp = _time.strftime("%Y%m%d-%H%M%S")
+        versioned_backup = f"{_HOSTS_REPAIR_BACKUP}-{stamp}"
+        with open(versioned_backup, "w", encoding="utf-8") as f:
+            f.write(current)
+        ctx.log(f"Backed up current hosts file to {versioned_backup}")
+        _prune_hosts_repair_backups(keep=3)
         try:
-            with open(_HOSTS_REPAIR_BACKUP, "w", encoding="utf-8") as f:
-                f.write(current)
-            ctx.log(f"Backed up current hosts file to {_HOSTS_REPAIR_BACKUP}")
-        except Exception as exc:
-            raise RuntimeError(f"Could not back up hosts file, aborting for safety: {exc}")
+            from app.config_persist import log_security_event
+            log_security_event("backup_rotation", f"Hosts repair backup created: {versioned_backup}")
+        except Exception:
+            pass
+    except Exception as exc:
+        raise RuntimeError(f"Could not back up hosts file, aborting for safety: {exc}")
     try:
         # F07/F3-2: atomic write via the shared helper — never truncate
         # hosts in place; a mid-write crash bricked DNS. The helper's unique
@@ -1035,6 +1067,26 @@ def _repair_desktop_dir() -> str:
     return known_folder("Desktop",
                         os.path.join(os.environ.get("USERPROFILE", ""), "Desktop"),
                         strict=True)
+
+
+def _repair_backups_dir() -> str:
+    """UX-001 fix: registry/firewall/driver exports used to land straight
+    on the Desktop — commonly OneDrive-synced, so multi-hundred-MB
+    registry hives synced slowly and cluttered the visible desktop.
+    Routes to Documents\\CleanerTool Backups instead (honors a
+    OneDrive-redirected Documents the same way Desktop redirection was
+    honored). Created on first use; every caller still logs the exact
+    path so discoverability isn't lost, just the location."""
+    docs = known_folder("Personal",
+                        os.path.join(os.environ.get("USERPROFILE", ""), "Documents"),
+                        strict=True)
+    dest = os.path.join(docs or os.path.join(os.environ.get("USERPROFILE", ""), "Documents"),
+                        "CleanerTool Backups")
+    try:
+        os.makedirs(dest, exist_ok=True)
+    except Exception:
+        pass
+    return dest
 
 
 def _repair_stamp() -> str:
@@ -1112,14 +1164,15 @@ def repair_tray_icons(ctx: TaskContext):
 
 def backup_firewall_rules(ctx: TaskContext):
     """Export the current Windows Firewall rules to a timestamped .wfw file
-    on the Desktop — the safety net that pairs with 'Reset Firewall'
+    in Documents\\CleanerTool Backups (UX-001: moved off the Desktop —
+    OneDrive sync churn/clutter) — the safety net that pairs with 'Reset Firewall'
     (which wipes every per-app rule). Backup-only: changes nothing, returns
     None so the runner never counts it as freed space. Admin required
     (firewall policy is machine-wide)."""
-    desktop = _repair_desktop_dir()
-    if not desktop or not os.path.isdir(desktop):
-        raise RuntimeError("Could not find your Desktop folder — nothing was backed up.")
-    dest = os.path.join(desktop, f"FirewallRules_{_repair_stamp()}.wfw")
+    backups_dir = _repair_backups_dir()
+    if not backups_dir or not os.path.isdir(backups_dir):
+        raise RuntimeError("Could not find/create the backups folder — nothing was backed up.")
+    dest = os.path.join(backups_dir, f"FirewallRules_{_repair_stamp()}.wfw")
     ctx.set_status("Backing up firewall rules...")
     run_cmd_checked(ctx, f'netsh advfirewall export "{dest}"', timeout=120)
     if not os.path.isfile(dest):
@@ -1131,13 +1184,14 @@ def backup_firewall_rules(ctx: TaskContext):
 
 def backup_registry_hives(ctx: TaskContext):
     """Save copies of the SYSTEM, SOFTWARE and current-user registry hives
-    to a timestamped folder on the Desktop — a restore point for settings.
+    to a timestamped folder in Documents\\CleanerTool Backups (UX-001:
+    moved off the Desktop) — a restore point for settings.
     Backup-only: changes nothing. Admin required (HKLM hives). Verifies
     every file landed before reporting success."""
-    desktop = _repair_desktop_dir()
-    if not desktop or not os.path.isdir(desktop):
-        raise RuntimeError("Could not find your Desktop folder — nothing was backed up.")
-    dest_dir = os.path.join(desktop, f"RegistryBackup_{_repair_stamp()}")
+    backups_dir = _repair_backups_dir()
+    if not backups_dir or not os.path.isdir(backups_dir):
+        raise RuntimeError("Could not find/create the backups folder — nothing was backed up.")
+    dest_dir = os.path.join(backups_dir, f"RegistryBackup_{_repair_stamp()}")
     try:
         os.makedirs(dest_dir, exist_ok=True)
     except OSError as exc:
@@ -1171,14 +1225,15 @@ def backup_registry_hives(ctx: TaskContext):
 
 
 def backup_drivers(ctx: TaskContext):
-    """Export all third-party drivers to a timestamped folder on the Desktop
+    """Export all third-party drivers to a timestamped folder in
+    Documents\\CleanerTool Backups (UX-001: moved off the Desktop)
     (DISM driver export) — the safety net before reinstalling GPU drivers
     with DDU or swapping hardware. Backup-only: changes nothing. Admin
     required. Verifies the folder is non-empty before reporting success."""
-    desktop = _repair_desktop_dir()
-    if not desktop or not os.path.isdir(desktop):
-        raise RuntimeError("Could not find your Desktop folder — nothing was backed up.")
-    dest_dir = os.path.join(desktop, f"DriverBackup_{_repair_stamp()}")
+    backups_dir = _repair_backups_dir()
+    if not backups_dir or not os.path.isdir(backups_dir):
+        raise RuntimeError("Could not find/create the backups folder — nothing was backed up.")
+    dest_dir = os.path.join(backups_dir, f"DriverBackup_{_repair_stamp()}")
     try:
         os.makedirs(dest_dir, exist_ok=True)
     except OSError as exc:

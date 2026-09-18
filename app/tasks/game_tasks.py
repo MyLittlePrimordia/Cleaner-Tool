@@ -33,6 +33,40 @@ def _desktop_dir() -> str:
                         os.path.join(os.environ.get("USERPROFILE", ""), "Desktop"))
 
 
+def _game_saves_backup_dir() -> str:
+    """UX-001 fix: save-game zips used to land straight on the Desktop and
+    pile up there forever (acknowledged but never addressed — see the
+    pruning note below). Documents\\CleanerTool Backups\\Game Saves keeps
+    the Desktop clean and OneDrive-sync-light; the exact path is still
+    logged on every backup so it stays easy to find."""
+    docs = known_folder("Personal",
+                        os.path.join(os.environ.get("USERPROFILE", ""), "Documents"))
+    dest = os.path.join(docs or os.path.join(os.environ.get("USERPROFILE", ""), "Documents"),
+                        "CleanerTool Backups", "Game Saves")
+    try:
+        os.makedirs(dest, exist_ok=True)
+    except Exception:
+        pass
+    return dest
+
+
+def _prune_game_saves_backups(folder: str, keep: int = 5) -> None:
+    """Keep only the `keep` most recent GameSavesBackup_*.zip files — these
+    used to accumulate on the Desktop forever with no cap (a hazard the
+    code already called out but never acted on)."""
+    try:
+        matches = [f for f in os.listdir(folder)
+                  if f.startswith("GameSavesBackup_") and f.endswith(".zip")]
+        matches.sort(reverse=True)  # timestamp in the name sorts chronologically
+        for stale in matches[keep:]:
+            try:
+                os.remove(os.path.join(folder, stale))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def _shell_dir(name: str, fallback: str) -> str:
     """Known-folder path with OneDrive redirection (F-4): Documents is
     OneDrive-redirected by default on new Win11 profiles, so a saves backup
@@ -42,7 +76,9 @@ def _shell_dir(name: str, fallback: str) -> str:
 
 
 def backup_game_saves(ctx: TaskContext):
-    """Zip known save locations to the Desktop, timestamped. Read-only on
+    """Zip known save locations to Documents\\CleanerTool Backups\\Game
+    Saves (UX-001: moved off the Desktop, and pruned to the 5 most
+    recent), timestamped. Read-only on
     sources; creates ONE file; deletes nothing — the safety net that pairs
     with the app's 'never touch saves' cleaning rule.
 
@@ -91,15 +127,15 @@ def backup_game_saves(ctx: TaskContext):
                 except OSError:
                     continue
                 files_to_zip.append((fp, os.path.join(tag, os.path.relpath(fp, path))))
-    desktop = _desktop_dir()
+    desktop = _game_saves_backup_dir()
     try:
         free = shutil.disk_usage(desktop).free
     except OSError as exc:
-        raise RuntimeError(f"Could not check free space on your Desktop drive: {exc}")
+        raise RuntimeError(f"Could not check free space for the backup: {exc}")
     if free < total:
         from app.utils import format_bytes
         raise RuntimeError(
-            f"Not enough space on your Desktop drive (need ~{format_bytes(total)}, "
+            f"Not enough space in the backup folder's drive (need ~{format_bytes(total)}, "
             f"have {format_bytes(free)})."
         )
 
@@ -112,7 +148,7 @@ def backup_game_saves(ctx: TaskContext):
     with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as zf:
         for fp, arcname in files_to_zip:
             if ctx.cancelled():
-                ctx.log("  ! Cancelled — partial zip kept on Desktop.")
+                ctx.log("  ! Cancelled — partial zip kept in the backup folder.")
                 return None
             try:
                 zf.write(fp, arcname)
@@ -122,6 +158,7 @@ def backup_game_saves(ctx: TaskContext):
     if skipped:
         ctx.log(f"  (skipped {skipped} locked/inaccessible files — close running games for a full backup)")
     ctx.log(f"Backup complete: {count} files -> {dest}")
+    _prune_game_saves_backups(desktop, keep=5)
     return None
 
 
@@ -646,10 +683,12 @@ TASKS = [
     Task("game_files", "Clean Game Files", "Removes logs, crashes and junk from top games like Fortnite, PUBG, BG3 plus a Unity log sweep for indies; keeps saves", clean_game_files, default=True, admin_required=False),
     Task("steam_stuck", "Clear Stuck Steam Downloads", "Removes huge leftover files from failed Steam updates; frees lots of space", clean_steam_stuck_downloads, default=False, admin_required=False),
     Task("gpu_shader_caches", "Clean Shader Caches", "Rebuilds DirectX/NVIDIA/AMD/Intel shader caches to fix game stutter", clean_gpu_shader_caches, default=False, admin_required=False),
-    Task("game_captures", "Clean Game Captures", "Removes old Xbox Game Bar clips to free disk space", clean_game_captures, default=False, admin_required=False),
+    Task("game_captures", "Clean Game Captures", "Deletes ALL Xbox Game Bar clips in Videos\\Captures (no age filter, not backed up) — opt-in only", clean_game_captures, default=False, admin_required=False),
     # default=False ON PURPOSE: an always-on backup in the weekly scheduler
-    # would pile up timestamped zips on the Desktop forever.
-    Task("backup_saves", "Back Up Game Saves", "Zips your save folders (Saved Games, My Games, Minecraft) to a timestamped file on your Desktop", backup_game_saves, default=False, admin_required=False),
+    # still shouldn't run unattended by default — but the zip pile-up this
+    # comment used to warn about is now capped (keeps the 5 most recent,
+    # see _prune_game_saves_backups) and no longer lands on the Desktop.
+    Task("backup_saves", "Back Up Game Saves", "Zips your save folders (Saved Games, My Games, Minecraft) to Documents\\CleanerTool Backups\\Game Saves (keeps the last 5)", backup_game_saves, default=False, admin_required=False),
     # Per-game mega-caches (user request 2026-09-12): separate opt-in rows so
     # a layman sees WHAT will redownload. All default=False (redownload cost
     # or game-specific), all skip honestly when the game isn't installed.

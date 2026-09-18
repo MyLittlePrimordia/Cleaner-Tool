@@ -50,12 +50,17 @@ A free Windows 10/11 utility for gamers: cleans junk, fixes common Windows probl
 - SSD health check and retrim, search index, printer spooler, clock sync
 - Read-only disk check
 
-**Tweak (all reversible, one-click Undo)**
+**Tweak (reversible, one-click Undo — one exception noted below)**
 - Minimal or Recommended presets
 - Ultimate Performance power plan, CPU boost, Game Mode, HAGS, Game DVR off
 - Classic right-click menu, no mouse acceleration, calmer animations and taskbar
 - Lower-ping network tweaks, USB dropout fix
 - One-click privacy: no ads/tips, local-only search, telemetry off, system-wide ad blocker
+
+<sub>Exception: the "No Explorer Auto Discovery" tweak (Advanced) can't be
+fully undone — Undo resets the setting it changed, but the per-folder view
+customizations it clears (Bags/BagMRU) rebuild as you browse, they're not
+restored. Every other tweak's Undo is a full, verified revert.</sub>
 
 **Install**
 - One-click runtimes every game needs: DirectX, VC++, .NET, Java

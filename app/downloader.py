@@ -27,7 +27,7 @@ import subprocess
 import tempfile
 import urllib.request
 
-from app.utils import TaskContext, TaskCancelled, run_cmd, run_cmd_checked
+from app.utils import TaskContext, TaskCancelled, run_cmd, run_cmd_checked, resolve_exe
 from app import capabilities as cap
 
 _UA = "CleanerTool/2.0 (component installer)"
@@ -437,7 +437,7 @@ def install_winget_app(ctx: TaskContext, package_id: str, app_name: str,
         source = "msstore"
     ctx.set_status(f"Downloading & installing {app_name}...")
     ctx.log(f"Fetching latest version of {app_name} [{package_id}] via winget...")
-    cmd = ["winget", "install", "--id", package_id, "--exact", "--source", source,
+    cmd = [resolve_exe("winget"), "install", "--id", package_id, "--exact", "--source", source,
            "--silent", "--accept-package-agreements", "--accept-source-agreements",
            "--disable-interactivity"]
     rc = run_cmd(ctx, cmd, shell=False, timeout=1200)
@@ -457,7 +457,7 @@ def install_winget_app(ctx: TaskContext, package_id: str, app_name: str,
 def _winget_silent(ctx: TaskContext, pkg_id: str, timeout: int = 900, force: bool = False) -> int:
     """VC++-batch installer path — also routed through run_cmd so the Stop
     button kills it too (same user-reported bug as install_winget_app)."""
-    cmd = ["winget", "install", "--id", pkg_id, "--source", "winget",
+    cmd = [resolve_exe("winget"), "install", "--id", pkg_id, "--source", "winget",
            "--accept-package-agreements", "--accept-source-agreements",
            "--silent", "--disable-interactivity"]
     if force:

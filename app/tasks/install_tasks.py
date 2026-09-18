@@ -27,7 +27,7 @@ for apps winget does NOT carry (all verified live on 2026-09-08):
 These render as embedded checkbox rows via EMBEDDED_TASKS_BY_CATEGORY.
 """
 
-from app.utils import TaskContext, TaskCancelled, run_cmd, run_cmd_checked
+from app.utils import TaskContext, TaskCancelled, run_cmd, run_cmd_checked, resolve_exe
 from app.downloader import (
     has_network, install_winget_app, install_vc_redists, install_directx_runtimes,
     _require_admin_for_install, _norm_winget_rc, _WINGET_BENIGN,
@@ -215,7 +215,7 @@ def _winget_install(ctx: TaskContext, package_id: str, label: str, timeout: int 
     raise here — so the common "component already present" state failed
     the whole bundle task with a misleading error. Normalize the exit
     code and treat the benign set as success, exactly like downloader.py."""
-    cmd = ["winget", "install", "--id", package_id, "--source", "msstore"] + _WINGET_ARGS
+    cmd = [resolve_exe("winget"), "install", "--id", package_id, "--source", "msstore"] + _WINGET_ARGS
     ctx.log(f"Installing {label} ({package_id})...")
     rc = run_cmd(ctx, cmd, shell=False, timeout=timeout)
     rc = _norm_winget_rc(rc)
@@ -657,10 +657,15 @@ def _verify_download_integrity(ctx: TaskContext, dest: str, label: str, part: di
     # signature gate (Peace: author code-signs every release via Certum)
     if part.get("require_signature"):
         import subprocess as _sp
+        # SEC-001: dest can contain a single quote (e.g. a Windows username
+        # like O'Brien lands it under %TEMP%), which used to break out of
+        # the PS single-quoted string — same escaping rule already applied
+        # in create_restore_point (utils.py), just missed here.
+        safe_dest = dest.replace("'", "''")
         try:
             out = _sp.run(
                 ["powershell", "-NoProfile", "-Command",
-                 f"(Get-AuthenticodeSignature -FilePath '{dest}').Status"],
+                 f"(Get-AuthenticodeSignature -FilePath '{safe_dest}').Status"],
                 capture_output=True, text=True, timeout=30,
                 creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
             )
@@ -1195,7 +1200,7 @@ def get_installed_ids(refresh: bool = False) -> "set[str] | None":
     import subprocess as _sp
     try:
         out = _sp.run(
-            ["winget", "list", "--accept-source-agreements", "--disable-interactivity"],
+            [resolve_exe("winget"), "list", "--accept-source-agreements", "--disable-interactivity"],
             capture_output=True, text=True, timeout=120,
             creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
         )
@@ -1269,7 +1274,7 @@ def get_upgradable_count(refresh: bool = False) -> "int | None":
         return None
     try:
         out = _sp.run(
-            ["winget", "upgrade", "--accept-source-agreements", "--disable-interactivity"],
+            [resolve_exe("winget"), "upgrade", "--accept-source-agreements", "--disable-interactivity"],
             capture_output=True, text=True, timeout=120,
             creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
         )
@@ -1287,6 +1292,15 @@ def get_upgradable_count(refresh: bool = False) -> "int | None":
             hdr_idx = i
             break
     data = lines[hdr_idx + 1:] if hdr_idx >= 0 else lines
+    if hdr_idx < 0:
+        # BUG-002: non-English winget builds don't say "Name/Id/Version/
+        # Available" so the header is never found. Counting from line 0
+        # anyway (the old behavior) treats every stray line — including
+        # localized "no upgrades" messages this parser doesn't
+        # recognize — as a real upgrade, showing a phantom badge count
+        # on a fully up-to-date system. Degrade to "unknown" (no badge)
+        # instead of a confidently wrong number.
+        return None
     count = 0
     for ln in data:
         s = ln.strip()
@@ -1391,7 +1405,7 @@ def update_all_apps(ctx: TaskContext):
     ctx.log("Running winget upgrade --all (silent, latest versions)...")
     live = _live_status_ctx(ctx)
     collected: "list[str]" = []
-    rc = run_cmd(live, ["winget", "upgrade", "--all", "--silent",
+    rc = run_cmd(live, [resolve_exe("winget"), "upgrade", "--all", "--silent",
                         "--accept-package-agreements", "--accept-source-agreements",
                         "--disable-interactivity"],
                   shell=False, timeout=3600, collect=collected)

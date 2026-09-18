@@ -112,7 +112,13 @@ PRESETS = {
             "user_temp_files", "system_temp_files", "win_update_cache",
             "delivery_optimization", "inet_cache", "recycle_bin", "error_reports",
             "thumbnail_cache", "chk_fragments", "old_logs", "dns_flush",
-            "game_files", "game_captures",
+            "game_files",
+            # BUG-001 fix: "game_captures" removed from this preset —
+            # its own task is deliberately default=False (irreplaceable
+            # Xbox Game Bar clips, no age filter despite the old label),
+            # and Deep Clean selections persist into scheduled
+            # --auto-clean runs. Stays available as an explicit Custom
+            # opt-in below; never auto-selected by a preset again.
             # user request 2026-09-12: the big per-game caches live here too
             # (each skips honestly when its game isn't installed; Star Citizen
             # needs admin like the other Program-Files tasks in this preset).

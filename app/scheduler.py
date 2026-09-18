@@ -8,6 +8,7 @@ import sys
 import subprocess
 from app.config_persist import load_config, save_config, update_config
 from app.elevation import is_admin
+from app.utils import resolve_exe
 
 TASK_NAME = "CleanerTool_AutoMaintenance"
 TASK_DESC = "Cleaner Tool automatic maintenance run"
@@ -71,7 +72,7 @@ def _build_schtasks_cmd(frequency, time_str, extra_args=None, today=None):
     task_run = subprocess.list2cmdline([exe] + args)
     task_name = TASK_NAME if not extra_args else TASK_NAME + "_" + extra_args[0].lstrip("-").replace("-", "_")
     cmd = [
-        "schtasks", "/Create", "/TN", task_name,
+        resolve_exe("schtasks"), "/Create", "/TN", task_name,
         "/TR", task_run,
         "/SC", sched, "/ST", time_str,
     ]
@@ -189,7 +190,7 @@ def disable_schedule(extra_args=None):
     """Delete the scheduled task (clean/repair task by default, or the
     Update Everything task with extra_args=["--auto-update"])."""
     task_name = TASK_NAME if not extra_args else TASK_NAME + "_" + extra_args[0].lstrip("-").replace("-", "_")
-    cmd = ["schtasks", "/Delete", "/TN", task_name, "/F"]
+    cmd = [resolve_exe("schtasks"), "/Delete", "/TN", task_name, "/F"]
     try:
         result = subprocess.run(cmd, shell=False, capture_output=True, text=True, timeout=30)
         if result.returncode == 0:
@@ -209,7 +210,7 @@ def disable_schedule(extra_args=None):
 def get_schedule_status(extra_args=None):
     """Check if the scheduled task exists and get its details."""
     task_name = TASK_NAME if not extra_args else TASK_NAME + "_" + extra_args[0].lstrip("-").replace("-", "_")
-    cmd = ["schtasks", "/Query", "/TN", task_name, "/V", "/FO", "LIST"]
+    cmd = [resolve_exe("schtasks"), "/Query", "/TN", task_name, "/V", "/FO", "LIST"]
     try:
         result = subprocess.run(cmd, shell=False, capture_output=True, text=True, timeout=30)
         return result.returncode == 0, result.stdout

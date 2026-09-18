@@ -8,7 +8,7 @@ import os
 # audit fix (hygiene): module-level `subprocess` was unused — every caller
 # that needs it already does its own local `import subprocess`.
 
-from app.utils import TaskContext, clean_folder_contents, run_cmd, restart_explorer
+from app.utils import TaskContext, clean_folder_contents, run_cmd, restart_explorer, resolve_exe
 from app.tasks.launcher_paths import (
     ALL_LAUNCHER_CACHE_PATHS, GPU_SHADER_CACHE_ALL, refresh_dynamic_paths,
 )
@@ -886,7 +886,7 @@ def clean_event_logs(ctx: TaskContext):
     # be interpolated into a shell=True string (injection via crafted
     # channel name when elevated). Per-log timeout is short so ~200 logs
     # can't stall for hours; the loop honors Stop.
-    rc = run_cmd(ctx, ["wevtutil", "el"], shell=False, timeout=60, collect=collected)
+    rc = run_cmd(ctx, [resolve_exe("wevtutil"), "el"], shell=False, timeout=60, collect=collected)
     if rc != 0 and not collected:
         raise RuntimeError(f"Could not list event logs (wevtutil el exited {rc}).")
     cleared = 0
@@ -900,7 +900,7 @@ def clean_event_logs(ctx: TaskContext):
         if name.lower() == "security":
             ctx.log("  (skipped Security log — audit trail preserved; clear it only from Event Viewer.)")
             continue
-        rc = run_cmd(ctx, ["wevtutil", "cl", name], shell=False, timeout=30)
+        rc = run_cmd(ctx, [resolve_exe("wevtutil"), "cl", name], shell=False, timeout=30)
         if rc == 0:
             cleared += 1
         else:

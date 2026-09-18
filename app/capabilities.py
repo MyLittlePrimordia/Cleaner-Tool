@@ -15,6 +15,7 @@ per-process since the app only installs things once per session.
 import functools
 import subprocess
 import sys
+from app.utils import resolve_exe
 
 IS_WINDOWS = sys.platform.startswith("win")
 if IS_WINDOWS:
@@ -74,7 +75,7 @@ def has_winget() -> bool:
         # shell=False with a list (shell=True + list is wrong-shaped on
         # Windows and needlessly spawns cmd.exe for a PATH lookup).
         r = subprocess.run(
-            ["where", "winget"], shell=False, capture_output=True, text=True, timeout=10,
+            [resolve_exe("where"), "winget"], shell=False, capture_output=True, text=True, timeout=10,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         return r.returncode == 0 and "winget" in (r.stdout or "").lower()

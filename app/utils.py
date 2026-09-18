@@ -71,6 +71,47 @@ def known_folder(name: str, fallback: str = "", *, strict: bool = False) -> str:
     return fallback
 
 
+# SEC-002 hardening: known inbox-tool absolute paths, tried before a bare
+# name so a same-user-writable app/CWD directory can't shadow the real
+# tool for a process that sometimes runs elevated (install/repair/tweak
+# flows). Falls back to shutil.which(), then the bare name as a last
+# resort (logged) so this never breaks LTSC/Server SKUs where a tool
+# might live somewhere unexpected.
+_EXE_CACHE: dict = {}
+
+
+def resolve_exe(name: str) -> str:
+    """Absolute path for a well-known Windows inbox tool (winget,
+    powershell, schtasks, powercfg, tasklist, wevtutil, ping, net, ...).
+    Cached per-process. Never raises — worst case returns `name` itself,
+    identical to the old bare-name behavior."""
+    if name in _EXE_CACHE:
+        return _EXE_CACHE[name]
+    result = name
+    try:
+        system_root = os.environ.get("SystemRoot", r"C:\Windows")
+        sys32 = os.path.join(system_root, "System32")
+        candidates = [os.path.join(sys32, f"{name}.exe")]
+        if name == "winget":
+            # winget ships via the App Installer MSIX package, not System32 —
+            # WindowsApps holds a versioned real exe behind an alias stub;
+            # shutil.which() finds the per-user alias correctly.
+            candidates = []
+        for cand in candidates:
+            if os.path.isfile(cand):
+                result = cand
+                break
+        else:
+            import shutil as _shutil
+            which = _shutil.which(name)
+            if which:
+                result = which
+    except Exception:
+        result = name
+    _EXE_CACHE[name] = result
+    return result
+
+
 def atomic_write_text(dest: str, content: str, newline: str = "\n",
                       *, restore_readonly: bool = False) -> None:
     """Write `content` to `dest` atomically via a unique temp file in the
@@ -761,8 +802,9 @@ def powercfg_query_indexes(ctx: TaskContext, subgroup: str, setting: str) -> "tu
     sub = _POWERCFG_ALIAS_GUIDS.get(subgroup, subgroup)
     set_guid = _POWERCFG_ALIAS_GUIDS.get(setting, setting)
     try:
+        powercfg_exe = resolve_exe("powercfg")
         result = subprocess.run(
-            f"powercfg /q scheme_current {sub} {set_guid}",
+            f'"{powercfg_exe}" /q scheme_current {sub} {set_guid}',
             shell=True, capture_output=True, text=True, timeout=15,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
@@ -911,8 +953,9 @@ def _reg_delete_tree(root, path: str):
 def _is_explorer_running() -> bool:
     """True if at least one explorer.exe process exists right now."""
     try:
+        tasklist_exe = resolve_exe("tasklist")
         out = subprocess.check_output(
-            "tasklist /fi \"imagename eq explorer.exe\" /fo csv /nh",
+            f'"{tasklist_exe}" /fi "imagename eq explorer.exe" /fo csv /nh',
             shell=True, text=True, timeout=5, stderr=subprocess.DEVNULL,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )

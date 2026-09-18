@@ -34,6 +34,8 @@ from __future__ import annotations
 import threading
 import time
 
+from app.utils import resolve_exe
+
 # Built-in watchlist: stable game-client executable names (lowercase,
 # WITH extension — tasklist reports Image Name exactly so). Launchers
 # themselves (steam.exe etc.) are deliberately NOT here: an idle
@@ -125,7 +127,7 @@ def default_get_processes(timeout: int = 10, wanted=None):
     try:
         import subprocess as _sp
         out = _sp.check_output(
-            ["tasklist", "/fo", "csv", "/nh"], text=True, timeout=timeout,
+            [resolve_exe("tasklist"), "/fo", "csv", "/nh"], text=True, timeout=timeout,
             errors="replace", stderr=_sp.DEVNULL,
             creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
         )

@@ -30,6 +30,7 @@ import re
 import socket
 import subprocess
 import time
+from app.utils import resolve_exe
 
 # Epic's official per-region ping endpoints (Epic support docs point
 # players at these very hosts; verified ICMP-responsive 2026).
@@ -1006,7 +1007,7 @@ def probe_icmp(host, count=3, timeout_ms=1500, cancelled=None):
         count = 3
     try:
         proc = subprocess.run(
-            ["ping", "-n", str(count), "-w", str(int(timeout_ms)), host],
+            [resolve_exe("ping"), "-n", str(count), "-w", str(int(timeout_ms)), host],
             shell=False, capture_output=True, text=True, timeout=count * 6 + 10,
             errors="replace",
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))

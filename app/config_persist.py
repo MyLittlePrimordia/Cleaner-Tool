@@ -19,6 +19,46 @@ def _get_config_dir() -> Path:
 CONFIG_DIR = _get_config_dir()
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
+# ARCH-001: one small append-only local event log for security-relevant
+# events (config quarantines, elevation outcomes, backup rotations) that
+# previously left no persistent record anywhere. Additive only — nothing
+# reads this back into app behavior, it exists purely so a future
+# debugging session (yours or a support thread) has more than "it just
+# reset" to go on. Capped to the last ~2000 lines, same idea as the GUI's
+# own in-memory log cap, so it can never grow unbounded over months.
+EVENTS_LOG_FILE = CONFIG_DIR / "events.log"
+_EVENTS_LOCK = threading.Lock()
+
+
+def log_security_event(category: str, message: str) -> None:
+    """Append one timestamped line to the local event log. Best-effort and
+    never raises — this is observability, not a control path, so a
+    failure here must never affect the caller's actual operation."""
+    try:
+        from datetime import datetime
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{stamp}] [{category}] {message}\n"
+        with _EVENTS_LOCK:
+            try:
+                os.makedirs(CONFIG_DIR, exist_ok=True)
+            except Exception:
+                pass
+            with open(EVENTS_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(line)
+            # cheap cap check — only actually trims once in a long while,
+            # so no need to count lines on every single append
+            try:
+                if os.path.getsize(EVENTS_LOG_FILE) > 512_000:
+                    with open(EVENTS_LOG_FILE, "r", encoding="utf-8", errors="ignore") as f:
+                        lines = f.readlines()
+                    if len(lines) > 2000:
+                        with open(EVENTS_LOG_FILE, "w", encoding="utf-8") as f:
+                            f.writelines(lines[-2000:])
+            except Exception:
+                pass
+    except Exception:
+        pass
+
 DEFAULT_CONFIG = {
     "schedule_enabled": False,
     "schedule_frequency": "weekly",  # daily, weekly, monthly
@@ -179,7 +219,14 @@ def _quarantine_corrupt_config(exc: Exception) -> None:
     Best-effort: a failed rename must never crash startup. A visible
     warning goes to stderr (config_persist is imported by every entry
     point including the headless scheduler; GUI users see the effects as
-    a reset to defaults, hence the console note)."""
+    a reset to defaults, hence the console note).
+
+    REL-002 fix: stderr is null in the windowed frozen exe (and pythonw),
+    so on a GUI run this warning was completely invisible — the user just
+    saw their tweak badges/selections silently reset with zero
+    explanation. A small sibling marker file is now also written; GUI
+    startup calls consume_quarantine_notice() once to surface the same
+    message in the visible run log, then deletes the marker."""
     target = None
     try:
         from datetime import datetime
@@ -189,6 +236,16 @@ def _quarantine_corrupt_config(exc: Exception) -> None:
     except Exception:
         target = None
     where = f"quarantined to {target}" if target else "could NOT be moved aside (keeping it in place)"
+    message = (f"Settings were reset to defaults because the saved file was "
+               f"corrupt ({type(exc).__name__}: {exc}) — the original was "
+               f"{where}.")
+    try:
+        marker = CONFIG_FILE.with_name("config.json.quarantine-notice")
+        with open(marker, "w", encoding="utf-8") as f:
+            f.write(message)
+    except Exception:
+        pass
+    log_security_event("config_quarantine", message)
     # M15: sys.stderr can be None/closed in pythonw or the windowed frozen
     # exe — an unguarded print would raise out of the corrupt-config handler
     # and crash startup on exactly the case it was meant to survive.
@@ -200,6 +257,29 @@ def _quarantine_corrupt_config(exc: Exception) -> None:
               f"({type(exc).__name__}: {exc}) — {where}. Starting with defaults.", file=stream)
     except Exception:
         pass
+
+
+def consume_quarantine_notice() -> "str | None":
+    """One-shot read of the quarantine marker (REL-002): returns the
+    honest reset explanation and deletes the marker, or None if nothing
+    was quarantined since the last check. Call once from GUI startup and
+    log the result — never raises."""
+    try:
+        marker = CONFIG_FILE.with_name("config.json.quarantine-notice")
+        if not marker.exists():
+            return None
+        try:
+            with open(marker, "r", encoding="utf-8") as f:
+                message = f.read().strip()
+        except Exception:
+            message = None
+        try:
+            marker.unlink()
+        except Exception:
+            pass
+        return message or None
+    except Exception:
+        return None
 
 
 def _load_config_from_disk() -> dict:

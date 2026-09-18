@@ -4,6 +4,15 @@ Dangerous combo detection and warnings.
 
 from typing import List
 
+# Reboot Planner (improvement-report 2.4): every tweak key that requires a
+# restart to take effect, in one place so the "multiple reboots" INFO_NOTICE
+# below and the Run-bar badge (gui.py TaskTab) can never drift apart.
+REBOOT_TWEAK_KEYS = [
+    "hags", "priority_separation", "disable_fast_startup",
+    "ssd_trim", "ssd_superfetch", "ssd_last_access", "ssd_prefetch",
+    "mpo_fix",
+]
+
 
 # Define dangerous combinations: (task_keys, warning_message)
 # Split into two tiers (user feedback: curated presets like Deep Clean /
@@ -42,7 +51,7 @@ INFO_NOTICES = [
     # again — the dead keys were harmless but misleading).
     # tasks.txt: MPO fix also requires a reboot.
     (
-        ["hags", "priority_separation", "disable_fast_startup", "ssd_trim", "ssd_superfetch", "ssd_last_access", "ssd_prefetch", "mpo_fix"],
+        REBOOT_TWEAK_KEYS,
         "ℹ️ Multiple selected tweaks require a reboot (HAGS, Priority Separation, Fast Startup, SSD tweaks, MPO). "
         "You only need ONE reboot after all changes. The app will remind you at the end."
     ),

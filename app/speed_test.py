@@ -366,8 +366,14 @@ def upload_parallel(num_bytes_per_stream: int, streams: int = PARALLEL_STREAMS,
     threads = [_th.Thread(target=_work, args=(p,), daemon=True) for p in payloads]
     for t in threads:
         t.start()
+    # REL-001: mirror download_parallel's shared deadline (L04 above) — this
+    # loop used to join each thread for the full timeout+5s in sequence,
+    # so one stalled upload stream could wedge the whole round to ~4x the
+    # documented budget instead of the same cap download already has.
+    import time as _time
+    deadline = _time.monotonic() + timeout + 5.0
     for t in threads:
-        t.join(timeout + 5.0)
+        t.join(max(0.0, deadline - _time.monotonic()))
         if is_cancelled():
             break
     if not results:

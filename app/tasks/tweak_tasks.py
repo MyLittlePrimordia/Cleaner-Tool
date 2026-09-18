@@ -3776,7 +3776,7 @@ TASKS = [
     Task("games_priority", "Boost Game Priority", "Raises game priority for CPU and graphics", apply_games_priority, default=False, admin_required=True, revert=revert_games_priority, verify=verify_games_priority),
     Task("usb_suspend", "Fix USB Dropouts", "Stops Windows pausing USB mics and controllers", apply_usb_suspend, default=False, admin_required=True, revert=revert_usb_suspend),
     Task("disk_timeout", "Keep Drive Awake", "Stops drive from sleeping while you game", apply_disk_timeout, default=False, admin_required=True, revert=revert_disk_timeout),
-    Task("disable_fast_startup", "Fix Boot Issues", "Turns off fast boot to fix driver problems", apply_fast_startup_fix, default=False, admin_required=True, revert=revert_fast_startup_fix),
+    Task("disable_fast_startup", "Fix Boot Issues", "Turns off fast boot to fix driver problems", apply_fast_startup_fix, default=False, admin_required=True, revert=revert_fast_startup_fix, risk="REBOOT REQUIRED"),
     Task("limit_telemetry", "Limit Tracking", "Tells Windows to collect less info about you", apply_limit_telemetry, default=False, admin_required=True, revert=revert_limit_telemetry, verify=verify_limit_telemetry),
     Task("activity_history", "Disable Activity History", "Stops Windows saving your recent files and history", apply_activity_history_disable, default=False, admin_required=True, revert=revert_activity_history_disable),
     Task("consumer_features", "Disable Consumer Features", "Stops Windows installing suggested apps", apply_consumer_features_disable, default=False, admin_required=True, revert=revert_consumer_features_disable),

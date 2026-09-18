@@ -5135,12 +5135,104 @@ class TaskTab(tk.Frame):
             self._health_reapply_btn.pack(side="left", padx=6)
         else:
             label, bg, fg = "Run", accent, COLORS["black"]
-            self.run_btn = AnimatedButton(
-                self.run_row, text=label, command=self._run_selected,
-                bg=bg, fg=fg, font=(F, 12, "bold"), padx=42, pady=11,
-            )
-            self.run_btn.pack(anchor="center")
+            if self.tab_name == "Clean":
+                # improvement-report 2.1: Preview-Before-You-Clean — reuses
+                # the exact dry_run + measure_clean_tasks() machinery the
+                # Storage Insight dialog already uses, just scoped to
+                # whatever's currently selected instead of every category.
+                # The button itself only shows once something is actually
+                # selected (see _refresh_run_count) — nothing to preview
+                # otherwise, so no popup is ever needed to say so.
+                btns = tk.Frame(self.run_row, bg=COLORS["bg"])
+                btns.pack(anchor="center")
+                self.run_btn = AnimatedButton(
+                    btns, text=label, command=self._run_selected,
+                    bg=bg, fg=fg, font=(F, 12, "bold"), padx=42, pady=11,
+                )
+                self.run_btn.pack(side="left", padx=6)
+                self._preview_btn = AnimatedButton(
+                    btns, text="Preview", command=self._preview_clicked,
+                    bg=COLORS["surface"], fg=COLORS["text"],
+                    font=(F, 12, "bold"), padx=24, pady=11,
+                )
+                # not packed here — _refresh_run_count shows/hides it
+            else:
+                self.run_btn = AnimatedButton(
+                    self.run_row, text=label, command=self._run_selected,
+                    bg=bg, fg=fg, font=(F, 12, "bold"), padx=42, pady=11,
+                )
+                self.run_btn.pack(anchor="center")
+        if self.tab_name == "Tweak" and self.mode in ("preset", "custom"):
+            # improvement-report 2.4: Reboot Planner badge — count is
+            # refreshed in _refresh_run_count() below on every toggle.
+            self._reboot_badge = tk.Label(
+                self.run_row, text="", font=(F, 9), bg=COLORS["bg"],
+                fg=COLORS["accent_yellow"])
+            self._reboot_badge.pack(pady=(6, 0))
         self._refresh_run_count()
+
+    def _preview_clicked(self):
+        """Estimate how much the currently checked/selected items would
+        free, without deleting anything (improvement-report 2.1). Reuses
+        the same dry_run ctx + measure_clean_tasks() Storage Insight
+        already uses; keys outside SCAN_ALLOWLIST honestly measure 0, so
+        the result banner says so rather than implying a false total.
+        The button only shows once something is selected (see
+        _refresh_run_count), so there's nothing to prompt here — this
+        guard is just a no-op safety net, not a user-facing path."""
+        selected = self.selected_tasks()
+        if not selected:
+            return
+        try:
+            btn = self._preview_btn
+            btn.config_text("Estimating…")
+            btn.config(state="disabled")
+        except Exception:
+            pass
+        keys = [t.key for t in selected]
+
+        def _worker():
+            try:
+                from app.storage_scan import (
+                    acquire_scan, release_scan, make_measure_ctx,
+                    measure_clean_tasks, SCAN_ALLOWLIST, SCAN_EXCLUDED_NOTE)
+            except Exception:
+                self.app.root.after(0, self._preview_done, None, None)
+                return
+            if not acquire_scan(cancelled=lambda: False):
+                self.app.root.after(0, self._preview_done, "busy", None)
+                return
+            try:
+                ctx = make_measure_ctx(
+                    set_status=lambda m: self.app.root.after(0, self.app.set_status, m))
+                sizes = measure_clean_tasks(ctx, keys)
+                total = sum(sizes.values())
+                skipped = [k for k in keys if k not in SCAN_ALLOWLIST]
+                self.app.root.after(0, self._preview_done, total, skipped)
+            finally:
+                release_scan()
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _preview_done(self, total, skipped):
+        try:
+            btn = self._preview_btn
+            btn.config_text("Preview")
+            btn.config(state="normal")
+        except Exception:
+            pass
+        if total == "busy":
+            self.app.set_status("A scan is already running — try Preview again in a moment.")
+            return
+        if total is None:
+            self.app.set_status("Preview isn't available right now.")
+            return
+        from app.utils import format_bytes
+        msg = f"Preview: about {format_bytes(total)} would be freed."
+        if skipped:
+            msg += (f" ({len(skipped)} selected item(s) — game saves/backups/bloat-removal "
+                    "and similar — aren't estimated; they don't just delete files by size.)")
+        self.app.set_status(msg)
 
     def _run_count(self) -> int:
         """Live selection size for the Run button (user request: show what
@@ -5169,6 +5261,42 @@ class TaskTab(tk.Frame):
                 btn.config_text(f"Run ({n})" if n else "Run")
         except Exception:
             pass
+        # improvement-report 2.1 (user follow-up): the Preview button only
+        # shows once something is actually selected — no more "nothing
+        # selected, pick something first" popup, the button just isn't
+        # there to click when there's nothing to preview.
+        preview_btn = getattr(self, "_preview_btn", None)
+        if preview_btn is not None:
+            try:
+                if preview_btn.winfo_exists():
+                    if self._run_count() > 0:
+                        if not preview_btn.winfo_ismapped():
+                            preview_btn.pack(side="left", padx=6)
+                    else:
+                        if preview_btn.winfo_ismapped():
+                            preview_btn.pack_forget()
+            except Exception:
+                pass
+        # improvement-report 2.4: Reboot Planner badge. Keyed off the same
+        # task.risk == "REBOOT REQUIRED" tag the end-of-run reminder
+        # already uses (_run_tasks_worker) — a separate hand-maintained
+        # key list here would just be a second copy to drift out of sync
+        # (which is exactly what had happened: "Fix Boot Issues" was
+        # missing this tag despite its own dangerous-combo warning saying
+        # it needs a reboot — fixed alongside this badge).
+        badge = getattr(self, "_reboot_badge", None)
+        if badge is not None:
+            try:
+                if badge.winfo_exists():
+                    n_reboot = sum(1 for t in self.selected_tasks()
+                                  if getattr(t, "risk", "") == "REBOOT REQUIRED")
+                    if n_reboot:
+                        plural = "s" if n_reboot != 1 else ""
+                        badge.config(text=f"🔁 {n_reboot} tweak{plural} need a reboot — one reboot covers all")
+                    else:
+                        badge.config(text="")
+            except Exception:
+                pass
 
     # ---------------- interactions ---------------- #
 
@@ -11209,7 +11337,10 @@ class MouseTesterDialog(ThemedModal):
     _AIM_R = 22
 
     _BTNS = (("Left", 1), ("Middle", 2), ("Right", 3),
-             ("Side 1", 4), ("Side 2", 5))
+             ("Side 1", 4), ("Side 2", 5))  # button numbers -> Tk event.num
+    # num -> Win32 virtual-key code, for GetAsyncKeyState polling below.
+    _POLL_VKS = {1: 0x01, 3: 0x02, 2: 0x04, 4: 0x05, 5: 0x06}
+    _POLL_MS = 3  # ~330Hz — see _start_button_poll for why Tk events alone aren't enough
 
     def __init__(self, parent, app):
         self.app = app
@@ -11228,6 +11359,21 @@ class MouseTesterDialog(ThemedModal):
         self._aim_errs = []
         self._aim_spawn_t = 0.0
         self._aim_target = None
+        # Real button-state polling via GetAsyncKeyState (see
+        # _start_button_poll) instead of Tk's own ButtonPress/Release —
+        # probed once here; falls back to plain Tk events if this isn't
+        # Windows or the call fails for any reason.
+        self._user32 = None
+        try:
+            import ctypes as _ct
+            _u32 = _ct.windll.user32
+            _u32.GetAsyncKeyState(0x01)  # sanity call — raises if unusable
+            self._user32 = _u32
+        except Exception:
+            self._user32 = None
+        self._vk_down = {}
+        self._poll_after_id = None
+        self._hires_timer = False
         super().__init__(parent, title="Mouse Tester", accent=TAB_ACCENTS["Clean"])
         body = self.body
         tabs = tk.Frame(body, bg=COLORS["bg"])
@@ -11244,6 +11390,7 @@ class MouseTesterDialog(ThemedModal):
     # ---------------- view switching ---------------- #
 
     def _switch(self, key):
+        self._stop_button_poll()
         self._view = key
         for child in self._content.winfo_children():
             try:
@@ -11253,6 +11400,8 @@ class MouseTesterDialog(ThemedModal):
         self._held.clear()
         if key == "buttons":
             self._build_buttons()
+            if self._user32 is not None:
+                self._start_button_poll()
         else:
             self._build_aim()
         self._bind_mouse()
@@ -11268,11 +11417,15 @@ class MouseTesterDialog(ThemedModal):
                 except Exception:
                     pass
             if self._view == "buttons":
-                self._dlg.bind("<ButtonPress>", self._on_press, add="+")
-                self._dlg.bind("<ButtonRelease>", self._on_release, add="+")
                 self._dlg.bind("<MouseWheel>", self._on_wheel, add="+")
                 self._dlg.bind("<Motion>", self._on_move, add="+")
-                self._dlg.bind("<Double-Button-1>", self._on_double, add="+")
+                if self._user32 is None:
+                    # Not Windows (or GetAsyncKeyState unavailable) —
+                    # fall back to plain Tk click events. Same
+                    # rapid-click blind spot as before, but this only
+                    # applies outside real Windows use.
+                    self._dlg.bind("<ButtonPress>", self._on_tk_press_fallback, add="+")
+                    self._dlg.bind("<ButtonRelease>", self._on_tk_release_fallback, add="+")
             else:
                 self._dlg.bind("<ButtonPress>", self._on_aim_click, add="+")
             try:
@@ -11282,6 +11435,67 @@ class MouseTesterDialog(ThemedModal):
         except Exception:
             pass
 
+    # ---------------- real button-state polling ---------------- #
+    #
+    # Why this exists: Tk's <ButtonPress>/<ButtonRelease> come from
+    # Windows translating raw clicks into synthetic Tk events, and for
+    # a genuine fast double-click Windows itself merges the second
+    # click into a single WM_LBUTTONDBLCLK message rather than a plain
+    # WM_LBUTTONDOWN — exactly the kind of message Tk's event
+    # translation can drop or mishandle depending on the Tcl/Tk build,
+    # which is why the second click of a fast pair could fail to
+    # register at all (not just measure wrong). GetAsyncKeyState reads
+    # each button's real electrical state straight from Windows,
+    # bypassing that whole translation path, so nothing about how
+    # Windows decides to bundle rapid clicks into messages matters
+    # anymore. Polled at ~330Hz (every 3ms) via a temporarily-raised
+    # 1ms system timer resolution, which comfortably resolves clicks
+    # far faster than any human or mechanical switch double-click.
+
+    def _start_button_poll(self):
+        self._vk_down = {num: False for num in self._POLL_VKS}
+        try:
+            import ctypes as _ct
+            _ct.windll.winmm.timeBeginPeriod(1)
+            self._hires_timer = True
+        except Exception:
+            self._hires_timer = False
+        self._poll_buttons()
+
+    def _poll_buttons(self):
+        try:
+            if self._user32 is not None:
+                for num, vk in self._POLL_VKS.items():
+                    down = bool(self._user32.GetAsyncKeyState(vk) & 0x8000)
+                    was = self._vk_down.get(num, False)
+                    if down and not was:
+                        self._press(num)
+                    elif was and not down:
+                        self._release(num)
+                    self._vk_down[num] = down
+        except Exception:
+            pass
+        if self._view == "buttons":
+            try:
+                self._poll_after_id = self._dlg.after(self._POLL_MS, self._poll_buttons)
+            except Exception:
+                self._poll_after_id = None
+
+    def _stop_button_poll(self):
+        if self._poll_after_id:
+            try:
+                self._dlg.after_cancel(self._poll_after_id)
+            except Exception:
+                pass
+            self._poll_after_id = None
+        if self._hires_timer:
+            try:
+                import ctypes as _ct
+                _ct.windll.winmm.timeEndPeriod(1)
+            except Exception:
+                pass
+            self._hires_timer = False
+
     # ---------------- Buttons tab ---------------- #
 
     def _build_buttons(self):
@@ -11289,15 +11503,11 @@ class MouseTesterDialog(ThemedModal):
                                     font=(F, 10, "bold"), bg=COLORS["bg"],
                                     fg=COLORS["subtext"], anchor="w")
         self._status_lbl.pack(fill="x", pady=(0, 6))
-        row = tk.Frame(self._content, bg=COLORS["bg"])
-        row.pack(pady=(8, 4))
         self._btn_shapes = {}
-        for label, num in self._BTNS:
-            cell = tk.Frame(row, bg=COLORS["surface"], padx=18, pady=14)
-            cell.pack(side="left", padx=5)
-            tk.Label(cell, text=label, font=(F, 9, "bold"),
-                     bg=COLORS["surface"], fg=COLORS["subtext"]).pack()
-            self._btn_shapes[num] = cell
+        self._mouse_cv = tk.Canvas(self._content, width=220, height=300,
+                                   bg=COLORS["bg"], bd=0, highlightthickness=0)
+        self._mouse_cv.pack(pady=(4, 4))
+        self._draw_mouse_wireframe()
         stats = tk.Frame(self._content, bg=COLORS["bg"])
         stats.pack(fill="x", pady=(8, 0))
         for c in range(4):
@@ -11310,6 +11520,40 @@ class MouseTesterDialog(ThemedModal):
         tk.Label(self._content, text="Polling = real mouse-event rate (1000Hz mice read ~1000).",
                  font=(F, 8), bg=COLORS["bg"], fg=COLORS["subtext"],
                  wraplength=640).pack(pady=(8, 0))
+
+    def _draw_mouse_wireframe(self):
+        """A wireframe mouse silhouette (top-down) that lights up per
+        button — same idea as the gamepad's outline artwork, but drawn
+        as vector shapes instead of a bundled PNG. That's deliberate:
+        it needs no third-party asset (no licensing/attribution to
+        track, nothing extra to bundle in the build), it themes exactly
+        (idle = outline in the app's subtext gray, held = the same
+        accent green the gamepad lights up with), and it stays crisp
+        at any DPI. Proportions are modeled on a standard minimalist
+        mouse glyph (a rounded-capsule body with a center wheel notch —
+        the same silhouette shape used by e.g. the Lucide icon set,
+        ISC-licensed) extended with a seam and two side buttons so
+        every zone this dialog tracks has a matching spot on the body."""
+        cv = self._mouse_cv
+        body = _round_rect_points(45, 12, 175, 270, 65, steps=10)
+        cv.create_polygon(body, smooth=True, fill="", outline=COLORS["subtext"],
+                          width=2)
+        # seam between left/right click surfaces
+        cv.create_line(110, 18, 110, 108, fill=COLORS["subtext"], width=2)
+
+        def zone(x0, y0, x1, y1, r, num, label):
+            pts = _round_rect_points(x0, y0, x1, y1, r, steps=6)
+            shape = cv.create_polygon(pts, smooth=True, fill="",
+                                      outline=COLORS["subtext"], width=1)
+            text = cv.create_text((x0 + x1) / 2, (y0 + y1) / 2, text=label,
+                                  font=(F, 10, "bold"), fill=COLORS["subtext"])
+            self._btn_shapes[num] = (shape, text)
+
+        zone(52, 20, 106, 104, 16, 1, "L")     # Left click
+        zone(114, 20, 168, 104, 16, 3, "R")    # Right click
+        zone(99, 30, 121, 78, 10, 2, "M")      # Wheel / middle click
+        zone(24, 138, 54, 168, 12, 4, "4")     # Side 1 (back)
+        zone(24, 178, 54, 208, 12, 5, "5")     # Side 2 (forward)
 
     def _mstat(self, parent, col, title):
         try:
@@ -11325,71 +11569,70 @@ class MouseTesterDialog(ThemedModal):
             return None, None
 
     def _paint_btn(self, num, held):
-        cell = self._btn_shapes.get(num)
-        if cell is None:
+        got = self._btn_shapes.get(num)
+        if not got:
             return
+        shape, text = got
         color = COLORS["accent_green"] if held else (
-            _hex_lerp(COLORS["accent_green"], COLORS["surface"], 0.75)
-            if num in self._tested else COLORS["surface"])
+            _hex_lerp(COLORS["accent_green"], COLORS["bg"], 0.7)
+            if num in self._tested else "")
+        outline = COLORS["accent_green"] if (held or num in self._tested) else COLORS["subtext"]
         try:
-            cell.config(bg=color)
-            for w in cell.winfo_children():
-                try:
-                    w.config(bg=color)
-                except Exception:
-                    pass
+            self._mouse_cv.itemconfig(shape, fill=color, outline=outline)
+            self._mouse_cv.itemconfig(
+                text, fill=COLORS["black"] if held else COLORS["subtext"])
         except Exception:
             pass
 
-    def _on_press(self, event):
-        try:
-            num = int(getattr(event, "num", 0) or 0)
-        except Exception:
-            return
+    def _press(self, num):
+        """Shared press handling — called from the GetAsyncKeyState poll
+        (normal path) or the Tk-event fallback (non-Windows dev runs).
+        Runs unconditionally on every detected down-transition; not
+        gated behind "already held", so one missed/late release can't
+        wedge a button and silently freeze the double-click stat."""
         if num not in self._btn_shapes:
             return
-        if num not in self._held:
-            self._held.add(num)
-            self._tested.add(num)
-            try:
-                import time as _time
-                now = _time.perf_counter()
-                if num == 1:
-                    if self._last_click_t:
-                        gap = (now - self._last_click_t) * 1000.0
-                        # BUG FIX: this used to sit unused until the OS's
-                        # own <Double-Button-1> virtual event fired to
-                        # display it — but that event only fires within
-                        # the OS's own double-click window/target and is
-                        # easy to miss (slightly-too-slow clicks, tiny
-                        # mouse movement between clicks, or focus
-                        # churn from repainting the button cells all
-                        # suppressed it), which is why the stat barely
-                        # ever updated. The gap is measured here, off
-                        # real event timestamps, independent of the OS
-                        # double-click detector — so show it directly.
-                        self._last_dbl_ms = gap
-                        try:
-                            if gap <= 1500.0:
-                                self._stat_dbl.config(text=f"{gap:.0f}ms")
-                            else:
-                                self._stat_dbl.config(text="—")
-                        except Exception:
-                            pass
-                    self._last_click_t = now
-            except Exception:
-                pass
-            self._paint_btn(num, True)
-            self._refresh_mstats()
-
-    def _on_release(self, event):
         try:
-            num = int(getattr(event, "num", 0) or 0)
+            import time as _time
+            now = _time.perf_counter()
+            if num == 1:
+                if self._last_click_t:
+                    gap = (now - self._last_click_t) * 1000.0
+                    self._last_dbl_ms = gap
+                    try:
+                        if gap <= 1500.0:
+                            self._stat_dbl.config(text=f"{gap:.0f}ms")
+                        else:
+                            self._stat_dbl.config(text="—")
+                    except Exception:
+                        pass
+                self._last_click_t = now
         except Exception:
-            return
+            pass
+        self._held.discard(num)
+        self._held.add(num)
+        self._tested.add(num)
+        self._paint_btn(num, True)
+        self._refresh_mstats()
+
+    def _release(self, num):
         self._held.discard(num)
         self._paint_btn(num, False)
         self._refresh_mstats()
+
+    def _on_tk_press_fallback(self, event):
+        try:
+            num = int(getattr(event, "num", 0) or 0)
+        except Exception:
+            return
+        self._press(num)
+
+    def _on_tk_release_fallback(self, event):
+        try:
+            num = int(getattr(event, "num", 0) or 0)
+        except Exception:
+            return
+        self._release(num)
 
     def _on_wheel(self, event):
         try:
@@ -11414,13 +11657,6 @@ class MouseTesterDialog(ThemedModal):
                     self._stat_poll.config(text=f"{hz:.0f}Hz")
                 except Exception:
                     pass
-        except Exception:
-            pass
-
-    def _on_double(self, event):
-        try:
-            gap = getattr(self, "_last_dbl_ms", 0.0)
-            self._stat_dbl.config(text=f"{gap:.0f}ms" if gap else "—")
         except Exception:
             pass
 
@@ -11684,6 +11920,7 @@ class MouseTesterDialog(ThemedModal):
     def _stop(self):
         self._aim_running = False
         self._aim_target = None
+        self._stop_button_poll()
         try:
             self._close_aim_fullscreen()
         except Exception:
@@ -12432,6 +12669,22 @@ class Application:
 
         self._build_log(bottom)
         self._start_disk_monitor()
+
+        # REL-002: surface a corrupt-config reset here instead of leaving
+        # it stderr-only (invisible in the windowed frozen exe/pythonw —
+        # the user would otherwise just see their tweak badges and
+        # selections silently reset with zero explanation).
+        try:
+            from app.config_persist import consume_quarantine_notice
+            _notice = consume_quarantine_notice()
+            if _notice:
+                self.log(f"  ! {_notice}")
+        except Exception:
+            pass
+
+        # improvement-report 2.2: keyboard shortcuts. Bound on root (not
+        # add="+") so a rebuild replaces rather than stacks bindings.
+        self._bind_global_shortcuts()
 
         # Chrome restack (bottom-corners bug fix): everything above was
         # just (re)built — new siblings stacked above the chrome pieces
@@ -14770,6 +15023,46 @@ class Application:
                                   args=(tab_name, tasks, mode, quiet), daemon=True)
         self._worker_thread = thread
         thread.start()
+
+    def _bind_global_shortcuts(self):
+        """improvement-report 2.2: Ctrl+Enter runs the active tab, Escape
+        stops a running task (dialogs already bind their own Escape-to-
+        close — see ThemedModal — so this never conflicts, it only fires
+        when the main window itself has focus), Ctrl+1..5 switches tabs,
+        Ctrl+L copies the run log. Best-effort: any failure here should
+        never block the app from starting."""
+        try:
+            self.root.bind("<Control-Return>", lambda _e: self._shortcut_run())
+            self.root.bind("<Control-KP_Enter>", lambda _e: self._shortcut_run())
+            self.root.bind("<Escape>", lambda _e: self._request_cancel())
+            for i, name in enumerate(TAB_NAMES, start=1):
+                if i > 9:
+                    break
+                self.root.bind(f"<Control-Key-{i}>",
+                               lambda _e, n=name: self._switch_to(n))
+            self.root.bind("<Control-l>", lambda _e: self._shortcut_copy_log())
+            self.root.bind("<Control-L>", lambda _e: self._shortcut_copy_log())
+        except Exception:
+            pass
+
+    def _shortcut_run(self):
+        if self._busy:
+            return
+        try:
+            tab = self.tabs.get(self.active_tab)
+            if tab is not None and hasattr(tab, "_run_selected"):
+                tab._run_selected()
+        except Exception:
+            pass
+
+    def _shortcut_copy_log(self):
+        try:
+            text = "\n".join(self._log_lines)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.set_status("Log copied to clipboard.")
+        except Exception:
+            self.set_status("Could not copy the log.")
 
     def _request_cancel(self):
         if not self._busy:

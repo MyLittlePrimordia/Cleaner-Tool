@@ -10998,97 +10998,86 @@ class SpeakerTestDialog(ThemedModal):
 
 
 class WebcamDialog(ThemedModal):
-    """Webcam Test: live in-app preview (Start/Stop) so streamers can
-    check black feeds before going live. Dep-free DirectShow (no pip
-    anything, LTSC-safe) with an LTSC-aware native fallback. No
-    settings changed, device released on Stop/close."""
+    """Webcam Test: one button, live preview, camera released on close.
 
-    _PREVIEW_W = 640
-    _PREVIEW_H = 360
-    _TICK_MS = 33
+    The camera itself is opened by the user's browser via getUserMedia,
+    served from a throwaway loopback page this app starts and stops (see
+    app/webcam_web.py for why, and for the lifecycle contract). Nothing
+    is installed, downloaded or written to disk — still zero dependency.
+
+    This dialog owns only the plumbing: start the local page, hand it to
+    a browser window, watch the heartbeat, and tear everything down the
+    moment either side closes so the camera never stays claimed.
+    """
+
+    _POLL_MS = 700
 
     def __init__(self, parent, app):
         self.app = app
-        self._cap = None
+        self._srv = None
+        self._poll_after = None
         self._running = False
-        self._tick_after = None
-        self._img_ref = None
-        self._last_t = 0.0
-        self._fps_ema = 0.0
-        self._cam_index = 0
-        self._cam_choices = []
+        self._announced = False
         super().__init__(parent, title="Webcam Test", accent=TAB_ACCENTS["Clean"])
         body = self.body
+
         tk.Label(body, text="Check your camera before you go live.",
                  font=(F, 10, "bold"), bg=COLORS["bg"],
-                 fg=COLORS["subtext"], anchor="w").pack(fill="x", pady=(0, 6))
-        # Plain Frame holder at exact pixel size (Label/Canvas sizing
-        # games pushed the buttons off the dialog before — a Frame with
-        # pack_propagate(False) holds 640x360 and DirectShow draws into
-        # its HWND directly, no Pillow, no per-frame Tk work).
-        self._holder = tk.Frame(body, width=self._PREVIEW_W,
-                                height=self._PREVIEW_H, bg="#000000",
-                                bd=0, highlightthickness=0)
-        self._holder.pack(pady=(0, 6))
-        try:
-            self._holder.pack_propagate(False)
-        except Exception:
-            pass
-        try:
-            self._holder.bind("<Configure>", lambda _e: self._fit_video())
-        except Exception:
-            pass
-        self._info_lbl = tk.Label(body, text="Press Start to open your camera.",
-                                  font=(F, 9), bg=COLORS["bg"],
-                                  fg=COLORS["subtext"], wraplength=640)
-        self._info_lbl.pack(pady=(0, 6))
-        self._cam_row = tk.Frame(body, bg=COLORS["bg"])
-        self._cam_var = tk.StringVar(value="")
+                 fg=COLORS["text"], anchor="w").pack(fill="x", pady=(0, 2))
+        tk.Label(body,
+                 text=("Opens a private test window on this PC. Your browser "
+                       "asks for camera permission — choose Allow, and you "
+                       "should see yourself straight away."),
+                 font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
+                 anchor="w", justify="left", wraplength=700).pack(
+                     fill="x", pady=(0, 14))
+
+        # What the test actually reports, so the card is not a black box
+        # before it is pressed.
+        card = tk.Frame(body, bg=COLORS["bg_alt"], bd=0, highlightthickness=1,
+                        highlightbackground=COLORS["hairline"])
+        card.pack(fill="x", pady=(0, 16))
+        for _line in (
+                "\u2022  Live picture — proves the camera, driver and cable all work",
+                "\u2022  Resolution, megapixels and shape of the picture it sends",
+                "\u2022  Frames per second, measured from the real stream",
+                "\u2022  A plain-English reason when it will not start",
+        ):
+            tk.Label(card, text=_line, font=(F, 9), bg=COLORS["bg_alt"],
+                     fg=COLORS["subtext"], anchor="w").pack(
+                         fill="x", padx=16, pady=(9 if _line.endswith("work")
+                                                  else 0, 9))
+
         row = tk.Frame(body, bg=COLORS["bg"])
         row.pack()
-        self._toggle_btn = AnimatedButton(row, text="Start",
+        self._toggle_btn = AnimatedButton(row, text="Start Webcam Test",
                                           command=self._toggle,
-                                          bg=COLORS["surface"], fg=COLORS["text"],
-                                          font=(F, 9, "bold"), padx=22, pady=6)
+                                          bg=COLORS["accent_green"],
+                                          fg=COLORS["black"],
+                                          font=(F, 10, "bold"), padx=26, pady=9)
         self._toggle_btn.pack(side="left", padx=4)
-        _native_label = ("Camera Privacy Settings" if self._is_ltsc()
-                          else "Open Windows Camera")
-        self._native_btn = AnimatedButton(row, text=_native_label,
-                       command=self._open_native_camera,
-                       bg=COLORS["surface"], fg=COLORS["text"],
-                       font=(F, 9, "bold"), padx=14, pady=6)
-        self._native_btn.pack(side="left", padx=4)
-        Tooltip(self._toggle_btn, "Start/stop the live preview")
-        if self._is_ltsc():
-            self._set_info("LTSC detected — Windows has no Camera app here, so "
-                            "Start/Stop above is the real test.")
-        self.on_close(self._stop)
+        self._settings_btn = AnimatedButton(
+            row, text="Camera Privacy Settings",
+            command=self._open_privacy,
+            bg=COLORS["surface"], fg=COLORS["text"],
+            font=(F, 9, "bold"), padx=16, pady=9)
+        self._settings_btn.pack(side="left", padx=4)
+        Tooltip(self._toggle_btn,
+                "Opens the test window and asks your browser for camera access")
+        Tooltip(self._settings_btn,
+                "Windows' own camera permission page — needed if access is "
+                "blocked system-wide")
 
-    @staticmethod
-    def _is_ltsc():
-        """True on LTSC/LTSB editions — they ship no Camera app, and
-        Windows' own ShellExecute succeeds even when the target app
-        isn't installed (it just pops its own 'get this from the
-        Store' dialog), so Python never sees that as an exception.
-        Detecting LTSC up front and skipping the attempt entirely is
-        the only way to avoid showing that dialog. Never raises."""
-        try:
-            import winreg as _wr
-            base = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"
-            with _wr.OpenKey(_wr.HKEY_LOCAL_MACHINE, base) as key:
-                for name in ("ProductName", "EditionID"):
-                    try:
-                        val, _t = _wr.QueryValueEx(key, name)
-                    except OSError:
-                        continue
-                    val = str(val or "")
-                    if "LTSC" in val.upper() or "LTSB" in val.upper() \
-                            or val in ("EnterpriseS", "EnterpriseSN",
-                                       "IoTEnterpriseS"):
-                        return True
-        except Exception:
-            pass
-        return False
+        self._info_lbl = tk.Label(
+            body, text="Ready. Closing the test window releases your camera "
+                       "for OBS, Discord or Teams.",
+            font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
+            wraplength=700, justify="center")
+        self._info_lbl.pack(pady=(14, 0))
+
+        self.on_close(self._shutdown)
+
+    # -- helpers -------------------------------------------------------- #
 
     def _set_info(self, text):
         try:
@@ -11096,233 +11085,133 @@ class WebcamDialog(ThemedModal):
         except Exception:
             pass
 
+    def _set_btn(self, text):
+        try:
+            self._toggle_btn.config_text(text)
+        except Exception:
+            try:
+                self._toggle_btn.config(text=text)
+            except Exception:
+                pass
+
+    # -- start / stop --------------------------------------------------- #
+
     def _toggle(self):
         if self._running:
-            self._stop_preview()
+            self._shutdown()
+            self._set_info("Test stopped — your camera has been released.")
         else:
-            self._start_preview()
+            self._start()
 
-    def _open_capture(self, index):
-        # Retired with the OpenCV path (kept as a no-op so any external
-        # caller degrades to the DirectShow engine instead of crashing).
-        return None
-
-    def _probe_cameras(self):
-        # Retired with the OpenCV path — see _ensure_cams().
-        return []
-
-    def _ensure_cams(self):
-        """Real device names via DirectShow (fast, ~100ms). True when at
-        least one camera exists. Never raises."""
+    def _start(self):
         try:
-            from app.dshow_cam import list_cameras
-            cams = list_cameras() or []
+            from app.webcam_web import WebcamTestServer, open_test_window
         except Exception:
-            cams = []
-        self._cam_choices = [(c.get("index", i), c.get("name", ""))
-                             for i, c in enumerate(cams)]
-        return bool(self._cam_choices)
-
-    def _refresh_cam_row(self):
-        try:
-            for w in list(self._cam_row.winfo_children()):
-                try:
-                    w.destroy()
-                except Exception:
-                    pass
-            if len(self._cam_choices) > 1:
-                import tkinter.ttk as _ttk
-                tk.Label(self._cam_row, text="Camera:", font=(F, 9),
-                         bg=COLORS["bg"], fg=COLORS["subtext"]).pack(side="left")
-                names = [n or f"Camera {i}" for i, n in self._cam_choices]
-                if not self._cam_var.get() or self._cam_var.get() not in names:
-                    self._cam_var.set(names[0] if names else "")
-                combo = _ttk.Combobox(self._cam_row, textvariable=self._cam_var,
-                                      values=names, state="readonly",
-                                      width=40, font=(F, 9))
-                combo.pack(side="left", padx=(6, 0))
-                try:
-                    combo.bind("<<ComboboxSelected>>", lambda _e: self._switch_camera())
-                except Exception:
-                    pass
-                self._cam_row.pack(pady=(0, 6))
-            else:
-                try:
-                    self._cam_row.pack_forget()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    def _picked_index(self):
-        try:
-            sel = (self._cam_var.get() or "").strip()
-            names = [n or f"Camera {i}" for i, n in self._cam_choices]
-            if sel in names:
-                return self._cam_choices[names.index(sel)][0]
-        except Exception:
-            pass
-        try:
-            return self._cam_choices[0][0]
-        except Exception:
-            return 0
-
-    def _picked_name(self):
-        try:
-            sel = (self._cam_var.get() or "").strip()
-            if sel:
-                return sel
-        except Exception:
-            pass
-        try:
-            _i, n = self._cam_choices[0]
-            return n or f"Camera {_i}"
-        except Exception:
-            return "camera"
-
-    def _fit_video(self):
-        try:
-            pv = getattr(self, "_preview", None)
-            if pv is not None and getattr(pv, "live", False):
-                pv.resize(self._PREVIEW_W, self._PREVIEW_H)
-        except Exception:
-            pass
-
-    def _switch_camera(self):
-        was_running = False
-        try:
-            pv = getattr(self, "_preview", None)
-            was_running = bool(pv is not None and pv.live)
-        except Exception:
-            pass
-        try:
-            self._stop_preview()
-        except Exception:
-            pass
-        if was_running:
-            self._start_preview()
-
-    def _start_preview(self):
-        # Dep-free DirectShow path: enumerate (fast), open the pick into
-        # the holder HWND, run. No pip anything — works on LTSC.
-        if not self._ensure_cams():
-            self._set_info("No camera found — check Privacy > Camera, or use the fallback below.")
+            self._set_info("Webcam test engine unavailable on this build.")
             return
-        self._refresh_cam_row()
+
+        srv = WebcamTestServer()
         try:
-            from app.dshow_cam import Preview
+            url = srv.start()
         except Exception:
-            self._set_info("Camera engine unavailable on this PC — use the fallback below.")
+            url = ""
+        if not url:
+            self._set_info("Couldn't open a local test page (no free loopback "
+                           "port). Close other local servers and try again.")
+            try:
+                srv.stop()
+            except Exception:
+                pass
+            return
+
+        try:
+            mode = open_test_window(url)
+        except Exception:
+            mode = ""
+        if not mode:
+            try:
+                srv.stop()
+            except Exception:
+                pass
+            self._set_info("No web browser found on this PC. The test window "
+                           "needs one (Edge, Chrome, Firefox or Brave) — this "
+                           "is common on LTSC installs with no browser.")
+            return
+
+        self._srv = srv
+        self._running = True
+        self._announced = False
+        self._set_btn("Stop Test")
+        self._set_info("Opening the test window… choose Allow when your "
+                       "browser asks for the camera.")
+        try:
+            self.app.log("  > Webcam Test opened (%s)." % mode)
+        except Exception:
+            pass
+        self._schedule_poll()
+
+    def _schedule_poll(self):
+        try:
+            self._poll_after = self._dlg.after(self._POLL_MS, self._poll)
+        except Exception:
+            self._poll_after = None
+
+    def _poll(self):
+        """Watch the test page. When it goes, the test is over."""
+        self._poll_after = None
+        if not self._running or self._srv is None:
             return
         try:
-            try:
-                self._holder.update_idletasks()
-            except Exception:
-                pass
-            hwnd = self._holder.winfo_id()
+            reached = self._srv.page_reached()
+            alive = self._srv.page_open()
         except Exception:
-            self._set_info("Could not open this camera — use the fallback below.")
+            reached, alive = False, False
+        if alive:
+            if reached and not self._announced:
+                self._announced = True
+                self._set_info("Test window is open. Close it (or press Stop "
+                               "Test) when you're done — that releases the "
+                               "camera.")
+            self._schedule_poll()
             return
-        try:
-            pv = Preview()
-            if not pv.open(self._picked_index(), hwnd,
-                           self._PREVIEW_W, self._PREVIEW_H):
-                raise RuntimeError("open failed")
-            try:
-                old = getattr(self, "_preview", None)
-                if old is not None:
-                    old.close()
-            except Exception:
-                pass
-            self._preview = pv
-            self._running = True
-            try:
-                self._toggle_btn.config_text("Stop")
-            except Exception:
-                try:
-                    self._toggle_btn.config(text="Stop")
-                except Exception:
-                    pass
-            self._set_info(f"Live: {self._picked_name()} — Stop releases the camera for OBS/Discord.")
-        except Exception:
-            reason = ""
-            try:
-                reason = (getattr(pv, "last_error", "") or "").strip()
-            except Exception:
-                reason = ""
-            try:
-                pv.close()
-            except Exception:
-                pass
-            if reason:
-                self._set_info(reason)
-            else:
-                self._set_info("Could not open this camera — check Privacy > Camera settings, "
-                                "or try the fallback below.")
+        self._shutdown()
+        if reached:
+            self._set_info("Test window closed — your camera has been "
+                           "released.")
+        else:
+            self._set_info("The test window never opened. Try your browser "
+                           "manually, or check Camera Privacy Settings.")
 
-    def _tick(self):
-        # Retired with the OpenCV path — DirectShow renders itself, so
-        # there is no frame pump anymore. Kept as a no-op.
-        self._tick_after = None
+    def _shutdown(self):
+        """Stop everything. Safe to call repeatedly, never raises.
 
-    def _stop_preview(self):
-        if self._tick_after is not None:
+        Killing the server is also the signal the page watches for: it
+        stops its own camera tracks within a second of losing us, so no
+        stream can outlive this dialog."""
+        if self._poll_after is not None:
             try:
-                self._dlg.after_cancel(self._tick_after)
+                self._dlg.after_cancel(self._poll_after)
             except Exception:
                 pass
-            self._tick_after = None
-        try:
-            pv = getattr(self, "_preview", None)
-            if pv is not None:
-                pv.close()
-        except Exception:
-            pass
+            self._poll_after = None
+        srv, self._srv = self._srv, None
+        if srv is not None:
+            try:
+                srv.stop()
+            except Exception:
+                pass
         self._running = False
-        try:
-            self._toggle_btn.config_text("Start")
-        except Exception:
-            try:
-                self._toggle_btn.config(text="Start")
-            except Exception:
-                pass
-        self._set_info("Preview stopped — camera released.")
+        self._announced = False
+        self._set_btn("Start Webcam Test")
 
-    def _open_native_camera(self):
-        # LTSC-aware: on LTSC the Store Camera app isn't installed, but
-        # Windows' ShellExecute still "succeeds" launching the URI — it
-        # just pops its own "get this app from the Store" dialog that
-        # Python can't see or catch. So on LTSC we skip the attempt
-        # entirely and go straight to the one page that does exist
-        # there (Camera privacy settings), instead of showing users a
-        # dead-end Store prompt while our own label promised a camera.
-        if self._is_ltsc():
-            try:
-                self.app._launch_settings("ms-settings:privacy-webcam")
-                self._set_info("LTSC has no Camera app — Start/Stop above is the real test. "
-                               "Opened camera-permission settings instead.")
-            except Exception as exc:
-                self._set_info(f"Could not open Settings ({exc}).")
-            return
-        try:
-            import os as _os
-            _os.startfile("microsoft.windows.camera:")
-            return
-        except Exception:
-            pass
+    def _open_privacy(self):
         try:
             self.app._launch_settings("ms-settings:privacy-webcam")
-            self._set_info("Couldn't open the Camera app — the preview above is the test. "
-                           "Check permission in the settings page just opened.")
+            self._set_info("Opened Windows camera permissions. 'Let desktop "
+                           "apps access your camera' must be on for any "
+                           "browser to see it.")
         except Exception as exc:
-            self._set_info(f"Could not open a camera app ({exc}).")
-            try:
-                self.app.log("  ! webcam fallback failed.")
-            except Exception:
-                pass
-
-    def _stop(self):
-        self._stop_preview()
+            self._set_info("Could not open Settings (%s)." % exc)
 
 
 class MouseTesterDialog(ThemedModal):
@@ -12061,101 +11950,6 @@ class SpecsDialog(ThemedModal):
 
 
 class ToolsTab(tk.Frame):
-    # Retired OpenCV webcam body, kept as inert text (not code) so the
-    # history of the removed path stays visible; the live dialog above
-    # uses the dep-free DirectShow engine instead.
-    _RETIRED_OPENCV_BODY = '''
-        try:
-            import time as _time
-            import cv2 as _cv2
-            from PIL import Image as _Image
-            from PIL import ImageTk as _ImageTk
-            ok, frame = self._cap.read()
-            if ok and frame is not None:
-                now = _time.perf_counter()
-                if self._last_t:
-                    dt = now - self._last_t
-                    if dt > 0:
-                        inst = 1.0 / dt
-                        self._fps_ema = inst if not self._fps_ema else (0.9 * self._fps_ema + 0.1 * inst)
-                self._last_t = now
-                h, w = frame.shape[:2]
-                rgb = _cv2.cvtColor(frame, _cv2.COLOR_BGR2RGB)
-                img = _Image.fromarray(rgb)
-                img.thumbnail((self._PREVIEW_W, self._PREVIEW_H))
-                photo = _ImageTk.PhotoImage(image=img)
-                self._img_ref = photo
-                try:
-                    self._cv.delete("frame")
-                    self._cv.create_image(self._PREVIEW_W // 2, self._PREVIEW_H // 2,
-                                          image=photo, anchor="center", tags=("frame",))
-                except Exception:
-                    pass
-                try:
-                    if not getattr(self, "_black_warned", False):
-                        fps_txt = f" @ ~{self._fps_ema:.0f}fps measured" if self._fps_ema else ""
-                        self._set_info(f"Live: {w}x{h}{fps_txt} — Stop releases the camera.")
-                except Exception:
-                    pass
-            else:
-                self._set_info("Frame read failed — camera may be in use by another app.")
-        except Exception:
-            pass
-        try:
-            self._tick_after = self._dlg.after(self._TICK_MS, self._tick)
-        except Exception:
-            self._tick_after = None
-
-    def _stop_preview(self):
-        self._running = False
-        if self._tick_after is not None:
-            try:
-                self._dlg.after_cancel(self._tick_after)
-            except Exception:
-                pass
-            self._tick_after = None
-        if self._cap is not None:
-            try:
-                self._cap.release()
-            except Exception:
-                pass
-            self._cap = None
-        self._img_ref = None
-        try:
-            self._cv.delete("frame")
-            self._cv.create_text(self._PREVIEW_W // 2, self._PREVIEW_H // 2,
-                                 text="Press Start", font=(F, 12, "bold"),
-                                 fill=COLORS["subtext"], tags=("hint",))
-        except Exception:
-            pass
-        try:
-            self._toggle_btn.config_text("Start")
-        except Exception:
-            try:
-                self._toggle_btn.config(text="Start")
-            except Exception:
-                pass
-        self._set_info("Preview stopped — camera released.")
-
-    def _open_native_camera(self):
-        try:
-            import os as _os
-            _os.startfile("microsoft.windows.camera:")  # noqa: S606 — system URI, not an exe
-        except Exception as exc:
-            self._set_info(f"Could not open Windows Camera ({exc}).")
-            try:
-                self.app.log(f"  ! webcam fallback failed: {exc}")
-            except Exception:
-                pass
-
-    def _stop(self):
-        self._stop_preview()
-
-
-    '''
-
-
-class ToolsTab(tk.Frame):
     """Tools tab (user redesign 2026-09): the 5th tab — pink accent.
 
     Nine feature cards in a 3x3 grid — the exact same card size,
@@ -12190,7 +11984,7 @@ class ToolsTab(tk.Frame):
         ("speaker", "🔊", "Speaker Test",
          "Surround check on any output", TAB_ACCENTS["Clean"]),
         ("webcam", "📷", "Webcam Test",
-         "Live camera preview", TAB_ACCENTS["Clean"]),
+         "Check your camera works", TAB_ACCENTS["Clean"]),
         ("mouse", "🖱️", "Mouse Tester",
          "Buttons, polling + aim test", TAB_ACCENTS["Clean"]),
         ("specs", "💻", "PC Specs",
@@ -13228,9 +13022,10 @@ class Application:
             pass
 
     def _open_webcam_test(self):
-        """Webcam Test entry (Tools tab card). Live preview popup
-        (dep-free DirectShow, device released on close — no
-        busy-guard needed, same rationale as the speed popup)."""
+        """Webcam Test entry (Tools tab card). Opens the popup that
+        drives the loopback getUserMedia test page (app/webcam_web.py).
+        The camera is released when either window closes, so no
+        busy-guard is needed — same rationale as the speed popup."""
         try:
             WebcamDialog(self.root, self).wait()
         except Exception:

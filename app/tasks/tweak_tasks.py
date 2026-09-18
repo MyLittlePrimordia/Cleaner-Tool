@@ -1588,7 +1588,9 @@ def apply_stop_telemetry(ctx: TaskContext):
     can be restored by the revert."""
     # H5: the old unchecked run_cmd calls logged success even when every
     # service/task was absent (LTSC) or access-denied. Best-effort with
-    # honest counting: individual misses warn, but zero successes raises.
+    # honest counting: individual misses warn, but zero successes skips.
+    # M5/M6 parity: snapshot the real prior service start types so revert
+    # restores them instead of guessing auto/demand.
     _telemetry_tasks = (
         "\\Microsoft\\Windows\\Application Experience\\Microsoft Compatibility Appraiser",
         "\\Microsoft\\Windows\\Application Experience\\ProgramDataUpdater",
@@ -1601,22 +1603,38 @@ def apply_stop_telemetry(ctx: TaskContext):
         "\\Microsoft\\Windows\\DiskDiagnostic\\Microsoft-Windows-DiskDiagnosticDataCollector",
         "\\Microsoft\\Windows\\Windows Error Reporting\\QueueReporting",
     )
+    had_snapshot = bool(get_tweak_snapshot("stop_telemetry"))
+    _priors: dict = {}
+    for _svc in ("DiagTrack", "dmwappushservice"):
+        _prior = sc_query_start_type(ctx, _svc)
+        if _prior is not None:
+            _priors[_svc] = _prior
+    if _priors:
+        save_tweak_snapshot("stop_telemetry", _priors)
     _ok = 0
-    for _cmd in ("sc config DiagTrack start= disabled",
-                 "sc config dmwappushservice start= disabled"):
-        if run_cmd(ctx, _cmd, timeout=30) == 0:
+    for _svc in ("DiagTrack", "dmwappushservice"):
+        if ctx.cancelled():
+            raise TaskCancelled("Stop Telemetry stopped by user.")
+        if run_cmd(ctx, f"sc config {_svc} start= disabled", timeout=30) == 0:
             _ok += 1
         else:
-            ctx.log(f"  ! skipped (service absent or access denied): {_cmd}")
-    if run_cmd(ctx, "net stop DiagTrack", timeout=30) == 0:
-        _ok += 1
+            ctx.log(f"  ! skipped (service absent or access denied): sc config {_svc} start= disabled")
+    # Volatile stop only — unchecked and uncounted (a reboot undoes it; the
+    # persistent change is the sc config above). Same shape as M5 SysMain.
+    run_cmd(ctx, "net stop DiagTrack", timeout=30)
     for task in _telemetry_tasks:
+        if ctx.cancelled():
+            raise TaskCancelled("Stop Telemetry stopped by user.")
         if run_cmd(ctx, f'schtasks /change /tn "{task}" /disable', timeout=30) == 0:
             _ok += 1
         else:
             ctx.log(f"  ! skipped (task absent): {task}")
     if _ok == 0:
-        raise RuntimeError("No telemetry service or task could be changed — nothing was disabled.")
+        if not had_snapshot:
+            clear_tweak_snapshot("stop_telemetry")
+        # Nothing to do (LTSC/VM with no DiagTrack+tasks) is a skip, not a
+        # failure — same contract as NVIDIA opt-out / SSD tweaks.
+        raise TaskSkipped("No telemetry service or task found — nothing to disable (nothing to do).")
     ctx.log(f"Telemetry services and diagnostic scheduled tasks disabled ({_ok} change(s) applied).")
 
 def revert_stop_telemetry(ctx: TaskContext):
@@ -1632,22 +1650,40 @@ def revert_stop_telemetry(ctx: TaskContext):
         "\\Microsoft\\Windows\\DiskDiagnostic\\Microsoft-Windows-DiskDiagnosticDataCollector",
         "\\Microsoft\\Windows\\Windows Error Reporting\\QueueReporting",
     )
+    # M5/M6 parity: restore the snapshotted prior start types. Fall back to
+    # the documented Windows defaults only when no snapshot exists (tweak
+    # applied by an older app version, or config cleared).
+    snap = get_tweak_snapshot("stop_telemetry") or {}
+    _defaults = {"DiagTrack": "auto", "dmwappushservice": "demand"}
+    _targets: dict = {}
+    for _svc, _dflt in _defaults.items():
+        _t = snap.get(_svc)
+        if _t is None:
+            ctx.log(f"  (no saved prior {_svc} start type — restoring `{_dflt}`, the Windows default)")
+            _t = _dflt
+        elif not _valid_snapshot_start_type(_t):
+            raise _snapshot_validation_error("stop_telemetry", f"{_svc} start_type", _t)
+        _targets[_svc] = _t
     _ok = 0
-    for _cmd in ("sc config DiagTrack start= auto",
-                 "sc config dmwappushservice start= demand"):
-        if run_cmd(ctx, _cmd, timeout=30) == 0:
+    for _svc, _t in _targets.items():
+        if ctx.cancelled():
+            raise TaskCancelled("Stop Telemetry restore stopped by user — snapshot kept for Undo.")
+        if run_cmd(ctx, f"sc config {_svc} start= {_t}", timeout=30) == 0:
             _ok += 1
         else:
-            ctx.log(f"  ! skipped (service absent or access denied): {_cmd}")
-    if run_cmd(ctx, "net start DiagTrack", timeout=30) == 0:
-        _ok += 1
+            ctx.log(f"  ! skipped (service absent or access denied): sc config {_svc} start= {_t}")
+    # Volatile start only — unchecked and uncounted (mirror of apply).
+    run_cmd(ctx, "net start DiagTrack", timeout=30)
     for task in _telemetry_tasks:
+        if ctx.cancelled():
+            raise TaskCancelled("Stop Telemetry restore stopped by user — snapshot kept for Undo.")
         if run_cmd(ctx, f'schtasks /change /tn "{task}" /enable', timeout=30) == 0:
             _ok += 1
         else:
             ctx.log(f"  ! skipped (task absent): {task}")
     if _ok == 0:
-        raise RuntimeError("No telemetry service or task could be restored.")
+        raise TaskSkipped("No telemetry service or task found — nothing to restore.")
+    clear_tweak_snapshot("stop_telemetry")
     ctx.log(f"Telemetry services and tasks re-enabled ({_ok} change(s) applied).")
 
 
@@ -2335,6 +2371,10 @@ def _query_video_mode_list():
                 ("dmMediaType", wintypes.DWORD), ("dmDitherType", wintypes.DWORD),
                 ("dmReserved1", wintypes.DWORD), ("dmReserved2", wintypes.DWORD),
                 ("dmPanningWidth", wintypes.DWORD), ("dmPanningHeight", wintypes.DWORD),
+                # Full DEVMODE size (a short struct lets a sloppy display
+                # driver write past the buffer — heap corruption detonating
+                # later at GC; observed on virtual GPUs).
+                ("dmDisplayFixedOutput", wintypes.DWORD),
             ]
 
         user32 = ctypes.windll.user32
@@ -2359,6 +2399,55 @@ def _query_video_mode_list():
         return current, maximum
     except Exception:
         return None, None
+
+
+def _query_precise_refresh_rate():
+    """Exact rational refresh rate (e.g. 59.94Hz) via QueryDisplayConfig.
+    Read-only, active paths only. Returns float or None — never guesses.
+    Fail-closed: struct-size approximations that don't match hardware just
+    return None and callers fall back to the integer Hz."""
+    if not IS_WINDOWS:
+        return None
+    import ctypes
+    from ctypes import wintypes
+    try:
+        class LUID(ctypes.Structure):
+            _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
+
+        class _RATIONAL(ctypes.Structure):
+            _fields_ = [("Numerator", wintypes.UINT), ("Denominator", wintypes.UINT)]
+
+        class _SRC(ctypes.Structure):
+            _fields_ = [("adapterId", LUID), ("id", wintypes.UINT),
+                        ("modeInfoIdx", wintypes.UINT), ("statusFlags", wintypes.UINT)]
+
+        class _TGT(ctypes.Structure):
+            _fields_ = [("adapterId", LUID), ("id", wintypes.UINT),
+                        ("modeInfoIdx", wintypes.UINT), ("outputTechnology", wintypes.UINT),
+                        ("rotation", wintypes.UINT), ("scaling", wintypes.UINT),
+                        ("refreshRate", _RATIONAL), ("scanLineOrdering", wintypes.UINT),
+                        ("targetAvailable", wintypes.BOOL), ("statusFlags", wintypes.UINT)]
+
+        class _PATH(ctypes.Structure):
+            _fields_ = [("sourceInfo", _SRC), ("targetInfo", _TGT), ("flags", wintypes.UINT)]
+
+        user32 = ctypes.windll.user32
+        pc, mc = wintypes.UINT(), wintypes.UINT()
+        if user32.GetDisplayConfigBufferSizes(2, ctypes.byref(pc), ctypes.byref(mc)) != 0:
+            return None
+        if not pc.value:
+            return None
+        paths = (_PATH * pc.value)()
+        modes = (ctypes.c_byte * (mc.value * 64))()
+        if user32.QueryDisplayConfig(2, ctypes.byref(pc), ctypes.byref(paths),
+                                     ctypes.byref(mc), ctypes.byref(modes), None) != 0:
+            return None
+        rr = paths[0].targetInfo.refreshRate
+        if not rr.Denominator:
+            return None
+        return rr.Numerator / rr.Denominator
+    except Exception:
+        return None
 
 
 def apply_refresh_rate_fix(ctx: TaskContext):
@@ -2396,6 +2485,10 @@ def apply_refresh_rate_fix(ctx: TaskContext):
                 ("dmMediaType", wintypes.DWORD), ("dmDitherType", wintypes.DWORD),
                 ("dmReserved1", wintypes.DWORD), ("dmReserved2", wintypes.DWORD),
                 ("dmPanningWidth", wintypes.DWORD), ("dmPanningHeight", wintypes.DWORD),
+                # Full DEVMODE size (a short struct lets a sloppy display
+                # driver write past the buffer — heap corruption detonating
+                # later at GC; observed on virtual GPUs).
+                ("dmDisplayFixedOutput", wintypes.DWORD),
             ]
         user32 = ctypes.windll.user32
         dm = DEVMODE()
@@ -2448,6 +2541,10 @@ def revert_refresh_rate_fix(ctx: TaskContext):
                 ("dmMediaType", wintypes.DWORD), ("dmDitherType", wintypes.DWORD),
                 ("dmReserved1", wintypes.DWORD), ("dmReserved2", wintypes.DWORD),
                 ("dmPanningWidth", wintypes.DWORD), ("dmPanningHeight", wintypes.DWORD),
+                # Full DEVMODE size (a short struct lets a sloppy display
+                # driver write past the buffer — heap corruption detonating
+                # later at GC; observed on virtual GPUs).
+                ("dmDisplayFixedOutput", wintypes.DWORD),
             ]
         user32 = ctypes.windll.user32
         dm = DEVMODE()
@@ -3322,6 +3419,34 @@ def verify_classic_shortcut_icons() -> "bool | None":
         return None
 
 
+_IPV4_PATH = "SYSTEM\\CurrentControlSet\\Services\\Tcpip6\\Parameters"
+_IPV4_SPECS = [("HKLM", _IPV4_PATH, "DisabledComponents", "REG_DWORD")]
+
+
+def apply_prefer_ipv4(ctx: TaskContext):
+    """Prefer IPv4 over IPv6 for gaming (fixes lag on bad IPv6 routers).
+    Sets Microsoft's documented 0x20 flag — IPv6 stays enabled, IPv4 just
+    wins. Needs reboot. Snapshot + revert restores the exact prior value."""
+    _snap_reg_values(ctx, "prefer_ipv4", _IPV4_SPECS)
+    reg_set_value_checked(ctx, "HKLM", _IPV4_PATH, "DisabledComponents", 0x20)
+    ctx.log("IPv4 preferred for gaming (reboot to take effect).")
+
+
+def revert_prefer_ipv4(ctx: TaskContext):
+    _restore_reg_values(ctx, "prefer_ipv4")
+    ctx.log("IP version preference restored (reboot to take effect).")
+
+
+def verify_prefer_ipv4() -> "bool | None":
+    try:
+        v = __verify_read("HKLM", _IPV4_PATH, "DisabledComponents")
+        if v is None:
+            return None
+        return int(v) == 0x20
+    except Exception:
+        return None
+
+
 def apply_reserved_storage_off(ctx: TaskContext):
     """Free ~7 GB: Windows sets aside a chunk of your drive ('reserved
     storage') so future updates always have room. If your drive is
@@ -3713,4 +3838,5 @@ TASKS = [
     Task("device_search_history_off", "No On-Device Search History", "Windows stops remembering what you searched for on this PC", apply_device_search_history_off, default=False, revert=revert_device_search_history_off, verify=verify_device_search_history_off, admin_required=False),
     Task("long_paths", "Allow Long File Paths", "Lets games and mods use very long file names without errors", apply_long_paths, default=False, revert=revert_long_paths, verify=verify_long_paths, admin_required=True),
     Task("classic_shortcut_icons", "Classic Shortcut Icons", "Clean desktop icons: no arrow overlay, no ' - Shortcut' text", apply_classic_shortcut_icons, default=False, revert=revert_classic_shortcut_icons, verify=verify_classic_shortcut_icons, admin_required=False),
+    Task("prefer_ipv4", "Prefer IPv4 For Gaming", "Fixes lag on bad IPv6 routers by preferring IPv4; IPv6 stays on", apply_prefer_ipv4, default=False, revert=revert_prefer_ipv4, verify=verify_prefer_ipv4, admin_required=True),
 ]

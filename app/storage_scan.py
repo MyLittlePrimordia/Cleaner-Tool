@@ -25,6 +25,10 @@ Two read-only scanners, no UI here (the dialog lives in gui.py):
 Both scanners honor ctx.cancelled()/cancelled() so closing the dialog
 stops the walk promptly, and both skip reparse points (same guard as
 the cleaner — a junction must never inflate another drive's total).
+
+3. write_benchmark() — one HONEST number pair for the C: drive: writes
+a temp file of N MB with fsync, reads it back, reports MB/s each way.
+Temp file is always removed (finally + cancelled paths). stdlib only.
 """
 
 from __future__ import annotations
@@ -33,6 +37,7 @@ import glob
 import json
 import os
 import re
+import time
 
 from app.utils import TaskContext
 
@@ -446,3 +451,101 @@ def find_game_libraries(cancelled=None, on_game=None) -> list:
 
     games.sort(key=lambda g: g["bytes"], reverse=True)
     return games
+
+
+# --------------------------------------------------------------------------- #
+# 3. Write benchmark — honest sequential MB/s, temp file always removed
+# --------------------------------------------------------------------------- #
+
+BENCH_MB = 32
+_BENCH_CHUNK = 1 << 20  # 1 MB incompressible-ish chunks
+
+
+def write_benchmark(drive_root: str = "C:\\", size_mb: int = BENCH_MB,
+                    cancelled=None, progress_cb=None):
+    """Sequential write+read benchmark on one drive.
+
+    Writes `size_mb` MB to a uniquely-named temp file in the drive's
+    temp dir with fsync, reads it back, returns (write_mbps, read_mbps).
+    (None, None) when cancelled or on any failure — never a fake 0.
+    The temp file is removed on every path (success, cancel, error).
+    stdlib only; Tk-free (the dialog threads + hops this)."""
+    is_cancelled = cancelled or (lambda: False)
+    try:
+        import tempfile as _tf
+        tmpdir = _tf.gettempdir()
+        if os.path.splitdrive(os.path.abspath(tmpdir))[0].upper() != \
+                os.path.splitdrive(os.path.abspath(drive_root))[0].upper():
+            tmpdir = os.path.join(os.path.abspath(drive_root), "Windows", "Temp")
+            if not os.path.isdir(tmpdir):
+                tmpdir = None
+        fd, path = _tf.mkstemp(prefix="cleaner_bench_", suffix=".bin", dir=tmpdir)
+        os.close(fd)
+    except Exception:
+        return None, None
+    total = max(1, int(size_mb)) * (1 << 20)
+    data = None
+    try:
+        data = os.urandom(_BENCH_CHUNK)
+    except Exception:
+        pass
+    if data is None:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+        return None, None
+    write_mbps = read_mbps = None
+    try:
+        # --- sequential write (fsync so the number isn't page-cache fiction)
+        t0 = time.perf_counter()
+        written = 0
+        with open(path, "wb") as fh:
+            while written < total:
+                if is_cancelled():
+                    return None, None
+                fh.write(data)
+                written += len(data)
+                try:
+                    if progress_cb is not None:
+                        progress_cb(0.5 * written / total)
+                except Exception:
+                    pass
+            try:
+                fh.flush()
+                os.fsync(fh.fileno())
+            except Exception:
+                pass
+        dt = time.perf_counter() - t0
+        if dt > 0 and not is_cancelled():
+            write_mbps = (written / dt) / 1_000_000.0
+        # --- sequential read back
+        t0 = time.perf_counter()
+        got = 0
+        with open(path, "rb") as fh:
+            while True:
+                if is_cancelled():
+                    return None, None
+                chunk = fh.read(_BENCH_CHUNK)
+                if not chunk:
+                    break
+                got += len(chunk)
+                try:
+                    if progress_cb is not None:
+                        progress_cb(0.5 + 0.5 * got / max(1, written))
+                except Exception:
+                    pass
+        dt = time.perf_counter() - t0
+        if dt > 0 and not is_cancelled() and got:
+            read_mbps = (got / dt) / 1_000_000.0
+        if is_cancelled():
+            return None, None
+        return write_mbps, read_mbps
+    except Exception:
+        return None, None
+    finally:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass

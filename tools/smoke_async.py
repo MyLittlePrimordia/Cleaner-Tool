@@ -575,9 +575,12 @@ def main():
             fail(f"pilot apply: {exc!r}")
             return
         # game exits -> two clean polls -> revert of the FRESH keys only:
-        # ultimate_performance (session-applied) is reverted, game_mode
-        # (pre-existing) is left strictly alone
-        _state["registry"] = {"game_mode": True, "ultimate_performance": True}
+        # background_apps (session-applied, non-admin so it runs in both
+        # elevated and limited mode) is reverted, game_mode (pre-existing)
+        # is left strictly alone. Module-8: intent reflects what actually
+        # ran — an admin-only key like ultimate_performance would never have
+        # been applied in limited mode, so it must not be expected here.
+        _state["registry"] = {"game_mode": True, "background_apps": True}
         _state["procs"][0] = []
         root.after(300, poll_pilot_reverted)
 
@@ -590,7 +593,7 @@ def main():
             return
         try:
             assert revs[0][0] == "Tweak", revs
-            assert set(revs[0][2]) == {"ultimate_performance"}, revs
+            assert set(revs[0][2]) == {"background_apps"}, revs
             print("  pilot revert: fresh-only keys via engine OK", flush=True)
         except AssertionError as exc:
             fail(f"pilot revert: {exc!r}")

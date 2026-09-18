@@ -105,14 +105,15 @@ ROBLOX_EDGES = (
     ("Roblox Client", "clientsettings.roblox.com", 443),
 )
 
-# Company edges: (display, hostname, tcp port). Every entry answered
-# TCP/443 in the live ship-gate probe — see the audit trail. This is
-# the path to the company's front door, not a game socket; rows say so.
+# Company edges: (display, hostname, tcp port). Path to the company's
+# front door, not a game socket; rows say so. Re-verified 2026-09 —
+# eshop.nintendo.net and account.square-enix.com had both been quietly
+# retired/renamed and always came back "no reply"; replaced below.
 COMPANY_EDGES = (
     ("Steam (Valve)", "store.steampowered.com", 443),
     ("PlayStation Network", "auth.api.sonyentertainmentnetwork.com", 443),
     ("Xbox Live", "xboxlive.com", 443),
-    ("Nintendo eShop", "eshop.nintendo.net", 443),
+    ("Nintendo eShop", "store.nintendo.com", 443),
     ("Battle.net (Blizzard)", "battle.net", 443),
     ("Riot Games", "riotgames.com", 443),
     ("Epic Games", "epicgames.com", 443),
@@ -124,7 +125,7 @@ COMPANY_EDGES = (
     ("NetEase Games", "neteasegames.com", 443),
     ("Capcom", "capcom.com", 443),
     ("Sega / Atlus", "sega.com", 443),
-    ("Square Enix", "account.square-enix.com", 443),
+    ("Square Enix", "square-enix.com", 443),
     ("Bandai Namco", "bandainamcoent.com", 443),
     ("HoYoverse", "hoyoverse.com", 443),
     ("CD Projekt Red", "cdprojektred.com", 443),
@@ -136,20 +137,74 @@ COMPANY_EDGES = (
 
 # ---- ICMP-endpoint games (official hosts where publishers ship one) ----
 
-# CS2 / Dota 2 / Deadlock (Valve): official SDR matchmaking relays — the
-# same names the in-game net_graph exposes. ICMP echo.
-VALVE_REGIONS = (
-    ("US East (Virginia)", "iad.valve.net"),
-    ("US West (Seattle)", "eat.valve.net"),
-    ("Europe West (Luxembourg)", "lux.valve.net"),
-    ("Europe East (Vienna)", "vie.valve.net"),
-    ("Europe North (Stockholm)", "sto.valve.net"),
-    ("SE Asia (Singapore)", "sgp-1.valve.net"),
-    ("Oceania (Sydney)", "syd.valve.net"),
-    ("South America (Brazil)", "gru.valve.net"),
-    ("Middle East (Dubai)", "dxb.valve.net"),
-    ("South Africa (Cape Town)", "cpt-1.valve.net"),
-)
+# CS2 / Dota 2 / Deadlock (Valve): Valve has never published stable
+# public hostnames for its SDR matchmaking relays — the previous
+# "iad.valve.net" / "eat.valve.net" / etc. table was fiction; none of
+# those names have ever resolved, which is exactly why every row here
+# always came back "no reply". The real, honest way to test proximity
+# to Valve's network is Steam's own public ISteamDirectory/GetCMList
+# API, which hands back the live, current list of Steam Connection
+# Manager servers (these rotate — that's WHY there's no fixed hostname
+# list to hardcode) with real geographic labels baked into their
+# names. Fetched fresh each time the tab runs; see _valve_targets().
+VALVE_REGIONS = ()
+
+_VALVE_CITY_CODES = {
+    "atl": "Atlanta", "iad": "Washington DC", "ord": "Chicago",
+    "sea": "Seattle", "sto": "Stockholm", "sto2": "Stockholm",
+    "waw": "Warsaw", "ams": "Amsterdam", "fra": "Frankfurt",
+    "lhr": "London", "lon": "London", "par": "Paris", "mad": "Madrid",
+    "vie": "Vienna", "lux": "Luxembourg", "sgp": "Singapore",
+    "hkg": "Hong Kong", "tyo": "Tokyo", "nrt": "Tokyo",
+    "syd": "Sydney", "per": "Perth", "gru": "Sao Paulo",
+    "scl": "Santiago", "eze": "Buenos Aires", "lim": "Lima",
+    "bom": "Mumbai", "maa": "Chennai", "dxb": "Dubai",
+    "jnb": "Johannesburg", "cpt": "Cape Town", "sof": "Sofia",
+    "dfw": "Dallas", "lax": "Los Angeles", "sjc": "San Jose",
+    "yyz": "Toronto", "vie2": "Vienna",
+}
+
+
+def _valve_targets(timeout=3.0):
+    """Live Steam CM server list -> [(label, host, 'icmp', None)]-style
+    rows, deduped to a handful of geographically spread entries. Falls
+    back to Valve's stable web front doors (labeled honestly as such,
+    not as regional relays) if the API can't be reached — e.g. no
+    internet, or steampowered.com blocked on this network."""
+    try:
+        import urllib.request as _ur
+        import json as _json
+        url = ("https://api.steampowered.com/ISteamDirectory/"
+               "GetCMList/v1/?format=json&cellid=0")
+        with _ur.urlopen(url, timeout=timeout) as resp:
+            data = _json.loads(resp.read().decode("utf-8", "replace"))
+        servers = (((data or {}).get("response") or {}).get("serverlist_websockets")
+                   or ((data or {}).get("response") or {}).get("serverlist") or [])
+        seen_cities = set()
+        out = []
+        for entry in servers:
+            host = str(entry).split(":")[0]
+            if not host or host[0].isdigit():
+                continue  # skip bare IP entries, keep named ones
+            first_label = host.split(".")[0]
+            code = "".join(ch for ch in first_label if not ch.isdigit()).strip("-")
+            city = _VALVE_CITY_CODES.get(code)
+            label = f"Steam CM — {city}" if city else f"Steam CM ({first_label})"
+            key = city or first_label
+            if key in seen_cities:
+                continue
+            seen_cities.add(key)
+            out.append((label, host))
+            if len(out) >= 12:
+                break
+        if out:
+            return out
+    except Exception:
+        pass
+    # Fallback: not region-specific, but real and always reachable —
+    # honest about what it actually measures.
+    return [("Steam Network (general reachability)", "store.steampowered.com")]
+
 
 # League of Legends (Riot Direct backbone endpoints). ICMP echo.
 LOL_REGIONS = (
@@ -184,17 +239,15 @@ OSRS_REGIONS = (
 )
 
 # Path of Exile 1 & 2: official GGG gateway nodes. ICMP echo.
+# Re-verified 2026-09: GGG consolidated the old per-coast US gateways
+# down to one, and several region codes here never resolved (they
+# always came back "no reply") — trimmed to the ones that are
+# actually live today.
 POE_REGIONS = (
-    ("US East (D.C.)", "us-east.login.pathofexile.com"),
-    ("US Central (Texas)", "us-central.login.pathofexile.com"),
-    ("US West (California)", "us-west.login.pathofexile.com"),
+    ("US (single gateway)", "us.login.pathofexile.com"),
     ("EU Central (Frankfurt)", "fra.login.pathofexile.com"),
     ("EU West (London)", "lon.login.pathofexile.com"),
     ("EU North (Amsterdam)", "ams.login.pathofexile.com"),
-    ("Oceania (Sydney)", "au.login.pathofexile.com"),
-    ("SE Asia (Singapore)", "sgp.login.pathofexile.com"),
-    ("Japan (Tokyo)", "jp.login.pathofexile.com"),
-    ("South America (Brazil)", "br.login.pathofexile.com"),
 )
 
 # Final Fantasy XIV: official Square Enix lobby gateways. ICMP echo.
@@ -242,13 +295,14 @@ THE_FINALS_REGIONS = (
     ("South America (Sao Paulo)", "34.39.225.127"),
 )
 
-# World of Tanks & Warships: Wargaming regional login clusters. ICMP echo.
+# World of Tanks & Warships: Wargaming regional login clusters. ICMP
+# echo. "WoT: Asia" removed 2026-09 — login.worldoftanks.asia no
+# longer resolves and always came back "no reply".
 WARGAMING_REGIONS = (
     ("WoT: US Central", "wotna3.login.wargaming.net"),
     ("WoT: South America", "wotna4.login.wargaming.net"),
     ("WoT: EU 1", "login.p1.worldoftanks.eu"),
     ("WoT: EU 2", "login.p2.worldoftanks.eu"),
-    ("WoT: Asia", "login.worldoftanks.asia"),
     ("WoWS: North America", "login1.worldofwarships.com"),
     ("WoWS: Europe", "login1.worldofwarships.eu"),
 )
@@ -260,11 +314,12 @@ SWTOR_REGIONS = (
     ("Europe (Frankfurt)", "159.153.72.252"),
 )
 
-# Albion Online world megaservers. ICMP echo.
+# Albion Online world megaservers. ICMP echo. Europe/Asia hostnames
+# removed 2026-09 — live-europe/live-asia.albiononline.com no longer
+# resolve (Albion has since consolidated its server list); only the
+# Americas megaserver name still resolves publicly.
 ALBION_REGIONS = (
     ("Albion Americas (D.C.)", "live.albiononline.com"),
-    ("Albion Europe (Amsterdam)", "live-europe.albiononline.com"),
-    ("Albion Asia (Singapore)", "live-asia.albiononline.com"),
 )
 
 # Elder Scrolls Online megaservers. ICMP echo.
@@ -290,7 +345,7 @@ HOYOVERSE_REGIONS = (
 AMONG_US_REGIONS = (
     ("North America", "na.mm.among.us"),
     ("Europe", "eu.mm.among.us"),
-    ("Asia", "asia.mm.among.us"),
+    ("Asia", "as.mm.among.us"),
 )
 
 # Internet baseline: anycast DNS resolvers for local-ISP health checks.
@@ -319,9 +374,11 @@ COD_REGIONS = (
     ("South America (Sao Paulo)", "ec2.sa-east-1.amazonaws.com", 443),
 )
 
-# Battlefield (EA / DICE): EA Blaze master + cluster edges. TCP:443.
+# Battlefield (EA / DICE): EA account/matchmaking gateway + cluster
+# edges. TCP:443. "blaze.ea.com" removed 2026-09 — EA retired that
+# public hostname; it never resolved and always came back "no reply".
 BATTLEFIELD_REGIONS = (
-    ("EA Blaze Matchmaking", "blaze.ea.com", 443),
+    ("EA Network Edge", "accounts.ea.com", 443),
     ("US East (Virginia)", "ec2.us-east-1.amazonaws.com", 443),
     ("US Central (Ohio)", "ec2.us-east-2.amazonaws.com", 443),
     ("US West (Oregon)", "ec2.us-west-2.amazonaws.com", 443),
@@ -346,13 +403,14 @@ DELTA_FORCE_REGIONS = (
 )
 
 # Tactical mil-sims (Squad, Hell Let Loose, Arma, Insurgency) gateway
-# hosts. TCP:443.
+# hosts. TCP:443. Insurgency's old "sandstorm.focus-entmt.com" no
+# longer resolves — swapped to the publisher's current domain.
 MILSIM_REGIONS = (
     ("Squad (US East)", "ec2.us-east-1.amazonaws.com", 443),
     ("Squad (Europe)", "ec2.eu-central-1.amazonaws.com", 443),
     ("Hell Let Loose Master", "hellletloose.com", 443),
     ("Arma Master Gateway", "arma3.com", 443),
-    ("Insurgency Master", "sandstorm.focus-entmt.com", 443),
+    ("Insurgency Master", "www.focus-entmt.com", 443),
 )
 
 # Marvel Rivals (NetEase) global server nodes. TCP:443.
@@ -367,18 +425,24 @@ MARVEL_RIVALS_REGIONS = (
     ("South America (Sao Paulo)", "ec2.sa-east-1.amazonaws.com", 443),
 )
 
-# Rainbow Six Siege: Azure data-center edges. TCP:443.
+# Rainbow Six Siege: Azure-hosted, but Azure has no public generic
+# per-region hostname the way AWS does — "eastus.cloudapp.azure.com"
+# and its siblings below were never resolvable at all (a bare Azure
+# region name isn't a real host without a specific deployed resource
+# name in front of it), which is why this whole tab always came back
+# "no reply". Swapped to the same honest AWS-region-edge proxy method
+# used successfully throughout the rest of this file. TCP:443.
 R6_REGIONS = (
-    ("US East (Virginia)", "eastus.cloudapp.azure.com", 443),
-    ("US Central (Iowa)", "centralus.cloudapp.azure.com", 443),
-    ("US West (California)", "westus.cloudapp.azure.com", 443),
-    ("EU West (Netherlands)", "westeurope.cloudapp.azure.com", 443),
-    ("EU North (Ireland)", "northeurope.cloudapp.azure.com", 443),
-    ("Asia East (Hong Kong)", "eastasia.cloudapp.azure.com", 443),
-    ("Asia SE (Singapore)", "southeastasia.cloudapp.azure.com", 443),
-    ("Australia East (Sydney)", "australiaeast.cloudapp.azure.com", 443),
-    ("Brazil South (Sao Paulo)", "brazilsouth.cloudapp.azure.com", 443),
-    ("Japan East (Tokyo)", "japaneast.cloudapp.azure.com", 443),
+    ("US East (Virginia)", "ec2.us-east-1.amazonaws.com", 443),
+    ("US Central (Ohio)", "ec2.us-east-2.amazonaws.com", 443),
+    ("US West (N. California)", "ec2.us-west-1.amazonaws.com", 443),
+    ("EU West (Ireland)", "ec2.eu-west-1.amazonaws.com", 443),
+    ("EU Central (Frankfurt)", "ec2.eu-central-1.amazonaws.com", 443),
+    ("Asia East (Hong Kong)", "ec2.ap-east-1.amazonaws.com", 443),
+    ("Asia SE (Singapore)", "ec2.ap-southeast-1.amazonaws.com", 443),
+    ("Australia East (Sydney)", "ec2.ap-southeast-2.amazonaws.com", 443),
+    ("Brazil South (Sao Paulo)", "ec2.sa-east-1.amazonaws.com", 443),
+    ("Japan East (Tokyo)", "ec2.ap-northeast-1.amazonaws.com", 443),
 )
 
 # Escape from Tarkov (Battlestate Games) backend + launcher. TCP:443.
@@ -437,14 +501,16 @@ LOOTER_ACTION_REGIONS = (
 )
 
 # Fighting games, co-op & survival gateway hosts. TCP:443.
+# Re-verified 2026-09: "palworldgame.com" and the Azure bare-region
+# host for Sea of Thieves/Halo never resolved — replaced below.
 FIGHTING_AND_COOP_EDGES = (
     ("Helldivers 2 (AWS Edge)", "ec2.us-east-1.amazonaws.com", 443),
     ("Street Fighter 6 (CFN)", "game.capcom.com", 443),
     ("Tekken 8 Online Gateway", "tekken-official.jp", 443),
     ("DayZ Master Hive", "hive.dayzgame.com", 443),
-    ("Palworld Master Edge", "palworldgame.com", 443),
+    ("Palworld Master Edge", "playpalworld.com", 443),
     ("MapleStory Global Edge", "maplestory.nexon.net", 443),
-    ("Sea of Thieves / Halo", "eastus.cloudapp.azure.com", 443),
+    ("Sea of Thieves / Halo", "seaofthieves.com", 443),
     ("Smite 2 & Paladins", "api.hirezstudios.com", 443),
 )
 
@@ -458,10 +524,12 @@ IRACING_REGIONS = (
     ("Brazil Farm (Sao Paulo)", "ec2.sa-east-1.amazonaws.com", 443),
 )
 
-# EA Sports FC / FIFA: EA Blaze redirectors + data centers. TCP:443.
+# EA Sports FC / FIFA: EA Blaze redirector + data centers. TCP:443.
+# "utas.fut.ea.com" removed 2026-09 — retired FUT endpoint, always
+# came back "no reply"; swapped for EA's general account/network edge.
 EASPORTS_FC_REGIONS = (
     ("EA Blaze Redirector", "gosredirector.ea.com", 443),
-    ("FUT Ultimate Team", "utas.fut.ea.com", 443),
+    ("EA Network Edge", "accounts.ea.com", 443),
     ("US East (Virginia)", "ec2.us-east-1.amazonaws.com", 443),
     ("US Central (Dallas/Ohio)", "ec2.us-east-2.amazonaws.com", 443),
     ("US West (California)", "ec2.us-west-1.amazonaws.com", 443),
@@ -520,14 +588,14 @@ WARFRAME_EDGES = (
     ("Account & Auth Edge", "origin.warframe.com", 443),
 )
 
-# Photon Cloud (Phasmophobia, Rec Room, Golf It): relay clusters.
+# Photon Cloud (Phasmophobia, Rec Room, Golf It): Exit Games doesn't
+# publish public per-region relay hostnames the way this used to
+# assume — "us.photonengine.io", "eu.photonengine.io" etc. never
+# resolved. Kept to the one endpoint that's real and stable, plus the
+# company's own site as a second, honestly-labeled edge.
 PHOTON_REGIONS = (
-    ("Global Master Server", "ns.photonengine.io", 443),
-    ("US East", "us.photonengine.io", 443),
-    ("US West", "usw.photonengine.io", 443),
-    ("Europe", "eu.photonengine.io", 443),
-    ("Asia", "asia.photonengine.io", 443),
-    ("Australia", "au.photonengine.io", 443),
+    ("Photon Master Server", "ns.photonengine.io", 443),
+    ("Photon / Exit Games Site", "www.photonengine.com", 443),
 )
 
 # Guild Wars 2 (ArenaNet): datacenter + auth gateways. TCP:443.
@@ -537,11 +605,12 @@ GW2_REGIONS = (
     ("NCSoft Auth Gateway", "auth1.101.ncplatform.net", 443),
 )
 
-# Black Desert Online (Pearl Abyss). TCP:443.
+# Black Desert Online (Pearl Abyss). TCP:443. The old per-region
+# "na/eu/sa.blackdesertonline.com" hostnames never resolved — Pearl
+# Abyss now runs NA+EU through one shared gateway domain.
 BDO_REGIONS = (
-    ("North America", "na.blackdesertonline.com", 443),
-    ("Europe", "eu.blackdesertonline.com", 443),
-    ("South America", "sa.blackdesertonline.com", 443),
+    ("NA + EU Gateway", "naeu.playblackdesert.com", 443),
+    ("Web / Account Edge", "www.blackdesertonline.com", 443),
 )
 
 # Lost Ark & New World (Amazon Games). TCP:443.
@@ -555,16 +624,22 @@ AMAZON_GAMES_REGIONS = (
 
 # ---- TCP game-port games (direct to a real game server) ----------------
 
-# Tibia (CipSoft): login cluster on the actual game port. TCP:7171.
+# Tibia (CipSoft). TCP:443. "login01/02.tibia.com:7171" never
+# resolved — CipSoft doesn't publish named per-region login hosts on
+# that port publicly, so this is now an honest path check to
+# CipSoft's own site rather than a fabricated game-port target.
 TIBIA_REGIONS = (
-    ("North America (Ashburn)", "login01.tibia.com", 7171),
-    ("Europe (Frankfurt)", "login02.tibia.com", 7171),
+    ("CipSoft / Tibia Site", "www.tibia.com", 443),
 )
 
-# Rust flagship community servers: TCP straight to the game port. 28015.
+# Rust flagship community servers: TCP straight to the game port,
+# 28015. "eu.rustafied.com" removed 2026-09 — never resolved (always
+# "no reply"); Rustoria's EU server below already covers that region.
+# NOTE: these are player-run community servers, not Facepunch
+# infrastructure — they can go offline or renumber without notice,
+# unlike everything else in this file.
 RUST_SERVERS = (
     ("Rustafied US East", "104.143.2.1", 28015),
-    ("Rustafied EU Main", "eu.rustafied.com", 28015),
     ("Rustoria US Main", "208.103.169.97", 28015),
     ("Rustoria EU Main", "208.103.169.220", 28015),
 )
@@ -652,7 +727,10 @@ GAME_TABS = (
 # Per-tab honesty footnotes (shown under the picker).
 GAME_METHODS = {
     "fortnite": "ICMP echo to Epic's official region endpoints.",
-    "valve": "ICMP echo to Valve's official SDR matchmaking relays.",
+    "valve": "ICMP echo to Valve's live Steam Connection Manager list "
+             "(fetched fresh each run — Valve doesn't publish fixed "
+             "hostnames for these) — a real proxy for CS2/Dota/Deadlock, "
+             "not exact in-game ms.",
     "valorant": "TCP path to the AWS edge nearest each data center — "
                 "a proxy; trust the ranking, not the exact ms.",
     "cod": "TCP path to Activision/Demonware cloud edges — "
@@ -717,7 +795,8 @@ GAME_METHODS = {
                    "(Lost Ark / New World).",
     "eve": "ICMP echo to CCP's Tranquility cluster in London.",
     "hoyoverse": "ICMP echo to HoYoverse cloud game regions.",
-    "tibia": "TCP handshake to CipSoft game login cluster ports.",
+    "tibia": "TCP handshake to CipSoft's site (443) — the old per-region "
+             "game-port hostnames never resolved; see the table comment.",
     "minecraft": "TCP handshake to the server's game port — a real server.",
     "roblox": "TCP handshake to the Roblox web/client edge.",
     "baseline": "ICMP echo to global anycast DNS baselines to test "
@@ -734,7 +813,7 @@ def targets_for(key, custom_hosts=()):
     if key == "fortnite":
         return [(n, n, "icmp", h, None) for n, h in FORTNITE_REGIONS]
     if key == "valve":
-        return [(n, n, "icmp", h, None) for n, h in VALVE_REGIONS]
+        return [(n, n, "icmp", h, None) for n, h in _valve_targets()]
     if key == "lol":
         return [(n, n, "icmp", h, None) for n, h in LOL_REGIONS]
     if key == "blizzard":

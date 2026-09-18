@@ -206,19 +206,40 @@ def clean_recycle_bin_and_dumps(ctx: TaskContext):
     memory_dump = f"{_WINDIR}\\Memory.dmp"
     if os.path.isfile(memory_dump):
         try:
-            st = os.stat(memory_dump)
-            size = st.st_size
-            try:
-                os.remove(memory_dump)
-            except FileNotFoundError:
-                # Race: file deleted between stat and remove
-                size = 0
-            except OSError:
-                ctx.log(f"  (skipped locked dump: {memory_dump})")
-                size = 0
-            if size:
-                total += size
-                ctx.log(f"Cleaning crash dump: {memory_dump} ({size} bytes)")
+            from app.utils import _is_reparse_point as _is_rp
+            # CAND-01: never delete through a junction/symlink, honor dry-run
+            # and Stop — same guard as game_tasks._clean_files.
+            if _is_rp(memory_dump):
+                ctx.log(f"  (skipped reparse-point file: {memory_dump})")
+            elif bool(getattr(ctx, "dry_run", False)):
+                try:
+                    size = os.path.getsize(memory_dump)
+                except OSError:
+                    size = 0
+                if size:
+                    total += size
+                    ctx.log(f"[dry-run] would clean crash dump: {memory_dump} ({size} bytes)")
+            elif ctx.cancelled():
+                ctx.log("  ! stopped — skipping Memory.dmp.")
+            else:
+                st = os.stat(memory_dump)
+                size = st.st_size
+                # Re-verify immediately before removal (defense in depth).
+                if _is_rp(memory_dump):
+                    ctx.log(f"  (skipped reparse-point file: {memory_dump})")
+                    size = 0
+                else:
+                    try:
+                        os.remove(memory_dump)
+                    except FileNotFoundError:
+                        # Race: file deleted between stat and remove
+                        size = 0
+                    except OSError:
+                        ctx.log(f"  (skipped locked dump: {memory_dump})")
+                        size = 0
+                if size:
+                    total += size
+                    ctx.log(f"Cleaning crash dump: {memory_dump} ({size} bytes)")
         except OSError:
             ctx.log(f"  (skipped locked dump: {memory_dump})")
     ctx.log("Emptying Recycle Bin (silent)...")
@@ -283,7 +304,24 @@ def clean_chk_fragments(ctx: TaskContext):
     for pattern in patterns:
         for path in globmod.glob(pattern):
             try:
+                if ctx.cancelled():
+                    ctx.log("  ! stopped — skipping remaining disk fragments.")
+                    break
                 if os.path.isfile(path):
+                    from app.utils import _is_reparse_point as _is_rp2
+                    # CAND-01: same reparse-point + dry-run guard as _clean_files.
+                    try:
+                        if _is_rp2(path):
+                            continue
+                    except Exception:
+                        continue
+                    if bool(getattr(ctx, "dry_run", False)):
+                        try:
+                            size = os.path.getsize(path)
+                        except OSError:
+                            continue
+                        total += size
+                        continue
                     # L2 fix: size must be added to `total` only AFTER
                     # os.remove() succeeds. The old order added it first —
                     # if remove() then raised (e.g. a locked file), the
@@ -293,6 +331,11 @@ def clean_chk_fragments(ctx: TaskContext):
                     # (Matches the correct order already used in
                     # game_tasks._clean_files and utils.clean_folder_contents.)
                     size = os.path.getsize(path)
+                    try:
+                        if _is_rp2(path):
+                            continue
+                    except Exception:
+                        continue
                     os.remove(path)
                     total += size
                 elif os.path.isdir(path):
@@ -929,12 +972,33 @@ def clean_steam_download_cache(ctx: TaskContext):
     appinfo = os.path.join(root, "appcache", "appinfo.vdf")
     try:
         if os.path.isfile(appinfo):
-            # Count only AFTER a successful remove (a locked file must not
-            # inflate the freed-space total).
-            size = os.path.getsize(appinfo)
-            os.remove(appinfo)
-            total += size
-            ctx.log(f"Removed stale app manifest: {appinfo}")
+            from app.utils import _is_reparse_point as _is_rp3
+            try:
+                _is_rp = _is_rp3(appinfo)
+            except Exception:
+                _is_rp = True
+            if _is_rp:
+                ctx.log(f"  (skipped reparse-point file: {appinfo})")
+            elif bool(getattr(ctx, "dry_run", False)):
+                size = os.path.getsize(appinfo)
+                total += size
+                ctx.log(f"[dry-run] would remove stale app manifest: {appinfo}")
+            elif ctx.cancelled():
+                ctx.log("  ! stopped — keeping appinfo.vdf.")
+            else:
+                # Count only AFTER a successful remove (a locked file must not
+                # inflate the freed-space total).
+                size = os.path.getsize(appinfo)
+                try:
+                    _is_rp2 = _is_rp3(appinfo)
+                except Exception:
+                    _is_rp2 = True
+                if _is_rp2:
+                    ctx.log(f"  (skipped reparse-point file: {appinfo})")
+                else:
+                    os.remove(appinfo)
+                    total += size
+                    ctx.log(f"Removed stale app manifest: {appinfo}")
     except OSError as exc:
         ctx.log(f"  (kept appinfo.vdf: {exc})")
     return total
@@ -984,10 +1048,36 @@ def clean_terminal_history(ctx: TaskContext):
         os.path.join(_APPDATA, "Microsoft\\Windows\\PowerShell\\PSReadLine\\Visual Studio Code Host_history.txt"),
     ]
     total = 0
+    from app.utils import _is_reparse_point as _is_rp4
+    dry = bool(getattr(ctx, "dry_run", False))
     for path in files:
         try:
+            if ctx.cancelled():
+                ctx.log("  ! stopped — keeping remaining history files.")
+                break
             if os.path.isfile(path):
+                try:
+                    if _is_rp4(path):
+                        ctx.log(f"  (skipped reparse-point file: {path})")
+                        continue
+                except Exception:
+                    continue
+                if dry:
+                    try:
+                        size = os.path.getsize(path)
+                    except OSError as exc:
+                        ctx.log(f"  (kept history file: {exc})")
+                        continue
+                    total += size
+                    ctx.log(f"[dry-run] would remove terminal history: {path}")
+                    continue
                 size = os.path.getsize(path)
+                try:
+                    if _is_rp4(path):
+                        ctx.log(f"  (skipped reparse-point file: {path})")
+                        continue
+                except Exception:
+                    continue
                 os.remove(path)
                 total += size
                 ctx.log(f"Removed terminal history: {path}")
@@ -996,6 +1086,19 @@ def clean_terminal_history(ctx: TaskContext):
     if not total:
         ctx.log("No terminal history found.")
     return total
+
+
+def clean_stream_app_logs(ctx: TaskContext):
+    """Clear Medal / Overwolf (Outplayed) / SteelSeries GG diagnostic logs
+    and web caches (clips and settings untouched — logs only)."""
+    folders = [
+        os.path.join(_LOCALAPPDATA, "Medal", "logs"),
+        os.path.join(_LOCALAPPDATA, "Medal", "Cache"),
+        os.path.join(_LOCALAPPDATA, "Overwolf", "Log"),
+        os.path.join(_LOCALAPPDATA, "Overwolf", "Cache"),
+        os.path.join(_LOCALAPPDATA, "SteelSeries", "GG", "logs"),
+    ]
+    return _clean_many(ctx, [f for f in folders if f], "stream app logs")
 
 
 from app.tasks import Task  # noqa: E402
@@ -1038,4 +1141,5 @@ TASKS = [
     Task("terminal_history", "Clear Terminal History", "Clears PowerShell command history for privacy; settings untouched", clean_terminal_history, default=False, admin_required=False),
     Task("onedrive_logs", "Clear OneDrive Logs", "Removes diagnostic logs OneDrive leaves behind; files and settings untouched", clean_onedrive_logs, default=False, admin_required=False),
     Task("webview_cache", "Clear WebView App Caches", "Clears embedded-browser junk from EA App, CurseForge and similar launchers; logins kept", clean_webview_caches, default=False, admin_required=False),
+    Task("stream_logs", "Clear Stream App Logs", "Clears Medal, Outplayed and SteelSeries logs; clips and settings kept", clean_stream_app_logs, default=False, admin_required=False),
 ]

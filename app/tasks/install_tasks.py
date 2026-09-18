@@ -138,6 +138,10 @@ def ensure_winget_installed(ctx: TaskContext) -> bool:
     if rc == 0 and cap.has_winget():
         ctx.log("winget bootstrapped and verified — ready.")
         return True
+    # H-1: a user Stop during the 15-min bootstrap must not collapse into a
+    # generic "bootstrap failed" RuntimeError upstream — stay cancelled.
+    if rc == -1 or ctx.cancelled():
+        raise TaskCancelled("winget bootstrap cancelled by user.")
     ctx.log(f"  ! winget bootstrap failed (exit {rc}) — install the Microsoft Store instead.")
     return False
 
@@ -348,7 +352,13 @@ def install_legacy_runtimes(ctx: TaskContext):
     download sense, but grouped here as a 'missing component' installer.)"""
     ctx.set_status("Enabling DirectPlay and .NET 3.5 (DISM)...")
     rc1 = run_cmd(ctx, "dism /online /enable-feature /featurename:DirectPlay /all /norestart", timeout=900)
+    # H-1: Stop during the first DISM must not run a second 30-min DISM —
+    # fail fast as cancelled instead of marching on.
+    if rc1 == -1 or ctx.cancelled():
+        raise TaskCancelled("DirectPlay/.NET 3.5 enable cancelled by user.")
     rc2 = run_cmd(ctx, "dism /online /enable-feature /featurename:NetFx3 /all /norestart", timeout=1800)
+    if rc2 == -1 or ctx.cancelled():
+        raise TaskCancelled("DirectPlay/.NET 3.5 enable cancelled by user.")
     if rc1 not in (0, 3010) or rc2 not in (0, 3010):
         raise RuntimeError(
             "DISM could not enable DirectPlay/.NET 3.5 — LTSC may need the "
@@ -804,6 +814,10 @@ def install_apo_peace_bundle(ctx: TaskContext):
             # F07: shell=False argv — no cmd.exe parsing for elevated
             # installer exec (silent flags are space-separated literals).
             rc = run_cmd(ctx, [dest] + str(part["silent"]).split(), shell=False, timeout=900)
+            # H-1/H-2: user Stop (rc -1 / cancelled) must stay TaskCancelled,
+            # never a RuntimeError failure with a manual-download hint.
+            if rc == -1 or ctx.cancelled():
+                raise TaskCancelled(f"{part['label']} install cancelled by user.")
             if rc not in (0, 3010, 1638):  # 3010=reboot-needed success, 1638=already installed
                 raise RuntimeError(
                     f"{part['label']} installer exited with code {rc}. "
@@ -946,6 +960,10 @@ def _run_verified_installer(ctx: TaskContext, label: str, dest: str, silent: str
     # F07: shell=False argv — no cmd.exe parsing for elevated installer
     # exec (silent is space-separated literals like "/quiet /norestart").
     rc = run_cmd(ctx, [dest] + str(silent).split(), shell=False, timeout=1200)
+    # H-1/H-2: rc -1 means cancelled/timed-out/gave-up — a user Stop must
+    # surface as TaskCancelled ("stopped"), never as RuntimeError failure.
+    if rc == -1 or ctx.cancelled():
+        raise TaskCancelled(f"{label} install cancelled by user.")
     if rc not in ok_codes:
         raise RuntimeError(f"{label} installer exited with code {rc}. "
                            f"Manual download: {manual}")
@@ -1154,6 +1172,9 @@ def install_webview2(ctx: TaskContext):
     _ensure_winget(ctx)
     rc = install_winget_app(ctx, "Microsoft.EdgeWebView2Runtime", "WebView2 Runtime",
                             fallback_url="https://developer.microsoft.com/microsoft-edge/webview2/")
+    # H-1: cancelled (rc -1) must report Stopped, not "install failed".
+    if rc == -1 or ctx.cancelled():
+        raise TaskCancelled("WebView2 install cancelled by user.")
     if rc != 0:
         raise RuntimeError("WebView2 install failed — see the log.")
     ctx.log("WebView2 Runtime installed.")
@@ -1431,6 +1452,9 @@ def install_winget_unigetui(ctx: TaskContext):
     cap.invalidate_caches()
     rc = install_winget_app(ctx, "Devolutions.UniGetUI", "UniGetUI (Winget GUI)",
                             fallback_url="https://unigetui.com/")
+    # H-1: cancelled (rc -1) must report Stopped, not "install failed".
+    if rc == -1 or ctx.cancelled():
+        raise TaskCancelled("UniGetUI install cancelled by user.")
     if rc != 0:
         raise RuntimeError("UniGetUI install failed — see the log.")
     ctx.log("winget + UniGetUI complete — open UniGetUI to update everything with one click.")
@@ -1493,10 +1517,10 @@ APO_FLUIDEQ_TASK = Task("install_apo_fluideq", "Equalizer APO + FluidEQ",
 # link-only manual rows.
 RUSTDESK_TASK = Task("install_rustdesk", "RustDesk",
                      "FOSS remote desktop (TeamViewer replacement) — installed from the official GitHub release, hash-verified",
-                     install_rustdesk, default=False, admin_required=False)
+                     install_rustdesk, default=False, admin_required=True)
 FREEFILESYNC_TASK = Task("install_freefilesync", "FreeFileSync",
                          "1-click folder/drive backup mirror — installed from the author's signed official installer",
-                         install_freefilesync, default=False, admin_required=False)
+                         install_freefilesync, default=False, admin_required=True)
 
 # Embedded per-category task rows (round-8): maps a catalog category to the
 # standalone tasks that render as checkbox rows at the END of that

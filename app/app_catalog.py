@@ -1,6 +1,13 @@
 """
 Install tab — Master App Catalog data.
 
+2026-09-16 addition (user-approved Phase 2 Step 0): VirtualBox
+(Oracle.VirtualBox, verified live on winget thru 7.2.x) in Disk Imaging,
+VMs & Torrents; Windows Terminal (Microsoft.WindowsTerminal, verified
+live) in Utilities & Cleaners; Voicemeeter + VB-CABLE as manual-only
+link entries (winget 404 / no silent driver path — honest link-only
+like DS4Windows).
+
 2026-09-12 addition (user request): OpenRGB (OpenRGB.OpenRGB, verified
 FOUND on winget, homepage openrgb.org live 200) in Hardware Diagnostics
 & Tuning, next to Fan Control. Fan Control itself (Rem0o.FanControl,
@@ -181,6 +188,12 @@ MANUAL_ONLY_APPS = [
     {"id": 'manual:tiktok-live-studio', "name": 'TikTok LIVE Studio', "category": 'Media, Streaming & Audio',
      "description": 'Official TikTok desktop app for going live (no winget package)', "foss": False,
      "url": 'https://www.tiktok.com/live/studio'},
+    {"id": 'manual:voicemeeter', "name": 'Voicemeeter', "category": 'Media, Streaming & Audio',
+     "description": 'Free mic mixer for streamers — official download (winget package is broken, no auto-install)', "foss": False,
+     "url": 'https://vb-audio.com/Voicemeeter/'},
+    {"id": 'manual:vb-cable', "name": 'VB-CABLE', "category": 'Media, Streaming & Audio',
+     "description": 'Virtual audio cable to route game sound to OBS/Discord — official download (needs one manual driver click)', "foss": False,
+     "url": 'https://vb-audio.com/Cable/'},
 
 ]
 
@@ -632,6 +645,9 @@ APP_CATALOG = [
     {"id": 'Upscayl.Upscayl', "name": 'Upscayl', "category": 'Utilities & Cleaners',
      "description": 'Free AI upscaler: screenshots to 4K/8K', "foss": True,
      "url": 'https://www.upscayl.org/'},
+    {"id": 'Microsoft.WindowsTerminal', "name": 'Windows Terminal', "category": 'Utilities & Cleaners',
+     "description": 'Modern tabbed terminal missing on LTSC', "foss": True,
+     "url": 'https://aka.ms/terminal'},
     {"id": 'memstechtips.Winhance', "name": 'Winhance', "category": 'Utilities & Cleaners',
      "description": 'Windows optimizer and customizer for power users', "foss": False,
      "url": 'https://memstechtips.com/my-projects/winhance/', "fallback_url": 'https://github.com/memstechtips/Winhance'},
@@ -685,6 +701,9 @@ APP_CATALOG = [
     {"id": 'Ventoy.Ventoy', "name": 'Ventoy', "category": 'Disk Imaging, VMs & Torrents',
      "description": 'Boot multiple ISOs from one USB stick', "foss": True,
      "url": 'https://www.ventoy.net/'},
+    {"id": 'Oracle.VirtualBox', "name": 'VirtualBox', "category": 'Disk Imaging, VMs & Torrents',
+     "description": 'Free virtual PC runner for testing mods and LTSC experiments', "foss": True,
+     "url": 'https://www.virtualbox.org/'},
     # J. Local AI & GPU Model Runners
     {"id": 'nomic.gpt4all', "name": 'GPT4All', "category": 'Local AI & GPU Model Runners',
      "description": 'Offline private AI assistant that chats with your local documents and PDFs', "foss": True,

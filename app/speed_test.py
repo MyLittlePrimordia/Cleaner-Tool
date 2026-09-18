@@ -120,6 +120,50 @@ def ping_ms(host: str = PING_HOST, port: int = PING_PORT,
     return (samples[mid - 1] + samples[mid]) / 2.0
 
 
+STABILITY_ATTEMPTS = 10
+
+
+def ping_stability(host: str = PING_HOST, port: int = PING_PORT,
+                   timeout: float = PING_TIMEOUT_S,
+                   attempts: int = STABILITY_ATTEMPTS,
+                   cancelled=None):
+    """Jitter + packet loss from N TCP-connect samples.
+
+    Returns (jitter_ms_or_None, loss_pct_or_None): jitter is the mean
+    absolute difference between consecutive successful samples; loss is
+    100 * failed/attempted. (None, None) when cancelled or nothing
+    answered — never a fake 0. stdlib only, Tk-free."""
+    is_cancelled = cancelled or (lambda: False)
+    samples = []
+    for _ in range(max(1, attempts)):
+        if is_cancelled():
+            return None, None
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            t0 = time.perf_counter()
+            sock.connect((host, port))
+            samples.append((time.perf_counter() - t0) * 1000.0)
+        except OSError:
+            samples.append(None)
+        finally:
+            try:
+                if sock is not None:
+                    sock.close()
+            except Exception:
+                pass
+    if is_cancelled():
+        return None, None
+    failed = sum(1 for s in samples if s is None)
+    loss = 100.0 * failed / len(samples) if samples else None
+    good = [s for s in samples if s is not None]
+    if len(good) < 2:
+        return None, loss
+    jitter = sum(abs(b - a) for a, b in zip(good, good[1:])) / (len(good) - 1)
+    return jitter, loss
+
+
 def _mbps(num_bytes: int, seconds: float) -> "float | None":
     try:
         if seconds <= 0 or num_bytes <= 0:

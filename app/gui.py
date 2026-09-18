@@ -1021,6 +1021,12 @@ class StorageInsightDialog(ThemedModal):
             font=(F, 9, "bold"), padx=18, pady=7)
         self._clean_btn.pack(side="right")
         self._clean_btn.set_enabled(False)
+        self._bench_btn = AnimatedButton(foot, text="Benchmark", command=self._start_benchmark,
+                                         bg=COLORS["surface"], fg=COLORS["text"],
+                                         font=(F, 9, "bold"), padx=18,
+                                         pady=7)
+        self._bench_btn.pack(side="right", padx=(0, 8))
+        Tooltip(self._bench_btn, "Measures this drive's real write/read speed (32MB temp file, removed afterwards)")
         AnimatedButton(foot, text="Rescan", command=self._start_scan,
                        bg=COLORS["surface"], fg=COLORS["text"],
                        font=(F, 9, "bold"), padx=18,
@@ -1036,6 +1042,12 @@ class StorageInsightDialog(ThemedModal):
                      bg=COLORS["bg"], fg=COLORS["subtext"],
                      wraplength=self.WIDTH - 36, justify="left").pack(
                          side="bottom", anchor="w", pady=(8, 0))
+        self._bench_lbl = tk.Label(body, text="", font=(F, 8),
+                                   bg=COLORS["bg"], fg=COLORS["subtext"],
+                                   anchor="w", justify="left")
+        self._bench_lbl.pack(side="bottom", anchor="w")
+        self._bench_token = [True]
+        self._bench_busy = False
 
         # two symmetric columns in a scroll panel (uniform grid, like the
         # preset cards) — takes the remaining middle space; overflow
@@ -1074,6 +1086,74 @@ class StorageInsightDialog(ThemedModal):
             self._scan_token[0] = True
         except Exception:
             pass
+        try:
+            self._bench_token[0] = True
+        except Exception:
+            pass
+
+    def _start_benchmark(self):
+        """Isolated C: write/read benchmark (own thread + stop token —
+        closing the dialog cancels it; temp file always removed)."""
+        try:
+            if self._bench_busy:
+                self._bench_token[0] = True
+                return
+        except Exception:
+            pass
+        token = self._bench_token = [False]
+        self._bench_busy = True
+        try:
+            self._bench_btn.config_text("Stop")
+        except Exception:
+            pass
+        try:
+            self._bench_lbl.config(text="Benchmarking C: (32MB)…")
+        except Exception:
+            pass
+
+        def _prog(frac):
+            try:
+                pct = int(frac * 100)
+                self._ui(lambda: self._bench_lbl.config(
+                    text=f"Benchmarking C: (32MB)… {pct}%"))
+            except Exception:
+                pass
+
+        def _worker():
+            try:
+                from app.storage_scan import write_benchmark
+                w, r = write_benchmark("C:\\", 32,
+                                       cancelled=lambda: token[0],
+                                       progress_cb=_prog)
+            except Exception:
+                w, r = None, None
+            def _land():
+                self._bench_busy = False
+                try:
+                    self._bench_btn.config_text("Benchmark")
+                except Exception:
+                    pass
+                try:
+                    if token[0]:
+                        self._bench_lbl.config(text="Benchmark stopped — temp file removed.")
+                    elif w is None or r is None:
+                        self._bench_lbl.config(text="Benchmark failed — drive busy or no temp space.")
+                    else:
+                        self._bench_lbl.config(
+                            text=f"C: speed — write {w:.0f} MB/s · read {r:.0f} MB/s "
+                                 "(sequential 32MB; SSDs usually 300+).")
+                except Exception:
+                    pass
+            try:
+                self._ui(_land)
+            except Exception:
+                pass
+
+        try:
+            import threading as _th
+            _th.Thread(target=_worker, daemon=True).start()
+        except Exception:
+            self._bench_busy = False
 
     # ---- rows ---------------------------------------------------------- #
 
@@ -7664,7 +7744,8 @@ class SpeedTestDialog(ThemedModal):
     same pipe). Unreachable legs show '—', never a fake 0. No API
     keys on any path (app/speed_test.py)."""
 
-    LEGS = (("ping", "Ping"), ("download", "Download"), ("upload", "Upload"))
+    LEGS = (("ping", "Ping"), ("download", "Download"), ("upload", "Upload"),
+            ("stability", "Stability"))
 
     def __init__(self, parent, app):
         self.app = app
@@ -7910,9 +7991,9 @@ class SpeedTestDialog(ThemedModal):
             pass
 
     def _build_rows(self):
-        """One single stats row (user call): Ping / Download / Upload
-        evenly spaced in uniform columns — each cell stacks its title
-        over its value. _row_values keeps the leg -> value-label
+        """One single stats row (user call): Ping / Download / Upload /
+        Stability evenly spaced in uniform columns — each cell stacks its
+        title over its value. _row_values keeps the leg -> value-label
         contract so paints are untouched."""
         for w in list(self._rows_body.winfo_children()):
             try:
@@ -7996,7 +8077,7 @@ class SpeedTestDialog(ThemedModal):
         if not online:
             if dead():
                 return
-            for leg in ("ping", "download", "upload"):
+            for leg in ("ping", "download", "upload", "stability"):
                 self._ui(self._paint_result, leg, None, gen)
             self._ui(self._finish, False, gen)
             return
@@ -8023,6 +8104,18 @@ class SpeedTestDialog(ThemedModal):
         if dead():
             return
         self._ui(self._paint_result, "ping", ms, gen)
+        # — stability (jitter + loss from 10 ping samples, ~15s worst
+        # case — same host, real samples, honest Nones) — #
+        if dead():
+            return
+        self._ui(self._set_status, f"Server: {server_name} — testing stability…")
+        try:
+            stab = _st.ping_stability(cancelled=lambda: dead())
+        except Exception:
+            stab = (None, None)
+        if dead():
+            return
+        self._ui(self._paint_result, "stability", stab, gen)
         # — download (parallel streams, adaptive rounds) — #
         if dead():
             return
@@ -8147,10 +8240,32 @@ class SpeedTestDialog(ThemedModal):
             if lbl is not None and lbl.winfo_exists():
                 if leg == "ping":
                     txt = _fp(value)
+                elif leg == "stability":
+                    # value is a (jitter_ms|None, loss_pct|None) pair —
+                    # honest Nones read "—", never a fake 0.
+                    try:
+                        jit, loss = value
+                    except Exception:
+                        jit, loss = None, None
+                    if jit is None and loss is None:
+                        txt = "—"
+                    elif jit is None:
+                        txt = f"? · {loss:.0f}% loss"
+                    elif loss is None:
+                        txt = f"±{jit:.0f}ms · ?"
+                    else:
+                        txt = f"±{jit:.0f}ms · {loss:.0f}% loss"
                 else:
                     txt = _fmb(value)
-                if value is None:
+                if value is None or value == (None, None):
                     lbl.config(text=txt, fg=COLORS["accent_red"])
+                elif leg == "stability":
+                    try:
+                        jit, loss = value
+                        bad = (loss is not None and loss > 0) or (jit is not None and jit > 20)
+                        lbl.config(text=txt, fg=COLORS["accent_yellow"] if bad else COLORS["text"])
+                    except Exception:
+                        lbl.config(text=txt, fg=COLORS["text"])
                 else:
                     lbl.config(text=txt, fg=COLORS["text"])
         except Exception:
@@ -9431,10 +9546,25 @@ class MicCheckDialog(ThemedModal):
                        command=self._open_sound,
                        bg=COLORS["surface"], fg=COLORS["text"],
                        font=(F, 9, "bold"), padx=18, pady=7).pack(side="left")
+        self._rec_btn = AnimatedButton(brow, text="Record 3s",
+                                       command=self._record_take,
+                                       bg=COLORS["surface"], fg=COLORS["text"],
+                                       font=(F, 9, "bold"), padx=18, pady=7)
+        self._rec_btn.pack(side="left", padx=(8, 0))
+        Tooltip(self._rec_btn, "Records 3 seconds from the Windows default mic, then play it back to hear yourself")
+        self._play_btn = AnimatedButton(brow, text="Play back",
+                                        command=self._play_take,
+                                        bg=COLORS["surface"], fg=COLORS["text"],
+                                        font=(F, 9, "bold"), padx=18, pady=7)
+        self._play_btn.pack(side="left", padx=(8, 0))
+        self._play_btn.set_enabled(False)
         AnimatedButton(brow, text="Refresh",
                        command=self._refresh,
                        bg=COLORS["surface"], fg=COLORS["text"],
                        font=(F, 9, "bold"), padx=18, pady=7).pack(side="right")
+        self._take = None
+        self._recorder = None
+        self._rec_busy = False
         tk.Label(body, text="Mic blocked? Tweak tab → Custom → "
                             "Allow Microphone For Apps (reversible).",
                  font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
@@ -9603,6 +9733,11 @@ class MicCheckDialog(ThemedModal):
                     pass
             self._meter = None
             self._meter_name = ""
+            self._take = None
+            try:
+                self._play_btn.set_enabled(False)
+            except Exception:
+                pass
             for e in self._inputs:
                 try:
                     if (e or {}).get("name") == want \
@@ -9647,7 +9782,91 @@ class MicCheckDialog(ThemedModal):
         except Exception:
             pass
 
+    def _record_take(self):
+        """Record 3s from the DEFAULT mic on a worker (blocking winmm),
+        then enable Play back. Records the Windows default input — the
+        picker preselects it; say so when it doesn't match."""
+        if getattr(self, "_rec_busy", False):
+            try:
+                if self._recorder is not None:
+                    self._recorder.stop()
+            except Exception:
+                pass
+            return
+        self._rec_busy = True
+        self._take = None
+        try:
+            self._play_btn.set_enabled(False)
+            self._rec_btn.config_text("Stop")
+        except Exception:
+            pass
+        self._level_note.config(text="Recording 3s — speak normally…")
+
+        def _worker():
+            from app.mic_test import Recorder
+            rec = Recorder(seconds=3.0)
+            self._recorder = rec
+            try:
+                data = rec.record_wav()
+            except Exception:
+                data = None
+            finally:
+                self._recorder = None
+
+            def _land():
+                self._rec_busy = False
+                try:
+                    self._rec_btn.config_text("Record 3s")
+                except Exception:
+                    pass
+                if data:
+                    self._take = data
+                    try:
+                        self._play_btn.set_enabled(True)
+                    except Exception:
+                        pass
+                    self._level_note.config(
+                        text="Recorded 3s from the Windows default mic — press Play back to hear yourself.")
+                else:
+                    self._level_note.config(
+                        text="Recording failed — mic in use or permission blocked.")
+            try:
+                self._dlg.after(0, _land)
+            except Exception:
+                pass
+
+        try:
+            import threading as _th
+            _th.Thread(target=_worker, daemon=True,
+                       name="MicCheckRecord").start()
+        except Exception:
+            self._rec_busy = False
+
+    def _play_take(self):
+        if not getattr(self, "_take", None):
+            return
+        data = self._take
+
+        def _worker():
+            try:
+                from app.mic_test import play_wav_bytes
+                play_wav_bytes(data)
+            except Exception:
+                pass
+
+        try:
+            import threading as _th
+            _th.Thread(target=_worker, daemon=True,
+                       name="MicCheckPlay").start()
+        except Exception:
+            pass
+
     def _stop_tick(self):
+        try:
+            if getattr(self, "_recorder", None) is not None:
+                self._recorder.stop()
+        except Exception:
+            pass
         try:
             if self._tick_after is not None:
                 self._dlg.after_cancel(self._tick_after)
@@ -9689,12 +9908,40 @@ class MicCheckDialog(ThemedModal):
                     pass
             else:
                 try:
+                    import math as _math
+                    # dBFS scale: real gain language — 0dB is digital
+                    # full-scale (clip); aim peaks -12..-6dB for
+                    # Discord/OBS. Linear % hid clipping completely.
+                    peak = max(0.0, min(1.0, float(level)))
+                    db = 20.0 * _math.log10(peak) if peak > 0 else -60.0
+                    db = max(-60.0, db)
+                    # peak-hold with slow decay doubles as clip memory
+                    hold = float(getattr(self, "_peak_hold_db", -60.0))
+                    hold = db if db > hold else max(-60.0, hold - 1.5)
+                    self._peak_hold_db = hold
                     w = max(1, int(self._level_cv.winfo_width() or 400))
-                    self._level_cv.coords(self._level_item, 0, 0, w * level, 14)
-                    self._level_note.config(
-                        text=f"{int(round(level * 100))}% — " + (
-                            "Listening…" if level < 0.02
-                            else "Signal OK — your mic hears you."))
+                    frac = max(0.0, min(1.0, (db + 60.0) / 60.0))
+                    self._level_cv.coords(self._level_item, 0, 0, w * frac, 14)
+                    try:
+                        fill = COLORS["accent_green"] if db < -12 else (
+                            COLORS["accent_yellow"] if db < -3 else COLORS["accent_red"])
+                        self._level_cv.itemconfig(self._level_item, fill=fill)
+                    except Exception:
+                        pass
+                    if peak >= 0.99 or hold >= -1.0:
+                        self._level_note.config(
+                            text=f"CLIPPING at {hold:.0f}dB peak — turn the mic gain down.")
+                    elif db <= -59.0:
+                        self._level_note.config(text="-inf dB — Listening…")
+                    elif hold < -24.0:
+                        self._level_note.config(
+                            text=f"{db:.0f}dB (peak {hold:.0f}dB) — very quiet, raise gain.")
+                    elif hold <= -6.0:
+                        self._level_note.config(
+                            text=f"{db:.0f}dB (peak {hold:.0f}dB) — Signal OK, aim -12 to -6dB peaks.")
+                    else:
+                        self._level_note.config(
+                            text=f"{db:.0f}dB (peak {hold:.0f}dB) — hot, back off a little.")
                 except Exception:
                     pass
         except Exception:
@@ -10092,6 +10339,1585 @@ class GameServerPingDialog(ThemedModal):
             pass
 
 
+class KeyboardTesterDialog(ThemedModal):
+    """Keyboard Tester: QWERTY canvas that flashes each key while held and
+    keeps a dim mark after release so gaps show at a glance. Simultaneous
+    count gives a rough ghosting check. Pure Tk key events, zero Win32."""
+
+    _ROWS = [
+        [("Esc", "Escape", 1), ("F1", "F1", 1), ("F2", "F2", 1), ("F3", "F3", 1),
+         ("F4", "F4", 1), ("F5", "F5", 1), ("F6", "F6", 1), ("F7", "F7", 1),
+         ("F8", "F8", 1), ("F9", "F9", 1), ("F10", "F10", 1), ("F11", "F11", 1),
+         ("F12", "F12", 1)],
+        [("`", "grave", 1), ("1", "1", 1), ("2", "2", 1), ("3", "3", 1), ("4", "4", 1),
+         ("5", "5", 1), ("6", "6", 1), ("7", "7", 1), ("8", "8", 1), ("9", "9", 1),
+         ("0", "0", 1), ("-", "minus", 1), ("=", "equal", 1), ("Bksp", "BackSpace", 2)],
+        [("Tab", "Tab", 1.5), ("Q", "q", 1), ("W", "w", 1), ("E", "e", 1), ("R", "r", 1),
+         ("T", "t", 1), ("Y", "y", 1), ("U", "u", 1), ("I", "i", 1), ("O", "o", 1),
+         ("P", "p", 1), ("[", "bracketleft", 1), ("]", "bracketright", 1), ("\\", "backslash", 1.5)],
+        [("Caps", "Caps_Lock", 1.75), ("A", "a", 1), ("S", "s", 1), ("D", "d", 1),
+         ("F", "f", 1), ("G", "g", 1), ("H", "h", 1), ("J", "j", 1), ("K", "k", 1),
+         ("L", "l", 1), (";", "semicolon", 1), ("'", "apostrophe", 1), ("Enter", "Return", 2.25)],
+        [("Shift", "Shift_L", 2.25), ("Z", "z", 1), ("X", "x", 1), ("C", "c", 1), ("V", "v", 1),
+         ("B", "b", 1), ("N", "n", 1), ("M", "m", 1), (",", "comma", 1), (".", "period", 1),
+         ("/", "slash", 1), ("Shift", "Shift_R", 2.75)],
+        [("Ctrl", "Control_L", 1.5), ("Win", "Super_L", 1.25), ("Alt", "Alt_L", 1.25),
+         ("Space", "space", 6), ("Alt", "Alt_R", 1.25), ("Ctrl", "Control_R", 1.5)],
+    ]
+    _KEY_H = 46
+    _KEY_GAP = 4
+    _UNIT_W = 48
+
+    def __init__(self, parent, app):
+        self.app = app
+        self._key_shapes = {}
+        self._held = set()
+        self._tested = set()
+        super().__init__(parent, title="Keyboard Tester", accent=TAB_ACCENTS["Clean"])
+        body = self.body
+        self._status_lbl = tk.Label(body, text="Press any key.",
+                                    font=(F, 10, "bold"), bg=COLORS["bg"],
+                                    fg=COLORS["subtext"], anchor="w")
+        self._status_lbl.pack(fill="x", pady=(0, 6))
+        cv_w = int(15 * self._UNIT_W)
+        cv_h = len(self._ROWS) * (self._KEY_H + self._KEY_GAP) + self._KEY_GAP
+        self._cv = tk.Canvas(body, width=cv_w, height=cv_h, bg=COLORS["bg"],
+                             bd=0, highlightthickness=0)
+        self._cv.pack(pady=(0, 6))
+        self._draw_layout()
+        stats = tk.Frame(body, bg=COLORS["bg"])
+        stats.pack(fill="x", pady=(4, 0))
+        for c in range(3):
+            stats.grid_columnconfigure(c, weight=1, uniform="kbstats")
+        self._stat_held, _ = self._stat_block(stats, 0, "KEYS HELD")
+        self._stat_tested, _ = self._stat_block(stats, 1, "TESTED")
+        reset_cell = self._stat_cell(stats, 2)
+        _reset = AnimatedButton(reset_cell, text="Reset",
+                                command=self._reset_tested,
+                                bg=COLORS["surface"], fg=COLORS["text"],
+                                font=(F, 8, "bold"), padx=10, pady=3)
+        _reset.pack()
+        tk.Label(body, text="Windows grabs Win/PrintScreen/media keys before we see them.",
+                 font=(F, 8), bg=COLORS["bg"], fg=COLORS["subtext"],
+                 wraplength=640, justify="left").pack(fill="x", pady=(8, 0))
+        try:
+            # Escape carve-out: ThemedModal binds Escape to close, but Escape
+            # is itself a test target — unbind close so it lights up instead.
+            # Close via the X button.
+            self._dlg.unbind("<Escape>")
+            self._dlg.bind("<KeyPress>", self._on_press, add="+")
+            self._dlg.bind("<KeyRelease>", self._on_release, add="+")
+            self._dlg.focus_force()
+        except Exception:
+            pass
+        self.on_close(self._stop)
+
+    def _stat_block(self, parent, col, title):
+        try:
+            cell = tk.Frame(parent, bg=COLORS["bg"])
+            cell.grid(row=0, column=col, sticky="nsew", padx=12)
+            if title:
+                tk.Label(cell, text=title, font=(F, 8), bg=COLORS["bg"],
+                         fg=COLORS["subtext"]).pack()
+            val = tk.Label(cell, text="0", font=(F, 11, "bold"),
+                           bg=COLORS["bg"], fg=COLORS["text"])
+            val.pack()
+            return val, cell
+        except Exception:
+            return None, None
+
+    def _stat_cell(self, parent, col):
+        """Button-only cell (no value label — the old empty-title block
+        still created its '0' label, floating a stray 0 over Reset)."""
+        try:
+            cell = tk.Frame(parent, bg=COLORS["bg"])
+            cell.grid(row=0, column=col, sticky="nsew", padx=12)
+            return cell
+        except Exception:
+            return parent
+
+    def _draw_layout(self):
+        y = self._KEY_GAP
+        for row in self._ROWS:
+            x = self._KEY_GAP
+            for label, keysym, units in row:
+                w = units * self._UNIT_W - self._KEY_GAP
+                try:
+                    rect = self._cv.create_rectangle(
+                        x, y, x + w, y + self._KEY_H,
+                        fill=COLORS["surface"], outline=COLORS["hairline"])
+                    text = self._cv.create_text(
+                        x + w / 2, y + self._KEY_H / 2, text=label,
+                        font=(F, 9, "bold"), fill=COLORS["subtext"])
+                    self._key_shapes[keysym] = (rect, text)
+                except Exception:
+                    pass
+                x += w + self._KEY_GAP
+            y += self._KEY_H + self._KEY_GAP
+
+    def _paint_key(self, keysym, state):
+        shapes = self._key_shapes.get(keysym)
+        if not shapes:
+            return
+        rect, _text = shapes
+        color = {
+            "held": COLORS["accent_green"],
+            "tested": _hex_lerp(COLORS["accent_green"], COLORS["surface"], 0.75),
+            "idle": COLORS["surface"],
+        }.get(state, COLORS["surface"])
+        try:
+            self._cv.itemconfig(rect, fill=color)
+        except Exception:
+            pass
+
+    def _on_press(self, event):
+        ks = getattr(event, "keysym", "")
+        if ks not in self._key_shapes:
+            return
+        if ks not in self._held:
+            self._held.add(ks)
+            self._tested.add(ks)
+            self._paint_key(ks, "held")
+            self._refresh_stats()
+
+    def _on_release(self, event):
+        ks = getattr(event, "keysym", "")
+        self._held.discard(ks)
+        self._paint_key(ks, "tested" if ks in self._tested else "idle")
+        self._refresh_stats()
+
+    def _refresh_stats(self):
+        try:
+            self._stat_held.config(text=str(len(self._held)))
+            self._stat_tested.config(text=f"{len(self._tested)}/{len(self._key_shapes)}")
+        except Exception:
+            pass
+
+    def _reset_tested(self):
+        self._tested.clear()
+        for ks in self._key_shapes:
+            if ks not in self._held:
+                self._paint_key(ks, "idle")
+        self._refresh_stats()
+
+    def _stop(self):
+        pass
+
+
+class MonitorTestDialog(ThemedModal):
+    """Monitor Test (Option A): Info shows the real current mode via the
+    existing tweak_tasks query; Dead Pixels shows solid color fields with
+    an optional fullscreen Start. No refresh measurement claim."""
+
+    _COLORS_CYCLE = ("#000000", "#FFFFFF", "#FF0000", "#00FF00", "#0000FF", "#808080")
+
+    def __init__(self, parent, app):
+        self.app = app
+        self._view = "info"
+        self._color_idx = 0
+        self._fullscreen_win = None
+        super().__init__(parent, title="Monitor Test", accent=TAB_ACCENTS["Clean"])
+        body = self.body
+        tabs = tk.Frame(body, bg=COLORS["bg"])
+        tabs.pack(fill="x", pady=(0, 8))
+        self._tab_btns = {}
+        for key, label in (("info", "Info"), ("pixels", "Dead Pixels")):
+            b = AnimatedButton(tabs, text=label, command=lambda k=key: self._switch(k),
+                               bg=COLORS["surface"], fg=COLORS["text"],
+                               font=(F, 9, "bold"), padx=14, pady=6)
+            b.pack(side="left", padx=(0, 6))
+            self._tab_btns[key] = b
+        self._content = tk.Frame(body, bg=COLORS["bg"])
+        self._content.pack(fill="both", expand=True)
+        self.on_close(self._stop)
+        self._switch("info")
+
+    def _switch(self, key):
+        for child in self._content.winfo_children():
+            try:
+                child.destroy()
+            except Exception:
+                pass
+        self._view = key
+        if key == "info":
+            self._build_info()
+        else:
+            self._build_pixels()
+
+    def _build_info(self):
+        try:
+            from app.tasks.tweak_tasks import _query_video_mode_list, _query_precise_refresh_rate
+            current, maximum = _query_video_mode_list()
+            try:
+                precise = _query_precise_refresh_rate()
+            except Exception:
+                precise = None
+        except Exception:
+            current, maximum, precise = None, None, None
+        rows = tk.Frame(self._content, bg=COLORS["bg"])
+        rows.pack(fill="x", pady=(12, 0))
+        for c in range(2):
+            rows.grid_columnconfigure(c, weight=1, uniform="moninfo")
+
+        def stat(col, title, value):
+            cell = tk.Frame(rows, bg=COLORS["bg"])
+            cell.grid(row=0, column=col, sticky="nsew", padx=20, pady=8)
+            tk.Label(cell, text=title, font=(F, 8), bg=COLORS["bg"],
+                     fg=COLORS["subtext"]).pack()
+            tk.Label(cell, text=value, font=(F, 14, "bold"), bg=COLORS["bg"],
+                     fg=COLORS["text"]).pack()
+
+        if current:
+            try:
+                w, h, hz, _bits = current
+                if precise and 20.0 < precise < 500.0:
+                    stat(0, "CURRENT MODE", f"{w}x{h} @ {precise:.2f}Hz")
+                else:
+                    stat(0, "CURRENT MODE", f"{w}x{h} @ {hz}Hz")
+            except Exception:
+                stat(0, "CURRENT MODE", "?")
+        else:
+            stat(0, "CURRENT MODE", "?")
+        if maximum:
+            try:
+                _mw, _mh, mhz, _b = maximum
+                stat(1, "MAX Hz AT THIS RES", f"{mhz}Hz" if mhz else "?")
+            except Exception:
+                stat(1, "MAX Hz AT THIS RES", "?")
+        else:
+            stat(1, "MAX Hz AT THIS RES", "?")
+        tk.Label(self._content,
+                 text="Unknown fields show '?' rather than a guess.",
+                 font=(F, 8), bg=COLORS["bg"], fg=COLORS["subtext"],
+                 wraplength=520).pack(pady=(12, 0))
+
+    def _build_pixels(self):
+        self._pixel_cv = tk.Canvas(self._content, width=680, height=320,
+                                   bg=self._COLORS_CYCLE[self._color_idx], bd=0,
+                                   highlightthickness=0)
+        self._pixel_cv.pack(pady=(8, 4))
+        row = tk.Frame(self._content, bg=COLORS["bg"])
+        row.pack()
+        AnimatedButton(row, text="Next Color", command=self._next_pixel_color,
+                       bg=COLORS["surface"], fg=COLORS["text"],
+                       font=(F, 9, "bold"), padx=14, pady=6).pack(side="left", padx=4)
+        AnimatedButton(row, text="Start Fullscreen",
+                       command=self._open_fullscreen_pixels,
+                       bg=COLORS["surface"], fg=COLORS["text"],
+                       font=(F, 9, "bold"), padx=14, pady=6).pack(side="left", padx=4)
+        tk.Label(self._content,
+                 text="Card view can miss edge pixels — Start opens a fullscreen "
+                      "color field. Click for next color, Esc to return.",
+                 font=(F, 8), bg=COLORS["bg"], fg=COLORS["subtext"],
+                 wraplength=520).pack(pady=(8, 0))
+
+    def _next_pixel_color(self):
+        self._color_idx = (self._color_idx + 1) % len(self._COLORS_CYCLE)
+        try:
+            self._pixel_cv.config(bg=self._COLORS_CYCLE[self._color_idx])
+        except Exception:
+            pass
+
+    def _open_fullscreen_pixels(self):
+        try:
+            win = tk.Toplevel(self._dlg)
+            win.attributes("-fullscreen", True)
+            win.attributes("-topmost", True)
+            win.configure(bg=self._COLORS_CYCLE[self._color_idx])
+            idx = {"i": self._color_idx}
+
+            def cycle(_e=None):
+                idx["i"] = (idx["i"] + 1) % len(self._COLORS_CYCLE)
+                self._color_idx = idx["i"]
+                try:
+                    win.configure(bg=self._COLORS_CYCLE[idx["i"]])
+                except Exception:
+                    pass
+
+            def close(_e=None):
+                try:
+                    win.destroy()
+                except Exception:
+                    pass
+                self._fullscreen_win = None
+
+            win.bind("<Button-1>", cycle)
+            win.bind("<space>", cycle)
+            win.bind("<Escape>", close)
+            self._fullscreen_win = win
+            try:
+                win.focus_force()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _stop(self):
+        if self._fullscreen_win is not None:
+            try:
+                self._fullscreen_win.destroy()
+            except Exception:
+                pass
+            self._fullscreen_win = None
+
+
+class SpeakerTestDialog(ThemedModal):
+    """Speaker Test: 8-direction surround check (Dolby-Atmos style) on
+    any connected output. Tones are real stereo WAVs panned in code
+    (front = true pan, side/rear = level-stepped simulation, stated
+    in-UI). The picker chooses which device is TESTED — playback goes
+    straight to it via waveOut, so the Windows default is never
+    flipped. Unmatched devices fall back to default output, flagged
+    honestly in the status line."""
+
+    _ARROWS = {"FL": "\u2196", "FC": "\u2191", "FR": "\u2197",
+               "SL": "\u2190", "SR": "\u2192",
+               "RL": "\u2199", "RC": "\u2193", "RR": "\u2198"}
+
+    def __init__(self, parent, app):
+        self.app = app
+        self._out_var = tk.StringVar(value="")
+        self._outs = []
+        self._seq_after = None
+        super().__init__(parent, title="Speaker Test", accent=TAB_ACCENTS["Clean"])
+        body = self.body
+        tk.Label(body, text="Check each direction plays where it should.",
+                 font=(F, 10, "bold"), bg=COLORS["bg"],
+                 fg=COLORS["subtext"], anchor="w").pack(fill="x", pady=(0, 6))
+        # Test-target picker — only when >1 active output exists.
+        self._out_row = tk.Frame(body, bg=COLORS["bg"])
+        self._stat_lbl = tk.Label(body, text="", font=(F, 9),
+                                  bg=COLORS["bg"], fg=COLORS["subtext"],
+                                  wraplength=640)
+        self._stat_lbl.pack(pady=(0, 2))
+        grid = tk.Frame(body, bg=COLORS["bg"])
+        grid.pack(pady=(6, 4))
+        try:
+            from app.audio_out import DIRECTIONS as _DIRS
+        except Exception:
+            _DIRS = ()
+        _cells = {"FL": (0, 0), "FC": (0, 1), "FR": (0, 2),
+                  "SL": (1, 0), "SR": (1, 2),
+                  "RL": (2, 0), "RC": (2, 1), "RR": (2, 2)}
+        for key, label, _pan, _db, _hz in _DIRS:
+            r, c = _cells.get(key, (1, 1))
+            b = AnimatedButton(grid, text=self._ARROWS.get(key, label),
+                               command=lambda k=key: self._play(k),
+                               bg=COLORS["surface"], fg=COLORS["text"],
+                               font=(F, 16, "bold"), padx=16, pady=6)
+            b.grid(row=r, column=c, padx=4, pady=4, sticky="nsew")
+            Tooltip(b, label)
+        _ctr = AnimatedButton(grid, text="\u25cf",
+                              command=lambda: self._play("FC"),
+                              bg=COLORS["surface"], fg=COLORS["text"],
+                              font=(F, 16, "bold"), padx=16, pady=6)
+        _ctr.grid(row=1, column=1, padx=4, pady=4, sticky="nsew")
+        Tooltip(_ctr, "Center channel")
+        for ci in range(3):
+            grid.grid_columnconfigure(ci, weight=1, uniform="spkdirs")
+        ctl = tk.Frame(body, bg=COLORS["bg"])
+        ctl.pack(pady=(2, 0))
+        AnimatedButton(ctl, text="Sweep",
+                       command=self._play_all,
+                       bg=COLORS["surface"], fg=COLORS["text"],
+                       font=(F, 9, "bold"), padx=22, pady=6).pack(side="left", padx=4)
+        AnimatedButton(ctl, text="Stop",
+                       command=self._stop_sweep,
+                       bg=COLORS["surface"], fg=COLORS["text"],
+                       font=(F, 9, "bold"), padx=22, pady=6).pack(side="left", padx=4)
+        tk.Label(body, text="Same loudness everywhere — position tells speakers apart. "
+                            "Side/rear simulated on stereo (rows differ in pitch).",
+                 font=(F, 8), bg=COLORS["bg"], fg=COLORS["subtext"],
+                 wraplength=520).pack(pady=(4, 0))
+        tk.Label(body, text="No sound? Check Sound Settings + OBS mixer before assuming hardware.",
+                 font=(F, 8), bg=COLORS["bg"], fg=COLORS["subtext"],
+                 wraplength=520).pack(pady=(2, 0))
+        self._build_out_row()
+        self.on_close(self._stop)
+
+    def _build_out_row(self):
+        """Test-target picker (NOT a default flip — playback goes to the
+        picked device directly, the Windows default stays untouched)."""
+        try:
+            from app.audio_out import (list_render_endpoints as _list,
+                                       default_render_id as _def)
+        except Exception:
+            return
+        try:
+            eps = _list() or []
+        except Exception:
+            eps = []
+        actives = [e for e in eps if (e or {}).get("state") == 1
+                   and (e or {}).get("id")]
+        if len(actives) <= 1:
+            return  # single output — no picker, same as before
+        self._outs = actives
+        try:
+            _defid = _def()
+        except Exception:
+            _defid = ""
+        names = [(e or {}).get("name", "") for e in actives]
+        pick = ""
+        for e in actives:
+            if (e or {}).get("id", "") == _defid:
+                pick = (e or {}).get("name", "")
+                break
+        self._out_var.set(pick or (names[0] if names else ""))
+        try:
+            import tkinter.ttk as _ttk
+            tk.Label(self._out_row, text="Test:", font=(F, 9, "bold"),
+                     bg=COLORS["bg"], fg=COLORS["text"]).pack(side="left")
+            _ttk.Combobox(self._out_row, textvariable=self._out_var,
+                          values=names, state="readonly",
+                          width=44, font=(F, 9)).pack(side="left", padx=(6, 0))
+            self._out_row.pack(pady=(6, 0))
+        except Exception:
+            pass
+
+    def _target_index(self):
+        """waveOut index for the picked output, or None (=> default)."""
+        try:
+            from app.audio_out import match_waveout as _match
+        except Exception:
+            return None
+        want = (self._out_var.get() or "").strip()
+        if not want and len(getattr(self, "_outs", []) or []) <= 1:
+            return None
+        try:
+            if want:
+                idx = _match(want)
+                if idx is not None:
+                    return idx
+        except Exception:
+            pass
+        return None
+
+    def _say(self, text):
+        try:
+            self._stat_lbl.config(text=text)
+        except Exception:
+            pass
+
+    def _play(self, key):
+        try:
+            from app.audio_out import (DIRECTIONS as _DIRS,
+                                       directional_wav as _wav,
+                                       play_wav_on_device as _playdev,
+                                       play_wav_bytes as _playdef)
+        except Exception:
+            self._say("Audio engine unavailable on this PC.")
+            return
+        spec = next((d for d in _DIRS if d[0] == key), None)
+        if spec is None:
+            return
+        _k, label, pan, db, hz = spec
+        want = (self._out_var.get() or "").strip()
+        self._say(f"Playing: {label}" + (f" on {want}…" if want else "…"))
+        try:
+            data = _wav(pan, db, freq_hz=hz)
+            if not data:
+                self._say(f"Could not build {label} tone — check Sound Settings.")
+                return
+            idx = self._target_index()
+            if idx is None:
+                ok = _playdef(data)
+                self._say((f"Played: {label}" + (f" on {want}." if want else ".")
+                           + " Heard it in the wrong place? Check wiring.")
+                          if ok else f"Could not play {label} — check Sound Settings.")
+                return
+            ok, used_default = _playdev(data, idx)
+            if not ok:
+                self._say(f"Could not play {label} — check Sound Settings.")
+            elif used_default:
+                self._say(f"Played: {label} on the default output "
+                          f"(exact device not reachable) — heard it wrong? Check wiring.")
+            else:
+                self._say(f"Played: {label} on {want or 'picked output'} — "
+                          f"heard it in the wrong place? Check wiring.")
+        except Exception:
+            self._say(f"Could not play {label} — check Sound Settings.")
+
+    def _play_all(self, idx=0):
+        try:
+            from app.audio_out import DIRECTIONS as _DIRS
+        except Exception:
+            return
+        if idx >= len(_DIRS):
+            self._say("Sweep done — every direction played once.")
+            return
+        self._play(_DIRS[idx][0])
+        try:
+            self._seq_after = self._dlg.after(700, lambda: self._play_all(idx + 1))
+        except Exception:
+            pass
+
+    def _stop_sweep(self):
+        if self._seq_after is not None:
+            try:
+                self._dlg.after_cancel(self._seq_after)
+            except Exception:
+                pass
+            self._seq_after = None
+        self._say("Sweep stopped.")
+
+    def _stop(self):
+        if self._seq_after is not None:
+            try:
+                self._dlg.after_cancel(self._seq_after)
+            except Exception:
+                pass
+            self._seq_after = None
+
+
+class WebcamDialog(ThemedModal):
+    """Webcam Test: live in-app preview (Start/Stop) so streamers can
+    check black feeds before going live. Dep-free DirectShow (no pip
+    anything, LTSC-safe) with an LTSC-aware native fallback. No
+    settings changed, device released on Stop/close."""
+
+    _PREVIEW_W = 640
+    _PREVIEW_H = 360
+    _TICK_MS = 33
+
+    def __init__(self, parent, app):
+        self.app = app
+        self._cap = None
+        self._running = False
+        self._tick_after = None
+        self._img_ref = None
+        self._last_t = 0.0
+        self._fps_ema = 0.0
+        self._cam_index = 0
+        self._cam_choices = []
+        super().__init__(parent, title="Webcam Test", accent=TAB_ACCENTS["Clean"])
+        body = self.body
+        tk.Label(body, text="Check your camera before you go live.",
+                 font=(F, 10, "bold"), bg=COLORS["bg"],
+                 fg=COLORS["subtext"], anchor="w").pack(fill="x", pady=(0, 6))
+        # Plain Frame holder at exact pixel size (Label/Canvas sizing
+        # games pushed the buttons off the dialog before — a Frame with
+        # pack_propagate(False) holds 640x360 and DirectShow draws into
+        # its HWND directly, no Pillow, no per-frame Tk work).
+        self._holder = tk.Frame(body, width=self._PREVIEW_W,
+                                height=self._PREVIEW_H, bg="#000000",
+                                bd=0, highlightthickness=0)
+        self._holder.pack(pady=(0, 6))
+        try:
+            self._holder.pack_propagate(False)
+        except Exception:
+            pass
+        try:
+            self._holder.bind("<Configure>", lambda _e: self._fit_video())
+        except Exception:
+            pass
+        self._info_lbl = tk.Label(body, text="Press Start to open your camera.",
+                                  font=(F, 9), bg=COLORS["bg"],
+                                  fg=COLORS["subtext"], wraplength=640)
+        self._info_lbl.pack(pady=(0, 6))
+        self._cam_row = tk.Frame(body, bg=COLORS["bg"])
+        self._cam_var = tk.StringVar(value="")
+        row = tk.Frame(body, bg=COLORS["bg"])
+        row.pack()
+        self._toggle_btn = AnimatedButton(row, text="Start",
+                                          command=self._toggle,
+                                          bg=COLORS["surface"], fg=COLORS["text"],
+                                          font=(F, 9, "bold"), padx=22, pady=6)
+        self._toggle_btn.pack(side="left", padx=4)
+        _native_label = ("Camera Privacy Settings" if self._is_ltsc()
+                          else "Open Windows Camera")
+        self._native_btn = AnimatedButton(row, text=_native_label,
+                       command=self._open_native_camera,
+                       bg=COLORS["surface"], fg=COLORS["text"],
+                       font=(F, 9, "bold"), padx=14, pady=6)
+        self._native_btn.pack(side="left", padx=4)
+        Tooltip(self._toggle_btn, "Start/stop the live preview")
+        if self._is_ltsc():
+            self._set_info("LTSC detected — Windows has no Camera app here, so "
+                            "Start/Stop above is the real test.")
+        self.on_close(self._stop)
+
+    @staticmethod
+    def _is_ltsc():
+        """True on LTSC/LTSB editions — they ship no Camera app, and
+        Windows' own ShellExecute succeeds even when the target app
+        isn't installed (it just pops its own 'get this from the
+        Store' dialog), so Python never sees that as an exception.
+        Detecting LTSC up front and skipping the attempt entirely is
+        the only way to avoid showing that dialog. Never raises."""
+        try:
+            import winreg as _wr
+            base = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+            with _wr.OpenKey(_wr.HKEY_LOCAL_MACHINE, base) as key:
+                for name in ("ProductName", "EditionID"):
+                    try:
+                        val, _t = _wr.QueryValueEx(key, name)
+                    except OSError:
+                        continue
+                    val = str(val or "")
+                    if "LTSC" in val.upper() or "LTSB" in val.upper() \
+                            or val in ("EnterpriseS", "EnterpriseSN",
+                                       "IoTEnterpriseS"):
+                        return True
+        except Exception:
+            pass
+        return False
+
+    def _set_info(self, text):
+        try:
+            self._info_lbl.config(text=text)
+        except Exception:
+            pass
+
+    def _toggle(self):
+        if self._running:
+            self._stop_preview()
+        else:
+            self._start_preview()
+
+    def _open_capture(self, index):
+        # Retired with the OpenCV path (kept as a no-op so any external
+        # caller degrades to the DirectShow engine instead of crashing).
+        return None
+
+    def _probe_cameras(self):
+        # Retired with the OpenCV path — see _ensure_cams().
+        return []
+
+    def _ensure_cams(self):
+        """Real device names via DirectShow (fast, ~100ms). True when at
+        least one camera exists. Never raises."""
+        try:
+            from app.dshow_cam import list_cameras
+            cams = list_cameras() or []
+        except Exception:
+            cams = []
+        self._cam_choices = [(c.get("index", i), c.get("name", ""))
+                             for i, c in enumerate(cams)]
+        return bool(self._cam_choices)
+
+    def _refresh_cam_row(self):
+        try:
+            for w in list(self._cam_row.winfo_children()):
+                try:
+                    w.destroy()
+                except Exception:
+                    pass
+            if len(self._cam_choices) > 1:
+                import tkinter.ttk as _ttk
+                tk.Label(self._cam_row, text="Camera:", font=(F, 9),
+                         bg=COLORS["bg"], fg=COLORS["subtext"]).pack(side="left")
+                names = [n or f"Camera {i}" for i, n in self._cam_choices]
+                if not self._cam_var.get() or self._cam_var.get() not in names:
+                    self._cam_var.set(names[0] if names else "")
+                combo = _ttk.Combobox(self._cam_row, textvariable=self._cam_var,
+                                      values=names, state="readonly",
+                                      width=40, font=(F, 9))
+                combo.pack(side="left", padx=(6, 0))
+                try:
+                    combo.bind("<<ComboboxSelected>>", lambda _e: self._switch_camera())
+                except Exception:
+                    pass
+                self._cam_row.pack(pady=(0, 6))
+            else:
+                try:
+                    self._cam_row.pack_forget()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _picked_index(self):
+        try:
+            sel = (self._cam_var.get() or "").strip()
+            names = [n or f"Camera {i}" for i, n in self._cam_choices]
+            if sel in names:
+                return self._cam_choices[names.index(sel)][0]
+        except Exception:
+            pass
+        try:
+            return self._cam_choices[0][0]
+        except Exception:
+            return 0
+
+    def _picked_name(self):
+        try:
+            sel = (self._cam_var.get() or "").strip()
+            if sel:
+                return sel
+        except Exception:
+            pass
+        try:
+            _i, n = self._cam_choices[0]
+            return n or f"Camera {_i}"
+        except Exception:
+            return "camera"
+
+    def _fit_video(self):
+        try:
+            pv = getattr(self, "_preview", None)
+            if pv is not None and getattr(pv, "live", False):
+                pv.resize(self._PREVIEW_W, self._PREVIEW_H)
+        except Exception:
+            pass
+
+    def _switch_camera(self):
+        was_running = False
+        try:
+            pv = getattr(self, "_preview", None)
+            was_running = bool(pv is not None and pv.live)
+        except Exception:
+            pass
+        try:
+            self._stop_preview()
+        except Exception:
+            pass
+        if was_running:
+            self._start_preview()
+
+    def _start_preview(self):
+        # Dep-free DirectShow path: enumerate (fast), open the pick into
+        # the holder HWND, run. No pip anything — works on LTSC.
+        if not self._ensure_cams():
+            self._set_info("No camera found — check Privacy > Camera, or use the fallback below.")
+            return
+        self._refresh_cam_row()
+        try:
+            from app.dshow_cam import Preview
+        except Exception:
+            self._set_info("Camera engine unavailable on this PC — use the fallback below.")
+            return
+        try:
+            try:
+                self._holder.update_idletasks()
+            except Exception:
+                pass
+            hwnd = self._holder.winfo_id()
+        except Exception:
+            self._set_info("Could not open this camera — use the fallback below.")
+            return
+        try:
+            pv = Preview()
+            if not pv.open(self._picked_index(), hwnd,
+                           self._PREVIEW_W, self._PREVIEW_H):
+                raise RuntimeError("open failed")
+            try:
+                old = getattr(self, "_preview", None)
+                if old is not None:
+                    old.close()
+            except Exception:
+                pass
+            self._preview = pv
+            self._running = True
+            try:
+                self._toggle_btn.config_text("Stop")
+            except Exception:
+                try:
+                    self._toggle_btn.config(text="Stop")
+                except Exception:
+                    pass
+            self._set_info(f"Live: {self._picked_name()} — Stop releases the camera for OBS/Discord.")
+        except Exception:
+            reason = ""
+            try:
+                reason = (getattr(pv, "last_error", "") or "").strip()
+            except Exception:
+                reason = ""
+            try:
+                pv.close()
+            except Exception:
+                pass
+            if reason:
+                self._set_info(reason)
+            else:
+                self._set_info("Could not open this camera — check Privacy > Camera settings, "
+                                "or try the fallback below.")
+
+    def _tick(self):
+        # Retired with the OpenCV path — DirectShow renders itself, so
+        # there is no frame pump anymore. Kept as a no-op.
+        self._tick_after = None
+
+    def _stop_preview(self):
+        if self._tick_after is not None:
+            try:
+                self._dlg.after_cancel(self._tick_after)
+            except Exception:
+                pass
+            self._tick_after = None
+        try:
+            pv = getattr(self, "_preview", None)
+            if pv is not None:
+                pv.close()
+        except Exception:
+            pass
+        self._running = False
+        try:
+            self._toggle_btn.config_text("Start")
+        except Exception:
+            try:
+                self._toggle_btn.config(text="Start")
+            except Exception:
+                pass
+        self._set_info("Preview stopped — camera released.")
+
+    def _open_native_camera(self):
+        # LTSC-aware: on LTSC the Store Camera app isn't installed, but
+        # Windows' ShellExecute still "succeeds" launching the URI — it
+        # just pops its own "get this app from the Store" dialog that
+        # Python can't see or catch. So on LTSC we skip the attempt
+        # entirely and go straight to the one page that does exist
+        # there (Camera privacy settings), instead of showing users a
+        # dead-end Store prompt while our own label promised a camera.
+        if self._is_ltsc():
+            try:
+                self.app._launch_settings("ms-settings:privacy-webcam")
+                self._set_info("LTSC has no Camera app — Start/Stop above is the real test. "
+                               "Opened camera-permission settings instead.")
+            except Exception as exc:
+                self._set_info(f"Could not open Settings ({exc}).")
+            return
+        try:
+            import os as _os
+            _os.startfile("microsoft.windows.camera:")
+            return
+        except Exception:
+            pass
+        try:
+            self.app._launch_settings("ms-settings:privacy-webcam")
+            self._set_info("Couldn't open the Camera app — the preview above is the test. "
+                           "Check permission in the settings page just opened.")
+        except Exception as exc:
+            self._set_info(f"Could not open a camera app ({exc}).")
+            try:
+                self.app.log("  ! webcam fallback failed.")
+            except Exception:
+                pass
+
+    def _stop(self):
+        self._stop_preview()
+
+
+class MouseTesterDialog(ThemedModal):
+    """Mouse Tester: Buttons tab (every button lights while held, wheel
+    tick counter, live polling-rate from real event intervals,
+    double-click gap) + Aim tab (10 targets, score from reaction ms +
+    accuracy — Aim-Labs-lite, Tk ovals only). Pure Tk events, zero
+    Win32, zero risk."""
+
+    _POLL_WINDOW_S = 1.0
+    _AIM_ROUNDS = 10
+    _AIM_R = 22
+
+    _BTNS = (("Left", 1), ("Middle", 2), ("Right", 3),
+             ("Side 1", 4), ("Side 2", 5))
+
+    def __init__(self, parent, app):
+        self.app = app
+        self._view = "buttons"
+        self._btn_shapes = {}
+        self._held = set()
+        self._tested = set()
+        self._wheel_ticks = 0
+        self._move_times = []
+        self._last_click_t = 0.0
+        self._aim_running = False
+        self._aim_left = 0
+        self._aim_hits = 0
+        self._aim_shots = 0
+        self._aim_times = []
+        self._aim_errs = []
+        self._aim_spawn_t = 0.0
+        self._aim_target = None
+        super().__init__(parent, title="Mouse Tester", accent=TAB_ACCENTS["Clean"])
+        body = self.body
+        tabs = tk.Frame(body, bg=COLORS["bg"])
+        tabs.pack(fill="x", pady=(0, 8))
+        for key, label in (("buttons", "Buttons"), ("aim", "Aim Test")):
+            AnimatedButton(tabs, text=label, command=lambda k=key: self._switch(k),
+                           bg=COLORS["surface"], fg=COLORS["text"],
+                           font=(F, 9, "bold"), padx=14, pady=6).pack(side="left", padx=(0, 6))
+        self._content = tk.Frame(body, bg=COLORS["bg"])
+        self._content.pack(fill="both", expand=True)
+        self.on_close(self._stop)
+        self._switch("buttons")
+
+    # ---------------- view switching ---------------- #
+
+    def _switch(self, key):
+        self._view = key
+        for child in self._content.winfo_children():
+            try:
+                child.destroy()
+            except Exception:
+                pass
+        self._held.clear()
+        if key == "buttons":
+            self._build_buttons()
+        else:
+            self._build_aim()
+        self._bind_mouse()
+
+    def _bind_mouse(self):
+        # Rebind per view (old bindings die with the old content, but
+        # Toplevel bindings persist — unbind first to avoid doubles).
+        try:
+            for seq in ("<ButtonPress>", "<ButtonRelease>", "<MouseWheel>",
+                        "<Motion>", "<Double-Button-1>"):
+                try:
+                    self._dlg.unbind(seq)
+                except Exception:
+                    pass
+            if self._view == "buttons":
+                self._dlg.bind("<ButtonPress>", self._on_press, add="+")
+                self._dlg.bind("<ButtonRelease>", self._on_release, add="+")
+                self._dlg.bind("<MouseWheel>", self._on_wheel, add="+")
+                self._dlg.bind("<Motion>", self._on_move, add="+")
+                self._dlg.bind("<Double-Button-1>", self._on_double, add="+")
+            else:
+                self._dlg.bind("<ButtonPress>", self._on_aim_click, add="+")
+            try:
+                self._dlg.focus_force()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    # ---------------- Buttons tab ---------------- #
+
+    def _build_buttons(self):
+        self._status_lbl = tk.Label(self._content, text="Click every button, scroll the wheel.",
+                                    font=(F, 10, "bold"), bg=COLORS["bg"],
+                                    fg=COLORS["subtext"], anchor="w")
+        self._status_lbl.pack(fill="x", pady=(0, 6))
+        row = tk.Frame(self._content, bg=COLORS["bg"])
+        row.pack(pady=(8, 4))
+        self._btn_shapes = {}
+        for label, num in self._BTNS:
+            cell = tk.Frame(row, bg=COLORS["surface"], padx=18, pady=14)
+            cell.pack(side="left", padx=5)
+            tk.Label(cell, text=label, font=(F, 9, "bold"),
+                     bg=COLORS["surface"], fg=COLORS["subtext"]).pack()
+            self._btn_shapes[num] = cell
+        stats = tk.Frame(self._content, bg=COLORS["bg"])
+        stats.pack(fill="x", pady=(8, 0))
+        for c in range(4):
+            stats.grid_columnconfigure(c, weight=1, uniform="mousestats")
+        self._stat_tested, _ = self._mstat(stats, 0, "TESTED")
+        self._stat_poll, _ = self._mstat(stats, 1, "POLLING")
+        self._stat_wheel, _ = self._mstat(stats, 2, "WHEEL TICKS")
+        self._stat_dbl, _ = self._mstat(stats, 3, "DOUBLE-CLICK")
+        self._refresh_mstats()
+        tk.Label(self._content, text="Polling = real mouse-event rate (1000Hz mice read ~1000).",
+                 font=(F, 8), bg=COLORS["bg"], fg=COLORS["subtext"],
+                 wraplength=640).pack(pady=(8, 0))
+
+    def _mstat(self, parent, col, title):
+        try:
+            cell = tk.Frame(parent, bg=COLORS["bg"])
+            cell.grid(row=0, column=col, sticky="nsew", padx=8)
+            tk.Label(cell, text=title, font=(F, 8), bg=COLORS["bg"],
+                     fg=COLORS["subtext"]).pack()
+            val = tk.Label(cell, text="—", font=(F, 11, "bold"),
+                           bg=COLORS["bg"], fg=COLORS["text"])
+            val.pack()
+            return val, cell
+        except Exception:
+            return None, None
+
+    def _paint_btn(self, num, held):
+        cell = self._btn_shapes.get(num)
+        if cell is None:
+            return
+        color = COLORS["accent_green"] if held else (
+            _hex_lerp(COLORS["accent_green"], COLORS["surface"], 0.75)
+            if num in self._tested else COLORS["surface"])
+        try:
+            cell.config(bg=color)
+            for w in cell.winfo_children():
+                try:
+                    w.config(bg=color)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _on_press(self, event):
+        try:
+            num = int(getattr(event, "num", 0) or 0)
+        except Exception:
+            return
+        if num not in self._btn_shapes:
+            return
+        if num not in self._held:
+            self._held.add(num)
+            self._tested.add(num)
+            try:
+                import time as _time
+                now = _time.perf_counter()
+                if num == 1:
+                    if self._last_click_t:
+                        gap = (now - self._last_click_t) * 1000.0
+                        # BUG FIX: this used to sit unused until the OS's
+                        # own <Double-Button-1> virtual event fired to
+                        # display it — but that event only fires within
+                        # the OS's own double-click window/target and is
+                        # easy to miss (slightly-too-slow clicks, tiny
+                        # mouse movement between clicks, or focus
+                        # churn from repainting the button cells all
+                        # suppressed it), which is why the stat barely
+                        # ever updated. The gap is measured here, off
+                        # real event timestamps, independent of the OS
+                        # double-click detector — so show it directly.
+                        self._last_dbl_ms = gap
+                        try:
+                            if gap <= 1500.0:
+                                self._stat_dbl.config(text=f"{gap:.0f}ms")
+                            else:
+                                self._stat_dbl.config(text="—")
+                        except Exception:
+                            pass
+                    self._last_click_t = now
+            except Exception:
+                pass
+            self._paint_btn(num, True)
+            self._refresh_mstats()
+
+    def _on_release(self, event):
+        try:
+            num = int(getattr(event, "num", 0) or 0)
+        except Exception:
+            return
+        self._held.discard(num)
+        self._paint_btn(num, False)
+        self._refresh_mstats()
+
+    def _on_wheel(self, event):
+        try:
+            self._wheel_ticks += 1 if int(getattr(event, "delta", 0) or 0) >= 0 else 1
+        except Exception:
+            self._wheel_ticks += 1
+        self._refresh_mstats()
+
+    def _on_move(self, event):
+        try:
+            import time as _time
+            now = _time.perf_counter()
+            self._move_times.append(now)
+            cutoff = now - self._POLL_WINDOW_S
+            while self._move_times and self._move_times[0] < cutoff:
+                self._move_times.pop(0)
+            n = len(self._move_times)
+            if n >= 3:
+                span = self._move_times[-1] - self._move_times[0]
+                hz = (n - 1) / span if span > 0 else 0.0
+                try:
+                    self._stat_poll.config(text=f"{hz:.0f}Hz")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _on_double(self, event):
+        try:
+            gap = getattr(self, "_last_dbl_ms", 0.0)
+            self._stat_dbl.config(text=f"{gap:.0f}ms" if gap else "—")
+        except Exception:
+            pass
+
+    def _refresh_mstats(self):
+        try:
+            self._stat_tested.config(
+                text=f"{len(self._tested)}/{len(self._btn_shapes)}")
+        except Exception:
+            pass
+        try:
+            self._stat_wheel.config(text=str(self._wheel_ticks))
+        except Exception:
+            pass
+
+    # ---------------- Aim tab ---------------- #
+
+    _AIM_BG = "#0b0d12"
+    _AIM_GRID = "#151923"
+
+    def _build_aim(self):
+        self._aim_running = False
+        self._aim_target = None
+        self._aim_win = None
+        tk.Label(self._content, text="Full-screen aim trainer — 10 targets, "
+                 "center hits score more.",
+                 font=(F, 10, "bold"), bg=COLORS["bg"],
+                 fg=COLORS["subtext"], anchor="w",
+                 wraplength=640, justify="left").pack(fill="x", pady=(0, 10))
+        self._aim_info = tk.Label(self._content,
+                                  text="Press Start — the test opens full-screen. "
+                                       "Esc quits early.",
+                                  font=(F, 9), bg=COLORS["bg"],
+                                  fg=COLORS["subtext"], wraplength=640,
+                                  justify="left")
+        self._aim_info.pack(pady=(0, 10))
+        row = tk.Frame(self._content, bg=COLORS["bg"])
+        row.pack(pady=(4, 0))
+        self._aim_btn = AnimatedButton(row, text="Start",
+                                       command=self._aim_start,
+                                       bg=COLORS["surface"], fg=COLORS["text"],
+                                       font=(F, 9, "bold"), padx=22, pady=6)
+        self._aim_btn.pack()
+
+    def _aim_start(self):
+        self._aim_running = True
+        self._aim_left = self._AIM_ROUNDS
+        self._aim_hits = 0
+        self._aim_shots = 0
+        self._aim_times = []
+        self._aim_errs = []
+        try:
+            self._aim_btn.config_text("Restart")
+        except Exception:
+            pass
+        self._open_aim_fullscreen()
+
+    def _open_aim_fullscreen(self):
+        """Real full-screen test window (was a plain 680x320 inline
+        canvas before — no room to actually test flick range, and it
+        looked like a placeholder). Own Toplevel, own event loop
+        bindings, closed on finish or Esc."""
+        try:
+            win = tk.Toplevel(self._dlg)
+            self._aim_win = win
+            win.configure(bg=self._AIM_BG)
+            try:
+                win.attributes("-fullscreen", True)
+            except Exception:
+                # Fallback for WMs that reject -fullscreen: cover the
+                # whole primary display manually.
+                sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+                win.overrideredirect(True)
+                win.geometry(f"{sw}x{sh}+0+0")
+            try:
+                win.attributes("-topmost", True)
+            except Exception:
+                pass
+            win.focus_force()
+            sw = win.winfo_screenwidth()
+            sh = win.winfo_screenheight()
+            cv = tk.Canvas(win, width=sw, height=sh, bg=self._AIM_BG,
+                           bd=0, highlightthickness=0, cursor="crosshair")
+            cv.pack(fill="both", expand=True)
+            self._aim_cv = cv
+            self._aim_w, self._aim_h = sw, sh
+            # Faint grid — plain black used to read as an empty/broken
+            # window; this reads as an actual aim-trainer arena.
+            step = 64
+            for gx in range(0, sw, step):
+                cv.create_line(gx, 0, gx, sh, fill=self._AIM_GRID, width=1)
+            for gy in range(0, sh, step):
+                cv.create_line(0, gy, sw, gy, fill=self._AIM_GRID, width=1)
+            self._aim_hud = cv.create_text(
+                sw // 2, 36, text="", fill=COLORS["text"],
+                font=(F, 14, "bold"), anchor="n")
+            self._aim_sub = cv.create_text(
+                sw // 2, 64, text="Click the target — Esc to quit",
+                fill=COLORS["subtext"], font=(F, 10), anchor="n")
+            cv.bind("<Button-1>", self._on_aim_click)
+            win.bind("<Escape>", lambda _e: self._aim_abort())
+            win.protocol("WM_DELETE_WINDOW", self._aim_abort)
+            self._update_aim_hud()
+            self._aim_next()
+        except Exception:
+            self._aim_win = None
+            self._aim_info.config(text="Couldn't open the full-screen test on this display.")
+
+    def _update_aim_hud(self):
+        try:
+            done = self._AIM_ROUNDS - self._aim_left
+            n = len(self._aim_times)
+            avg = sum(self._aim_times) / n if n else 0.0
+            self._aim_cv.itemconfig(
+                self._aim_hud,
+                text=f"Target {min(done + 1, self._AIM_ROUNDS)}/{self._AIM_ROUNDS}"
+                     f"   ·   hits {self._aim_hits}   ·   avg {avg:.0f}ms" if n
+                     else f"Target {min(done + 1, self._AIM_ROUNDS)}/{self._AIM_ROUNDS}")
+        except Exception:
+            pass
+
+    def _aim_abort(self):
+        self._aim_running = False
+        self._aim_target = None
+        try:
+            if self._aim_win is not None:
+                self._aim_win.destroy()
+        except Exception:
+            pass
+        self._aim_win = None
+        try:
+            self._aim_info.config(text="Test cancelled. Press Start to try again.")
+        except Exception:
+            pass
+
+    def _aim_next(self):
+        cv = getattr(self, "_aim_cv", None)
+        if cv is None:
+            return
+        try:
+            cv.delete("target")
+        except Exception:
+            return
+        if self._aim_left <= 0:
+            self._aim_finish()
+            return
+        try:
+            import random as _rand
+            import time as _time
+            r = self._AIM_R
+            pad = r + 40
+            x = _rand.randint(pad, max(pad + 1, self._aim_w - pad))
+            y = _rand.randint(pad, max(pad + 1, self._aim_h - pad))
+            # Layered rings read as a lit target instead of a flat dot —
+            # outer glow ring, mid ring, bullseye, crosshair ticks.
+            cv.create_oval(x - r - 10, y - r - 10, x + r + 10, y + r + 10,
+                           outline="#5a1a1a", width=2, tags="target")
+            cv.create_oval(x - r, y - r, x + r, y + r,
+                           fill=COLORS["accent_red"], outline="#ffffff",
+                           width=2, tags="target")
+            cv.create_oval(x - r * 2 // 3, y - r * 2 // 3,
+                           x + r * 2 // 3, y + r * 2 // 3,
+                           fill=COLORS["accent_yellow"], outline="",
+                           tags="target")
+            cv.create_oval(x - 5, y - 5, x + 5, y + 5,
+                           fill="#FFFFFF", outline="", tags="target")
+            tick = r + 16
+            for dx, dy in ((tick, 0), (-tick, 0), (0, tick), (0, -tick)):
+                cv.create_line(x + dx * 0.55, y + dy * 0.55, x + dx, y + dy,
+                               fill="#8a8f9a", width=2, tags="target")
+            self._aim_target = (x, y)
+            self._aim_spawn_t = _time.perf_counter()
+            self._update_aim_hud()
+        except Exception:
+            pass
+
+    def _on_aim_click(self, event):
+        if not self._aim_running or self._aim_target is None:
+            return
+        try:
+            import time as _time
+            import math as _math
+            x, y = self._aim_target
+            px, py = event.x, event.y
+            self._aim_shots += 1
+            dist = _math.hypot(px - x, py - y)
+            ms = (_time.perf_counter() - self._aim_spawn_t) * 1000.0
+            if dist <= self._AIM_R:
+                self._aim_hits += 1
+                self._aim_times.append(ms)
+                self._aim_errs.append(max(0.0, 1.0 - dist / self._AIM_R))
+                self._aim_left -= 1
+                self._aim_target = None
+                try:
+                    self._aim_cv.itemconfig(self._aim_sub,
+                                            text=f"Hit! {ms:.0f}ms", fill=COLORS["accent_green"])
+                except Exception:
+                    pass
+                self._aim_next()
+            else:
+                self._aim_errs.append(0.0)
+                try:
+                    self._aim_cv.itemconfig(self._aim_sub, text="Miss — try again",
+                                            fill=COLORS["accent_red"])
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _aim_finish(self):
+        self._aim_running = False
+        self._aim_target = None
+        try:
+            import statistics as _st
+            n = len(self._aim_times)
+            avg = sum(self._aim_times) / n if n else 0.0
+            best = min(self._aim_times) if n else 0.0
+            acc = (sum(self._aim_errs) / self._aim_shots * 100.0) if self._aim_shots else 0.0
+            score = int(100000.0 * (acc / 100.0) / avg) if avg > 0 else 0
+            if avg <= 0:
+                verdict = "No hits — try again!"
+            elif avg < 250 and acc >= 70:
+                verdict = "Cracked aim — streamer material."
+            elif avg < 350:
+                verdict = "Solid casual aim."
+            else:
+                verdict = "Warming up — run it back."
+            summary = (f"Score {score} · avg {avg:.0f}ms · best {best:.0f}ms · "
+                       f"accuracy {acc:.0f}% ({self._aim_hits}/{self._AIM_ROUNDS} hits). {verdict}")
+        except Exception:
+            summary = "Run finished."
+        # Show the result on the full-screen canvas briefly, then close
+        # it and land back on the modal with the same summary.
+        try:
+            cv = getattr(self, "_aim_cv", None)
+            if cv is not None:
+                cv.delete("target")
+                cv.itemconfig(self._aim_hud, text="Run complete")
+                cv.itemconfig(self._aim_sub, text=summary, fill=COLORS["text"])
+                self._dlg.after(1400, self._close_aim_fullscreen)
+            else:
+                self._close_aim_fullscreen()
+        except Exception:
+            self._close_aim_fullscreen()
+        try:
+            self._aim_info.config(text=summary)
+        except Exception:
+            pass
+        try:
+            self._aim_btn.config_text("Play again")
+        except Exception:
+            pass
+
+    def _close_aim_fullscreen(self):
+        try:
+            if self._aim_win is not None:
+                self._aim_win.destroy()
+        except Exception:
+            pass
+        self._aim_win = None
+
+    def _stop(self):
+        self._aim_running = False
+        self._aim_target = None
+        try:
+            self._close_aim_fullscreen()
+        except Exception:
+            pass
+
+
+class SpecsDialog(ThemedModal):
+    """PC Specs: Speccy-style summary in plain words — left nav
+    (Summary, OS, CPU, RAM, Board, Graphics, Storage, Audio, Network),
+    one-line facts on the right, Copy Summary for support posts.
+    Read-only engine (app/pc_specs.py); anything unreadable shows
+    'Unknown', never a guess. No temperatures — those need a driver
+    stdlib code can't honestly read."""
+
+    _TABS = ("Summary", "OS", "CPU", "RAM", "Board", "Graphics",
+             "Storage", "Audio", "Network")
+
+    def __init__(self, parent, app):
+        self.app = app
+        self._tab = "Summary"
+        super().__init__(parent, title="PC Specs", accent=TAB_ACCENTS["Clean"])
+        body = self.body
+        cols = tk.Frame(body, bg=COLORS["bg"])
+        cols.pack(fill="both", expand=True)
+        nav = tk.Frame(cols, bg=COLORS["bg_alt"], width=150)
+        nav.pack(side="left", fill="y", padx=(0, 8))
+        try:
+            nav.pack_propagate(False)
+        except Exception:
+            pass
+        self._nav_btns = {}
+        for tab in self._TABS:
+            b = AnimatedButton(nav, text=tab, command=lambda t=tab: self._show(t),
+                               bg=COLORS["bg_alt"], fg=COLORS["text"],
+                               font=(F, 9, "bold"), padx=10, pady=5)
+            b.pack(fill="x", padx=6, pady=2)
+            self._nav_btns[tab] = b
+        self._detail = tk.Frame(cols, bg=COLORS["bg"])
+        self._detail.pack(side="left", fill="both", expand=True)
+        foot = tk.Frame(body, bg=COLORS["bg"])
+        foot.pack(fill="x", pady=(8, 0))
+        tk.Label(foot, text="Unknown = couldn't be read, never guessed.",
+                 font=(F, 8), bg=COLORS["bg"], fg=COLORS["subtext"]).pack(side="left")
+        AnimatedButton(foot, text="Copy Summary",
+                       command=self._copy_summary,
+                       bg=COLORS["surface"], fg=COLORS["text"],
+                       font=(F, 9, "bold"), padx=14, pady=6).pack(side="right")
+        self._copy_note = tk.Label(foot, text="", font=(F, 8),
+                                   bg=COLORS["bg"], fg=COLORS["accent_green"])
+        self._copy_note.pack(side="right", padx=(0, 8))
+        self.on_close(self._stop)
+        self._show("Summary")
+
+    def _rows(self, pairs):
+        for child in self._detail.winfo_children():
+            try:
+                child.destroy()
+            except Exception:
+                pass
+        for title, value in pairs:
+            tk.Label(self._detail, text=title, font=(F, 11, "bold"),
+                     bg=COLORS["bg"], fg=COLORS["text"],
+                     anchor="w").pack(fill="x", pady=(8, 0))
+            tk.Label(self._detail, text=value or "Unknown", font=(F, 9),
+                     bg=COLORS["bg"], fg=COLORS["subtext"], anchor="w",
+                     justify="left", wraplength=560).pack(fill="x")
+
+    def _show(self, tab):
+        self._tab = tab
+        try:
+            from app import pc_specs as _sp
+        except Exception:
+            self._rows([("Error", "Specs engine unavailable.")])
+            return
+        try:
+            if tab == "Summary":
+                lines = _sp.summary_lines() or ["Nothing readable."]
+                self._rows([("Your PC at a glance", "\n".join(lines))])
+            elif tab == "OS":
+                cap, build = _sp.os_info()
+                self._rows([("Operating System", cap),
+                            ("Version", build)])
+            elif tab == "CPU":
+                name, detail = _sp.cpu_info()
+                self._rows([("Processor", name), ("Speed · Cores", detail)])
+            elif tab == "RAM":
+                head, detail = _sp.ram_info()
+                self._rows([("Memory", head), ("Available", detail or "Unknown")])
+            elif tab == "Board":
+                name, detail = _sp.board_info()
+                self._rows([("Motherboard", name), ("Firmware", detail or "Unknown")])
+            elif tab == "Graphics":
+                gpus = _sp.gpu_info()
+                rows = [(f"GPU {i + 1}", g) for i, g in enumerate(gpus)] or [
+                    ("Graphics", "Unknown")]
+                try:
+                    from app.tasks.tweak_tasks import _query_video_mode_list
+                    cur, _mx = _query_video_mode_list()
+                    if cur:
+                        rows.append(("Display now",
+                                     f"{cur[0]}x{cur[1]} @ {cur[2]}Hz"))
+                except Exception:
+                    pass
+                self._rows(rows)
+            elif tab == "Storage":
+                disks = _sp.storage_info()
+                rows = [(f"{d['drive']} {d['label']}".strip(),
+                         f"{_sp._gb(d['free'])} free of {_sp._gb(d['total'])}"
+                         + (f" · {d['fs']}" if d.get("fs") else ""))
+                        for d in disks] or [("Drives", "Unknown")]
+                self._rows(rows)
+            elif tab == "Audio":
+                names = _sp.audio_info()
+                rows = [(f"Output {i + 1}", n) for i, n in enumerate(names)] or [
+                    ("Audio", "Unknown")]
+                self._rows(rows)
+            elif tab == "Network":
+                name, dns = _sp.net_info()
+                self._rows([("Computer", name), ("Network", dns)])
+        except Exception:
+            self._rows([("Error", "Could not read this section.")])
+
+    def _copy_summary(self):
+        try:
+            from app import pc_specs as _sp
+            text = "\n".join(_sp.summary_lines())
+            self._dlg.clipboard_clear()
+            self._dlg.clipboard_append(text)
+            self._copy_note.config(text="Copied!")
+        except Exception:
+            try:
+                self._copy_note.config(text="Copy failed.")
+            except Exception:
+                pass
+
+    def _stop(self):
+        pass
+
+
+class ToolsTab(tk.Frame):
+    # Retired OpenCV webcam body, kept as inert text (not code) so the
+    # history of the removed path stays visible; the live dialog above
+    # uses the dep-free DirectShow engine instead.
+    _RETIRED_OPENCV_BODY = '''
+        try:
+            import time as _time
+            import cv2 as _cv2
+            from PIL import Image as _Image
+            from PIL import ImageTk as _ImageTk
+            ok, frame = self._cap.read()
+            if ok and frame is not None:
+                now = _time.perf_counter()
+                if self._last_t:
+                    dt = now - self._last_t
+                    if dt > 0:
+                        inst = 1.0 / dt
+                        self._fps_ema = inst if not self._fps_ema else (0.9 * self._fps_ema + 0.1 * inst)
+                self._last_t = now
+                h, w = frame.shape[:2]
+                rgb = _cv2.cvtColor(frame, _cv2.COLOR_BGR2RGB)
+                img = _Image.fromarray(rgb)
+                img.thumbnail((self._PREVIEW_W, self._PREVIEW_H))
+                photo = _ImageTk.PhotoImage(image=img)
+                self._img_ref = photo
+                try:
+                    self._cv.delete("frame")
+                    self._cv.create_image(self._PREVIEW_W // 2, self._PREVIEW_H // 2,
+                                          image=photo, anchor="center", tags=("frame",))
+                except Exception:
+                    pass
+                try:
+                    if not getattr(self, "_black_warned", False):
+                        fps_txt = f" @ ~{self._fps_ema:.0f}fps measured" if self._fps_ema else ""
+                        self._set_info(f"Live: {w}x{h}{fps_txt} — Stop releases the camera.")
+                except Exception:
+                    pass
+            else:
+                self._set_info("Frame read failed — camera may be in use by another app.")
+        except Exception:
+            pass
+        try:
+            self._tick_after = self._dlg.after(self._TICK_MS, self._tick)
+        except Exception:
+            self._tick_after = None
+
+    def _stop_preview(self):
+        self._running = False
+        if self._tick_after is not None:
+            try:
+                self._dlg.after_cancel(self._tick_after)
+            except Exception:
+                pass
+            self._tick_after = None
+        if self._cap is not None:
+            try:
+                self._cap.release()
+            except Exception:
+                pass
+            self._cap = None
+        self._img_ref = None
+        try:
+            self._cv.delete("frame")
+            self._cv.create_text(self._PREVIEW_W // 2, self._PREVIEW_H // 2,
+                                 text="Press Start", font=(F, 12, "bold"),
+                                 fill=COLORS["subtext"], tags=("hint",))
+        except Exception:
+            pass
+        try:
+            self._toggle_btn.config_text("Start")
+        except Exception:
+            try:
+                self._toggle_btn.config(text="Start")
+            except Exception:
+                pass
+        self._set_info("Preview stopped — camera released.")
+
+    def _open_native_camera(self):
+        try:
+            import os as _os
+            _os.startfile("microsoft.windows.camera:")  # noqa: S606 — system URI, not an exe
+        except Exception as exc:
+            self._set_info(f"Could not open Windows Camera ({exc}).")
+            try:
+                self.app.log(f"  ! webcam fallback failed: {exc}")
+            except Exception:
+                pass
+
+    def _stop(self):
+        self._stop_preview()
+
+
+    '''
+
+
 class ToolsTab(tk.Frame):
     """Tools tab (user redesign 2026-09): the 5th tab — pink accent.
 
@@ -10120,6 +11946,18 @@ class ToolsTab(tk.Frame):
          "Mics, permission + live level", TAB_ACCENTS["Tweak"]),
         ("gameping", "📶", "Server Ping",
          "Ping game servers before you queue", TAB_ACCENTS["Clean"]),
+        ("keyboard", "⌨️", "Keyboard Tester",
+         "See which keys register — spot ghosting", TAB_ACCENTS["Clean"]),
+        ("monitor", "🖥️", "Monitor Test",
+         "Dead pixels + display info", TAB_ACCENTS["Clean"]),
+        ("speaker", "🔊", "Speaker Test",
+         "Surround check on any output", TAB_ACCENTS["Clean"]),
+        ("webcam", "📷", "Webcam Test",
+         "Live camera preview", TAB_ACCENTS["Clean"]),
+        ("mouse", "🖱️", "Mouse Tester",
+         "Buttons, polling + aim test", TAB_ACCENTS["Clean"]),
+        ("specs", "💻", "PC Specs",
+         "Your PC at a glance", TAB_ACCENTS["Clean"]),
     )
 
     _SHORTCUTS = (
@@ -10307,6 +12145,18 @@ class ToolsTab(tk.Frame):
                 self.app._open_mic_check()
             elif key == "gameping":
                 self.app._open_game_server_ping()
+            elif key == "keyboard":
+                self.app._open_keyboard_tester()
+            elif key == "monitor":
+                self.app._open_monitor_test()
+            elif key == "speaker":
+                self.app._open_speaker_test()
+            elif key == "webcam":
+                self.app._open_webcam_test()
+            elif key == "mouse":
+                self.app._open_mouse_tester()
+            elif key == "specs":
+                self.app._open_pc_specs()
         except Exception:
             pass
 
@@ -11100,6 +12950,55 @@ class Application:
         except Exception:
             pass
 
+    def _open_keyboard_tester(self):
+        """Keyboard Tester entry (Tools tab card). Opens the tester
+        popup (pure Tk key events, no busy-guard needed)."""
+        try:
+            KeyboardTesterDialog(self.root, self).wait()
+        except Exception:
+            pass
+
+    def _open_monitor_test(self):
+        """Monitor Test entry (Tools tab card). Opens the Info + Dead
+        Pixels popup (read-only query + solid fills, no busy-guard)."""
+        try:
+            MonitorTestDialog(self.root, self).wait()
+        except Exception:
+            pass
+
+    def _open_speaker_test(self):
+        """Speaker Test entry (Tools tab card). Plays test tones
+        (winsound only, no busy-guard needed)."""
+        try:
+            SpeakerTestDialog(self.root, self).wait()
+        except Exception:
+            pass
+
+    def _open_webcam_test(self):
+        """Webcam Test entry (Tools tab card). Live preview popup
+        (dep-free DirectShow, device released on close — no
+        busy-guard needed, same rationale as the speed popup)."""
+        try:
+            WebcamDialog(self.root, self).wait()
+        except Exception:
+            pass
+
+    def _open_mouse_tester(self):
+        """Mouse Tester entry (Tools tab card). Buttons + aim-test
+        popup (pure Tk events, no busy-guard needed)."""
+        try:
+            MouseTesterDialog(self.root, self).wait()
+        except Exception:
+            pass
+
+    def _open_pc_specs(self):
+        """PC Specs entry (Tools tab card). Read-only summary popup
+        (registry + SMBIOS reads, no busy-guard needed)."""
+        try:
+            SpecsDialog(self.root, self).wait()
+        except Exception:
+            pass
+
     def _pilot_preset_tasks(self):
         """Task objects for the configured session preset (tolerant:
         unknown preset names / stale keys degrade to Game Session, then
@@ -11447,23 +13346,6 @@ class Application:
             tasks = []
         if not tasks:
             return
-        try:
-            self._pilot_applied_keys = [t.key for t in tasks]
-        except Exception:
-            self._pilot_applied_keys = []
-        try:
-            # Fresh-keys only: exclude tweaks that were ALREADY applied
-            # before this session (the user may want those persistent —
-            # reverting them at session end would undo the user's own
-            # deliberate setup, not the pilot's work).
-            before = set(get_tweak_state() or {})
-        except Exception:
-            before = set()
-        try:
-            self._pilot_fresh_keys = [k for k in self._pilot_applied_keys
-                                      if k not in before]
-        except Exception:
-            self._pilot_fresh_keys = list(self._pilot_applied_keys)
         busy = False
         try:
             with self._busy_lock:
@@ -11479,6 +13361,27 @@ class Application:
             # background trigger must never pop "Administrator Required"
             # over someone's game — run_tasks would do exactly that)
             runnable = [t for t in tasks if not t.admin_required]
+        # Module-8: intent must reflect what will actually run — capturing
+        # applied_keys pre-filter claimed admin tweaks the limited-mode run
+        # never applied, leaving revert overbroad (saved only by the live
+        # registry intersection downstream).
+        try:
+            self._pilot_applied_keys = [t.key for t in runnable]
+        except Exception:
+            self._pilot_applied_keys = []
+        try:
+            # Fresh-keys only: exclude tweaks that were ALREADY applied
+            # before this session (the user may want those persistent —
+            # reverting them at session end would undo the user's own
+            # deliberate setup, not the pilot's work).
+            before = set(get_tweak_state() or {})
+        except Exception:
+            before = set()
+        try:
+            self._pilot_fresh_keys = [k for k in self._pilot_applied_keys
+                                      if k not in before]
+        except Exception:
+            self._pilot_fresh_keys = list(self._pilot_applied_keys)
         if busy or modal or not runnable:
             try:
                 self.log("Game Session Auto-Pilot: game detected "
@@ -12577,11 +14480,20 @@ class Application:
         winget, bundles before individual apps), then catalog apps — one
         worker, one progress bar, fully cancelable via the Stop button
         (install commands are registered with the cancel registry now)."""
+        # Module-8: never hold _busy_lock across a modal (ThemedModal.wait
+        # pumps a nested event loop — a worker completion or an after()
+        # callback taking the same non-reentrant lock would self-deadlock
+        # the Tk thread). Check-and-set is split: fast check under lock,
+        # modal without lock, re-check under lock before claiming.
+        with self._busy_lock:
+            _busy_now = self._busy
+        if _busy_now:
+            _themed_showinfo(self.root, "Busy",
+                             "Please wait for the current operation to finish.",
+                             accent=COLORS["accent_yellow"])
+            return
         with self._busy_lock:
             if self._busy:
-                _themed_showinfo(self.root, "Busy",
-                                 "Please wait for the current operation to finish.",
-                                 accent=COLORS["accent_yellow"])
                 return
             self._busy = True
 
@@ -12663,16 +14575,21 @@ class Application:
                 pass
 
         def _worker():
-            ok_n, fail_n, stopped = 0, 0, False
+            ok_n, fail_n, skipped_n, stopped = 0, 0, 0, False
 
             def _record(task, status, exc):
                 # F2-2: same outcome contract as the run_tasks worker (via
                 # _invoke_single_task); the mapping to the install counters
-                # lives here only. A skip from an install task is counted
-                # as a failure row, matching the old generic-except catch.
-                nonlocal ok_n, fail_n, stopped
+                # lives here only. A skip (nothing to do on this machine) is
+                # completed-with-skip — logged, never a failure, never wedging
+                # the summary count (the old code had no skip branch at all,
+                # silently dropping the outcome).
+                nonlocal ok_n, fail_n, skipped_n, stopped
                 if status == "ok":
                     ok_n += 1
+                elif status == "skip":
+                    skipped_n += 1
+                    self.log(f"  (skipped) {task.label}: {exc}")
                 elif status == "fail":
                     fail_n += 1
                     self.log(f"  ! {task.label} failed: {exc or 'no run available'}")
@@ -12722,7 +14639,7 @@ class Application:
                 self.log("Stopped — remaining items were skipped.")
                 _done(False, f"Stopped: {ok_n} finished before stopping.", ok_n, fail_n)
             else:
-                summary = f"Install complete: {ok_n} succeeded" + (f", {fail_n} failed" if fail_n else "") + "."
+                summary = f"Install complete: {ok_n} succeeded" + (f", {skipped_n} skipped" if skipped_n else "") + (f", {fail_n} failed" if fail_n else "") + "."
                 _done(True, summary, ok_n, fail_n)
 
         thread = threading.Thread(target=_worker, daemon=True)
@@ -12760,11 +14677,17 @@ class Application:
                     )
                 return
 
+        # Module-8: same no-lock-across-modal rule as install_selected_mixed
+        # — check under lock, modal without lock, claim under lock.
+        with self._busy_lock:
+            _busy_now = self._busy
+        if _busy_now:
+            if not quiet:
+                _themed_showinfo(self.root, "Busy", "Please wait for the current operation to finish.",
+                                 accent=COLORS["accent_yellow"])
+            return
         with self._busy_lock:
             if self._busy:
-                if not quiet:
-                    _themed_showinfo(self.root, "Busy", "Please wait for the current operation to finish.",
-                                     accent=COLORS["accent_yellow"])
                 return
             self._busy = True
 

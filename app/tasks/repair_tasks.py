@@ -379,7 +379,8 @@ def repair_network_stack_defaults(ctx: TaskContext):
     # succeeds and renew fails (router down, remote session), the machine
     # is left without an IP. Check each side; abort loudly on renew failure.
     if ctx.cancelled():
-        raise RuntimeError("Network reset cancelled by user before DHCP renew.")
+        from app.utils import TaskCancelled
+        raise TaskCancelled("Network reset cancelled by user before DHCP renew.")
     if run_cmd(ctx, "ipconfig /release", timeout=60) != 0:
         failures.append("ipconfig /release")
         ctx.log("  ! DHCP release failed — skipping renew (address left as-is).")
@@ -1374,6 +1375,38 @@ def audit_mic_consent(ctx: TaskContext):
     return None
 
 
+def repair_nvidia_app_services(ctx: TaskContext):
+    """Restarts the NVIDIA background service trio behind 'NVIDIA App
+    won't open / stuck on splash'. Any of the three may be absent
+    depending on which NVIDIA software is installed — that's normal,
+    not a failure. Counted honestly per-service, never silently
+    swallowed."""
+    from app.utils import TaskSkipped, TaskCancelled
+    ctx.set_status("Restarting NVIDIA background services...")
+    services = ["NvContainerLocalSystem", "NvContainerNetworkService",
+                "NVDisplay.ContainerLocalSystem"]
+    found = ok = 0
+    for svc in services:
+        if ctx.cancelled():
+            raise TaskCancelled("NVIDIA App repair cancelled by user.")
+        if run_cmd(ctx, f"sc query {svc}", timeout=15) != 0:
+            continue  # not installed on this machine — no-op, not a failure
+        found += 1
+        run_cmd(ctx, f"net stop {svc} /y", timeout=30)
+        if ctx.cancelled():
+            raise TaskCancelled("NVIDIA App repair cancelled by user.")
+        rc = run_cmd(ctx, f"net start {svc}", timeout=30)
+        if rc == 0:
+            ok += 1
+        else:
+            ctx.log(f"  ! {svc} did not restart cleanly (exit {rc})")
+    if found == 0:
+        raise TaskSkipped("No NVIDIA container services found — no NVIDIA App installed.")
+    if ok == 0:
+        raise RuntimeError("Found NVIDIA services but none restarted cleanly — see log.")
+    ctx.log(f"Restarted {ok}/{found} NVIDIA background service(s). Relaunch the NVIDIA App.")
+
+
 # --------------------------------------------------------------------------- #
 # Installer tasks MOVED to app/tasks/install_tasks.py (Install tab) — every
 # internet-required task lives there now, per the user's 4th-tab request.
@@ -1429,4 +1462,5 @@ TASKS = [
     Task("driver_export", "Back Up Drivers", "Saves copies of your working drivers to the Desktop before reinstalling any", backup_drivers, default=False, admin_required=True),
     Task("startup_audit", "Check Startup Programs", "Shows what slows your boot; changes nothing, removes nothing", audit_startup_impact, default=False, admin_required=False),
     Task("micfix_audit", "Why Can't They Hear Me?", "Diagnoses mic-not-heard in games/chat from privacy + device state; changes nothing", audit_mic_consent, default=False, admin_required=False),
+    Task("nvidia_app_fix", "Fix NVIDIA App Won't Open", "Restarts NVIDIA background services behind splash-screen hangs", repair_nvidia_app_services, default=False, admin_required=True),
 ]

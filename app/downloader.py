@@ -256,6 +256,10 @@ def install_directx_runtimes(ctx: TaskContext):
         # 3010 = success, reboot recommended — dxsetup treats it as success
         # F07: shell=False argv — no cmd.exe parsing for elevated exec.
         rc = run_cmd(ctx, [dest] + str(info["silent_args"]).split(), shell=False, timeout=1800)
+        # H-1/H-2: user Stop (rc -1 / cancelled) must stay TaskCancelled,
+        # never a RuntimeError failure.
+        if rc == -1 or ctx.cancelled():
+            raise TaskCancelled("DirectX install cancelled by user.")
         if rc not in (0, 3010, 1638):  # 1638 = already installed per MSI semantics
             raise RuntimeError(f"DirectX installer exited with code {rc}.")
         # M7: exit 0 alone never proved the runtimes landed (the /Q wrapper
@@ -321,6 +325,10 @@ def install_vc_redists(ctx: TaskContext):
                 # real install. Retry once with --force.
                 _log(ctx, f"{label}: winget reported OK but runtime DLL still missing — retrying with --force")
                 rc2 = _winget_silent(ctx, pkg_id, force=True)
+                # H-1: Stop during the --force retry must stay cancelled,
+                # never recorded as a plain per-package failure.
+                if rc2 == -1 or ctx.cancelled():
+                    raise TaskCancelled("VC++ install cancelled by user.")
                 if rc2 == 0 and _vcredist_installed(pkg_id):
                     installed.append(label)
                     _log(ctx, f"{label}: installed via forced reinstall.")

@@ -377,6 +377,25 @@ def run_auto_clean(selected_tasks_by_tab):
     completed, failed = 0, 0
     skipped_n = 0
 
+    # Module-8 GUI parity: headless --auto-clean must honor the same
+    # admin_required gate as run_tasks. A schedule created from Limited Mode
+    # runs non-elevated (no /RL HIGHEST) — attempting admin tasks there would
+    # fail/half-write instead of gracefully skipping like the GUI.
+    try:
+        if not is_admin():
+            _blocked = [t for t in tasks_to_run if getattr(t, "admin_required", False)]
+            if _blocked:
+                _names = ", ".join(t.label for t in _blocked)
+                ctx.log(f"Limited mode: skipping {len(_blocked)} admin-only task(s): {_names}")
+                skipped_n += len(_blocked)
+            tasks_to_run = [t for t in tasks_to_run if not getattr(t, "admin_required", False)]
+            if not tasks_to_run:
+                _summary = "Auto-clean skipped: all selected tasks need Administrator rights."
+                ctx.log(_summary)
+                return True, _summary
+    except Exception:
+        pass
+
     # Show the scheduled-run toast (audit dead-code fix: notify_scheduled_run
     # existed with zero callers — a scheduled run was invisible unless the
     # user happened to see a window). F14: fire-and-forget on a daemon

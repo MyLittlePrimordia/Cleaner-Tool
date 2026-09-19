@@ -105,7 +105,40 @@ DEFAULT_CONFIG = {
     # "hostname:port" = TCP handshake). Same coercion contract as the
     # pilot path picks above.
     "gameping_hosts": [],
+    # Feature 10 ("How is my PC doing?"): a tiny rolling log of finished
+    # Clean runs — [{"t": unix_seconds, "b": bytes_freed}], newest last,
+    # capped at _RUN_HISTORY_MAX. Only used to print one friendly
+    # sentence on the scorecard ("You've freed 12 GB this month"). No
+    # paths, no task names, nothing identifying — just a date and a size.
+    "run_history": [],
+    # Feature 7 (Install Profiles / "My Setups"): {name: [package ids]}.
+    # Saved app picks the user can restore in one click.
+    "install_profiles": {},
+    # Feature 9 (Game Night): active = the user pressed Start and has not
+    # pressed End; keys = the tweaks Game Night itself turned on, so End
+    # can put back exactly those and nothing the user had already set.
+    # close_apps = which optional background apps to quiet (all off).
+    # Survives a restart on purpose: closing the app mid-session must not
+    # strand the machine in game settings with no way back.
+    "game_night_active": False,
+    "game_night_keys": [],
+    "game_night_close_apps": [],
+    # Startup Manager: items the user has disabled, enough data to put
+    # each one back exactly as it was. Registry items store {source,
+    # name, command, value_type}; Startup-folder items store {source,
+    # name, command} where command is the held file's path under this
+    # app's own config directory (never the user's Startup folder).
+    "startup_disabled": [],
 }
+
+_STARTUP_MAX = 200
+
+# Feature 10: keep the history short — this is a friendly summary, not an
+# audit trail, and the config file should stay small.
+_RUN_HISTORY_MAX = 120
+# Feature 7: bounds so a hand-edited config can never balloon the file.
+_PROFILE_MAX = 20
+_PROFILE_ITEMS_MAX = 400
 
 # Phase 2 (#12): mapping used to migrate configs saved by the old 5-tab UI.
 # Games-tab twins -> the Clean-tab task that cleans the identical paths
@@ -351,6 +384,72 @@ def _load_config_from_disk() -> dict:
                     if isinstance(h, str) and h.strip()][:64]
             if not isinstance(data.get("tweak_snapshots"), dict):
                 data["tweak_snapshots"] = {}
+            # Feature 10: same hand-edited-config contract as the lists
+            # above — anything that is not a well-formed {t, b} entry is
+            # dropped rather than crashing the summary line later.
+            if not isinstance(data.get("run_history"), list):
+                data["run_history"] = []
+            else:
+                clean_hist = []
+                for entry in data["run_history"]:
+                    if not isinstance(entry, dict):
+                        continue
+                    try:
+                        t = float(entry.get("t", 0))
+                        b = int(entry.get("b", 0))
+                    except (TypeError, ValueError):
+                        continue
+                    if t > 0 and b >= 0:
+                        clean_hist.append({"t": t, "b": b})
+                data["run_history"] = clean_hist[-_RUN_HISTORY_MAX:]
+            # Feature 7: profiles are {name: [str ids]} — coerce junk away.
+            if not isinstance(data.get("install_profiles"), dict):
+                data["install_profiles"] = {}
+            else:
+                clean_prof = {}
+                for name, ids in list(data["install_profiles"].items())[:_PROFILE_MAX]:
+                    if not isinstance(name, str) or not name.strip():
+                        continue
+                    if not isinstance(ids, list):
+                        continue
+                    clean_prof[name.strip()[:60]] = [
+                        i for i in ids
+                        if isinstance(i, str) and i.strip()][:_PROFILE_ITEMS_MAX]
+                data["install_profiles"] = clean_prof
+            # Feature 9: same coercion contract as every list above.
+            if not isinstance(data.get("game_night_active"), bool):
+                data["game_night_active"] = False
+            for _gn_key in ("game_night_keys", "game_night_close_apps"):
+                if not isinstance(data.get(_gn_key), list):
+                    data[_gn_key] = []
+                else:
+                    data[_gn_key] = [
+                        k for k in data[_gn_key]
+                        if isinstance(k, str) and k.strip()][:200]
+            # Startup Manager: same coercion contract — a hand-edited or
+            # corrupted entry is dropped rather than crashing the toggle
+            # list or, worse, being trusted as a restore record.
+            if not isinstance(data.get("startup_disabled"), list):
+                data["startup_disabled"] = []
+            else:
+                clean_su = []
+                for rec in data["startup_disabled"]:
+                    if not isinstance(rec, dict):
+                        continue
+                    src = rec.get("source")
+                    nm = rec.get("name")
+                    cmd = rec.get("command")
+                    if not (isinstance(src, str) and src.strip()
+                            and isinstance(nm, str) and nm.strip()
+                            and isinstance(cmd, str)):
+                        continue
+                    vtype = rec.get("value_type", "")
+                    clean_su.append({
+                        "source": src.strip(), "name": nm.strip()[:200],
+                        "command": cmd[:4096],
+                        "value_type": vtype if isinstance(vtype, str) else "",
+                    })
+                data["startup_disabled"] = clean_su[:_STARTUP_MAX]
             return data
         except FileNotFoundError:
             pass  # file vanished between exists() and open() — treat as missing
@@ -538,3 +637,229 @@ def get_tweak_state() -> dict:
     state = {tid: True for tid in cfg.get("tweak_snapshots", {})}
     state.update({tid: True for tid in cfg.get("applied_tweaks", [])})
     return state
+
+
+# --------------------------------------------------------------------------- #
+# Feature 10 — "How is my PC doing?" run history
+# --------------------------------------------------------------------------- #
+
+def record_run(bytes_freed: int) -> None:
+    """Append one finished Clean run to the rolling history.
+
+    Called on the Tk thread right after a run lands. Best-effort: a
+    failure here must never disturb the run's own outcome, so every
+    error is swallowed (same contract as mark_tweak_applied)."""
+    try:
+        n = int(bytes_freed or 0)
+    except (TypeError, ValueError):
+        return
+    if n <= 0:
+        return          # nothing freed = nothing worth remembering
+    try:
+        import time as _time
+        stamp = _time.time()
+
+        def _mut(cfg):
+            hist = cfg.get("run_history")
+            if not isinstance(hist, list):
+                hist = []
+            hist.append({"t": stamp, "b": n})
+            cfg["run_history"] = hist[-_RUN_HISTORY_MAX:]
+
+        update_config(_mut)
+    except Exception:
+        pass
+
+
+def freed_since(days: int = 30) -> "tuple[int, int]":
+    """(total_bytes_freed, run_count) over the last `days` days.
+
+    Returns (0, 0) when there is no history yet — the caller then shows
+    no sentence at all rather than a zero."""
+    try:
+        import time as _time
+        cutoff = _time.time() - (max(1, int(days)) * 86400)
+        total, runs = 0, 0
+        for entry in load_config().get("run_history", []) or []:
+            try:
+                if float(entry.get("t", 0)) >= cutoff:
+                    total += int(entry.get("b", 0))
+                    runs += 1
+            except (TypeError, ValueError):
+                continue
+        return total, runs
+    except Exception:
+        return 0, 0
+
+
+# --------------------------------------------------------------------------- #
+# Feature 7 — Install profiles ("My Setups")
+# --------------------------------------------------------------------------- #
+
+def get_install_profiles() -> dict:
+    """{name: [package ids]} — always a plain dict, never None."""
+    try:
+        profiles = load_config().get("install_profiles")
+        return dict(profiles) if isinstance(profiles, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_install_profile(name: str, ids: "list[str]") -> bool:
+    """Create or overwrite one profile. True when it was stored.
+
+    Single-lock read-modify-write (H9 contract) so a save from the dialog
+    can't clobber a concurrent one."""
+    try:
+        name = str(name or "").strip()[:60]
+        if not name:
+            return False
+        clean = [str(i) for i in (ids or []) if str(i).strip()][:_PROFILE_ITEMS_MAX]
+
+        def _mut(cfg):
+            profiles = cfg.get("install_profiles")
+            if not isinstance(profiles, dict):
+                profiles = {}
+            if name not in profiles and len(profiles) >= _PROFILE_MAX:
+                # full: drop nothing silently — refuse instead (the dialog
+                # tells the user to delete one first)
+                raise ValueError("profile limit reached")
+            profiles[name] = clean
+            cfg["install_profiles"] = profiles
+
+        update_config(_mut)
+        return True
+    except Exception:
+        return False
+
+
+def delete_install_profile(name: str) -> bool:
+    """Remove one profile. True when something was removed."""
+    try:
+        name = str(name or "").strip()
+        if not name:
+            return False
+        removed = {"hit": False}
+
+        def _mut(cfg):
+            profiles = cfg.get("install_profiles")
+            if isinstance(profiles, dict) and name in profiles:
+                profiles.pop(name, None)
+                cfg["install_profiles"] = profiles
+                removed["hit"] = True
+
+        update_config(_mut)
+        return removed["hit"]
+    except Exception:
+        return False
+
+
+# --------------------------------------------------------------------------- #
+# Feature 9 — Game Night state
+# --------------------------------------------------------------------------- #
+
+def get_game_night() -> dict:
+    """{"active": bool, "keys": [str], "close_apps": [str]}."""
+    try:
+        cfg = load_config()
+        return {
+            "active": bool(cfg.get("game_night_active", False)),
+            "keys": list(cfg.get("game_night_keys", []) or []),
+            "close_apps": list(cfg.get("game_night_close_apps", []) or []),
+        }
+    except Exception:
+        return {"active": False, "keys": [], "close_apps": []}
+
+
+def set_game_night(active: bool, keys=None) -> None:
+    """Record that Game Night started (with the keys it turned on) or
+    ended. Single-lock RMW, same contract as mark_tweak_applied."""
+    try:
+        want = bool(active)
+        klist = [str(k) for k in (keys or []) if str(k).strip()][:200]
+
+        def _mut(cfg):
+            cfg["game_night_active"] = want
+            cfg["game_night_keys"] = klist if want else []
+
+        update_config(_mut)
+    except Exception:
+        pass
+
+
+def set_game_night_close_apps(keys) -> None:
+    """Persist which optional background apps the user ticked."""
+    try:
+        klist = [str(k) for k in (keys or []) if str(k).strip()][:50]
+        update_config(lambda cfg: cfg.__setitem__("game_night_close_apps", klist))
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------- #
+# Startup Manager
+# --------------------------------------------------------------------------- #
+
+def get_startup_disabled() -> list:
+    """[{source, name, command, value_type}] for every item the user has
+    disabled — the data needed to put each one back exactly as it was."""
+    try:
+        items = load_config().get("startup_disabled")
+        return list(items) if isinstance(items, list) else []
+    except Exception:
+        return []
+
+
+def add_startup_disabled(record: dict) -> bool:
+    """Record one newly-disabled item. True when stored.
+
+    Single-lock RMW (H9 contract): the caller has already made the live
+    change (removed the registry value / moved the shortcut) by the time
+    this is called, so losing the race here would strand that change
+    with no way back — the lock makes that not happen."""
+    try:
+        source = str(record.get("source", "")).strip()
+        name = str(record.get("name", "")).strip()[:200]
+        command = str(record.get("command", ""))[:4096]
+        value_type = record.get("value_type", "")
+        value_type = value_type if isinstance(value_type, str) else ""
+        if not source or not name:
+            return False
+        clean = {"source": source, "name": name, "command": command,
+                 "value_type": value_type}
+
+        def _mut(cfg):
+            items = cfg.get("startup_disabled")
+            if not isinstance(items, list):
+                items = []
+            items = [r for r in items
+                     if not (r.get("source") == source and r.get("name") == name)]
+            items.append(clean)
+            cfg["startup_disabled"] = items[:_STARTUP_MAX]
+
+        update_config(_mut)
+        return True
+    except Exception:
+        return False
+
+
+def remove_startup_disabled(source: str, name: str) -> bool:
+    """Drop one record once its item has been re-enabled. True when
+    something was actually removed."""
+    try:
+        removed = {"hit": False}
+
+        def _mut(cfg):
+            items = cfg.get("startup_disabled")
+            if not isinstance(items, list):
+                return
+            kept = [r for r in items
+                    if not (r.get("source") == source and r.get("name") == name)]
+            if len(kept) != len(items):
+                removed["hit"] = True
+            cfg["startup_disabled"] = kept
+
+        update_config(_mut)
+        return removed["hit"]
+    except Exception:
+        return False

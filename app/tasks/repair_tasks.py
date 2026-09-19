@@ -402,6 +402,40 @@ def repair_network_stack_defaults(ctx: TaskContext):
     ctx.log("Network stack reset to defaults. A reboot is recommended.")
 
 
+def repair_network_light(ctx: TaskContext):
+    """Lighter internet fix: flush DNS + reset Winsock — no IP release/renew.
+
+    repair_network_stack_defaults (Fix Internet Connection) above resets
+    the whole stack, and its riskiest moment is the release/renew pair:
+    if release succeeds and renew then fails (router down, remote/VPN
+    session), the machine is left with no IP at all until the user runs
+    `ipconfig /renew` manually. That risk buys real value for a genuinely
+    broken stack, but most "my internet feels off" cases are actually
+    stale DNS or a corrupted Winsock catalog — this covers exactly those,
+    with no step that can end in "no IP address."
+
+    Winsock reset still needs a restart to fully take effect (Windows
+    itself says so) — the log tells the user that rather than implying
+    the fix is complete the moment the command returns.
+    """
+    ctx.set_status("Running the light internet fix...")
+    failures: list = []
+    if run_cmd(ctx, "ipconfig /flushdns", timeout=30) != 0:
+        failures.append("flush DNS")
+    if ctx.cancelled():
+        from app.utils import TaskCancelled
+        raise TaskCancelled("Light internet fix cancelled by user.")
+    if run_cmd(ctx, "netsh winsock reset", timeout=60) != 0:
+        failures.append("reset Winsock")
+    if failures:
+        raise RuntimeError(
+            "Light internet fix partially failed: " + ", ".join(failures)
+            + ". Your IP address was never touched either way.")
+    ctx.log("DNS flushed and Winsock reset. Restart your PC for the "
+           "Winsock reset to fully take effect; your IP address was left "
+           "exactly as it was.")
+
+
 # --------------------------------------------------------------------------- #
 # Round 2 checks (user request) — report-only, plain-language verdicts
 # --------------------------------------------------------------------------- #
@@ -1475,6 +1509,7 @@ TASKS = [
     Task("ssd_maintenance", "SSD Maintenance", "Retrims your SSD and checks drive health", repair_ssd_maintenance, default=False),
     Task("vss_repair", "Fix Restore Points (VSS)", "Restarts the shadow-copy service so checkpoints work again", repair_vss_restore_points, default=False),
     Task("network_reset", "Fix Internet Connection", "Resets internet settings to defaults, repairs bad tweaks", repair_network_stack_defaults, default=False, risk="REBOOT REQUIRED"),
+    Task("network_light", "Fix Internet (Light)", "Flushes DNS and resets Winsock without touching your IP address — try this first", repair_network_light, default=False),
     Task("sfc_scan", "Fix System Files", "Scans and fixes broken Windows files that crash games", repair_sfc_scan, default=False),
     Task("dism_restorehealth", "Repair Windows Image", "Downloads fresh Windows files to fix a broken image", repair_dism_restorehealth, default=False),
     Task("dism_cleanup", "Cleanup Update Storage", "Cleans old update leftovers but keeps uninstall option", repair_dism_component_cleanup, default=False),

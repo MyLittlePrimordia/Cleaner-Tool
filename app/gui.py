@@ -671,6 +671,79 @@ def _release_transparent_color(c):
         pass
 
 
+def _system_drive_root() -> str:
+    """Root of the drive Windows is actually installed on, e.g. 'C:\\'.
+
+    BUG-001 fix (audit 2026-09): the scorecard's before/after capture and
+    the Storage Insight write-benchmark hard-coded "C:\\". On the machines
+    where Windows lives on another letter (dual-boot, custom installs,
+    some OEM images) that made the scorecard measure a drive the run never
+    touched — users saw 0 bytes freed after a clean that worked fine.
+    %SystemDrive% is set by Windows itself on every supported version; the
+    "C:" fallback keeps the old behaviour if it is ever missing.
+    """
+    try:
+        drive = (os.environ.get("SystemDrive") or "C:").strip()
+    except Exception:
+        drive = "C:"
+    if not drive:
+        drive = "C:"
+    if not drive.endswith("\\"):
+        drive += "\\"
+    return drive
+
+
+def _snapshot_all_drives(query_drives, query_free_total):
+    """{root: (free_bytes, total_bytes)} for every ready drive.
+
+    Feature 4 (multi-drive scorecard): a Clean run can free space on more
+    than one drive (games and shader caches often live on a second SSD),
+    but the scorecard only ever measured one. Taking the same instant
+    GetDiskFreeSpaceExW reading for every ready drive before and after the
+    run lets the card show each drive that actually gained space.
+
+    Both callables are passed in so this stays a plain module function
+    (the readers are Application staticmethods). Never raises: a drive
+    that fails to answer is simply absent from the snapshot, which the
+    renderer treats as 'no data for that drive'.
+    """
+    out = {}
+    try:
+        drives = query_drives() or []
+    except Exception:
+        return out
+    for entry in drives:
+        try:
+            root = entry[1]
+            pair = query_free_total(root)
+            if pair:
+                out[root] = pair
+        except Exception:
+            continue
+    return out
+
+
+def _drive_gains(before_map, after_map):
+    """[(root, gained_bytes)] for drives whose free space actually grew.
+
+    Sorted biggest gain first. Drives missing from either snapshot, or
+    that did not gain, are left out — the card never invents a number.
+    """
+    gains = []
+    try:
+        for root, before in (before_map or {}).items():
+            after = (after_map or {}).get(root)
+            if not before or not after:
+                continue
+            delta = (after[0] or 0) - (before[0] or 0)
+            if delta > 0:
+                gains.append((root, delta))
+    except Exception:
+        return []
+    gains.sort(key=lambda g: g[1], reverse=True)
+    return gains
+
+
 class ScorecardDialog(ThemedModal):
     """Themed end-of-run results card (user-approved feature 2026-09).
 
@@ -706,8 +779,19 @@ class ScorecardDialog(ThemedModal):
 
     def __init__(self, parent, *, tab_name, mode, cancelled, results,
                  total_bytes, before=None, after=None, needs_reboot=False,
-                 on_run_again=None, ok_text="Close"):
+                 on_run_again=None, ok_text="Close",
+                 before_drives=None, after_drives=None):
         self._run_again_cb = on_run_again
+        # Feature 3 (Copy results) needs the raw numbers after the widgets
+        # are built, so they are kept on the instance rather than living
+        # only as locals inside this constructor.
+        self._tab_name = tab_name
+        self._mode = mode
+        self._cancelled = bool(cancelled)
+        self._total_bytes = total_bytes or 0
+        self._results = list(results or [])
+        self._needs_reboot = bool(needs_reboot)
+        self._gains = _drive_gains(before_drives, after_drives)
         tab_accent = TAB_ACCENTS.get(tab_name, COLORS["accent_green"])
         if cancelled:
             self._title = ("Undo Stopped" if mode == "revert"
@@ -791,6 +875,39 @@ class ScorecardDialog(ThemedModal):
             tk.Label(chips, text="◦  stopped early", font=(F, 10, "bold"),
                      bg=COLORS["bg"], fg=COLORS["accent_yellow"]).pack(side="left", padx=(12, 0))
 
+        # per-drive breakdown (feature 4) — only when MORE THAN ONE drive
+        # actually gained space. One drive is the normal case and the hero
+        # number already says it; listing "C: +2.1 GB" under a "2.1 GB
+        # freed" headline would just be the same fact twice.
+        self._drive_rows = None
+        if len(self._gains) > 1:
+            drow = self._drive_rows = tk.Frame(body, bg=COLORS["bg"])
+            drow.pack(fill="x", padx=18, pady=(8, 0))
+            tk.Label(drow, text="Space freed on each drive", font=(F, 9, "bold"),
+                     bg=COLORS["bg"], fg=COLORS["subtext"]).pack(anchor="w")
+            line = tk.Frame(drow, bg=COLORS["bg"])
+            line.pack(fill="x", pady=(3, 0))
+            for root, gained in self._gains[:6]:
+                chip = tk.Frame(line, bg=COLORS["bg_alt"])
+                chip.pack(side="left", padx=(0, 8))
+                tk.Label(chip, text=str(root).rstrip("\\"), font=(F, 9, "bold"),
+                         bg=COLORS["bg_alt"], fg=COLORS["text"]).pack(
+                             side="left", padx=(8, 4), pady=3)
+                tk.Label(chip, text="+" + format_bytes(gained), font=(F, 9, "bold"),
+                         bg=COLORS["bg_alt"],
+                         fg=COLORS["accent_green"]).pack(
+                             side="left", padx=(0, 8), pady=3)
+
+        # "How is my PC doing?" (feature 10) — one friendly sentence, and
+        # only once there is more than this single run to talk about.
+        # Nothing to brag about yet = no line, rather than "freed 0 GB".
+        self._month_lbl = None
+        month_text = self._month_summary()
+        if month_text:
+            self._month_lbl = tk.Label(body, text=month_text, font=(F, 9),
+                                       bg=COLORS["bg"], fg=COLORS["subtext"])
+            self._month_lbl.pack(pady=(8, 0))
+
         # hairline separator
         tk.Frame(body, bg=COLORS["hairline"], height=1).pack(fill="x", padx=18, pady=(10, 4))
 
@@ -832,6 +949,13 @@ class ScorecardDialog(ThemedModal):
                            bg=COLORS["surface"], fg=COLORS["text"],
                            font=(F, 9, "bold"), padx=18,
                            pady=7).pack(side="right", padx=(8, 0))
+        # Feature 3: plain-English summary straight to the clipboard, so a
+        # user can paste it into a Discord help thread without screenshots.
+        self._copy_btn = AnimatedButton(
+            brow, text="Copy results", command=self._copy_results,
+            bg=COLORS["surface"], fg=COLORS["text"],
+            font=(F, 9, "bold"), padx=18, pady=7)
+        self._copy_btn.pack(side="right", padx=(8, 0))
         AnimatedButton(brow, text=ok_text, command=self.close,
                        bg=self._title_accent, fg=COLORS["black"],
                        font=(F, 9, "bold"), padx=22,
@@ -916,6 +1040,75 @@ class ScorecardDialog(ThemedModal):
                 x += seg_w
         except Exception:
             pass
+
+    # ---- summaries ------------------------------------------------------ #
+
+    def _month_summary(self):
+        """Friendly one-liner about the last 30 days, or "" if it would
+        not tell the user anything they cannot already see above.
+
+        Deliberately vague about precision ("about 12 GB"): the history
+        stores what each run reported, so it is a good running total, not
+        an accountant's figure, and the wording should not pretend
+        otherwise."""
+        try:
+            from app.config_persist import freed_since
+            total, runs = freed_since(30)
+        except Exception:
+            return ""
+        # One run in the window IS this run — nothing extra to say.
+        if runs < 2 or total <= 0:
+            return ""
+        return ("You've freed about %s in the last 30 days, across %d cleans."
+                % (format_bytes(total), runs))
+
+    def _summary_text(self):
+        """The plain-English block that Copy results puts on the clipboard."""
+        ok_n, skip_n, fail_n, stop_n = self._counts
+        lines = ["Cleaner Tool — %s" % self._title]
+        if self._total_bytes and self._total_bytes > 0:
+            lines.append("Space freed: %s" % format_bytes(self._total_bytes))
+        for root, gained in self._gains:
+            lines.append("  %s  +%s free" % (str(root).rstrip("\\"),
+                                             format_bytes(gained)))
+        parts = ["%d done" % ok_n]
+        if skip_n:
+            parts.append("%d had nothing to do" % skip_n)
+        if fail_n:
+            parts.append("%d failed" % fail_n)
+        if stop_n:
+            parts.append("stopped early")
+        lines.append("Result: " + ", ".join(parts))
+        if self._needs_reboot:
+            lines.append("Restart needed for some changes to take effect.")
+        if self._results:
+            lines.append("")
+            for label, status, nbytes in self._results:
+                word = {"ok": "done", "skip": "nothing to do",
+                        "fail": "failed", "stop": "stopped"}.get(status, status)
+                row = "  %s — %s" % (label, word)
+                if nbytes and nbytes > 0:
+                    row += " (%s)" % format_bytes(nbytes)
+                lines.append(row)
+        return "\n".join(lines)
+
+    def _copy_results(self):
+        """Clipboard copy with visible confirmation on the button itself.
+
+        Tk's clipboard is owned by the app, so the text would vanish when
+        Cleaner Tool exits; update() flushes it to the OS clipboard while
+        the window is still alive."""
+        try:
+            self._dlg.clipboard_clear()
+            self._dlg.clipboard_append(self._summary_text())
+            self._dlg.update()
+            self._copy_btn.config_text("Copied!")
+            self._dlg.after(1600, lambda: self._copy_btn.config_text("Copy results"))
+        except Exception:
+            try:
+                self._copy_btn.config_text("Couldn't copy")
+            except Exception:
+                pass
 
     # ---- actions -------------------------------------------------------- #
 
@@ -1122,7 +1315,7 @@ class StorageInsightDialog(ThemedModal):
         def _worker():
             try:
                 from app.storage_scan import write_benchmark
-                w, r = write_benchmark("C:\\", 32,
+                w, r = write_benchmark(_system_drive_root(), 32,
                                        cancelled=lambda: token[0],
                                        progress_cb=_prog)
             except Exception:
@@ -5928,6 +6121,218 @@ class TaskTab(tk.Frame):
 # Install tab — Master App Catalog browser (Install.txt spec)
 # --------------------------------------------------------------------------- #
 
+class InstallProfilesDialog(ThemedModal):
+    """"My Setups" (feature 7): save the current Install picks under a
+    friendly name and put them back in one click.
+
+    Aimed squarely at the "I just reinstalled Windows" moment — the user
+    ticks their usual apps once, names the set, and next time it is two
+    clicks instead of hunting through the catalog again. Profiles store
+    ONLY ids (winget ids for catalog apps, "task:<key>" for Essentials
+    and bundles) so nothing about the machine is written down.
+
+    Loading replaces the current selection rather than adding to it —
+    "My Setup" should mean exactly that set, not that set plus whatever
+    was already ticked.
+    """
+
+    _NAME_MAX = 40
+
+    def __init__(self, parent, tab):
+        self._tab = tab
+        self._rows_holder = None
+        super().__init__(parent, title="My Setups",
+                         accent=TAB_ACCENTS["Install"])
+        body = self.body
+
+        tk.Label(body, text="Save the apps you have ticked, and put them "
+                            "back any time.",
+                 font=(F, 10, "bold"), bg=COLORS["bg"], fg=COLORS["text"],
+                 anchor="w").pack(fill="x", pady=(0, 2))
+        tk.Label(body, text="Handy after a fresh Windows install — tick your "
+                            "usual apps once, save them, load them next time.",
+                 font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
+                 anchor="w", wraplength=700, justify="left").pack(
+                     fill="x", pady=(0, 14))
+
+        # --- save row ---
+        save_box = tk.Frame(body, bg=COLORS["bg_alt"])
+        save_box.pack(fill="x", pady=(0, 14))
+        inner = tk.Frame(save_box, bg=COLORS["bg_alt"])
+        inner.pack(fill="x", padx=14, pady=12)
+        n_now = self._current_count()
+        self._save_hint = tk.Label(
+            inner, text=self._save_hint_text(n_now), font=(F, 9),
+            bg=COLORS["bg_alt"], fg=COLORS["subtext"], anchor="w")
+        self._save_hint.pack(fill="x", pady=(0, 6))
+        entry_row = tk.Frame(inner, bg=COLORS["bg_alt"])
+        entry_row.pack(fill="x")
+        self._name_var = tk.StringVar(value="")
+        self._entry = RoundedEntry(entry_row, textvariable=self._name_var,
+                                   width=26, accent=TAB_ACCENTS["Install"])
+        self._entry.pack(side="left")
+        self._save_btn = AnimatedButton(
+            entry_row, text="Save", command=self._save,
+            bg=TAB_ACCENTS["Install"], fg=COLORS["black"],
+            font=(F, 9, "bold"), padx=20, pady=7)
+        self._save_btn.pack(side="left", padx=(8, 0))
+        self._save_btn.set_enabled(bool(n_now))
+        try:
+            self._entry.entry.bind("<Return>", lambda _e: self._save())
+        except Exception:
+            pass
+
+        # --- saved list ---
+        tk.Label(body, text="Saved setups", font=(F, 9, "bold"),
+                 bg=COLORS["bg"], fg=COLORS["subtext"],
+                 anchor="w").pack(fill="x", pady=(0, 4))
+        self._panel = ScrollableRoundedPanel(body)
+        self._panel.config(height=210)
+        self._panel.pack(fill="x")
+        self._rows_holder = self._panel.inner
+
+        self._status = tk.Label(body, text="", font=(F, 9), bg=COLORS["bg"],
+                                fg=COLORS["subtext"])
+        self._status.pack(pady=(10, 0))
+
+        brow = tk.Frame(body, bg=COLORS["bg"])
+        brow.pack(fill="x", pady=(12, 0))
+        AnimatedButton(brow, text="Close", command=self.close,
+                       bg=TAB_ACCENTS["Install"], fg=COLORS["black"],
+                       font=(F, 9, "bold"), padx=22,
+                       pady=7).pack(side="right")
+
+        self._refresh_rows()
+
+    # ---- helpers -------------------------------------------------- #
+
+    @staticmethod
+    def _save_hint_text(n):
+        if not n:
+            return "Nothing is ticked right now — tick some apps first."
+        return "You have %d app%s ticked. Give this set a name:" % (
+            n, "" if n == 1 else "s")
+
+    def _current_count(self):
+        try:
+            return len(self._tab.profile_ids())
+        except Exception:
+            return 0
+
+    def _say(self, text):
+        try:
+            self._status.config(text=text)
+        except Exception:
+            pass
+
+    def _refresh_rows(self):
+        """Rebuild the saved-setup list from config."""
+        holder = self._rows_holder
+        if holder is None:
+            return
+        try:
+            for w in list(holder.winfo_children()):
+                try:
+                    w.destroy()
+                except Exception:
+                    pass
+        except Exception:
+            return
+        try:
+            from app.config_persist import get_install_profiles
+            profiles = get_install_profiles()
+        except Exception:
+            profiles = {}
+        if not profiles:
+            tk.Label(holder, text="No saved setups yet.", font=(F, 9),
+                     bg=COLORS["bg_alt"], fg=COLORS["subtext"]).pack(pady=16)
+        else:
+            for name in sorted(profiles, key=lambda n: n.lower()):
+                self._build_row(holder, name, profiles[name])
+        try:
+            self._panel.refresh_scroll()
+        except Exception:
+            pass
+
+    def _build_row(self, parent, name, ids):
+        row = tk.Frame(parent, bg=COLORS["bg_alt"])
+        tk.Label(row, text=name, font=(F, 10, "bold"), bg=COLORS["bg_alt"],
+                 fg=COLORS["text"], anchor="w").pack(side="left", padx=(10, 6),
+                                                     pady=7)
+        n = len(ids or [])
+        tk.Label(row, text="%d app%s" % (n, "" if n == 1 else "s"),
+                 font=(F, 9), bg=COLORS["bg_alt"],
+                 fg=COLORS["subtext"]).pack(side="left")
+        AnimatedButton(row, text="Delete",
+                       command=lambda nm=name: self._delete(nm),
+                       bg=COLORS["surface"], fg=COLORS["subtext"],
+                       font=(F, 9, "bold"), padx=12,
+                       pady=5).pack(side="right", padx=(6, 10), pady=5)
+        AnimatedButton(row, text="Load",
+                       command=lambda nm=name, i=list(ids or []): self._load(nm, i),
+                       bg=TAB_ACCENTS["Install"], fg=COLORS["black"],
+                       font=(F, 9, "bold"), padx=16,
+                       pady=5).pack(side="right", pady=5)
+        row.pack(fill="x", pady=2)
+
+    # ---- actions -------------------------------------------------- #
+
+    def _save(self):
+        name = (self._name_var.get() or "").strip()[:self._NAME_MAX]
+        if not name:
+            self._say("Type a name first — for example 'My Setup'.")
+            return
+        try:
+            ids = self._tab.profile_ids()
+        except Exception:
+            ids = []
+        if not ids:
+            self._say("Nothing is ticked, so there is nothing to save.")
+            return
+        try:
+            from app.config_persist import save_install_profile
+            ok = save_install_profile(name, ids)
+        except Exception:
+            ok = False
+        if ok:
+            self._name_var.set("")
+            self._refresh_rows()
+            self._say("Saved '%s'." % name)
+        else:
+            # The only refusal the store raises is the 20-profile cap;
+            # anything else has already degraded to False the same way.
+            self._say("Couldn't save — you may already have 20 setups. "
+                      "Delete one and try again.")
+
+    def _load(self, name, ids):
+        try:
+            applied, missing = self._tab.apply_profile_ids(ids)
+        except Exception:
+            self._say("Couldn't load that setup.")
+            return
+        if missing:
+            self._say("Loaded '%s' — %d ticked, %d are no longer in the "
+                      "catalog." % (name, applied, missing))
+        else:
+            self._say("Loaded '%s' — %d app%s ticked." %
+                      (name, applied, "" if applied == 1 else "s"))
+        try:
+            n_now = self._current_count()
+            self._save_hint.config(text=self._save_hint_text(n_now))
+            self._save_btn.set_enabled(bool(n_now))
+        except Exception:
+            pass
+
+    def _delete(self, name):
+        try:
+            from app.config_persist import delete_install_profile
+            delete_install_profile(name)
+        except Exception:
+            pass
+        self._refresh_rows()
+        self._say("Deleted '%s'." % name)
+
+
 class InstallTab(tk.Frame):
     """Catalog browser: categories with checkboxes, [FOSS] badges, hover
     tooltips (description + link hint), per-category Select All, and one
@@ -6021,6 +6426,17 @@ class InstallTab(tk.Frame):
         )
         self.install_btn.pack(side="left", padx=6)
         self.install_btn.set_enabled(False)  # gray until something is picked
+        # Feature 7: save/restore the whole pick in one place. Deliberately
+        # a quiet surface-colour pill — it sits beside the two coloured
+        # action buttons without competing with them.
+        self._profiles_btn = AnimatedButton(
+            _btns, text="My Setups", command=self._open_profiles,
+            bg=COLORS["surface"], fg=COLORS["text"],
+            font=(F, 12, "bold"), padx=20, pady=11,
+        )
+        self._profiles_btn.pack(side="left", padx=6)
+        Tooltip(self._profiles_btn,
+                "Save the apps you ticked, and load them back any time")
 
         panel = ScrollableRoundedPanel(self)
         panel.pack(fill="both", expand=True, padx=26, pady=6)
@@ -6622,6 +7038,10 @@ class InstallTab(tk.Frame):
                 self.install_btn.set_enabled(False)
         if getattr(self, "update_btn", None):
             self.update_btn.set_enabled(enabled)
+        # Feature 7: loading a setup rewrites the tick boxes, so the
+        # button is gated with the others while a run is in flight.
+        if getattr(self, "_profiles_btn", None):
+            self._profiles_btn.set_enabled(enabled)
 
     def selected_apps(self):
         """Checked catalog apps + checked Essentials tasks, in one batch."""
@@ -6646,6 +7066,95 @@ class InstallTab(tk.Frame):
             if v is not None and v.get():
                 result.append(("app", a))
         return result
+
+    # ---------------- My Setups (feature 7) ---------------- #
+
+    def profile_ids(self):
+        """Current picks as stable ids for a saved setup.
+
+        Catalog apps keep their winget id; Essentials tasks and embedded
+        bundles are stored as "task:<key>" so the two namespaces can
+        never collide when a profile is loaded back."""
+        ids = []
+        try:
+            for kind, item in self.selected_apps():
+                if kind == "app":
+                    app_id = item.get("id")
+                    if app_id:
+                        ids.append(str(app_id))
+                else:
+                    key = getattr(item, "key", None)
+                    if key:
+                        ids.append("task:" + str(key))
+        except Exception:
+            return []
+        return ids
+
+    def apply_profile_ids(self, ids):
+        """Replace the current selection with `ids`. (applied, missing).
+
+        Replaces rather than adds: a saved setup means exactly that set.
+        Ids that no longer exist (an app pulled from the catalog since
+        the profile was saved) are counted and reported, never silently
+        dropped — the dialog tells the user how many did not match.
+
+        Only the vars are touched, so every existing safety gate on the
+        Install path (admin checks, winget verification) still applies
+        exactly as if the boxes had been ticked by hand."""
+        wanted = set(str(i) for i in (ids or []))
+        applied = 0
+        try:
+            # clear everything first
+            for var in list(getattr(self, "vars", {}).values()):
+                try:
+                    var.set(False)
+                except Exception:
+                    pass
+            for var in list(getattr(self, "ess_vars", {}).values()):
+                try:
+                    var.set(False)
+                except Exception:
+                    pass
+            for pair in list(getattr(self, "bundle_vars", {}).values()):
+                try:
+                    pair[0].set(False)
+                except Exception:
+                    pass
+            # then tick what the profile asks for
+            for app_id, var in getattr(self, "vars", {}).items():
+                if str(app_id) in wanted:
+                    try:
+                        var.set(True)
+                        applied += 1
+                    except Exception:
+                        pass
+            for key, var in getattr(self, "ess_vars", {}).items():
+                if ("task:" + str(key)) in wanted:
+                    try:
+                        var.set(True)
+                        applied += 1
+                    except Exception:
+                        pass
+            for key, pair in getattr(self, "bundle_vars", {}).items():
+                if ("task:" + str(key)) in wanted:
+                    try:
+                        pair[0].set(True)
+                        applied += 1
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        try:
+            self._refresh_install_count()
+        except Exception:
+            pass
+        return applied, max(0, len(wanted) - applied)
+
+    def _open_profiles(self):
+        try:
+            InstallProfilesDialog(self, self).wait()
+        except Exception:
+            pass
 
     def _install_selected(self):
         selected = self.selected_apps()
@@ -11949,10 +12458,765 @@ class SpecsDialog(ThemedModal):
         pass
 
 
+class GameNightDialog(ThemedModal):
+    """Game Night (feature 9): one press to get ready to play, one press
+    to put everything back.
+
+    The tweaks themselves are the existing "Game Session" preset, applied
+    and reverted through the normal run engine — so this dialog is a
+    front door, not a second way of changing Windows. What it adds over
+    picking that preset on the Tweak tab is the paired End: it remembers
+    exactly which tweaks IT turned on, so ending the session restores
+    those and leaves anything the user had already set alone.
+
+    Wording is deliberately flat and non-technical: someone about to play
+    a game should not have to read the words "registry" or "scheduler" to
+    decide whether this is safe.
+    """
+
+    def __init__(self, parent, app):
+        self.app = app
+        self._app_vars = {}
+        super().__init__(parent, title="Game Night",
+                         accent=TAB_ACCENTS["Tweak"])
+        body = self.body
+        active = self._active()
+
+        self._headline = tk.Label(
+            body, text="", font=(F, 13, "bold"), bg=COLORS["bg"],
+            fg=COLORS["text"], anchor="w")
+        self._headline.pack(fill="x", pady=(0, 2))
+        self._sub = tk.Label(
+            body, text="", font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
+            anchor="w", justify="left", wraplength=700)
+        self._sub.pack(fill="x", pady=(0, 14))
+
+        # what it does — four plain lines, no jargon
+        card = tk.Frame(body, bg=COLORS["bg_alt"])
+        card.pack(fill="x", pady=(0, 14))
+        for i, line in enumerate((
+                "\u2022  Switches Windows to its fastest power setting",
+                "\u2022  Gives games priority over background programs",
+                "\u2022  Turns off pop-ups, Sticky Keys and update restarts",
+                "\u2022  Puts every one of these back when you press End",
+        )):
+            tk.Label(card, text=line, font=(F, 9), bg=COLORS["bg_alt"],
+                     fg=COLORS["subtext"], anchor="w").pack(
+                         fill="x", padx=16, pady=(11 if i == 0 else 0, 9))
+
+        # optional quieting — off by default, per-app opt-in
+        tk.Label(body, text="Also close these while I play (optional)",
+                 font=(F, 9, "bold"), bg=COLORS["bg"], fg=COLORS["subtext"],
+                 anchor="w").pack(fill="x", pady=(0, 2))
+        tk.Label(body, text="Nothing is closed unless you switch it on here. "
+                            "Apps are asked to close normally, so you can still "
+                            "save your work.",
+                 font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
+                 anchor="w", justify="left", wraplength=700).pack(
+                     fill="x", pady=(0, 6))
+        self._apps_panel = ScrollableRoundedPanel(body)
+        self._apps_panel.config(height=140)
+        self._apps_panel.pack(fill="x")
+        self._build_app_rows()
+
+        self._status = tk.Label(body, text="", font=(F, 9), bg=COLORS["bg"],
+                                fg=COLORS["subtext"], wraplength=700,
+                                justify="center")
+        self._status.pack(pady=(10, 0))
+
+        brow = tk.Frame(body, bg=COLORS["bg"])
+        brow.pack(fill="x", pady=(10, 0))
+        AnimatedButton(brow, text="Close", command=self.close,
+                       bg=COLORS["surface"], fg=COLORS["text"],
+                       font=(F, 9, "bold"), padx=18,
+                       pady=7).pack(side="right", padx=(8, 0))
+        self._main_btn = AnimatedButton(
+            brow, text="", command=self._toggle,
+            bg=COLORS["accent_green"], fg=COLORS["black"],
+            font=(F, 11, "bold"), padx=28, pady=8)
+        self._main_btn.pack(side="right")
+
+        self._paint(active)
+
+    # ---- state ------------------------------------------------------ #
+
+    @staticmethod
+    def _active():
+        try:
+            from app.config_persist import get_game_night
+            return bool(get_game_night().get("active"))
+        except Exception:
+            return False
+
+    def _paint(self, active):
+        """Headline, sub-line and the big button, for one state."""
+        if active:
+            self._headline.config(text="Game Night is on",
+                                  fg=COLORS["accent_green"])
+            self._sub.config(text="Your PC is set up for gaming. Press End "
+                                  "Game Night when you're done to put your "
+                                  "normal settings back.")
+            self._main_btn.config_text("End Game Night")
+            # hover_bg passed explicitly: set_style only overwrites what it
+            # is given, so without it the pill would still hover-brighten
+            # toward the green it used to be.
+            self._main_btn.set_style(
+                bg=COLORS["accent_red"], fg="#FFFFFF",
+                hover_bg=_hex_lerp(COLORS["accent_red"], "#FFFFFF", 0.08))
+        else:
+            self._headline.config(text="Game Night is off", fg=COLORS["text"])
+            self._sub.config(text="One press gets your PC ready to play. "
+                                  "One press puts it back exactly as it was.")
+            self._main_btn.config_text("Start Game Night")
+            self._main_btn.set_style(
+                bg=COLORS["accent_green"], fg=COLORS["black"],
+                hover_bg=_hex_lerp(COLORS["accent_green"], "#FFFFFF", 0.08))
+
+    def _say(self, text):
+        try:
+            self._status.config(text=text)
+        except Exception:
+            pass
+
+    # ---- optional app list ------------------------------------------ #
+
+    def _build_app_rows(self):
+        try:
+            from app.game_night import CLOSEABLE_APPS
+            from app.config_persist import get_game_night
+            chosen = set(get_game_night().get("close_apps") or [])
+        except Exception:
+            return
+        holder = self._apps_panel.inner
+        for key, label, note, _exes in CLOSEABLE_APPS:
+            row = tk.Frame(holder, bg=COLORS["bg_alt"])
+            var = tk.BooleanVar(value=key in chosen)
+            self._app_vars[key] = var
+            ToggleSwitch(row, variable=var,
+                         command=self._save_app_choice).pack(
+                             side="left", padx=(10, 10), pady=6)
+            text = tk.Frame(row, bg=COLORS["bg_alt"])
+            text.pack(side="left", fill="x", expand=True)
+            tk.Label(text, text=label, font=(F, 9, "bold"),
+                     bg=COLORS["bg_alt"], fg=COLORS["text"],
+                     anchor="w").pack(fill="x")
+            tk.Label(text, text=note, font=(F, 8), bg=COLORS["bg_alt"],
+                     fg=COLORS["subtext"], anchor="w").pack(fill="x")
+            row.pack(fill="x", pady=1)
+        try:
+            self._apps_panel.refresh_scroll()
+        except Exception:
+            pass
+
+    def _save_app_choice(self, *_a):
+        try:
+            from app.config_persist import set_game_night_close_apps
+            set_game_night_close_apps(
+                [k for k, v in self._app_vars.items() if v.get()])
+        except Exception:
+            pass
+
+    # ---- the one button --------------------------------------------- #
+
+    def _toggle(self):
+        active = self._active()
+        # The run engine owns the progress bar and the log in the main
+        # window, so the dialog steps out of the way rather than sitting
+        # on top of its own run (run_tasks also refuses to start while a
+        # modal is open — same rule Session Pilot obeys).
+        self.close()
+        try:
+            if active:
+                self.app.end_game_night()
+            else:
+                self.app.start_game_night()
+        except Exception:
+            pass
+
+
+class DriveToolkitDialog(ThemedModal):
+    """Drive Toolkit (Tools tab card): 3-in-1 — Health, Speed, Capacity.
+    Same internal tab-switch pattern as MouseTesterDialog (Buttons/Aim):
+    two or three AnimatedButton tabs swap self._content wholesale.
+
+    Every check here is read-only or self-cleaning:
+      * Health only reads Get-PhysicalDisk — never writes anything
+      * Speed writes one temp file (app.storage_scan.write_benchmark
+        already guarantees its own cleanup) then deletes it
+      * Capacity writes temporary test files ONLY inside free space on
+        a REMOVABLE drive the user explicitly picked, and always
+        removes them — see app/drive_toolkit.py for the safety gates
+
+    All three run on a background thread with a stop token so closing
+    the dialog mid-check can never leave a thread writing to a drive
+    the dialog no longer has a handle open on.
+    """
+
+    _VIEWS = (("health", "Drive Health"), ("speed", "Speed Test"),
+             ("capacity", "USB/SD Check"))
+
+    def __init__(self, parent, app):
+        self.app = app
+        self._stop_token = [False]
+        self._view = "health"
+        super().__init__(parent, title="Drive Toolkit",
+                         accent=TAB_ACCENTS["Clean"])
+        body = self.body
+        tabs = tk.Frame(body, bg=COLORS["bg"])
+        tabs.pack(fill="x", pady=(0, 10))
+        self._tab_btns = {}
+        for key, label in self._VIEWS:
+            b = AnimatedButton(tabs, text=label,
+                               command=lambda k=key: self._switch(k),
+                               bg=COLORS["surface"], fg=COLORS["text"],
+                               font=(F, 9, "bold"), padx=14, pady=6)
+            b.pack(side="left", padx=(0, 6))
+            self._tab_btns[key] = b
+        self._content = tk.Frame(body, bg=COLORS["bg"])
+        self._content.pack(fill="both", expand=True)
+        self.on_close(self._stop)
+        self._switch("health")
+
+    # ---- tab switching ------------------------------------------------- #
+
+    def _switch(self, key):
+        self._stop_token[0] = True    # abandon whatever the old view was doing
+        self._stop_token = [False]
+        self._view = key
+        for child in self._content.winfo_children():
+            try:
+                child.destroy()
+            except Exception:
+                pass
+        for k, b in self._tab_btns.items():
+            try:
+                b.set_style(bg=(TAB_ACCENTS["Clean"] if k == key
+                               else COLORS["surface"]),
+                           fg=(COLORS["black"] if k == key else COLORS["text"]))
+            except Exception:
+                pass
+        if key == "health":
+            self._build_health()
+        elif key == "speed":
+            self._build_speed()
+        else:
+            self._build_capacity()
+
+    def _stop(self):
+        self._stop_token[0] = True
+
+    # ==================================================================== #
+    # Health
+    # ==================================================================== #
+
+    def _build_health(self):
+        c = self._content
+        tk.Label(c, text="Checks each drive's own reported health — the "
+                         "same signal Windows itself uses to warn you "
+                         "before a drive fails.",
+                 font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
+                 wraplength=700, justify="left").pack(anchor="w", pady=(0, 8))
+        self._health_panel = ScrollableRoundedPanel(c)
+        self._health_panel.config(height=280)
+        self._health_panel.pack(fill="both", expand=True)
+        brow = tk.Frame(c, bg=COLORS["bg"])
+        brow.pack(fill="x", pady=(8, 0))
+        self._health_status = tk.Label(brow, text="Checking…", font=(F, 9),
+                                       bg=COLORS["bg"], fg=COLORS["subtext"])
+        self._health_status.pack(side="left")
+        AnimatedButton(brow, text="Refresh", command=self._run_health,
+                       bg=COLORS["surface"], fg=COLORS["text"],
+                       font=(F, 9, "bold"), padx=16,
+                       pady=6).pack(side="right")
+        self._run_health()
+
+    def _run_health(self):
+        token = self._stop_token
+        self._health_status.config(text="Checking…")
+        for w in list(self._health_panel.inner.winfo_children()):
+            try:
+                w.destroy()
+            except Exception:
+                pass
+
+        def worker():
+            try:
+                from app.drive_toolkit import list_physical_disks
+                disks = list_physical_disks()
+            except Exception:
+                disks = []
+            if not token[0]:
+                self._dlg.after(0, lambda: self._health_done(disks, token))
+
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _health_done(self, disks, token):
+        if token[0] or self._view != "health":
+            return
+        try:
+            if not self._health_panel.winfo_exists():
+                return
+        except Exception:
+            return
+        if not disks:
+            tk.Label(self._health_panel.inner,
+                     text="Couldn't read drive health on this PC.",
+                     font=(F, 9), bg=COLORS["bg_alt"],
+                     fg=COLORS["subtext"]).pack(pady=16)
+            self._health_status.config(text="")
+            return
+        chip = {"Healthy": ("✅", COLORS["accent_green"]),
+               "Warning": ("⚠️", COLORS["accent_yellow"]),
+               "Unhealthy": ("❌", COLORS["accent_red"])}
+        worst = "Healthy"
+        for d in disks:
+            row = tk.Frame(self._health_panel.inner, bg=COLORS["bg_alt"])
+            glyph, color = chip.get(d["health"], ("•", COLORS["subtext"]))
+            if d["health"] == "Unhealthy":
+                worst = "Unhealthy"
+            elif d["health"] == "Warning" and worst != "Unhealthy":
+                worst = "Warning"
+            tk.Label(row, text=glyph, font=("Segoe UI Emoji", 12),
+                     bg=COLORS["bg_alt"]).pack(side="left", padx=(10, 8), pady=8)
+            info = tk.Frame(row, bg=COLORS["bg_alt"])
+            info.pack(side="left", fill="x", expand=True)
+            size_gb = d["size_bytes"] / (1024 ** 3) if d["size_bytes"] else 0
+            title = d["name"]
+            if size_gb:
+                title += f"  ·  {size_gb:.0f} GB  ·  {d['media_type']}"
+            else:
+                title += f"  ·  {d['media_type']}"
+            tk.Label(info, text=title, font=(F, 9, "bold"), bg=COLORS["bg_alt"],
+                     fg=COLORS["text"], anchor="w").pack(fill="x")
+            words = {"Healthy": "Working normally",
+                    "Warning": "Showing early warning signs — back up your files soon",
+                    "Unhealthy": "Failing — back up your files now"}
+            tk.Label(info, text=words.get(d["health"], d["health"]),
+                     font=(F, 8), bg=COLORS["bg_alt"], fg=color,
+                     anchor="w").pack(fill="x")
+            row.pack(fill="x", pady=2)
+        self._health_status.config(
+            text=("All drives look healthy." if worst == "Healthy"
+                 else "One or more drives need attention — see above."))
+
+    # ==================================================================== #
+    # Speed
+    # ==================================================================== #
+
+    def _build_speed(self):
+        c = self._content
+        tk.Label(c, text="A quick, real-world read/write test on any drive "
+                         "in your PC — handy for spotting a slow or failing "
+                         "drive, or comparing an old drive to a new one.",
+                 font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
+                 wraplength=700, justify="left").pack(anchor="w", pady=(0, 4))
+        tk.Label(c, text="This is a simple same-PC comparison, not a "
+                         "lab-grade benchmark — good for \"did my drive get "
+                         "slower\", not for marketing numbers.",
+                 font=(F, 8), bg=COLORS["bg"], fg=COLORS["subtext"],
+                 wraplength=700, justify="left").pack(anchor="w", pady=(0, 10))
+
+        row = tk.Frame(c, bg=COLORS["bg"])
+        row.pack(fill="x")
+        tk.Label(row, text="Drive:", font=(F, 9), bg=COLORS["bg"],
+                 fg=COLORS["subtext"]).pack(side="left")
+        try:
+            from app.drive_toolkit import list_fixed_drives
+            drives = list_fixed_drives()
+        except Exception:
+            drives = []
+        names = [f"{letter}:" for letter, *_ in drives] or ["C:"]
+        self._speed_var = tk.StringVar(value=names[0])
+        import tkinter.ttk as _ttk
+        combo = _ttk.Combobox(row, textvariable=self._speed_var, values=names,
+                              state="readonly", width=8, font=(F, 9))
+        combo.pack(side="left", padx=(6, 12))
+        self._speed_btn = AnimatedButton(
+            row, text="Test This Drive", command=self._run_speed,
+            bg=TAB_ACCENTS["Clean"], fg=COLORS["black"],
+            font=(F, 9, "bold"), padx=18, pady=7)
+        self._speed_btn.pack(side="left")
+        if not drives:
+            self._speed_btn.set_enabled(False)
+
+        results = tk.Frame(c, bg=COLORS["bg"])
+        results.pack(fill="x", pady=(20, 0))
+        results.grid_columnconfigure(0, weight=1, uniform="s")
+        results.grid_columnconfigure(1, weight=1, uniform="s")
+        w_cell = tk.Frame(results, bg=COLORS["bg_alt"])
+        w_cell.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        tk.Label(w_cell, text="WRITE", font=(F, 8, "bold"), bg=COLORS["bg_alt"],
+                 fg=COLORS["subtext"]).pack(pady=(12, 0))
+        self._write_lbl = tk.Label(w_cell, text="—", font=(F, 22, "bold"),
+                                   bg=COLORS["bg_alt"], fg=COLORS["text"])
+        self._write_lbl.pack(pady=(0, 12))
+        r_cell = tk.Frame(results, bg=COLORS["bg_alt"])
+        r_cell.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        tk.Label(r_cell, text="READ", font=(F, 8, "bold"), bg=COLORS["bg_alt"],
+                 fg=COLORS["subtext"]).pack(pady=(12, 0))
+        self._read_lbl = tk.Label(r_cell, text="—", font=(F, 22, "bold"),
+                                  bg=COLORS["bg_alt"], fg=COLORS["text"])
+        self._read_lbl.pack(pady=(0, 12))
+
+        self._speed_bar = AnimatedProgressBar(c, accent=TAB_ACCENTS["Clean"])
+        self._speed_bar.pack(fill="x", pady=(16, 0))
+        self._speed_status = tk.Label(c, text="", font=(F, 9), bg=COLORS["bg"],
+                                      fg=COLORS["subtext"])
+        self._speed_status.pack(pady=(6, 0))
+
+    def _run_speed(self):
+        token = self._stop_token
+        root = self._speed_var.get().strip() + "\\"
+        self._write_lbl.config(text="—")
+        self._read_lbl.config(text="—")
+        self._speed_btn.set_enabled(False)
+        self._speed_bar.set_fraction(0.0)
+        self._speed_status.config(text=f"Testing {root} …")
+
+        def progress(frac):
+            if not token[0]:
+                self._dlg.after(0, lambda: self._speed_bar.set_fraction(frac))
+
+        def worker():
+            try:
+                from app.drive_toolkit import benchmark_drive
+                w, r = benchmark_drive(root, cancelled=lambda: token[0],
+                                       progress_cb=progress)
+            except Exception:
+                w, r = None, None
+            if not token[0]:
+                self._dlg.after(0, lambda: self._speed_done(w, r, root, token))
+
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _speed_done(self, w, r, root, token):
+        if token[0] or self._view != "speed":
+            return
+        try:
+            self._speed_btn.set_enabled(True)
+        except Exception:
+            return
+        if w is None or r is None:
+            self._speed_status.config(text=f"Couldn't test {root} — it may "
+                                           "be write-protected or out of space.")
+            return
+        self._write_lbl.config(text=f"{w:.0f}")
+        self._read_lbl.config(text=f"{r:.0f}")
+        self._speed_status.config(text=f"{root}  —  MB/s (megabytes per second)")
+
+    # ==================================================================== #
+    # Capacity
+    # ==================================================================== #
+
+    def _build_capacity(self):
+        c = self._content
+        tk.Label(c, text="Checks whether a USB drive or SD card really "
+                         "holds what it claims. Fake/counterfeit cards "
+                         "report a bigger size than they actually have — "
+                         "once you fill past the real capacity, older "
+                         "files silently start getting corrupted.",
+                 font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
+                 wraplength=700, justify="left").pack(anchor="w", pady=(0, 4))
+        tk.Label(c, text="Uses free space temporarily and cleans up after "
+                         "itself — your existing files are never touched. "
+                         "Don't remove the drive during the test.",
+                 font=(F, 8), bg=COLORS["bg"], fg=COLORS["subtext"],
+                 wraplength=700, justify="left").pack(anchor="w", pady=(0, 10))
+
+        self._cap_drives = []
+        row = tk.Frame(c, bg=COLORS["bg"])
+        row.pack(fill="x")
+        tk.Label(row, text="Drive:", font=(F, 9), bg=COLORS["bg"],
+                 fg=COLORS["subtext"]).pack(side="left")
+        self._cap_var = tk.StringVar(value="")
+        import tkinter.ttk as _ttk
+        self._cap_combo = _ttk.Combobox(row, textvariable=self._cap_var,
+                                        values=[], state="readonly",
+                                        width=28, font=(F, 9))
+        self._cap_combo.pack(side="left", padx=(6, 8))
+        AnimatedButton(row, text="Refresh", command=self._refresh_cap_drives,
+                       bg=COLORS["surface"], fg=COLORS["text"],
+                       font=(F, 9, "bold"), padx=12,
+                       pady=6).pack(side="left")
+
+        mrow = tk.Frame(c, bg=COLORS["bg"])
+        mrow.pack(fill="x", pady=(10, 0))
+        self._cap_mode = tk.StringVar(value="quick")
+        for val, label in (("quick", "Quick check (a minute or two)"),
+                          ("full", "Full check (can take hours — most thorough)")):
+            rb = tk.Radiobutton(
+                mrow, text=label, value=val, variable=self._cap_mode,
+                font=(F, 9), bg=COLORS["bg"], fg=COLORS["text"],
+                selectcolor=COLORS["bg_alt"], activebackground=COLORS["bg"],
+                anchor="w")
+            rb.pack(anchor="w")
+
+        self._cap_btn = AnimatedButton(
+            c, text="Start Test", command=self._start_capacity,
+            bg=TAB_ACCENTS["Clean"], fg=COLORS["black"],
+            font=(F, 10, "bold"), padx=22, pady=8)
+        self._cap_btn.pack(pady=(12, 0))
+
+        self._cap_bar = AnimatedProgressBar(c, accent=TAB_ACCENTS["Clean"])
+        self._cap_bar.pack(fill="x", pady=(14, 0))
+        self._cap_result = tk.Label(c, text="", font=(F, 9), bg=COLORS["bg"],
+                                    fg=COLORS["subtext"], wraplength=700,
+                                    justify="left")
+        self._cap_result.pack(pady=(8, 0), anchor="w")
+        self._refresh_cap_drives()
+
+    def _refresh_cap_drives(self):
+        try:
+            from app.drive_toolkit import list_removable_drives
+            drives = list_removable_drives()
+        except Exception:
+            drives = []
+        self._cap_drives = drives
+        if not drives:
+            self._cap_combo.config(values=[])
+            self._cap_var.set("")
+            self._cap_result.config(
+                text="No USB drive or SD card detected. Plug one in, then "
+                     "click Refresh.")
+            self._cap_btn.set_enabled(False)
+            return
+        labels = []
+        for letter, root, free_b, total_b, label in drives:
+            gb = total_b / (1024 ** 3)
+            name = f"{letter}: — {label} ({gb:.1f} GB)" if label else \
+                  f"{letter}: ({gb:.1f} GB)"
+            labels.append(name)
+        self._cap_combo.config(values=labels)
+        self._cap_var.set(labels[0])
+        self._cap_result.config(text="")
+        self._cap_btn.set_enabled(True)
+
+    def _start_capacity(self):
+        idx = 0
+        try:
+            sel = self._cap_var.get()
+            labels = list(self._cap_combo["values"])
+            idx = labels.index(sel) if sel in labels else 0
+        except Exception:
+            idx = 0
+        if not self._cap_drives or idx >= len(self._cap_drives):
+            return
+        letter, root, free_b, total_b, label = self._cap_drives[idx]
+        mode = self._cap_mode.get()
+        if mode == "full":
+            gb = total_b / (1024 ** 3)
+            if not _themed_askyesno(
+                    self._dlg, "Full Check",
+                    f"A full check writes to all of {letter}:'s free space "
+                    f"(about {gb:.1f} GB) and can take a long time on a "
+                    "large drive. It won't erase your existing files.\n\n"
+                    "Continue?", accent=TAB_ACCENTS["Clean"]):
+                return
+        token = self._stop_token
+        self._cap_btn.set_enabled(False)
+        self._cap_bar.set_fraction(0.0)
+        self._cap_result.config(
+            text=f"Testing {letter}: — you can keep using your PC, just "
+                 "don't remove the drive.", fg=COLORS["subtext"])
+
+        def progress(frac):
+            if not token[0]:
+                self._dlg.after(0, lambda: self._cap_bar.set_fraction(frac))
+
+        def worker():
+            try:
+                from app.drive_toolkit import capacity_test
+                result = capacity_test(root, mode=mode,
+                                       cancelled=lambda: token[0],
+                                       progress_cb=progress)
+            except Exception as exc:
+                result = {"ok": False, "error": str(exc), "declared_bytes": 0,
+                          "good_bytes": 0, "tested_bytes": 0}
+            if not token[0]:
+                self._dlg.after(0, lambda: self._capacity_done(result, letter, token))
+
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _capacity_done(self, result, letter, token):
+        if token[0] or self._view != "capacity":
+            return
+        try:
+            self._cap_btn.set_enabled(True)
+        except Exception:
+            return
+        if result.get("error"):
+            self._cap_result.config(
+                text=f"Test stopped: {result['error']}", fg=COLORS["accent_yellow"])
+            return
+        gb = lambda b: b / (1024 ** 3)
+        if result["ok"]:
+            self._cap_result.config(
+                text=f"✅ {letter}: checks out — every part tested holds "
+                     f"real data ({gb(result['tested_bytes']):.2f} GB tested"
+                     + (", quick sample" if result.get("mode") == "quick" else "")
+                     + ").",
+                fg=COLORS["accent_green"])
+        else:
+            self._cap_result.config(
+                text=(f"⚠️ {letter}: is NOT what it claims. It reports "
+                     f"{gb(result['declared_bytes']):.1f} GB, but only "
+                     f"about {gb(result['good_bytes']):.2f} GB of the part "
+                     "we tested was genuine. The rest will corrupt your "
+                     "files once you fill past the real capacity — this is "
+                     "very likely a counterfeit or damaged drive."),
+                fg=COLORS["accent_red"])
+
+
+class StartupManagerDialog(ThemedModal):
+    """Startup Manager (Tools tab card): everything that launches at
+    sign-in, with one toggle each.
+
+    Covers Registry Run keys and Startup-folder shortcuts (see
+    app/startup_manager.py for why Task Scheduler is deliberately left
+    out). Each row shows a plain sentence of WHERE the item runs from
+    rather than a registry path, since the audience is non-technical.
+
+    Every toggle is instantly reversible — disabling never deletes
+    anything, it moves the original data into this app's own storage,
+    and the row's own switch flips it right back. HKLM / shared-startup
+    rows show a small shield + are disabled outright when not running
+    as Administrator, the same visual language Install/Custom already
+    use for admin-gated rows.
+    """
+
+    def __init__(self, parent, app):
+        self.app = app
+        self._rows = {}     # item_id -> {"toggle": ToggleSwitch, "var": BooleanVar}
+        super().__init__(parent, title="Startup Manager",
+                         accent=TAB_ACCENTS["Tools"])
+        body = self.body
+
+        tk.Label(body, text="Turn off apps that launch when Windows "
+                            "starts, without uninstalling anything.",
+                 font=(F, 10, "bold"), bg=COLORS["bg"], fg=COLORS["text"],
+                 anchor="w").pack(fill="x", pady=(0, 2))
+        tk.Label(body, text="Switch anything off here any time — nothing "
+                            "is deleted, and you can turn it back on with "
+                            "the same switch.",
+                 font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
+                 anchor="w", wraplength=700).pack(fill="x", pady=(0, 12))
+
+        self._panel = ScrollableRoundedPanel(body)
+        self._panel.config(height=340)
+        self._panel.pack(fill="both", expand=True)
+
+        brow = tk.Frame(body, bg=COLORS["bg"])
+        brow.pack(fill="x", pady=(10, 0))
+        self._status = tk.Label(brow, text="", font=(F, 9), bg=COLORS["bg"],
+                                fg=COLORS["subtext"], wraplength=560,
+                                justify="left")
+        self._status.pack(side="left", fill="x", expand=True)
+        AnimatedButton(brow, text="Refresh", command=self._refresh,
+                       bg=COLORS["surface"], fg=COLORS["text"],
+                       font=(F, 9, "bold"), padx=16,
+                       pady=6).pack(side="right", padx=(8, 0))
+        AnimatedButton(brow, text="Close", command=self.close,
+                       bg=TAB_ACCENTS["Tools"], fg=COLORS["black"],
+                       font=(F, 9, "bold"), padx=20,
+                       pady=6).pack(side="right")
+
+        self._refresh()
+
+    def _say(self, text):
+        try:
+            self._status.config(text=text)
+        except Exception:
+            pass
+
+    def _refresh(self):
+        holder = self._panel.inner
+        try:
+            for w in list(holder.winfo_children()):
+                w.destroy()
+        except Exception:
+            return
+        self._rows = {}
+        try:
+            from app.startup_manager import list_startup_items
+            items = list_startup_items()
+        except Exception:
+            items = []
+        if not items:
+            tk.Label(holder, text="Nothing found — or this PC couldn't be "
+                                  "checked.", font=(F, 9), bg=COLORS["bg_alt"],
+                     fg=COLORS["subtext"]).pack(pady=20)
+            try:
+                self._panel.refresh_scroll()
+            except Exception:
+                pass
+            return
+        from app.elevation import is_admin
+        admin = is_admin()
+        for it in items:
+            self._build_row(holder, it, admin)
+        try:
+            self._panel.refresh_scroll()
+        except Exception:
+            pass
+        n_on = sum(1 for i in items if i["enabled"])
+        self._say(f"{n_on} of {len(items)} start with Windows.")
+
+    def _build_row(self, parent, item, admin):
+        row = tk.Frame(parent, bg=COLORS["bg_alt"])
+        var = tk.BooleanVar(value=item["enabled"])
+        needs_admin = item["admin_required"] and not admin
+        toggle = ToggleSwitch(
+            row, variable=var,
+            command=lambda it=item, v=var: self._on_toggle(it, v))
+        toggle.pack(side="left", padx=(10, 10), pady=8)
+        if needs_admin:
+            try:
+                toggle.set_enabled(False)
+            except Exception:
+                pass
+        text = tk.Frame(row, bg=COLORS["bg_alt"])
+        text.pack(side="left", fill="x", expand=True)
+        name_row = tk.Frame(text, bg=COLORS["bg_alt"])
+        name_row.pack(fill="x")
+        tk.Label(name_row, text=item["name"], font=(F, 9, "bold"),
+                 bg=COLORS["bg_alt"], fg=COLORS["text"],
+                 anchor="w").pack(side="left")
+        if needs_admin:
+            shield = tk.Label(name_row, text="🛡️", font=(F, 8),
+                              bg=COLORS["bg_alt"])
+            shield.pack(side="left", padx=(6, 0))
+            Tooltip(shield, "Restart Cleaner Tool as Administrator to "
+                           "change this one")
+        tk.Label(text, text=item["source_label"], font=(F, 8),
+                 bg=COLORS["bg_alt"], fg=COLORS["subtext"],
+                 anchor="w").pack(fill="x")
+        row.pack(fill="x", pady=2)
+        self._rows[item["id"]] = {"toggle": toggle, "var": var, "row": row}
+
+    def _on_toggle(self, item, var):
+        wanted = var.get()
+        try:
+            from app.startup_manager import set_item_enabled
+            ok, msg = set_item_enabled(item["id"], wanted)
+        except Exception as exc:
+            ok, msg = False, str(exc)
+        if not ok:
+            # Snap the switch back — the write didn't happen, so the UI
+            # must not claim it did.
+            try:
+                var.set(not wanted)
+            except Exception:
+                pass
+        self._say(msg)
+
+
 class ToolsTab(tk.Frame):
     """Tools tab (user redesign 2026-09): the 5th tab — pink accent.
 
-    Nine feature cards in a 3x3 grid — the exact same card size,
+    Feature cards in a 3-wide grid — the exact same card size,
     gaps and grid as the Tweak tab's 6 preset cards (PER_ROW=3,
     same pack/grid/pad). The old inline shortcuts box now lives in
     the 6th card's Quick Tools popup, so the tab itself is cards
@@ -11967,6 +13231,12 @@ class ToolsTab(tk.Frame):
          "Find your fastest DNS", TAB_ACCENTS["Tweak"]),
         ("pilot", "🎮", "Auto-Pilot",
          "Auto-tweaks for games", TAB_ACCENTS["Tweak"]),
+        ("gamenight", "🌙", "Game Night",
+         "Get ready to play in one press", TAB_ACCENTS["Tweak"]),
+        ("drivetoolkit", "💽", "Drive Toolkit",
+         "Health, speed & real capacity checks", TAB_ACCENTS["Clean"]),
+        ("startup", "🚀", "Startup Manager",
+         "Stop apps launching with Windows", TAB_ACCENTS["Tools"]),
         ("speed", "🚀", "Speed Test",
          "Check download, upload + ping", TAB_ACCENTS["Clean"]),
         ("quick", "🧰", "Quick Tools",
@@ -12034,8 +13304,18 @@ class ToolsTab(tk.Frame):
         card_area = tk.Frame(self, bg=COLORS["bg"])
         card_area.pack(fill="x", padx=26, pady=(14, 4))
         self._card_area_ref = card_area
+        # A card count that is not a multiple of 3 would leave the final
+        # card jammed against the left edge with two empty cells beside
+        # it, which reads as a layout bug rather than a design. When
+        # exactly one card is left over it goes in the MIDDLE column, so
+        # the last row looks deliberate. Two left over already balance.
+        n_cards = len(self._CARDS)
+        lone_last = (n_cards % PER_ROW) == 1
+        last_row = (n_cards - 1) // PER_ROW
         for i, (key, icon, title, blurb, card_accent) in enumerate(self._CARDS):
             row, col = divmod(i, PER_ROW)
+            if lone_last and row == last_row:
+                col = 1
             self._build_card(card_area, row, col, key, icon, title, blurb,
                              card_accent)
         for c in range(PER_ROW):
@@ -12166,6 +13446,12 @@ class ToolsTab(tk.Frame):
                 self.app._open_dns_tester()
             elif key == "pilot":
                 self.app._open_pilot_dialog()
+            elif key == "gamenight":
+                self.app._open_game_night()
+            elif key == "drivetoolkit":
+                self.app._open_drive_toolkit()
+            elif key == "startup":
+                self.app._open_startup_manager()
             elif key == "speed":
                 self.app._open_speed_test()
             elif key == "quick":
@@ -13018,6 +14304,166 @@ class Application:
         (winsound only, no busy-guard needed)."""
         try:
             SpeakerTestDialog(self.root, self).wait()
+        except Exception:
+            pass
+
+    # ---------------- Game Night (feature 9) ---------------- #
+    # One press to get the PC ready to play, one press to put it back.
+    # Deliberately built on the same two rules Session Pilot already
+    # proved out (see _pilot_apply / _pilot_revert):
+    #   * apply and revert go through run_tasks(), so cancel, the Admin
+    #     Gate, snapshots and applied-tweak bookkeeping all behave as
+    #     normal — there is no second code path that changes Windows
+    #   * only tweaks Game Night itself turned on are reverted at the
+    #     end. Anything the user already had applied is left alone,
+    #     because undoing it would undo their own setup, not ours
+
+    def _game_night_tasks(self):
+        """Task objects for the Game Session preset. [] if none resolve."""
+        try:
+            from app.game_night import preset_task_keys
+            keys = preset_task_keys()
+            by_key = {t.key: t for t in TABS.get("Tweak", [])}
+            return [by_key[k] for k in keys if k in by_key]
+        except Exception:
+            return []
+
+    def _game_in_progress(self):
+        """True when the Auto-Pilot watcher currently sees a game running.
+
+        Used only to decide whether the run may pop a scorecard: a modal
+        window over someone's fullscreen game is hostile, so a Game Night
+        pressed mid-session reports through the log and a toast instead."""
+        try:
+            pilot = getattr(self, "_pilot", None)
+            # active_hit is a PROPERTY on SessionPilot (the exe name, or
+            # None when idle) — calling it would raise, and the except
+            # below would quietly turn that into "no game running".
+            return bool(pilot is not None and pilot.active_hit)
+        except Exception:
+            return False
+
+    def start_game_night(self):
+        """Apply the Game Session preset and remember what we turned on."""
+        tasks = self._game_night_tasks()
+        if not tasks:
+            self.set_status("Game Night: no gaming tweaks available.")
+            return
+        runnable = list(tasks)
+        if not is_admin():
+            # Limited mode: run what needs no admin rather than refusing
+            # outright, and say so — the session still gets most of it.
+            runnable = [t for t in tasks if not t.admin_required]
+            if len(runnable) != len(tasks):
+                self.log("Game Night: not running as Administrator — "
+                         f"applying {len(runnable)} of {len(tasks)} settings.")
+        if not runnable:
+            self.set_status("Game Night needs Administrator for these settings.")
+            return
+        # Fresh keys only (the pilot's rule): tweaks already applied before
+        # this press stay applied when Game Night ends.
+        try:
+            before = set(get_tweak_state() or {})
+        except Exception:
+            before = set()
+        fresh = [t.key for t in runnable if t.key not in before]
+        try:
+            from app.config_persist import set_game_night
+            set_game_night(True, fresh)
+        except Exception:
+            pass
+        # Optional background quieting — only apps the user switched on.
+        try:
+            from app.config_persist import get_game_night
+            from app.game_night import close_apps
+            chosen = get_game_night().get("close_apps") or []
+            if chosen:
+                self.log("Game Night: asking the apps you picked to close…")
+                closed = close_apps(chosen, log=self.log)
+                if closed:
+                    self.log("Game Night: closed " + ", ".join(closed) + ".")
+        except Exception:
+            pass
+        quiet = self._game_in_progress()
+        try:
+            self.log("===== Game Night: getting your PC ready to play =====")
+            if quiet:
+                import threading as _th
+                _th.Thread(target=show_toast,
+                           args=("🎮 Game Night on",
+                                 "Your PC is set up for gaming. End it in "
+                                 "Tools when you're done."),
+                           daemon=True).start()
+            self.run_tasks("Tweak", runnable, mode="run", quiet=quiet)
+        except Exception:
+            pass
+
+    def end_game_night(self):
+        """Put back exactly the tweaks Game Night turned on."""
+        try:
+            from app.config_persist import get_game_night, set_game_night
+            saved = list(get_game_night().get("keys") or [])
+        except Exception:
+            saved = []
+        if not saved:
+            try:
+                set_game_night(False)
+            except Exception:
+                pass
+            self.set_status("Game Night ended — your settings were already back.")
+            return
+        # Intersect with what is STILL applied: the user may have undone
+        # some of it manually in the meantime, and reverting a tweak that
+        # is already off is both pointless and confusing in the log.
+        try:
+            current = set(get_tweak_state() or {})
+        except Exception:
+            current = set()
+        keys = [k for k in saved if k in current]
+        try:
+            by_key = {t.key: t for t in TABS.get("Tweak", [])}
+            tasks = [by_key[k] for k in keys
+                     if k in by_key and by_key[k].revert is not None]
+        except Exception:
+            tasks = []
+        try:
+            set_game_night(False)
+        except Exception:
+            pass
+        if not tasks:
+            self.set_status("Game Night ended — your settings were already back.")
+            return
+        quiet = self._game_in_progress()
+        try:
+            self.log("===== Game Night: putting your settings back =====")
+            if quiet:
+                import threading as _th
+                _th.Thread(target=show_toast,
+                           args=("Game Night off",
+                                 "Your normal settings are back."),
+                           daemon=True).start()
+            self.run_tasks("Tweak", tasks, mode="revert", quiet=quiet)
+        except Exception:
+            pass
+
+    def _open_game_night(self):
+        """Game Night entry (Tools tab card)."""
+        try:
+            GameNightDialog(self.root, self).wait()
+        except Exception:
+            pass
+
+    def _open_drive_toolkit(self):
+        """Drive Toolkit entry (Tools tab card)."""
+        try:
+            DriveToolkitDialog(self.root, self).wait()
+        except Exception:
+            pass
+
+    def _open_startup_manager(self):
+        """Startup Manager entry (Tools tab card)."""
+        try:
+            StartupManagerDialog(self.root, self).wait()
         except Exception:
             pass
 
@@ -14811,7 +16257,13 @@ class Application:
         # _query_drives). The worker reads it via self._run_before_bytes;
         # a failed read (None) simply renders the scorecard without the
         # before/after bar — never invented numbers.
-        self._run_before_bytes = self._query_drive_free_total("C:\\")
+        self._run_before_bytes = self._query_drive_free_total(
+            _system_drive_root())
+        # Feature 4: same instant reading for every ready drive, so the
+        # scorecard can name each drive that gained space (a clean often
+        # spans the system SSD and a games drive).
+        self._run_before_drives = _snapshot_all_drives(
+            self._query_drives, self._query_drive_free_total)
         self._run_results = []       # per-task (label, status, bytes) tuples
 
         thread = threading.Thread(target=self._run_tasks_worker,
@@ -15042,6 +16494,17 @@ class Application:
             # quiet (pilot) runs skip the modal entirely — a grab_set
             # window over a fullscreen game is hostile; toast + status
             # line carry the outcome instead.
+            # Feature 10: remember this run BEFORE the card is built, so
+            # the 30-day sentence on the card includes it. Recorded for
+            # quiet (Auto-Pilot) runs too — they free real space — but
+            # never for Undo runs, which give space back rather than
+            # freeing it.
+            if mode == "run" and total_bytes and total_bytes > 0:
+                try:
+                    from app.config_persist import record_run
+                    record_run(total_bytes)
+                except Exception:
+                    pass
             if quiet:
                 try:
                     verb = "restored" if mode == "revert" else "applied"
@@ -15050,9 +16513,14 @@ class Application:
                     pass
                 return
             try:
-                after = self._query_drive_free_total("C:\\")
+                after = self._query_drive_free_total(_system_drive_root())
             except Exception:
                 after = None
+            try:
+                after_drives = _snapshot_all_drives(
+                    self._query_drives, self._query_drive_free_total)
+            except Exception:
+                after_drives = {}
             run_again = None
             if (not cancelled and tab_name == "Clean" and mode == "run"):
                 # 'Clean Again' — re-run the same selection. The task list
@@ -15071,6 +16539,8 @@ class Application:
                     after=after,
                     needs_reboot=needs_reboot,
                     on_run_again=run_again,
+                    before_drives=getattr(self, "_run_before_drives", None),
+                    after_drives=after_drives,
                 )
                 card.wait()
             except Exception:

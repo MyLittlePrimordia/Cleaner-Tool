@@ -630,6 +630,305 @@ def main():
     sc5._close()
     root.update()
 
+    # --- Feature 1/4: system-drive awareness + multi-drive scorecard ----
+    # Pure helpers, so these run identically on any machine.
+    import os as _os
+    _saved_sysdrive = _os.environ.get("SystemDrive")
+    try:
+        _os.environ["SystemDrive"] = "D:"
+        assert gui._system_drive_root() == "D:\\", gui._system_drive_root()
+        _os.environ["SystemDrive"] = "E:\\"
+        assert gui._system_drive_root() == "E:\\", gui._system_drive_root()
+        _os.environ.pop("SystemDrive", None)
+        assert gui._system_drive_root() == "C:\\", "missing SystemDrive must fall back to C:"
+    finally:
+        if _saved_sysdrive is None:
+            _os.environ.pop("SystemDrive", None)
+        else:
+            _os.environ["SystemDrive"] = _saved_sysdrive
+    # real machine still answers
+    assert gui._system_drive_root().endswith("\\")
+    # gains: only drives that grew, biggest first, junk tolerated
+    _before = {"C:\\": (100, 1000), "D:\\": (50, 500), "E:\\": (10, 100)}
+    _after = {"C:\\": (150, 1000), "D:\\": (50, 500), "E:\\": (99, 100)}
+    assert gui._drive_gains(_before, _after) == [("E:\\", 89), ("C:\\", 50)]
+    assert gui._drive_gains(None, None) == []
+    assert gui._drive_gains(_before, {}) == []
+    # a live snapshot of this machine must at least see the system drive
+    _snap = gui._snapshot_all_drives(gui.Application._query_drives,
+                                     gui.Application._query_drive_free_total)
+    assert isinstance(_snap, dict) and _snap, "no drives snapshotted"
+
+    # scorecard renders the per-drive strip only when 2+ drives gained
+    sc6 = gui.ScorecardDialog(
+        root, tab_name="Clean", mode="run", cancelled=False,
+        results=[("Shader caches", "ok", 139 * 1024**3)],
+        total_bytes=139 * 1024**3, needs_reboot=False,
+        before_drives=_before, after_drives=_after,
+    )
+    root.update()
+    assert sc6._drive_rows is not None, "two gaining drives must show the strip"
+    assert len(sc6._gains) == 2
+    # Feature 3: the clipboard summary names the freed space and both drives
+    _txt = sc6._summary_text()
+    assert "Space freed" in _txt and "E:" in _txt and "D:" not in _txt, _txt
+    assert "Shader caches" in _txt and "done" in _txt
+    sc6._close()
+    root.update()
+
+    # one gaining drive = no strip (the hero number already said it)
+    sc7 = gui.ScorecardDialog(
+        root, tab_name="Clean", mode="run", cancelled=False,
+        results=[("Temp files", "ok", 50)],
+        total_bytes=50, needs_reboot=False,
+        before_drives={"C:\\": (100, 1000)}, after_drives={"C:\\": (150, 1000)},
+    )
+    root.update()
+    assert sc7._drive_rows is None, "a single drive must not get its own strip"
+    sc7._close()
+    root.update()
+
+    # --- Feature 10: run history -> friendly 30-day sentence ------------
+    _hist_before = config_persist.load_config().get("run_history", [])
+    try:
+        config_persist.record_run(0)          # nothing freed = not recorded
+        _n0 = len(config_persist.load_config().get("run_history", []))
+        assert _n0 == len(_hist_before), "zero-byte runs must not be recorded"
+        config_persist.record_run(3 * 1024**3)
+        config_persist.record_run(2 * 1024**3)
+        _total, _runs = config_persist.freed_since(30)
+        assert _runs >= 2 and _total >= 5 * 1024**3, (_total, _runs)
+        _sc8 = gui.ScorecardDialog(
+            root, tab_name="Clean", mode="run", cancelled=False,
+            results=[("Temp files", "ok", 1024)], total_bytes=1024,
+        )
+        root.update()
+        assert _sc8._month_lbl is not None, "30-day sentence missing after 2 runs"
+        assert "30 days" in _sc8._month_lbl.cget("text")
+        _sc8._close()
+        root.update()
+    finally:
+        # leave the user's real history exactly as we found it
+        config_persist.update_config(
+            lambda cfg: cfg.__setitem__("run_history", list(_hist_before)))
+
+    # --- Feature 7: Install profiles ("My Setups") ----------------------
+    _profiles_before = config_persist.get_install_profiles()
+    try:
+        _inst = app.tabs["Install"]
+        assert getattr(_inst, "_profiles_btn", None) is not None, \
+            "My Setups button missing from the Install tab"
+        _ids = _inst.profile_ids()
+        assert isinstance(_ids, list)
+        # tick one real catalog app, save it, clear, load it back
+        _first_id = next(iter(_inst.vars), None)
+        assert _first_id is not None, "Install catalog has no apps to profile"
+        _inst.apply_profile_ids([])
+        assert _inst.profile_ids() == [], "clearing the selection failed"
+        _inst.vars[_first_id].set(True)
+        _saved_ids = _inst.profile_ids()
+        assert _first_id in _saved_ids
+        assert config_persist.save_install_profile("smoke_setup", _saved_ids)
+        _inst.apply_profile_ids([])
+        _applied, _missing = _inst.apply_profile_ids(
+            config_persist.get_install_profiles()["smoke_setup"])
+        assert _applied == len(_saved_ids) and _missing == 0, (_applied, _missing)
+        assert _inst.vars[_first_id].get(), "loaded profile did not tick the app"
+        # an id that no longer exists is reported, never silently dropped
+        _applied2, _missing2 = _inst.apply_profile_ids(["definitely-not-an-app"])
+        assert (_applied2, _missing2) == (0, 1), (_applied2, _missing2)
+        assert config_persist.delete_install_profile("smoke_setup")
+        assert "smoke_setup" not in config_persist.get_install_profiles()
+        # the dialog builds and lists what is stored
+        _pdlg = gui.InstallProfilesDialog(root, _inst)
+        root.update()
+        assert _pdlg._rows_holder is not None
+        _pdlg._close()
+        root.update()
+    finally:
+        _inst.apply_profile_ids([])
+        config_persist.update_config(
+            lambda cfg: cfg.__setitem__("install_profiles", dict(_profiles_before)))
+
+    # --- Feature 9: Game Night ------------------------------------------
+    from app import game_night as _gn
+    # the tweak set is the existing preset, never a private copy
+    from app.tab_presets import PRESETS as _PRESETS
+    assert _gn.preset_task_keys() == list(_PRESETS["Tweak"]["Game Session"])
+    assert _gn.preset_task_keys(), "Game Session preset resolved to nothing"
+    # only ticked apps ever map to an exe, unknown keys are ignored
+    assert _gn.exe_names_for([]) == ()
+    assert _gn.exe_names_for(["not-a-real-app"]) == ()
+    assert "chrome.exe" in _gn.exe_names_for(["browsers"])
+    assert "discord.exe" not in _gn.exe_names_for(["browsers"])
+    # nothing on the closeable list may be a game launcher or a driver app
+    _all_exes = " ".join(_gn.exe_names_for(list(_gn.APP_KEYS))).lower()
+    for _banned in ("steam", "epicgames", "riot", "battle.net", "gog",
+                    "nvidia", "amd", "razer", "logi", "synapse"):
+        assert _banned not in _all_exes, f"unsafe app on the quiet list: {_banned}"
+    # the tasks resolve to real, revertable Tweak tasks
+    _gn_tasks = app._game_night_tasks()
+    assert _gn_tasks, "Game Night resolved no tasks"
+    assert all(t.revert is not None for t in _gn_tasks), \
+        "every Game Night tweak must be undoable"
+    # _game_in_progress reads active_hit as a PROPERTY: a regression to
+    # active_hit() would be swallowed by the guard and silently report
+    # "no game running" forever, so pin the contract here.
+    from app.session_pilot import SessionPilot as _SP
+    assert isinstance(getattr(_SP, "active_hit"), property), \
+        "SessionPilot.active_hit is no longer a property"
+    assert app._game_in_progress() in (True, False)
+
+    # state round-trips and survives a reload
+    _gn_before = config_persist.get_game_night()
+    try:
+        config_persist.set_game_night(True, ["game_mode"])
+        assert config_persist.get_game_night()["active"] is True
+        assert config_persist.get_game_night()["keys"] == ["game_mode"]
+        # ending clears the keys so a later End can never re-revert them
+        config_persist.set_game_night(False)
+        assert config_persist.get_game_night()["active"] is False
+        assert config_persist.get_game_night()["keys"] == []
+        # End with nothing recorded must be a quiet no-op, not a run
+        app.end_game_night()
+        assert config_persist.get_game_night()["active"] is False
+        # dialog builds in both states and shows the right button
+        config_persist.set_game_night(True, ["game_mode"])
+        _gnd = gui.GameNightDialog(root, app)
+        root.update()
+        assert "End Game Night" in _gnd._main_btn._text, _gnd._main_btn._text
+        assert len(_gnd._app_vars) == len(_gn.APP_KEYS)
+        assert not any(v.get() for v in _gnd._app_vars.values()), \
+            "optional app quieting must default to off"
+        _gnd._close()
+        root.update()
+        config_persist.set_game_night(False)
+        _gnd2 = gui.GameNightDialog(root, app)
+        root.update()
+        assert "Start Game Night" in _gnd2._main_btn._text, _gnd2._main_btn._text
+        _gnd2._close()
+        root.update()
+    finally:
+        config_persist.set_game_night(bool(_gn_before.get("active")),
+                                      _gn_before.get("keys"))
+        config_persist.set_game_night_close_apps(_gn_before.get("close_apps"))
+
+    # --- Feature: Drive Toolkit (Health / Speed / Capacity) --------------
+    from app import drive_toolkit as _dtk
+    # pure helpers must never raise even with no real hardware behind them
+    assert isinstance(_dtk.list_physical_disks(), list)
+    assert isinstance(_dtk.list_fixed_drives(), list)
+    assert isinstance(_dtk.list_removable_drives(), list)
+    # capacity_test refuses non-removable drives regardless of caller —
+    # this must hold even off Windows (IS_WINDOWS gate short-circuits
+    # first there, but the removable-only gate is the one that matters
+    # on a real machine, so pin its wording too).
+    _cap_err = _dtk.capacity_test("C:\\", mode="quick")
+    assert _cap_err["ok"] is False and _cap_err["error"], _cap_err
+    # deterministic block generation: same (seed, index) -> same bytes,
+    # different index -> different bytes (spoof-resistance depends on this)
+    _b1 = _dtk._block_bytes(7, 3, 256)
+    _b2 = _dtk._block_bytes(7, 3, 256)
+    _b3 = _dtk._block_bytes(7, 4, 256)
+    assert _b1 == _b2 and _b1 != _b3
+    # dialog builds and defaults to the Health tab
+    _dtd = gui.DriveToolkitDialog(root, app)
+    root.update()
+    assert _dtd._view == "health"
+    assert hasattr(_dtd, "_health_panel")
+    _dtd._switch("speed")
+    root.update()
+    assert hasattr(_dtd, "_speed_bar")
+    _dtd._switch("capacity")
+    root.update()
+    assert hasattr(_dtd, "_cap_bar")
+    _dtd._close()
+    root.update()
+
+    # --- Feature: Startup Manager -----------------------------------------
+    from app import startup_manager as _sm
+    assert isinstance(_sm.list_startup_items(), list)
+    # config round-trips and coerces junk safely
+    _su_before = config_persist.get_startup_disabled()
+    try:
+        assert config_persist.add_startup_disabled(
+            {"source": "hkcu_run", "name": "SmokeTestItem",
+             "command": "C:\\smoke.exe", "value_type": "REG_SZ"})
+        _found = [r for r in config_persist.get_startup_disabled()
+                  if r["name"] == "SmokeTestItem"]
+        assert len(_found) == 1
+        assert config_persist.remove_startup_disabled("hkcu_run", "SmokeTestItem")
+        assert not [r for r in config_persist.get_startup_disabled()
+                    if r["name"] == "SmokeTestItem"]
+        # dialog builds and lists what's there
+        _sud = gui.StartupManagerDialog(root, app)
+        root.update()
+        assert isinstance(_sud._rows, dict)
+        _sud._close()
+        root.update()
+    finally:
+        config_persist.update_config(
+            lambda cfg: cfg.__setitem__("startup_disabled", list(_su_before)))
+
+    # --- improvements.txt items: Discord Cache_Data, Windows.old age gate,
+    #     light network repair -----------------------------------------
+    import os as _os
+    from app.tasks import launcher_paths as _lp
+    _discord_leaves = [_os.path.basename(p) for p in _lp.DISCORD_CACHE_PATHS if p]
+    assert "Cache_Data" in _discord_leaves, \
+        "Discord Cache_Data path missing — the real cache-bulk folder"
+    assert _discord_leaves.count("Cache_Data") == 4, \
+        "Cache_Data should appear once per Discord branch (stable/PTB/Canary/Dev)"
+    # nothing that could hold login/session data was added alongside it
+    for _banned in ("Local Storage", "Session Storage", "IndexedDB", "databases"):
+        assert not any(_banned in p for p in _lp.DISCORD_CACHE_PATHS), _banned
+
+    import tempfile as _tf, time as _time
+    from app.tasks import clean_tasks as _ct
+    from app.utils import TaskContext as _TC
+    _logs = []
+    _cctx = _TC(log=_logs.append, set_status=lambda *_: None)
+    _tmp_root = _tf.mkdtemp()
+    _saved_root = _ct._SYSTEMDRIVE_ROOT
+    try:
+        _ct._SYSTEMDRIVE_ROOT = _tmp_root
+        _wo = _os.path.join(_tmp_root, "Windows.old")
+        _os.makedirs(_wo)
+        with open(_os.path.join(_wo, "junk.bin"), "wb") as _f:
+            _f.write(b"x" * 1000)
+        # fresh -> must survive
+        _logs.clear()
+        _r1 = _ct.clean_windows_update_leftovers(_cctx)
+        assert _r1 == 0 and _os.path.isdir(_wo), \
+            "a same-day Windows.old must not be deleted"
+        assert any("leaving it for now" in l for l in _logs)
+        # aged 20 days -> must be removed
+        _old_t = _time.time() - 20 * 86400
+        _os.utime(_wo, (_old_t, _old_t))
+        _r2 = _ct.clean_windows_update_leftovers(_cctx)
+        assert _r2 > 0 and not _os.path.isdir(_wo), \
+            "a 20-day-old Windows.old should be removed"
+    finally:
+        _ct._SYSTEMDRIVE_ROOT = _saved_root
+
+    from app.tasks import repair_tasks as _rt
+    assert any(t.key == "network_light" for t in gui.TABS["Repair"]), \
+        "network_light task not registered on the Repair tab"
+    _nl_task = next(t for t in gui.TABS["Repair"] if t.key == "network_light")
+    assert _nl_task.default is False, "network_light must be opt-in like every repair task"
+    _saved_run_cmd = _rt.run_cmd
+    try:
+        _seen_cmds = []
+        _rt.run_cmd = lambda ctx, cmd, timeout=None: (_seen_cmds.append(cmd), 0)[1]
+        _logs2 = []
+        from app.utils import TaskContext as _TC2
+        _rt.repair_network_light(_TC2(log=_logs2.append, set_status=lambda *_: None))
+        assert _seen_cmds == ["ipconfig /flushdns", "netsh winsock reset"], _seen_cmds
+        assert not any("/release" in c or "/renew" in c for c in _seen_cmds), \
+            "light network fix must never touch the IP lease"
+    finally:
+        _rt.run_cmd = _saved_run_cmd
+
     # --- Tweak Health Center (user-approved feature 2, 2026-09) --------
     # Synchronous part only (entry/rows/banner/buttons/verify contract).
     # Real async runs (run_tasks worker -> scorecard dialog, health
@@ -2194,15 +2493,28 @@ def main():
     # the classic rows.
     tools_page = app.tabs["Tools"]
     assert isinstance(tools_page, gui.ToolsTab), type(tools_page).__name__
-    assert sorted(tools_page._card_frames) == ["dns", "gamepad", "gameping", "health",
-                                               "miccheck", "pilot", "quick",
-                                               "speed", "storage"], \
-        sorted(tools_page._card_frames)
-    # 3x3 geometry matches Tweak preset cards (same pads/uniform)
+    # Derived from _CARDS, not a frozen list: this assertion used to
+    # hard-code the original nine keys and had silently been failing ever
+    # since the tab grew past them. Checking the contract (every declared
+    # card is built, every card has a route) instead of the census means
+    # adding a card can never break the suite for no reason again.
+    _declared = [c[0] for c in gui.ToolsTab._CARDS]
+    assert sorted(tools_page._card_frames) == sorted(_declared), \
+        (sorted(tools_page._card_frames), sorted(_declared))
+    assert len(_declared) == len(set(_declared)), "duplicate Tools card key"
+    assert "gamenight" in tools_page._card_frames, "Game Night card missing"
+    # 3-wide grid, same pads/uniform as the Tweak preset cards. A single
+    # left-over card sits in the middle column so the last row is centred.
     _pos = {k: (v[0].grid_info()["row"], v[0].grid_info()["column"])
             for k, v in tools_page._card_frames.items()}
-    assert sorted(_pos.values()) == [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2),
-                                     (2, 0), (2, 1), (2, 2)], _pos
+    _n = len(_declared)
+    _expected = []
+    _lone = (_n % 3) == 1
+    _last_row = (_n - 1) // 3
+    for _i in range(_n):
+        _r, _c = divmod(_i, 3)
+        _expected.append((_r, 1 if (_lone and _r == _last_row) else _c))
+    assert sorted(_pos.values()) == sorted(_expected), (_pos, _expected)
     app._switch_to("Tools")
     root.update()
     _opened = []

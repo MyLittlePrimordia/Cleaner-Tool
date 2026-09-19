@@ -122,11 +122,17 @@ UBISOFT_CACHE_PATHS = [
     _join(LOCALAPPDATA, "Ubisoft Game Launcher", "logs"),
 ]
 
-# Discord — stable + PTB/Canary branches; Cache_Data holds the bulk
+# Discord — stable + PTB/Canary branches; Cache_Data holds the bulk.
+# Cache_Data added 2026-09 (was missing despite the comment above already
+# saying it holds the bulk — Cache itself is usually a near-empty shell,
+# Cache_Data is where the actual cached images/scripts/data live).
+# Do NOT add: Local Storage, Session Storage, IndexedDB, databases — those
+# can hold login tokens or settings, not just disposable cache.
 DISCORD_CACHE_PATHS = []
 for _branch in ("discord", "discordPTB", "discordCanary", "discordDevelopment"):
     DISCORD_CACHE_PATHS += [
         _join(APPDATA, _branch, "Cache"),
+        _join(APPDATA, _branch, "Cache_Data"),
         _join(APPDATA, _branch, "Code Cache"),
         _join(APPDATA, _branch, "GPUCache"),
     ]

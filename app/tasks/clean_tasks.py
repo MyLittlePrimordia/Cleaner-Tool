@@ -5,6 +5,7 @@ Laymen short labels + hover tooltips; compact symmetrical grid.
 
 import glob as globmod
 import os
+import time
 # audit fix (hygiene): module-level `subprocess` was unused — every caller
 # that needs it already does its own local `import subprocess`.
 
@@ -590,6 +591,18 @@ def clean_prefetch(ctx: TaskContext):
     return clean_folder_contents(ctx, f"{_WINDIR}\\Prefetch")
 
 
+# Days Windows.old must sit untouched before this task will remove it.
+# Windows itself keeps the "go back to your previous version of Windows"
+# option alive for up to 10 days after an upgrade; giving 4 extra days of
+# margin means this task is never the reason someone loses that option a
+# day or two before they would have decided to use it. The other upgrade-
+# debris folders below ($Windows.~BT etc.) don't carry that rollback
+# implication — they are only ever present mid-upgrade or are tiny by
+# comparison — so the age gate applies to Windows.old specifically rather
+# than slowing down cleanup of the others.
+_WINDOWS_OLD_MIN_AGE_DAYS = 14
+
+
 def clean_windows_update_leftovers(ctx: TaskContext):
     """Remove Windows Update / upgrade leftovers (Sophia Script's list).
 
@@ -597,6 +610,12 @@ def clean_windows_update_leftovers(ctx: TaskContext):
     $Windows.~WS, ESD, C:\\Intel, C:\\PerfLogs. These are installer debris and
     safe to delete AFTER an upgrade completed (Windows itself offers to remove
     most of them via Storage Sense after 10 days).
+
+    Windows.old specifically is age-gated (see _WINDOWS_OLD_MIN_AGE_DAYS):
+    even though this task is opt-in and its own title already tells the
+    user to wait a few days, a folder-age check catches the case where
+    someone runs it the same day they upgraded, on top of — not instead
+    of — that warning.
     """
     # F02: upgrade debris (Windows.old, $Windows.~*, $WinREAgent,
     # $GetCurrent, $SysReset) are whole staged installs — removing the
@@ -615,13 +634,28 @@ def clean_windows_update_leftovers(ctx: TaskContext):
         os.path.join(_SYSTEMDRIVE_ROOT, "Intel"),
         os.path.join(_SYSTEMDRIVE_ROOT, "PerfLogs"),
     ]
+    windows_old = os.path.join(_SYSTEMDRIVE_ROOT, "Windows.old")
     total = 0
     for folder in remove_root_folders:
         if not folder or not os.path.isabs(folder):
             continue
-        if os.path.exists(folder):
-            ctx.log(f"Cleaning update leftover: {folder}")
-            total += clean_folder_contents(ctx, folder, remove_root=True)
+        if not os.path.exists(folder):
+            continue
+        if folder == windows_old:
+            try:
+                age_days = (time.time() - os.path.getmtime(folder)) / 86400.0
+            except OSError:
+                ctx.log("Could not check Windows.old's age — "
+                       "leaving it alone to be safe.")
+                continue
+            if age_days < _WINDOWS_OLD_MIN_AGE_DAYS:
+                ctx.log(f"Windows.old is only {age_days:.1f} day(s) old — "
+                       f"leaving it for now (needs {_WINDOWS_OLD_MIN_AGE_DAYS}+ "
+                       "days, in case you want to go back to your previous "
+                       "version of Windows).")
+                continue
+        ctx.log(f"Cleaning update leftover: {folder}")
+        total += clean_folder_contents(ctx, folder, remove_root=True)
     for folder in keep_root_folders:
         if not folder or not os.path.isabs(folder):
             continue

@@ -228,7 +228,7 @@ CUSTOM_GROUPS = {
         ("Updates & downloads",
          ["wu_reset", "bits_reset", "time_sync", "gpupdate"]),
         ("Network & firewall",
-         ["network_reset", "firewall_reset", "arp_flush", "teredo_fix",
+         ["network_light", "network_reset", "firewall_reset", "arp_flush", "teredo_fix",
           "hosts_restore", "firewall_backup"]),
          ("Apps, Xbox, devices & drivers",
           ["xbox_apps", "store_apps_reregister", "search_index",

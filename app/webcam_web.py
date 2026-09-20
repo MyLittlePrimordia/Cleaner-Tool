@@ -175,6 +175,7 @@ _PAGE = r"""<!doctype html>
 
   <div class="controls">
     <button id="btn">Start camera</button>
+    <button id="snap" disabled title="Save one still frame as a PNG file">Snapshot PNG</button>
     <select id="pick" class="hide"></select>
   </div>
 
@@ -196,10 +197,15 @@ _PAGE = r"""<!doctype html>
   var v = document.getElementById("v");
   var ph = document.getElementById("ph");
   var btn = document.getElementById("btn");
+  var snap = document.getElementById("snap");
   var pick = document.getElementById("pick");
   var stats = document.getElementById("stats");
   var msg = document.getElementById("msg");
   var stream = null, fpsHandle = null, frames = [], ended = false;
+
+  function setSnap(on){
+    try{ snap.disabled = !on; }catch(e){}
+  }
 
   function say(text, kind){
     msg.innerHTML = text;
@@ -273,6 +279,7 @@ _PAGE = r"""<!doctype html>
 
   // ---- start / stop -------------------------------------------------
   function stop(quiet, keepPicker){
+    setSnap(false);
     if(fpsHandle && typeof v.cancelVideoFrameCallback === "function"){
       try{ v.cancelVideoFrameCallback(fpsHandle); }catch(e){}
     }
@@ -347,9 +354,10 @@ _PAGE = r"""<!doctype html>
           btn.textContent = "Stop camera";
           btn.className = "stop";
           var track = s.getVideoTracks()[0];
-          var wire = function(){ fillStats(track); startFps(track); };
-          if(v.readyState >= 2){ wire(); } else { v.onloadedmetadata = wire; }
+          var wire = function(){ fillStats(track); startFps(track); setSnap(true); };
+          if(v.readyState >= 2){ wire(); } else { v.onloadedmetadata = wire; };
           track.addEventListener("ended", function(){
+            setSnap(false);
             if(!ended){ stop(true); say("<b>The camera disconnected.</b> " +
               "Windows dropped the device \u2014 check the USB cable.", "bad"); }
           });
@@ -371,6 +379,43 @@ _PAGE = r"""<!doctype html>
 
   btn.addEventListener("click", function(){
     if(stream){ stop(false); } else { start(pick.value || null); }
+  });
+  snap.addEventListener("click", function(){
+    // One still frame -> PNG download. Pure client-side: the pixels
+    // never leave this PC (no upload, no server write — the loopback
+    // server only serves this page).
+    if(!stream){ return; }
+    try{
+      var w = v.videoWidth || 0, h = v.videoHeight || 0;
+      if(!w || !h){ say("No frame yet — wait a second and try again.", "warn"); return; }
+      var c = document.createElement("canvas");
+      c.width = w; c.height = h;
+      c.getContext("2d").drawImage(v, 0, 0, w, h);
+      var done = function(url){
+        try{
+          var a = document.createElement("a");
+          a.href = url; a.download = "webcam-snapshot.png";
+          document.body.appendChild(a); a.click();
+          setTimeout(function(){
+            try{ document.body.removeChild(a); }catch(e){}
+            try{ if(url.indexOf("blob:") === 0){ URL.revokeObjectURL(url); } }catch(e){}
+          }, 500);
+          say("<b>Snapshot saved.</b> Check your Downloads folder.", "good");
+        }catch(e){
+          say("Could not save the snapshot in this browser.", "warn");
+        }
+      };
+      if(typeof c.toBlob === "function"){
+        c.toBlob(function(b){
+          if(b){ done(URL.createObjectURL(b)); }
+          else { done(c.toDataURL("image/png")); }
+        }, "image/png");
+      } else {
+        done(c.toDataURL("image/png"));
+      }
+    }catch(e){
+      say("Could not grab a frame from this camera.", "warn");
+    }
   });
   pick.addEventListener("change", function(){
     if(stream){ stop(true, true); start(pick.value); }

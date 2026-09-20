@@ -9941,8 +9941,9 @@ def _capture_inputs():
 
 
 class GamepadDialog(ThemedModal):
-    """Gamepad Tester (user-requested Tools feature): live view of the
-    first connected XInput controller — buttons, triggers, both sticks.
+    """Gamepad Tester (user-requested Tools feature): live view of an
+    XInput controller — buttons, triggers, both sticks. Auto follows
+    the first live pad; the picker pins slots 1..4 for multi-pad rigs.
 
     Strictly read-only (GetState polls only; rumble/remap APIs are never
     bound). Polls on the Tk thread via after() — no worker threads, so no
@@ -9956,6 +9957,8 @@ class GamepadDialog(ThemedModal):
         self._pad_btns = {}
         self._stats = _PadReportStats()
         self._slot = -1
+        self._slot_want = -1  # -1 = Auto (first live pad), else 0..3 manual
+        self._slot_var = None
         self._rest = None        # drift-calibration center (lx,ly,rx,ry)
         self._rest_samples = []  # gathering buffer (hands off!)
         self._weak_var = None
@@ -9975,6 +9978,27 @@ class GamepadDialog(ThemedModal):
                                     font=(F, 10, "bold"), bg=COLORS["bg"],
                                     fg=COLORS["subtext"], anchor="w")
         self._status_lbl.pack(fill="x", pady=(0, 2))
+        # Slot picker: XInput has 4 slots. Auto = first live pad (old
+        # behavior); 1..4 pins polling + rumble to that slot so
+        # multi-controller setups are testable. DirectInput-only pads
+        # stay invisible — labeled honestly below.
+        slot_row = tk.Frame(body, bg=COLORS["bg"])
+        slot_row.pack(fill="x", pady=(0, 2))
+        tk.Label(slot_row, text="Controller:", font=(F, 9, "bold"),
+                 bg=COLORS["bg"], fg=COLORS["text"]).pack(side="left")
+        try:
+            import tkinter.ttk as _ttk
+            self._slot_var = tk.StringVar(value="Auto")
+            _slot_combo = _ttk.Combobox(slot_row, textvariable=self._slot_var,
+                                        values=["Auto", "1", "2", "3", "4"],
+                                        state="readonly", width=8, font=(F, 9))
+            _slot_combo.pack(side="left", padx=(6, 0))
+            _slot_combo.bind("<<ComboboxSelected>>", self._on_slot_pick)
+        except Exception:
+            self._slot_var = None
+        tk.Label(slot_row, text="XInput only — DirectInput pads won't show.",
+                 font=(F, 8), bg=COLORS["bg"],
+                 fg=COLORS["subtext"]).pack(side="left", padx=(10, 0))
         # Center piece: the pad artwork with horizontal trigger bars
         # drawn right above the shoulders (LT left, RT right). Artwork is
         # the white-outline Xbox stock (Noun Project, CC BY — credited in
@@ -10362,21 +10386,53 @@ class GamepadDialog(ThemedModal):
     def _stop_tick(self):
         self._stop_all()
 
+    def _on_slot_pick(self, _e=None):
+        """Pin polling + rumble to Auto / 1..4. Resets per-pad state so
+        report-rate + drift never mix samples from two pads."""
+        try:
+            want = (self._slot_var.get() if self._slot_var is not None else "Auto")
+        except Exception:
+            want = "Auto"
+        try:
+            new_want = int(want) - 1 if str(want).strip().isdigit() else -1
+            if new_want not in (-1, 0, 1, 2, 3):
+                new_want = -1
+        except Exception:
+            new_want = -1
+        try:
+            if new_want != getattr(self, "_slot_want", -1):
+                self._stop_rumble()
+            self._slot_want = new_want
+            self._stats.reset()
+            self._rest = None
+            self._rest_samples = []
+            self._slot = -1
+        except Exception:
+            pass
+
     def _tick(self):
         self._tick_after = None
         try:
             fn = _xinput_state_fn()
             state = None
             slot = -1
+            want = int(getattr(self, "_slot_want", -1) or -1)
             if fn is not None:
-                for s in range(4):
+                if want in (0, 1, 2, 3):
                     try:
-                        state = fn(s)
+                        state = fn(want)
                     except Exception:
                         state = None
-                    if state is not None:
-                        slot = s
-                        break
+                    slot = want if state is not None else -1
+                else:
+                    for s in range(4):
+                        try:
+                            state = fn(s)
+                        except Exception:
+                            state = None
+                        if state is not None:
+                            slot = s
+                            break
             if state is None:
                 if self._slot >= 0:
                     self._stop_rumble()
@@ -10384,9 +10440,14 @@ class GamepadDialog(ThemedModal):
                 self._stats.reset()
                 self._rest = None
                 self._rest_samples = []
-                self._status_lbl.config(
-                    text="No controller detected — connect one and press any button.",
-                    fg=COLORS["subtext"])
+                if want in (0, 1, 2, 3):
+                    self._status_lbl.config(
+                        text=f"Controller {want + 1} not detected — pick Auto or connect it.",
+                        fg=COLORS["subtext"])
+                else:
+                    self._status_lbl.config(
+                        text="No controller detected — connect one and press any button.",
+                        fg=COLORS["subtext"])
                 self._paint_pad_idle()
                 self._set_stat(self._stat_rate_val, "—")
                 self._set_stat(self._stat_ms_val, "—")
@@ -11371,6 +11432,9 @@ class KeyboardTesterDialog(ThemedModal):
         self._key_shapes = {}
         self._held = set()
         self._tested = set()
+        self._press_time = {}
+        self._stuck_after = None
+        self._STUCK_S = 10.0
         super().__init__(parent, title="Keyboard Tester", accent=TAB_ACCENTS["Clean"])
         body = self.body
         self._status_lbl = tk.Label(body, text="Press any key.",
@@ -11409,6 +11473,7 @@ class KeyboardTesterDialog(ThemedModal):
         except Exception:
             pass
         self.on_close(self._stop)
+        self._schedule_stuck()
 
     def _stat_block(self, parent, col, title):
         try:
@@ -11460,6 +11525,7 @@ class KeyboardTesterDialog(ThemedModal):
         rect, _text = shapes
         color = {
             "held": COLORS["accent_green"],
+            "stuck": COLORS["accent_red"],
             "tested": _hex_lerp(COLORS["accent_green"], COLORS["surface"], 0.75),
             "idle": COLORS["surface"],
         }.get(state, COLORS["surface"])
@@ -11468,6 +11534,57 @@ class KeyboardTesterDialog(ThemedModal):
         except Exception:
             pass
 
+    def _schedule_stuck(self):
+        try:
+            if self._stuck_after is not None:
+                try:
+                    self._dlg.after_cancel(self._stuck_after)
+                except Exception:
+                    pass
+            self._stuck_after = self._dlg.after(500, self._check_stuck)
+        except Exception:
+            self._stuck_after = None
+
+    def _check_stuck(self):
+        """Flag keys held longer than _STUCK_S as stuck (red + status).
+
+        Tk thread only via after(); auto-repeat KeyPress events must not
+        reset the clock — only the first press counts."""
+        self._stuck_after = None
+        try:
+            import time as _time
+            now = _time.monotonic()
+            stuck = []
+            for ks in list(self._held):
+                try:
+                    t0 = float(self._press_time.get(ks, now))
+                except Exception:
+                    t0 = now
+                held_s = now - t0
+                if held_s >= float(getattr(self, "_STUCK_S", 10.0)):
+                    stuck.append((ks, held_s))
+                    self._paint_key(ks, "stuck")
+            if stuck:
+                stuck.sort(key=lambda kv: kv[0])
+                names = ", ".join(f"{k} ({s:.0f}s)" for k, s in stuck[:4])
+                if len(stuck) > 4:
+                    names += f" +{len(stuck) - 4} more"
+                try:
+                    self._status_lbl.config(
+                        text=f"Stuck key? {names} — lift your finger or tap it again.",
+                        fg=COLORS["accent_red"])
+                except Exception:
+                    pass
+            else:
+                try:
+                    self._status_lbl.config(text="Press any key.",
+                                            fg=COLORS["subtext"])
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self._schedule_stuck()
+
     def _on_press(self, event):
         ks = getattr(event, "keysym", "")
         if ks not in self._key_shapes:
@@ -11475,12 +11592,21 @@ class KeyboardTesterDialog(ThemedModal):
         if ks not in self._held:
             self._held.add(ks)
             self._tested.add(ks)
+            try:
+                import time as _time
+                self._press_time[ks] = _time.monotonic()
+            except Exception:
+                pass
             self._paint_key(ks, "held")
             self._refresh_stats()
 
     def _on_release(self, event):
         ks = getattr(event, "keysym", "")
         self._held.discard(ks)
+        try:
+            self._press_time.pop(ks, None)
+        except Exception:
+            pass
         self._paint_key(ks, "tested" if ks in self._tested else "idle")
         self._refresh_stats()
 
@@ -11499,20 +11625,48 @@ class KeyboardTesterDialog(ThemedModal):
         self._refresh_stats()
 
     def _stop(self):
-        pass
+        try:
+            if getattr(self, "_stuck_after", None) is not None:
+                try:
+                    self._dlg.after_cancel(self._stuck_after)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self._stuck_after = None
+        try:
+            self._held.clear()
+            self._press_time.clear()
+        except Exception:
+            pass
 
 
 class MonitorTestDialog(ThemedModal):
     """Monitor Test (Option A): Info shows the real current mode via the
     existing tweak_tasks query; Dead Pixels shows solid color fields with
-    an optional fullscreen Start. No refresh measurement claim."""
+    an optional fullscreen Start, auto-advance timer and gradient check.
+    Fullscreen keeps an autohide control bar (taskbar-style) so edge
+    pixels stay inspectable. No refresh measurement claim."""
 
     _COLORS_CYCLE = ("#000000", "#FFFFFF", "#FF0000", "#00FF00", "#0000FF", "#808080")
+    _AUTO_MS_ON = 3000
+    _FS_HIDE_MS = 2500
 
     def __init__(self, parent, app):
         self.app = app
         self._color_idx = 0
         self._fullscreen_win = None
+        self._show_gradient = False
+        self._auto_ms = 0
+        self._auto_after = None
+        self._auto_btn = None
+        self._grad_btn = None
+        self._mode_lbl = None
+        self._fs_bar = None
+        self._fs_auto_btn = None
+        self._fs_grad_btn = None
+        self._fs_mode_lbl = None
+        self._fs_hide_after = None
         super().__init__(parent, title="Monitor Test", accent=TAB_ACCENTS["Clean"])
         body = self.body
         # UI fix: this used to be two tab pages (Info / Dead Pixels) for
@@ -11525,20 +11679,23 @@ class MonitorTestDialog(ThemedModal):
                                    bg=self._COLORS_CYCLE[self._color_idx], bd=0,
                                    highlightthickness=0)
         self._pixel_cv.pack(pady=(4, 8))
+        self._mode_lbl = None
+        # One row, three buttons: Fullscreen / Cycle (solids + gradient)
+        # / Auto On-Off at a fixed 3s cadence.
         row = tk.Frame(body, bg=COLORS["bg"])
-        row.pack()
-        AnimatedButton(row, text="Start Fullscreen",
+        row.pack(pady=(4, 0))
+        AnimatedButton(row, text="Fullscreen",
                        command=self._open_fullscreen_pixels,
                        bg=COLORS["surface"], fg=COLORS["text"],
                        font=(F, 9, "bold"), padx=16, pady=6).pack(side="left", padx=4)
         AnimatedButton(row, text="Cycle Colors", command=self._next_pixel_color,
                        bg=COLORS["surface"], fg=COLORS["text"],
                        font=(F, 9, "bold"), padx=16, pady=6).pack(side="left", padx=4)
-        tk.Label(body,
-                 text="Fullscreen catches edge pixels a small swatch can miss. "
-                      "Click or Space to cycle color, Esc to close.",
-                 font=(F, 8), bg=COLORS["bg"], fg=COLORS["subtext"],
-                 wraplength=520).pack(pady=(8, 0))
+        self._auto_btn = AnimatedButton(row, text="Auto Cycle: Off", command=self._toggle_auto,
+                                        bg=COLORS["surface"], fg=COLORS["text"],
+                                        font=(F, 9, "bold"), padx=16, pady=6)
+        self._auto_btn.pack(side="left", padx=4)
+        self._update_mode_ui()
         self.on_close(self._stop)
 
     def _build_specs_row(self, body):
@@ -11590,44 +11747,495 @@ class MonitorTestDialog(ThemedModal):
         else:
             stat(1, "MAX Hz HERE", "?")
         stat(2, "MONITOR", model or "?")
-        tk.Label(body,
-                 text="Unknown fields show '?' rather than a guess.",
-                 font=(F, 8), bg=COLORS["bg"], fg=COLORS["subtext"]).pack(pady=(0, 2))
+
+    def _render_swatch(self):
+        """Paint the small swatch: gradient strips or the solid color."""
+        try:
+            cv = self._pixel_cv
+            try:
+                cv.delete("grad")
+            except Exception:
+                pass
+            if getattr(self, "_show_gradient", False):
+                try:
+                    cv.config(bg="#000000")
+                except Exception:
+                    pass
+                try:
+                    w = int(cv.cget("width") or 680)
+                    h = int(cv.cget("height") or 260)
+                except Exception:
+                    w, h = 680, 260
+                steps = 64
+                for i in range(steps):
+                    v = int(i * 255 / max(1, steps - 1))
+                    col = f"#{v:02x}{v:02x}{v:02x}"
+                    x0 = w * i / steps
+                    x1 = w * (i + 1) / steps
+                    try:
+                        cv.create_rectangle(x0, 0, x1, h, fill=col, outline="",
+                                            tags="grad")
+                    except Exception:
+                        break
+            else:
+                try:
+                    cv.config(bg=self._COLORS_CYCLE[self._color_idx])
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self._update_mode_ui()
+
+    def _mode_text(self):
+        try:
+            total = len(self._COLORS_CYCLE) + 1
+            if getattr(self, "_show_gradient", False):
+                return f"Gradient {total}/{total} — banding check"
+            idx = int(getattr(self, "_color_idx", 0) or 0)
+            col = self._COLORS_CYCLE[idx % len(self._COLORS_CYCLE)]
+            return f"Solid {idx % len(self._COLORS_CYCLE) + 1}/{total} {col}"
+        except Exception:
+            return ""
+
+    def _set_btn_text(self, btn, text):
+        try:
+            if btn is None:
+                return
+            try:
+                btn.config_text(text)
+            except Exception:
+                try:
+                    btn._text = text
+                    try:
+                        btn._measure()
+                    except Exception:
+                        pass
+                    try:
+                        btn._draw()
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _update_mode_ui(self):
+        """Keep swatch label + Auto buttons (main + fullscreen) showing
+        the same state so the two surfaces never diverge."""
+        try:
+            txt = self._mode_text()
+        except Exception:
+            txt = ""
+        try:
+            if getattr(self, "_mode_lbl", None) is not None:
+                self._mode_lbl.config(text=txt)
+        except Exception:
+            pass
+        try:
+            ms = int(getattr(self, "_auto_ms", 0) or 0)
+            label = "Auto Cycle: Off" if not ms else "Auto Cycle: On"
+            self._set_btn_text(getattr(self, "_auto_btn", None), label)
+            self._set_btn_text(getattr(self, "_fs_auto_btn", None), label)
+            # Green = on, red = off so the state reads at a glance.
+            # Only restyle on actual change — redrawing the button canvas
+            # on every color step flickered over the transition.
+            for _b in (getattr(self, "_auto_btn", None),
+                       getattr(self, "_fs_auto_btn", None)):
+                try:
+                    if _b is None:
+                        continue
+                    want_bg = COLORS["accent_green"] if ms else COLORS["accent_red"]
+                    if getattr(_b, "_bg", None) == want_bg:
+                        continue
+                    if ms:
+                        _b.set_style(bg=COLORS["accent_green"], fg=COLORS["black"],
+                                     hover_bg=_hex_lerp(COLORS["accent_green"], "#FFFFFF", 0.08))
+                    else:
+                        _b.set_style(bg=COLORS["accent_red"], fg="#FFFFFF",
+                                     hover_bg=_hex_lerp(COLORS["accent_red"], "#FFFFFF", 0.08))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_fs_mode_lbl", None) is not None:
+                try:
+                    if self._fs_mode_lbl.winfo_exists():
+                        self._fs_mode_lbl.config(text=txt)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _advance_color(self):
+        """Step through all 7: 6 solids, then gradient, then back."""
+        try:
+            if getattr(self, "_show_gradient", False):
+                self._show_gradient = False
+                self._color_idx = (int(getattr(self, "_color_idx", 0) or 0) + 1) % len(self._COLORS_CYCLE)
+            else:
+                idx = int(getattr(self, "_color_idx", 0) or 0)
+                if idx >= len(self._COLORS_CYCLE) - 1:
+                    self._show_gradient = True
+                else:
+                    self._color_idx = idx + 1
+        except Exception:
+            pass
+        self._render_swatch()
+        self._sync_fullscreen()
 
     def _next_pixel_color(self):
-        self._color_idx = (self._color_idx + 1) % len(self._COLORS_CYCLE)
+        """Manual Cycle press: advance once and switch Auto off."""
         try:
-            self._pixel_cv.config(bg=self._COLORS_CYCLE[self._color_idx])
+            if int(getattr(self, "_auto_ms", 0) or 0):
+                self._auto_ms = 0
+                try:
+                    if getattr(self, "_auto_after", None) is not None:
+                        try:
+                            self._dlg.after_cancel(self._auto_after)
+                        except Exception:
+                            pass
+                    self._auto_after = None
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self._advance_color()
+
+    def _toggle_gradient(self):
+        """Jump straight to/from gradient (G shortcut in fullscreen)."""
+        self._show_gradient = not getattr(self, "_show_gradient", False)
+        self._render_swatch()
+        self._sync_fullscreen()
+
+    def _toggle_auto(self):
+        """Fixed-cadence auto-cycle On/Off (3s)."""
+        try:
+            cur = int(getattr(self, "_auto_ms", 0) or 0)
+            self._auto_ms = 0 if cur else int(self._AUTO_MS_ON)
+        except Exception:
+            self._auto_ms = 0
+        self._update_mode_ui()
+        self._schedule_auto()
+
+    def _schedule_auto(self):
+        try:
+            if getattr(self, "_auto_after", None) is not None:
+                try:
+                    self._dlg.after_cancel(self._auto_after)
+                except Exception:
+                    pass
+            self._auto_after = None
+        except Exception:
+            pass
+        try:
+            ms = int(getattr(self, "_auto_ms", 0) or 0)
+            if ms > 0:
+                self._auto_after = self._dlg.after(ms, self._auto_tick)
+        except Exception:
+            self._auto_after = None
+
+    def _auto_tick(self):
+        self._auto_after = None
+        try:
+            self._advance_color()
+        except Exception:
+            pass
+        self._schedule_auto()
+
+    def _paint_fullscreen_gradient(self, win):
+        """Draw a grayscale ramp on the fullscreen window for banding.
+
+        Only the test canvas is rebuilt — the autohide control bar is a
+        separate child and is left alone."""
+        try:
+            old = getattr(self, "_fs_canvas", None)
+            try:
+                if old is not None and old.winfo_exists():
+                    old.destroy()
+            except Exception:
+                pass
+            self._fs_canvas = None
+            try:
+                w = int(win.winfo_screenwidth() or 800)
+                h = int(win.winfo_screenheight() or 600)
+            except Exception:
+                w, h = 800, 600
+            cv = tk.Canvas(win, width=w, height=h, bd=0, highlightthickness=0,
+                           bg="#000000")
+            cv.pack(fill="both", expand=True)
+            steps = 64
+            for i in range(steps):
+                v = int(i * 255 / max(1, steps - 1))
+                col = f"#{v:02x}{v:02x}{v:02x}"
+                try:
+                    cv.create_rectangle(w * i / steps, 0, w * (i + 1) / steps, h,
+                                        fill=col, outline="")
+                except Exception:
+                    break
+            self._fs_canvas = cv
+            try:
+                self._raise_fs_bar()
+            except Exception:
+                pass
+            return cv
+        except Exception:
+            return None
+
+    def _clear_fullscreen_canvas(self):
+        try:
+            old = getattr(self, "_fs_canvas", None)
+            self._fs_canvas = None
+            try:
+                if old is not None and old.winfo_exists():
+                    old.destroy()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _sync_fullscreen(self):
+        """Push current swatch state to the open fullscreen window."""
+        try:
+            win = getattr(self, "_fullscreen_win", None)
+            if win is None:
+                return
+            try:
+                if not win.winfo_exists():
+                    self._fullscreen_win = None
+                    return
+            except Exception:
+                return
+            if getattr(self, "_show_gradient", False):
+                try:
+                    win.configure(bg="#000000")
+                except Exception:
+                    pass
+                self._paint_fullscreen_gradient(win)
+            else:
+                self._clear_fullscreen_canvas()
+                try:
+                    win.configure(bg=self._COLORS_CYCLE[self._color_idx])
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self._update_mode_ui()
+
+    def _build_fs_bar(self, win):
+        """Bottom-center controls overlay. Placed (not packed) so the test
+        surface keeps its full size underneath. Mirrors the main 3-button
+        row: Cycle / Auto / Exit."""
+        try:
+            bar = tk.Frame(win, bg=COLORS["bg"])
+            self._fs_mode_lbl = None
+            AnimatedButton(bar, text="Cycle", command=self._fs_cycle,
+                           bg=COLORS["surface"], fg=COLORS["text"],
+                           font=(F, 9, "bold"), padx=14, pady=6).pack(side="left", padx=4, pady=6)
+            self._fs_auto_btn = AnimatedButton(bar, text="Auto Cycle: Off",
+                                               command=self._toggle_auto,
+                                               bg=COLORS["surface"], fg=COLORS["text"],
+                                               font=(F, 9, "bold"), padx=14, pady=6)
+            self._fs_auto_btn.pack(side="left", padx=4, pady=6)
+            AnimatedButton(bar, text="Exit", command=self._close_fullscreen,
+                           bg=COLORS["surface"], fg=COLORS["text"],
+                           font=(F, 9, "bold"), padx=14, pady=6).pack(side="left", padx=4, pady=6)
+            self._fs_bar = bar
+            self._update_mode_ui()
+        except Exception:
+            self._fs_bar = None
+
+    def _fs_event_on_bar(self, ev):
+        """True if a fullscreen event came from the control bar (or one of
+        its buttons) rather than the test surface itself."""
+        try:
+            bar = getattr(self, "_fs_bar", None)
+            w = getattr(ev, "widget", None)
+            if bar is None or w is None:
+                return False
+            try:
+                if w == bar:
+                    return True
+            except Exception:
+                pass
+            try:
+                return str(w).startswith(str(bar))
+            except Exception:
+                return False
+        except Exception:
+            return False
+
+    def _fs_cycle(self, _e=None):
+        try:
+            self._next_pixel_color()
+        except Exception:
+            pass
+        try:
+            self._reset_fs_hide_timer()
+        except Exception:
+            pass
+
+    def _raise_fs_bar(self):
+        try:
+            bar = getattr(self, "_fs_bar", None)
+            if bar is not None and bar.winfo_exists():
+                try:
+                    bar.lift()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _show_fs_bar(self):
+        try:
+            win = getattr(self, "_fullscreen_win", None)
+            bar = getattr(self, "_fs_bar", None)
+            if win is None or bar is None:
+                return
+            try:
+                if not win.winfo_exists() or not bar.winfo_exists():
+                    return
+            except Exception:
+                return
+            try:
+                # Idempotent: re-placing + lifting an already-visible bar
+                # on every click caused visible flicker over the color
+                # change, so skip the redraw when it's already up.
+                if bar.winfo_manager() == "place":
+                    return
+            except Exception:
+                pass
+            try:
+                bar.place(relx=0.5, rely=1.0, anchor="s", y=-18)
+                bar.lift()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _hide_fs_bar(self):
+        self._fs_hide_after = None
+        try:
+            bar = getattr(self, "_fs_bar", None)
+            if bar is not None and bar.winfo_exists():
+                try:
+                    bar.place_forget()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _cancel_fs_hide_timer(self):
+        try:
+            if getattr(self, "_fs_hide_after", None) is not None:
+                try:
+                    win = getattr(self, "_fullscreen_win", None)
+                    if win is not None and win.winfo_exists():
+                        win.after_cancel(self._fs_hide_after)
+                    else:
+                        self._dlg.after_cancel(self._fs_hide_after)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self._fs_hide_after = None
+
+    def _reset_fs_hide_timer(self, _e=None):
+        """Show the bar on activity, hide it after idle. Taskbar-style."""
+        try:
+            self._show_fs_bar()
+            self._cancel_fs_hide_timer()
+        except Exception:
+            pass
+        try:
+            win = getattr(self, "_fullscreen_win", None)
+            ms = int(getattr(self, "_FS_HIDE_MS", 2500) or 2500)
+            if win is not None and win.winfo_exists():
+                try:
+                    self._fs_hide_after = win.after(ms, self._hide_fs_bar)
+                    return
+                except Exception:
+                    pass
+            self._fs_hide_after = self._dlg.after(ms, self._hide_fs_bar)
+        except Exception:
+            self._fs_hide_after = None
+
+    def _close_fullscreen(self, _e=None):
+        try:
+            self._cancel_fs_hide_timer()
+        except Exception:
+            pass
+        try:
+            win = getattr(self, "_fullscreen_win", None)
+            self._fullscreen_win = None
+            self._fs_bar = None
+            self._fs_auto_btn = None
+            self._fs_grad_btn = None
+            self._fs_mode_lbl = None
+            self._fs_canvas = None
+            if win is not None:
+                try:
+                    win.destroy()
+                except Exception:
+                    pass
         except Exception:
             pass
 
     def _open_fullscreen_pixels(self):
         try:
+            if getattr(self, "_fullscreen_win", None) is not None:
+                try:
+                    if self._fullscreen_win.winfo_exists():
+                        try:
+                            self._fullscreen_win.focus_force()
+                        except Exception:
+                            pass
+                        try:
+                            self._reset_fs_hide_timer()
+                        except Exception:
+                            pass
+                        return
+                except Exception:
+                    pass
+                self._close_fullscreen()
             win = tk.Toplevel(self._dlg)
             win.attributes("-fullscreen", True)
             win.attributes("-topmost", True)
-            win.configure(bg=self._COLORS_CYCLE[self._color_idx])
-            idx = {"i": self._color_idx}
+            win.configure(bg="#000000" if getattr(self, "_show_gradient", False)
+                          else self._COLORS_CYCLE[self._color_idx])
+            self._fullscreen_win = win
+            self._fs_canvas = None
+            self._fs_bar = None
+            if getattr(self, "_show_gradient", False):
+                self._paint_fullscreen_gradient(win)
+            self._build_fs_bar(win)
+            self._show_fs_bar()
+            self._reset_fs_hide_timer()
 
             def cycle(_e=None):
-                idx["i"] = (idx["i"] + 1) % len(self._COLORS_CYCLE)
-                self._color_idx = idx["i"]
+                # Clicks/keys on the control bar must not also trigger the
+                # window-level cycle — otherwise one press on Cycle/Auto/Exit
+                # advanced twice (skipped color = perceived jitter).
                 try:
-                    win.configure(bg=self._COLORS_CYCLE[idx["i"]])
+                    if self._fs_event_on_bar(_e):
+                        self._reset_fs_hide_timer()
+                        return
                 except Exception:
                     pass
+                self._next_pixel_color()
+                self._reset_fs_hide_timer()
 
-            def close(_e=None):
-                try:
-                    win.destroy()
-                except Exception:
-                    pass
-                self._fullscreen_win = None
+            def gradient(_e=None):
+                self._toggle_gradient()
+                self._reset_fs_hide_timer()
 
             win.bind("<Button-1>", cycle)
             win.bind("<space>", cycle)
-            win.bind("<Escape>", close)
-            self._fullscreen_win = win
+            win.bind("g", gradient)
+            win.bind("G", gradient)
+            win.bind("<Escape>", self._close_fullscreen)
+            win.bind("<Motion>", self._reset_fs_hide_timer)
+            win.bind("<Key>", self._reset_fs_hide_timer)
             try:
                 win.focus_force()
             except Exception:
@@ -11636,12 +12244,21 @@ class MonitorTestDialog(ThemedModal):
             pass
 
     def _stop(self):
-        if self._fullscreen_win is not None:
-            try:
-                self._fullscreen_win.destroy()
-            except Exception:
-                pass
-            self._fullscreen_win = None
+        try:
+            if getattr(self, "_auto_after", None) is not None:
+                try:
+                    self._dlg.after_cancel(self._auto_after)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self._auto_after = None
+        self._auto_ms = 0
+        try:
+            self._cancel_fs_hide_timer()
+        except Exception:
+            pass
+        self._close_fullscreen()
 
 
 class SpeakerTestDialog(ThemedModal):
@@ -11682,6 +12299,7 @@ class SpeakerTestDialog(ThemedModal):
         # poll loop self-rescheduled FROM the Tk thread drains it.
         self._audio_inbox = []
         self._audio_poll_after = None
+        self._dir_btns = {}  # play key -> AnimatedButton (for play highlight)
         super().__init__(parent, title="Speaker Test", accent=TAB_ACCENTS["Clean"])
         body = self.body
         tk.Label(body, text="Check each direction plays where it should.",
@@ -11693,8 +12311,29 @@ class SpeakerTestDialog(ThemedModal):
                                   bg=COLORS["bg"], fg=COLORS["subtext"],
                                   wraplength=640)
         self._stat_lbl.pack(pady=(0, 2))
+        # L/R identity check — separate from the 8-dir surround
+        # simulation below. Same tone, hard-panned: answers "is left
+        # actually plugged into left" without pitch tricks. Fixed equal
+        # widths so the pair reads symmetrical (text-measured canvases
+        # sized each glyph differently, like the 3x3 grid fix below).
+        lr = tk.Frame(body, bg=COLORS["bg"])
+        lr.pack(pady=(4, 10))
+        _lr_l = AnimatedButton(lr, text="\u25c0 LEFT",
+                               command=lambda: self._play_identity("L"),
+                               bg=COLORS["surface"], fg=COLORS["text"],
+                               font=(F, 10, "bold"), width=120, padx=22, pady=6)
+        _lr_l.pack(side="left", padx=4)
+        self._dir_btns["L"] = _lr_l
+        Tooltip(_lr_l, "Left speaker wiring check — same tone, hard-panned left")
+        _lr_r = AnimatedButton(lr, text="RIGHT \u25b6",
+                               command=lambda: self._play_identity("R"),
+                               bg=COLORS["surface"], fg=COLORS["text"],
+                               font=(F, 10, "bold"), width=120, padx=22, pady=6)
+        _lr_r.pack(side="left", padx=4)
+        self._dir_btns["R"] = _lr_r
+        Tooltip(_lr_r, "Right speaker wiring check — same tone, hard-panned right")
         grid = tk.Frame(body, bg=COLORS["bg"])
-        grid.pack(pady=(6, 4))
+        grid.pack(pady=(4, 4))
         try:
             from app.audio_out import DIRECTIONS as _DIRS
         except Exception:
@@ -11712,6 +12351,7 @@ class SpeakerTestDialog(ThemedModal):
         # buttons the exact same fixed pixel square sidesteps that
         # entirely — no stretch/redraw mismatch is possible.
         _SQ = 54
+        _SIM = {"SL", "SR", "RL", "RC", "RR"}
         for key, label, _pan, _db, _hz in _DIRS:
             r, c = _cells.get(key, (1, 1))
             b = AnimatedButton(grid, text=self._ARROWS.get(key, label),
@@ -11719,19 +12359,21 @@ class SpeakerTestDialog(ThemedModal):
                                bg=COLORS["surface"], fg=COLORS["text"],
                                font=(F, 16, "bold"), width=_SQ, height=_SQ)
             b.grid(row=r, column=c, padx=4, pady=4)
-            Tooltip(b, label)
+            self._dir_btns[key] = b
+            Tooltip(b, label + (" (simulated on stereo)" if key in _SIM else ""))
         _ctr = AnimatedButton(grid, text="\u25cf",
-                              command=lambda: self._play("FC"),
+                              command=lambda: self._play("FC", source="C"),
                               bg=COLORS["surface"], fg=COLORS["text"],
                               font=(F, 16, "bold"), width=_SQ, height=_SQ)
         _ctr.grid(row=1, column=1, padx=4, pady=4)
+        self._dir_btns["C"] = _ctr
         Tooltip(_ctr, "Center channel")
         for ci in range(3):
             grid.grid_columnconfigure(ci, weight=1, uniform="spkdirs")
         for ri in range(3):
             grid.grid_rowconfigure(ri, weight=1, uniform="spkdirs")
         ctl = tk.Frame(body, bg=COLORS["bg"])
-        ctl.pack(pady=(2, 0))
+        ctl.pack(pady=(12, 0))
         AnimatedButton(ctl, text="Sweep",
                        command=self._play_all,
                        bg=COLORS["surface"], fg=COLORS["text"],
@@ -11740,13 +12382,6 @@ class SpeakerTestDialog(ThemedModal):
                        command=self._stop_sweep,
                        bg=COLORS["surface"], fg=COLORS["text"],
                        font=(F, 9, "bold"), padx=22, pady=6).pack(side="left", padx=4)
-        tk.Label(body, text="Same loudness everywhere — position tells speakers apart. "
-                            "Side/rear simulated on stereo (rows differ in pitch).",
-                 font=(F, 8), bg=COLORS["bg"], fg=COLORS["subtext"],
-                 wraplength=520).pack(pady=(4, 0))
-        tk.Label(body, text="No sound? Check Sound Settings + OBS mixer before assuming hardware.",
-                 font=(F, 8), bg=COLORS["bg"], fg=COLORS["subtext"],
-                 wraplength=520).pack(pady=(2, 0))
         self._build_out_row()
         self.on_close(self._stop)
         self._poll_audio()
@@ -11801,12 +12436,12 @@ class SpeakerTestDialog(ThemedModal):
         self._out_var.set(pick or (names[0] if names else ""))
         try:
             import tkinter.ttk as _ttk
-            tk.Label(self._out_row, text="Test:", font=(F, 9, "bold"),
-                     bg=COLORS["bg"], fg=COLORS["text"]).pack(side="left")
+            tk.Label(self._out_row, text="Output Device:", font=(F, 9, "bold"),
+                     bg=COLORS["bg"], fg=COLORS["text"]).pack(pady=(0, 4))
             _ttk.Combobox(self._out_row, textvariable=self._out_var,
                           values=names, state="readonly",
-                          width=44, font=(F, 9)).pack(side="left", padx=(6, 0))
-            self._out_row.pack(pady=(6, 0))
+                          width=44, font=(F, 9)).pack()
+            self._out_row.pack(pady=(16, 0))
         except Exception:
             pass
 
@@ -11834,7 +12469,89 @@ class SpeakerTestDialog(ThemedModal):
         except Exception:
             pass
 
-    def _play(self, key, on_done=None):
+    def _highlight(self, key, on):
+        """Light one button green while its tone plays (Tk thread only —
+        called from button handlers and the inbox drain, never from the
+        audio worker). Each button lights only itself."""
+        try:
+            try:
+                b = (getattr(self, "_dir_btns", None) or {}).get(key)
+                if b is None:
+                    return
+                if on:
+                    b.set_style(bg=COLORS["accent_green"], fg=COLORS["black"],
+                                hover_bg=_hex_lerp(COLORS["accent_green"], "#FFFFFF", 0.08))
+                else:
+                    b.set_style(bg=COLORS["surface"], fg=COLORS["text"],
+                                hover_bg=_hex_lerp(COLORS["surface"], "#FFFFFF", 0.08))
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _clear_highlights(self):
+        try:
+            for k in list((getattr(self, "_dir_btns", None) or {})):
+                self._highlight(k, False)
+        except Exception:
+            pass
+
+    def _play_identity(self, side, on_done=None):
+        """Left/right wiring check: same 660Hz tone, hard-panned.
+
+        Separate from the 8-dir surround grid (which varies pitch to
+        fake position on stereo). Here position comes ONLY from pan,
+        so a reversed image means swapped wiring. Reuses the same
+        background-thread + inbox completion path as _play."""
+        try:
+            from app.audio_out import (directional_wav as _wav,
+                                       play_wav_on_device as _playdev,
+                                       play_wav_bytes as _playdef)
+        except Exception:
+            self._say("Audio engine unavailable on this PC.")
+            if on_done:
+                on_done()
+            return
+        side = "L" if str(side).upper().startswith("L") else "R"
+        label = "Left speaker" if side == "L" else "Right speaker"
+        pan = -1.0 if side == "L" else 1.0
+        self._say(f"Playing: {label}")
+        try:
+            data = _wav(pan, 0.0, freq_hz=660.0)
+        except Exception:
+            data = None
+        if not data:
+            self._say(f"Could not build {label} tone — check Sound Settings.")
+            if on_done:
+                on_done()
+            return
+        idx = self._target_index()
+        self._highlight(side, True)
+
+        def _worker():
+            with self._play_lock:
+                try:
+                    if idx is None:
+                        ok = _playdef(data)
+                    else:
+                        ok, _used_default = _playdev(data, idx)
+                except Exception:
+                    ok = False
+
+                def _finish():
+                    self._highlight(side, False)
+                    if not ok:
+                        self._say(f"Could not play {label} — check Sound Settings.")
+                    if on_done:
+                        on_done()
+                try:
+                    self._audio_inbox.append(_finish)
+                except Exception:
+                    pass
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _play(self, key, on_done=None, source=None):
         try:
             from app.audio_out import (DIRECTIONS as _DIRS,
                                        directional_wav as _wav,
@@ -11851,8 +12568,7 @@ class SpeakerTestDialog(ThemedModal):
                 on_done()
             return
         _k, label, pan, db, hz = spec
-        want = (self._out_var.get() or "").strip()
-        self._say(f"Playing: {label}" + (f" on {want}…" if want else "…"))
+        self._say(f"Playing: {label}")
         try:
             data = _wav(pan, db, freq_hz=hz)
         except Exception:
@@ -11863,6 +12579,8 @@ class SpeakerTestDialog(ThemedModal):
                 on_done()
             return
         idx = self._target_index()
+        hl = source or key
+        self._highlight(hl, True)
 
         # CT-005 audit fix: the actual device write + duration wait (up to
         # several seconds, busy-sleep) now happens on a background thread
@@ -11878,24 +12596,15 @@ class SpeakerTestDialog(ThemedModal):
                 try:
                     if idx is None:
                         ok = _playdef(data)
-                        msg = ((f"Played: {label}" + (f" on {want}." if want else ".")
-                               + " Heard it in the wrong place? Check wiring.")
-                              if ok else f"Could not play {label} — check Sound Settings.")
                     else:
-                        ok, used_default = _playdev(data, idx)
-                        if not ok:
-                            msg = f"Could not play {label} — check Sound Settings."
-                        elif used_default:
-                            msg = (f"Played: {label} on the default output "
-                                   f"(exact device not reachable) — heard it wrong? Check wiring.")
-                        else:
-                            msg = (f"Played: {label} on {want or 'picked output'} — "
-                                   f"heard it in the wrong place? Check wiring.")
+                        ok, _used_default = _playdev(data, idx)
                 except Exception:
-                    msg = f"Could not play {label} — check Sound Settings."
+                    ok = False
 
                 def _finish():
-                    self._say(msg)
+                    self._highlight(hl, False)
+                    if not ok:
+                        self._say(f"Could not play {label} — check Sound Settings.")
                     if on_done:
                         on_done()
                 # CT-005 refinement: post to the inbox (plain list append,
@@ -11914,7 +12623,6 @@ class SpeakerTestDialog(ThemedModal):
         except Exception:
             return
         if idx >= len(_DIRS):
-            self._say("Sweep done — every direction played once.")
             return
         # CT-005 audit fix: previously scheduled the next step on a blind
         # 700ms timer fired right after STARTING the current tone — now
@@ -11944,7 +12652,7 @@ class SpeakerTestDialog(ThemedModal):
             except Exception:
                 pass
             self._seq_after = None
-        self._say("Sweep stopped.")
+        self._clear_highlights()
 
     def _stop(self):
         self._sweep_active = False
@@ -12784,7 +13492,7 @@ class MouseTesterDialog(ThemedModal):
 class SpecsDialog(ThemedModal):
     """PC Specs: Speccy-style summary in plain words — left nav
     (Summary, OS, CPU, RAM, Board, Graphics, Storage, Audio, Network),
-    one-line facts on the right, Copy Summary for support posts.
+    one-line facts on the right, Copy Specs for support posts.
     Read-only engine (app/pc_specs.py); anything unreadable shows
     'Unknown', never a guess. No temperatures — those need a driver
     stdlib code can't honestly read."""
@@ -12818,8 +13526,8 @@ class SpecsDialog(ThemedModal):
         foot.pack(fill="x", pady=(8, 0))
         tk.Label(foot, text="Unknown = couldn't be read, never guessed.",
                  font=(F, 8), bg=COLORS["bg"], fg=COLORS["subtext"]).pack(side="left")
-        AnimatedButton(foot, text="Copy Summary",
-                       command=self._copy_summary,
+        AnimatedButton(foot, text="Copy Specs",
+                       command=self._copy_specs,
                        bg=COLORS["surface"], fg=COLORS["text"],
                        font=(F, 9, "bold"), padx=14, pady=6).pack(side="right")
         self._copy_note = tk.Label(foot, text="", font=(F, 8),
@@ -12902,10 +13610,16 @@ class SpecsDialog(ThemedModal):
         except Exception:
             self._rows([("Error", "Could not read this section.")])
 
-    def _copy_summary(self):
+    def _copy_specs(self):
+        """Copy the full specs report (support-ticket use case)."""
         try:
             from app import pc_specs as _sp
-            text = "\n".join(_sp.summary_lines())
+            try:
+                text = _sp.full_report_text()
+            except Exception:
+                text = "\n".join(_sp.summary_lines())
+            if not text:
+                raise ValueError("empty report")
             self._dlg.clipboard_clear()
             self._dlg.clipboard_append(text)
             self._copy_note.config(text="Copied!")

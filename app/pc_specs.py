@@ -533,3 +533,121 @@ def summary_lines():
     except Exception:
         pass
     return lines
+
+
+def full_report_lines():
+    """Every tab as plain lines for support tickets (Summary + 8 sections).
+
+    Mirrors what PCSpecsDialog._show renders, but as text — same getters,
+    same Unknown fallbacks, same never-raises contract. Display-now comes
+    from the same tweak_tasks query the Graphics tab uses (lazy import,
+    optional). Never raises; [] only if nothing at all was readable."""
+    lines = []
+    try:
+        import time as _time
+        lines.append("Cleaner Tool — PC Specs (full report)")
+        try:
+            lines.append("Generated: " + _time.strftime("%Y-%m-%d %H:%M:%S"))
+        except Exception:
+            pass
+        lines.append("")
+        for _s in (summary_lines() or []):
+            lines.append(_s)
+        lines.append("")
+        try:
+            cap, build = os_info()
+            lines.append("[OS]")
+            lines.append(f"Operating System: {cap or 'Unknown'}")
+            lines.append(f"Version: {build or 'Unknown'}")
+            lines.append("")
+        except Exception:
+            pass
+        try:
+            name, detail = cpu_info()
+            lines.append("[CPU]")
+            lines.append(f"Processor: {name or 'Unknown'}")
+            lines.append(f"Speed / Cores: {detail or 'Unknown'}")
+            lines.append("")
+        except Exception:
+            pass
+        try:
+            head, detail = ram_info()
+            lines.append("[RAM]")
+            lines.append(f"Memory: {head or 'Unknown'}")
+            lines.append(f"Available: {detail or 'Unknown'}")
+            lines.append("")
+        except Exception:
+            pass
+        try:
+            name, detail = board_info()
+            lines.append("[Board]")
+            lines.append(f"Motherboard: {name or 'Unknown'}")
+            lines.append(f"Firmware: {detail or 'Unknown'}")
+            lines.append("")
+        except Exception:
+            pass
+        try:
+            gpus = gpu_info() or []
+            lines.append("[Graphics]")
+            if gpus:
+                for i, g in enumerate(gpus):
+                    lines.append(f"GPU {i + 1}: {g}")
+            else:
+                lines.append("Graphics: Unknown")
+            try:
+                from app.tasks.tweak_tasks import _query_video_mode_list
+                cur, _mx = _query_video_mode_list()
+                if cur and cur[0] and cur[1]:
+                    lines.append(f"Display now: {cur[0]}x{cur[1]} @ {cur[2]}Hz")
+            except Exception:
+                pass
+            lines.append("")
+        except Exception:
+            pass
+        try:
+            disks = storage_info() or []
+            lines.append("[Storage]")
+            if disks:
+                for d in disks:
+                    try:
+                        label = f"{d.get('drive', '')} {d.get('label', '')}".strip()
+                        fs = f" · {d['fs']}" if d.get("fs") else ""
+                        lines.append(f"{label or 'Drive'}: "
+                                     f"{_gb(d.get('free', 0))} free of "
+                                     f"{_gb(d.get('total', 0))}{fs}")
+                    except Exception:
+                        continue
+            else:
+                lines.append("Drives: Unknown")
+            lines.append("")
+        except Exception:
+            pass
+        try:
+            names = audio_info() or []
+            lines.append("[Audio]")
+            if names:
+                for i, n in enumerate(names):
+                    lines.append(f"Output {i + 1}: {n}")
+            else:
+                lines.append("Audio: Unknown")
+            lines.append("")
+        except Exception:
+            pass
+        try:
+            name, dns = net_info()
+            lines.append("[Network]")
+            lines.append(f"Computer: {name or 'Unknown'}")
+            lines.append(f"Network: {dns or 'Unknown'}")
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return lines
+
+
+def full_report_text():
+    """full_report_lines() joined for clipboard/file. Never raises."""
+    try:
+        return "\n".join(full_report_lines())
+    except Exception:
+        return ""

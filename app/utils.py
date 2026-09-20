@@ -162,6 +162,49 @@ def atomic_write_text(dest: str, content: str, newline: str = "\n",
 import threading
 import queue
 
+
+def exclusive_create_text(dest: str, content: str, newline: str = "\n") -> bool:
+    """Create `dest` with `content` ONLY if nothing already exists there,
+    atomically (SEC-001 audit fix). The old hosts-backup call site did
+    `if not os.path.isfile(path): open(path, "w")` — a plain check-then-write
+    with a window between the two, and a plain "w" open follows a symlink if
+    one is already sitting at that path rather than refusing it. A low-priv
+    local process (this tool runs elevated) could plant a symlink at the
+    backup path pointing at an arbitrary protected file; either race would
+    make the "one-time backup" write clobber that target instead. This uses
+    O_CREAT|O_EXCL (a single atomic syscall — no separate check to race) plus
+    an explicit _is_reparse_point rejection for a clear, logged failure
+    reason, consistent with how the rest of this module already refuses to
+    walk/delete through junctions and symlinks.
+
+    Returns True if created; False if something was already there (an
+    existing real backup, or someone else's file/symlink) — the caller
+    should treat "already existed" as "nothing to do", not an error.
+    Raises on any other failure (permissions, disk full, etc.)."""
+    dest = os.path.normpath(dest)
+    if _is_reparse_point(dest) or os.path.exists(dest):
+        return False
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    try:
+        fd = os.open(dest, flags, 0o600)
+    except FileExistsError:
+        return False
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline=newline) as fh:
+            fh.write(content)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except Exception:
+                pass
+        return True
+    except Exception:
+        try:
+            os.remove(dest)
+        except Exception:
+            pass
+        raise
+
 # Track the currently running subprocess per worker thread so it can be killed on user cancel.
 # Use a global registry keyed by thread ident so the main (GUI) thread can cancel
 # a command running in the worker thread.
@@ -403,12 +446,30 @@ def run_cmd(ctx: TaskContext, command: str, shell: bool = True, timeout: Optiona
             # give up waiting (returning -1) rather than blocking forever
             # if the process somehow never reaps.
             wait_start = time.time()
+            # REL-001 audit fix: this used to give up (and kill) exactly 30s
+            # after EOF unconditionally, ignoring whatever `timeout=` the
+            # caller had already agreed to — silently overriding a longer
+            # budget with a shorter, unrelated one. sfc/DISM run with
+            # timeout=600-1800 specifically because they're slow; a build
+            # that finishes printing output at t=1750s but takes a further
+            # 31s for Windows to actually reap the process (final log
+            # writes, handle release) got force-killed and reported FAILED
+            # at t=1780s, inside its own 1800s budget. Continue counting
+            # against that SAME budget (elapsed since the command started,
+            # not a fresh clock since EOF) when the caller gave one; only
+            # fall back to the original 30s cap when they didn't, since
+            # nothing else would ever bound an unbounded call in that case.
+            # Never LESS patient than the old flat 30s, only ever more.
+            if timeout is not None:
+                deadline = start_time + max(timeout, 30)
+            else:
+                deadline = wait_start + 30
             while proc.poll() is None:
                 if ctx.cancelled():
                     _kill_proc(proc)
                     ctx.log("  ! command cancelled")
                     return -1
-                if time.time() - wait_start > 30:
+                if time.time() > deadline:
                     ctx.log("  ! process did not exit after command completed — giving up wait")
                     # audit fix: a give-up WITHOUT a kill orphans a running
                     # process the cancel registry no longer tracks (the
@@ -637,6 +698,13 @@ _TYPE_MAP = {
     "REG_MULTI_SZ": winreg.REG_MULTI_SZ if IS_WINDOWS else None,
 }
 
+# CT-001 audit fix: reverse lookup so a snapshot can record the ACTUAL prior
+# winreg type (from QueryValueEx) instead of guessing. Without this, reverting
+# a value that was never given an explicit spec type got stamped REG_DWORD by
+# default even when the real prior value was REG_SZ, and restoring a string
+# under REG_DWORD raises inside winreg.SetValueEx (revert fails outright).
+_TYPE_MAP_REV = {v: k for k, v in _TYPE_MAP.items() if v is not None}
+
 # F13 sentinel: value exists but is unreadable (access denied). Distinct
 # from None (absent) so snapshots never record "absent" for denied keys.
 _REG_DENIED = object()
@@ -724,34 +792,46 @@ def reg_delete_value(ctx: TaskContext, hive: str, path: str, name: str) -> bool:
                 pass
 
 
-def reg_get_value(ctx: TaskContext, hive: str, path: str, name: str):
-    """Read a registry value. Returns the value; None if the key/value
-    doesn't exist; _REG_DENIED if it exists but can't be read (F13:
-    missing vs denied must not collapse — a denied prior snapshotted as
-    absent made revert DELETE a pre-existing value)."""
+def reg_get_value_typed(ctx: TaskContext, hive: str, path: str, name: str):
+    """Read a registry value AND its real winreg type (CT-001 audit fix).
+    Returns (value, type_name) where type_name is one of _TYPE_MAP's keys
+    (e.g. "REG_SZ"), or None if the type has no name in _TYPE_MAP. Value
+    is None if the key/value doesn't exist; _REG_DENIED if it exists but
+    can't be read (F13: missing vs denied must not collapse — a denied
+    prior snapshotted as absent made revert DELETE a pre-existing value).
+    In both of those cases type_name is None (nothing was queried)."""
     key = None
     try:
         root = _HIVES[hive]
         key = winreg.OpenKey(root, path, 0, _reg_access(write=False))
-        value, _ = winreg.QueryValueEx(key, name if name else None)
-        return value
+        value, vtype = winreg.QueryValueEx(key, name if name else None)
+        return value, _TYPE_MAP_REV.get(vtype)
     except FileNotFoundError:
-        return None
+        return None, None
     except PermissionError:
-        return _REG_DENIED
+        return _REG_DENIED, None
     except OSError as exc:
         # ERROR_ACCESS_DENIED == 5 (winerror); errnos vary by SKU.
         if getattr(exc, "winerror", None) == 5 or getattr(exc, "errno", None) in (5, 13):
-            return _REG_DENIED
-        return None
+            return _REG_DENIED, None
+        return None, None
     except Exception:
-        return None
+        return None, None
     finally:
         if key is not None:
             try:
                 winreg.CloseKey(key)
             except Exception:
                 pass
+
+
+def reg_get_value(ctx: TaskContext, hive: str, path: str, name: str):
+    """Read a registry value. Returns the value; None if the key/value
+    doesn't exist; _REG_DENIED if it exists but can't be read (F13:
+    missing vs denied must not collapse — a denied prior snapshotted as
+    absent made revert DELETE a pre-existing value)."""
+    value, _vtype = reg_get_value_typed(ctx, hive, path, name)
+    return value
 
 
 # --------------------------------------------------------------------------- #

@@ -38,7 +38,7 @@ from app.config import (
     APP_NAME, WINDOW_SIZE, WINDOW_MIN_SIZE, COLORS, FONT_FAMILY, APP_VERSION,
 )
 from app.elevation import is_admin, relaunch_as_admin
-from app.utils import TaskContext, TaskSkipped, TaskCancelled, format_bytes
+from app.utils import TaskContext, TaskSkipped, TaskCancelled, format_bytes, IS_WINDOWS
 from app.tab_presets import TABS, PRESETS, TAB_NAMES
 from app.toast import notify_clean_complete, notify_low_space, show_toast
 from app.warnings import check_dangerous_combos, check_info_notices
@@ -789,7 +789,14 @@ class ScorecardDialog(ThemedModal):
         self._mode = mode
         self._cancelled = bool(cancelled)
         self._total_bytes = total_bytes or 0
-        self._results = list(results or [])
+        # Audit fix (Scorecard "why failed"): results grew a 4th element
+        # (a short failure reason) but existing callers — including this
+        # file's own construction site above and several smoke-test
+        # fixtures — still pass 3-tuples. Normalize once here instead of
+        # requiring every caller to know about the new shape.
+        results = [tuple(r) + (None,) if len(r) < 4 else tuple(r)
+                   for r in (results or [])]
+        self._results = list(results)
         self._needs_reboot = bool(needs_reboot)
         self._gains = _drive_gains(before_drives, after_drives)
         tab_accent = TAB_ACCENTS.get(tab_name, COLORS["accent_green"])
@@ -805,10 +812,10 @@ class ScorecardDialog(ThemedModal):
 
         # counts straight from the per-task results (never from stale
         # counters — the dialog owns its own truth)
-        ok_n = sum(1 for _l, s, _b in results if s == "ok")
-        skip_n = sum(1 for _l, s, _b in results if s == "skip")
-        fail_n = sum(1 for _l, s, _b in results if s == "fail")
-        stop_n = sum(1 for _l, s, _b in results if s == "stop")
+        ok_n = sum(1 for _l, s, _b, _r in results if s == "ok")
+        skip_n = sum(1 for _l, s, _b, _r in results if s == "skip")
+        fail_n = sum(1 for _l, s, _b, _r in results if s == "fail")
+        stop_n = sum(1 for _l, s, _b, _r in results if s == "stop")
         self._counts = (ok_n, skip_n, fail_n, stop_n)
 
         super().__init__(parent, title=self._title,
@@ -921,8 +928,8 @@ class ScorecardDialog(ThemedModal):
         if not results:
             tk.Label(panel.inner, text="No tasks ran.", font=(F, 9),
                      bg=COLORS["bg_alt"], fg=COLORS["subtext"]).pack(pady=12)
-        for label, status, nbytes in results:
-            self._build_row(panel.inner, label, status, nbytes)
+        for label, status, nbytes, reason in results:
+            self._build_row(panel.inner, label, status, nbytes, reason)
         # settle scroll metrics NOW (ctor-time) so scroll_enabled is
         # correct even before the canvas ever maps — the harness asserts
         # on it without pumping Configure events
@@ -975,26 +982,47 @@ class ScorecardDialog(ThemedModal):
             "stop": ("◦", COLORS["accent_yellow"]),
         }.get(status, ("•", COLORS["subtext"]))
 
-    def _build_row(self, parent, label, status, nbytes):
+    def _build_row(self, parent, label, status, nbytes, reason=None):
         """One compact one-liner: status glyph | task label (+ plain-
         language suffix for skip/fail/stop) | bytes freed (right). Same
-        bg_alt row look as the preset summary cells."""
+        bg_alt row look as the preset summary cells.
+
+        Audit fix ("why failed"): a failed row used to just say "— failed
+        (see log)" — technically true but meant re-opening the text log
+        and hunting for the matching line to find out what actually went
+        wrong. The real reason was already being captured (and logged)
+        right at the point of failure; it just never rode along into the
+        Scorecard's own results. Show a short version inline (tooltip
+        carries the full text — some exception messages run long)."""
         glyph, gcolor = self._glyphs(status)
         row = tk.Frame(parent, bg=COLORS["bg_alt"])
         tk.Label(row, text=glyph, font=(F, 9, "bold"), bg=COLORS["bg_alt"],
                  fg=gcolor, width=2, anchor="w").pack(side="left")
         text, fg = label, COLORS["text"]
+        full_reason = None
         if status == "skip":
             text += "  — nothing to do"
             fg = COLORS["subtext"]
+            full_reason = reason
         elif status == "fail":
-            text += "  — failed (see log)"
+            if reason:
+                short = reason if len(reason) <= 60 else reason[:57] + "…"
+                text += f"  — {short}"
+                full_reason = reason
+            else:
+                text += "  — failed (see log)"
         elif status == "stop":
             text += "  — stopped"
             fg = COLORS["subtext"]
-        tk.Label(row, text=text, font=(F, 9), bg=COLORS["bg_alt"], fg=fg,
-                 anchor="w", justify="left",
-                 wraplength=400).pack(side="left", padx=(2, 0))
+        lbl = tk.Label(row, text=text, font=(F, 9), bg=COLORS["bg_alt"], fg=fg,
+                       anchor="w", justify="left",
+                       wraplength=400)
+        lbl.pack(side="left", padx=(2, 0))
+        if full_reason:
+            try:
+                Tooltip(lbl, full_reason)
+            except Exception:
+                pass
         if nbytes and nbytes > 0:
             tk.Label(row, text=format_bytes(nbytes), font=(F, 9, "bold"),
                      bg=COLORS["bg_alt"],
@@ -1083,12 +1111,18 @@ class ScorecardDialog(ThemedModal):
             lines.append("Restart needed for some changes to take effect.")
         if self._results:
             lines.append("")
-            for label, status, nbytes in self._results:
+            for label, status, nbytes, reason in self._results:
                 word = {"ok": "done", "skip": "nothing to do",
                         "fail": "failed", "stop": "stopped"}.get(status, status)
                 row = "  %s — %s" % (label, word)
                 if nbytes and nbytes > 0:
                     row += " (%s)" % format_bytes(nbytes)
+                # Audit fix ("why failed"): include the actual reason in the
+                # copyable summary too — this text is what gets pasted into
+                # a support request/bug report, so the reason belongs here
+                # at least as much as in the dialog itself.
+                if status == "fail" and reason:
+                    row += ": %s" % reason
                 lines.append(row)
         return "\n".join(lines)
 
@@ -1204,25 +1238,31 @@ class StorageInsightDialog(ThemedModal):
         # live in a scroll panel taking exactly the remaining space.
         foot = tk.Frame(body, bg=COLORS["bg"])
         foot.pack(side="bottom", fill="x", pady=(10, 6))
+        # UI fix (Rescan clipping): status_lbl had no width limit, so a
+        # long status line could eat into the room the three buttons
+        # needed and push Rescan (packed closest to the label) partly
+        # off the edge of the fixed-width card. Capping it to wrap onto
+        # a second line instead guarantees the buttons always have their
+        # full width available.
         self._status_lbl = tk.Label(foot, text="Starting scan…", font=(F, 9),
                                     bg=COLORS["bg"], fg=COLORS["subtext"],
-                                    anchor="w")
+                                    anchor="w", justify="left", wraplength=340)
         self._status_lbl.pack(side="left")
         self._clean_btn = AnimatedButton(
             foot, text="Clean Selected", command=self._clean_selected,
             bg=TAB_ACCENTS["Clean"], fg=COLORS["black"],
-            font=(F, 9, "bold"), padx=18, pady=7)
+            font=(F, 9, "bold"), padx=16, pady=7)
         self._clean_btn.pack(side="right")
         self._clean_btn.set_enabled(False)
         self._bench_btn = AnimatedButton(foot, text="Benchmark", command=self._start_benchmark,
                                          bg=COLORS["surface"], fg=COLORS["text"],
-                                         font=(F, 9, "bold"), padx=18,
+                                         font=(F, 9, "bold"), padx=16,
                                          pady=7)
         self._bench_btn.pack(side="right", padx=(0, 8))
         Tooltip(self._bench_btn, "Measures this drive's real write/read speed (32MB temp file, removed afterwards)")
         AnimatedButton(foot, text="Rescan", command=self._start_scan,
                        bg=COLORS["surface"], fg=COLORS["text"],
-                       font=(F, 9, "bold"), padx=18,
+                       font=(F, 9, "bold"), padx=16,
                        pady=7).pack(side="right", padx=(0, 8))
 
         # honest footnote: what the estimates do NOT cover (above footer)
@@ -1568,9 +1608,19 @@ class StorageInsightDialog(ThemedModal):
             except Exception:
                 pass
         if not self._games:
+            # Audit note: verified this path is always reached (scan
+            # errors already collapse to games=[] in _scan_worker, not a
+            # stuck "Scanning…"). Wording enhanced per feedback to explain
+            # the likely reason (custom/portable installs aren't in the
+            # launcher libraries this scans) instead of a bare "not found".
             tk.Label(self._games_body, text="No game libraries detected on this PC.",
-                     font=(F, 9), bg=COLORS["bg"],
-                     fg=COLORS["subtext"]).pack(anchor="w", pady=6)
+                     font=(F, 9, "bold"), bg=COLORS["bg"],
+                     fg=COLORS["text"]).pack(anchor="w", pady=(6, 2))
+            tk.Label(self._games_body,
+                     text="Custom or portable installs outside a launcher's "
+                          "library folder won't show up here.",
+                     font=(F, 8), bg=COLORS["bg"], fg=COLORS["subtext"],
+                     wraplength=320, justify="left").pack(anchor="w")
             return
         shown = self._games[:self._MAX_GAMES]
         for g in shown:
@@ -2449,7 +2499,9 @@ class PilotDialog(ThemedModal):
                  fg=COLORS["subtext"], wraplength=680,
                  justify="left").pack(anchor="w")
 
-        # master switch row
+        # UI fix (less busy): master toggle + preset picker used to be two
+        # separate rows — merged onto one, since together they're really
+        # one sentence ("Watch for games, and run [preset] when one starts").
         mrow = tk.Frame(body, bg=COLORS["bg"])
         mrow.pack(fill="x", pady=(10, 0))
         self._enabled_var = tk.BooleanVar(
@@ -2458,28 +2510,23 @@ class PilotDialog(ThemedModal):
         tk.Label(mrow, text="Watch for games", font=(F, 10, "bold"),
                  bg=COLORS["bg"], fg=COLORS["text"]).pack(
                      side="left", padx=(10, 0))
+        tk.Label(mrow, text="Run:", font=(F, 9), bg=COLORS["bg"],
+                 fg=COLORS["text"]).pack(side="left", padx=(18, 0))
+        self._preset_var = tk.StringVar(value=preset)
+        combo = self._preset_combo = ttk.Combobox(
+            mrow, textvariable=self._preset_var,
+            values=self._preset_names, state="readonly",
+            width=14, font=(F, 9))
+        combo.pack(side="left", padx=(8, 0))
+        try:
+            combo.bind("<<ComboboxSelected>>", self._on_preset)
+        except Exception:
+            pass
         self._live_lbl = tk.Label(mrow, text="", font=(F, 9, "bold"),
                                   bg=COLORS["bg"], fg=COLORS["subtext"])
         self._live_lbl.pack(side="right")
         try:
             self._enabled_var.trace_add("write", self._on_toggle)
-        except Exception:
-            pass
-
-        # preset picker row
-        prow = tk.Frame(body, bg=COLORS["bg"])
-        prow.pack(fill="x", pady=(10, 0))
-        tk.Label(prow, text="When a game starts, run:",
-                 font=(F, 9), bg=COLORS["bg"],
-                 fg=COLORS["text"]).pack(side="left")
-        self._preset_var = tk.StringVar(value=preset)
-        combo = self._preset_combo = ttk.Combobox(
-            prow, textvariable=self._preset_var,
-            values=self._preset_names, state="readonly",
-            width=16, font=(F, 9))
-        combo.pack(side="left", padx=(8, 0))
-        try:
-            combo.bind("<<ComboboxSelected>>", self._on_preset)
         except Exception:
             pass
 
@@ -2504,23 +2551,17 @@ class PilotDialog(ThemedModal):
         self._games_body = tk.Frame(body, bg=COLORS["bg"])
         self._games_body.pack(fill="x", pady=(4, 0))
         # three ways to grow the watchlist (Phase-5): installed games,
-        # installed apps, and the classic drive browse for portable exes
+        # installed apps, and the classic drive browse for portable exes.
+        # UI fix (less clutter): collapsed the three separate buttons that
+        # used to sit here into one "+ Add games…" button with a small
+        # picker menu — same three ways in, one thing to look at.
         addrow = tk.Frame(body, bg=COLORS["bg"])
         addrow.pack(fill="x", pady=(6, 0))
-        AnimatedButton(addrow, text="+ Installed games…",
-                       command=self._pick_from_games,
+        self._add_btn = AnimatedButton(addrow, text="+ Add games…",
+                       command=self._open_add_menu,
                        bg=COLORS["surface"], fg=COLORS["text"],
-                       font=(F, 9), padx=14, pady=5).pack(side="left")
-        AnimatedButton(addrow, text="+ Installed apps…",
-                       command=self._pick_from_apps,
-                       bg=COLORS["surface"], fg=COLORS["text"],
-                       font=(F, 9), padx=14, pady=5).pack(
-                           side="left", padx=(8, 0))
-        AnimatedButton(addrow, text="+ Browse…",
-                       command=self._add_game,
-                       bg=COLORS["surface"], fg=COLORS["text"],
-                       font=(F, 9), padx=14, pady=5).pack(
-                           side="left", padx=(8, 0))
+                       font=(F, 9, "bold"), padx=16, pady=6)
+        self._add_btn.pack(side="left")
         # watch-all toggle (default ON for new users — user ruling
         # 2026-09-12; anyone whose config already carries a choice keeps
         # it. Detection is path-verified, never guessed.)
@@ -2543,6 +2584,69 @@ class PilotDialog(ThemedModal):
         except Exception:
             pass
         self._rebuild_game_rows()
+
+        # --- Manual session now (merged from the former Game Night card,
+        # audit fix: that card was a thin, easily-missed duplicate of this
+        # exact preset with no way to tell it apart from Auto-Pilot. Same
+        # tweaks, same apply/revert engine, same fresh-keys-only rule —
+        # just started by hand instead of by a detected game.) ---
+        # UI fix (less busy): header + description condensed to one line.
+        tk.Frame(body, bg=COLORS["hairline"], height=1).pack(
+            fill="x", pady=(12, 8))
+        tk.Label(body,
+                 text="Start a session now (optional) — same tweaks, "
+                      "End puts them back.",
+                 font=(F, 9, "bold"), bg=COLORS["bg"], fg=COLORS["text"],
+                 wraplength=680, justify="left", anchor="w").pack(
+                     fill="x", pady=(0, 6))
+        try:
+            from app.game_night import CLOSEABLE_APPS as _CLOSEABLE_APPS
+            from app.config_persist import get_game_night as _get_gn
+            gn = _get_gn() or {}
+        except Exception:
+            _CLOSEABLE_APPS, gn = (), {}
+        chosen = set(gn.get("close_apps") or [])
+        self._close_vars = {}
+        if _CLOSEABLE_APPS:
+            tk.Label(body, text="Also close while I play (optional)",
+                     font=(F, 9, "bold"), bg=COLORS["bg"],
+                     fg=COLORS["subtext"], anchor="w").pack(
+                         fill="x", pady=(0, 2))
+            # UI fix: this box was a cramped 110px showing barely 2 rows
+            # of a 6-row list, forcing a scrollbar for almost nothing.
+            # Space reclaimed above (merged toggle/preset row, condensed
+            # "Start a session now" text) goes straight here instead.
+            close_panel = ScrollableRoundedPanel(body)
+            close_panel.config(height=165)
+            close_panel.pack(fill="x", pady=(0, 8))
+            holder = close_panel.inner
+            for key, label, note, _exes in _CLOSEABLE_APPS:
+                row = tk.Frame(holder, bg=COLORS["bg_alt"])
+                var = tk.BooleanVar(value=(key in chosen))
+                self._close_vars[key] = var
+                ToggleSwitch(row, variable=var,
+                             command=self._save_close_choice).pack(
+                                 side="left", padx=(10, 10), pady=6)
+                text = tk.Frame(row, bg=COLORS["bg_alt"])
+                text.pack(side="left", fill="x", expand=True)
+                tk.Label(text, text=label, font=(F, 9, "bold"),
+                         bg=COLORS["bg_alt"], fg=COLORS["text"],
+                         anchor="w").pack(fill="x")
+                tk.Label(text, text=note, font=(F, 8), bg=COLORS["bg_alt"],
+                         fg=COLORS["subtext"], anchor="w").pack(fill="x")
+                row.pack(fill="x", pady=1)
+            try:
+                close_panel.refresh_scroll()
+            except Exception:
+                pass
+        mbrow = tk.Frame(body, bg=COLORS["bg"])
+        mbrow.pack(fill="x", pady=(2, 0))
+        self._manual_btn = AnimatedButton(
+            mbrow, text="", command=self._toggle_manual_session,
+            bg=COLORS["accent_green"], fg=COLORS["black"],
+            font=(F, 10, "bold"), padx=20, pady=8)
+        self._manual_btn.pack(side="left")
+        self._refresh_manual_btn()
 
         # honesty footer + Done
         tk.Label(body, text="Only watches while this app is open. Turning it off "
@@ -2683,6 +2787,23 @@ class PilotDialog(ThemedModal):
             pass
         self.refresh_live_status()
 
+    def _open_add_menu(self):
+        """Small popup menu for the three ways to grow the watchlist
+        (Phase-5) — collapsed from three separate buttons into one, per
+        user feedback that the row read as cluttered."""
+        try:
+            menu = tk.Menu(self._dlg, tearoff=0, bg=COLORS["surface"],
+                           fg=COLORS["text"], activebackground=TAB_ACCENTS["Tweak"],
+                           activeforeground=COLORS["black"], bd=0)
+            menu.add_command(label="Installed games…", command=self._pick_from_games)
+            menu.add_command(label="Installed apps…", command=self._pick_from_apps)
+            menu.add_command(label="Browse for a file…", command=self._add_game)
+            x = self._add_btn.winfo_rootx()
+            y = self._add_btn.winfo_rooty() + self._add_btn.winfo_height()
+            menu.tk_popup(x, y)
+        except Exception:
+            pass
+
     def _pick_from_games(self):
         """Searchable installed-games picker (Steam/Epic/GOG/Ubisoft/
         Riot/Xbox/EA via app.game_catalog). The enumeration runs in the
@@ -2816,6 +2937,51 @@ class PilotDialog(ThemedModal):
                                       fg=TAB_ACCENTS["Tweak"])
         except Exception:
             pass
+        self._refresh_manual_btn()
+
+    def _save_close_choice(self, *_a):
+        try:
+            from app.config_persist import set_game_night_close_apps
+            set_game_night_close_apps(
+                [k for k, v in self._close_vars.items() if v.get()])
+        except Exception:
+            pass
+
+    def _active_manual(self):
+        try:
+            from app.config_persist import get_game_night
+            return bool(get_game_night().get("active"))
+        except Exception:
+            return False
+
+    def _refresh_manual_btn(self):
+        """Reflect the actual on-disk session state — kept in sync from
+        refresh_live_status so this stays correct even if the session was
+        started/ended from somewhere other than this dialog's own button."""
+        try:
+            on = self._active_manual()
+            if on:
+                self._manual_btn.config_text("End session now")
+                self._manual_btn.set_style(
+                    bg=COLORS["accent_red"], fg="#FFFFFF",
+                    hover_bg=_hex_lerp(COLORS["accent_red"], "#FFFFFF", 0.08))
+            else:
+                self._manual_btn.config_text("Start session now")
+                self._manual_btn.set_style(
+                    bg=COLORS["accent_green"], fg=COLORS["black"],
+                    hover_bg=_hex_lerp(COLORS["accent_green"], "#FFFFFF", 0.08))
+        except Exception:
+            pass
+
+    def _toggle_manual_session(self):
+        try:
+            if self._active_manual():
+                self.app.end_game_night()
+            else:
+                self.app.start_game_night()
+        except Exception:
+            pass
+        self._refresh_manual_btn()
 
     def set_live_status(self, text, color=None):
         try:
@@ -4909,13 +5075,18 @@ class TaskTab(tk.Frame):
                      font=(F, 11), bg=COLORS["bg"], fg=COLORS["subtext"]).pack(expand=True)
             return
         keys = self.presets[self._selected_preset]
+        # UI fix: the title ("Minimal — 13 tasks") and blurb ("Safe speed
+        # basics, no risk.") used to stack on two rows, eating vertical
+        # space the scroll box below badly needed. One row, same info.
         head = tk.Frame(wrap, bg=COLORS["bg"])
-        head.pack(fill="x", pady=(2, 8))
+        head.pack(fill="x", pady=(2, 6))
         accent = TAB_ACCENTS[self.tab_name]
         tk.Label(head, text=f"{self._selected_preset} — {len(keys)} tasks",
-                 font=(F, 13, "bold"), bg=COLORS["bg"], fg=accent).pack(anchor="w")
-        tk.Label(head, text=self.PRESET_BLURBS.get(self._selected_preset, ""),
-                 font=(F, 10), bg=COLORS["bg"], fg=COLORS["subtext"]).pack(anchor="w")
+                 font=(F, 12, "bold"), bg=COLORS["bg"], fg=accent).pack(side="left")
+        blurb = self.PRESET_BLURBS.get(self._selected_preset, "")
+        if blurb:
+            tk.Label(head, text="  ·  " + blurb, font=(F, 9),
+                     bg=COLORS["bg"], fg=COLORS["subtext"]).pack(side="left")
 
         panel = ScrollableRoundedPanel(wrap)
         panel.pack(fill="both", expand=True)
@@ -4927,9 +5098,18 @@ class TaskTab(tk.Frame):
             dot = tk.Canvas(cell, width=8, height=8, bg=COLORS["bg_alt"], highlightthickness=0)
             dot.create_oval(1, 1, 7, 7, fill=TAB_ACCENTS[self.tab_name], outline="")
             dot.pack(side="left", padx=(0, 6), anchor="n")
+            # Audit fix (text clipping): wraplength used to be a fixed 215px
+            # set once here, but _regrid below picks 3, 4, OR 5 columns
+            # depending on window size — at 5 columns a cell can be well
+            # under 215px wide, so the label's text overflowed its cell and
+            # got visually clipped by the neighboring column (seen in
+            # screenshots: "Remove Old Drivers" / "Empty User Temp Fil…").
+            # Start at a safe narrow-column value; _regrid corrects it to
+            # the REAL column width every time it re-flows.
             lbl = tk.Label(cell, text=t.label, font=(F, 9), bg=COLORS["bg_alt"],
-                           fg=COLORS["text"], anchor="w", justify="left", wraplength=215)
+                           fg=COLORS["text"], anchor="w", justify="left", wraplength=150)
             lbl.pack(side="left", anchor="w")
+            cell._wrap_label = lbl  # so _regrid can retarget it per column width
             Tooltip(lbl, t.description)
             if getattr(t, "risk", "SAFE") == "REBOOT REQUIRED":
                 r = tk.Label(cell, text=" 🔄", font=("Segoe UI Emoji", 9), bg=COLORS["bg_alt"],
@@ -4995,6 +5175,16 @@ class TaskTab(tk.Frame):
                 best = 3
         cols = best
         r = 0
+        # Audit fix (text clipping): retarget every cell's label to the
+        # REAL width this layout pass just chose for `cols`, instead of the
+        # fixed 150/215px guess set at cell-creation time. Recomputed fresh
+        # from inner_w/cols here (not the loop's col_w variable above,
+        # which can be stale in the "nothing fit, use the widest that keeps
+        # cells readable" fallback branch). 12 = the cell's own grid padx
+        # (6+6); ~30 = the dot canvas (8px) + its padx (6) + slack for the
+        # optional trailing 🔄 reboot-required icon, so text never runs
+        # into either neighbor.
+        wrap_w = max(80, (inner_w // cols) - 12 - 30)
         for hdr, bcells in blocks:
             if hdr is not None:
                 hdr.grid(row=r, column=0, columnspan=cols, sticky="ew",
@@ -5003,6 +5193,12 @@ class TaskTab(tk.Frame):
             for i, (cell, _t) in enumerate(bcells):
                 rr, cc = divmod(i, cols)
                 cell.grid(row=r + rr, column=cc, sticky="nw", padx=6, pady=2)
+                lbl = getattr(cell, "_wrap_label", None)
+                if lbl is not None:
+                    try:
+                        lbl.config(wraplength=wrap_w)
+                    except Exception:
+                        pass
             r += (len(bcells) + cols - 1) // cols
         for c in range(cols):
             panel.inner.grid_columnconfigure(c, weight=1, uniform="grid")
@@ -6426,17 +6622,12 @@ class InstallTab(tk.Frame):
         )
         self.install_btn.pack(side="left", padx=6)
         self.install_btn.set_enabled(False)  # gray until something is picked
-        # Feature 7: save/restore the whole pick in one place. Deliberately
-        # a quiet surface-colour pill — it sits beside the two coloured
-        # action buttons without competing with them.
-        self._profiles_btn = AnimatedButton(
-            _btns, text="My Setups", command=self._open_profiles,
-            bg=COLORS["surface"], fg=COLORS["text"],
-            font=(F, 12, "bold"), padx=20, pady=11,
-        )
-        self._profiles_btn.pack(side="left", padx=6)
-        Tooltip(self._profiles_btn,
-                "Save the apps you ticked, and load them back any time")
+        # "My Setups" (feature 7) removed from the Install tab per user
+        # request — the save/restore profile button next to Install/Update
+        # wasn't needed. _open_profiles() and the profiles storage stay in
+        # place (harmless, still reachable if a future surface wants them);
+        # self._profiles_btn is simply never created, and the guard at
+        # set_run_enabled() already handles that via getattr(..., None).
 
         panel = ScrollableRoundedPanel(self)
         panel.pack(fill="both", expand=True, padx=26, pady=6)
@@ -6465,7 +6656,7 @@ class InstallTab(tk.Frame):
             if _g not in _seen_groups:
                 _seen_groups.append(_g)
         _group_subs = {
-            "LTSC Missing Components": "— the Store, winget, Xbox, Game Bar & codecs that LTSC strips out",
+            "LTSC Missing Components": "— the Store, Xbox, Game Bar, codecs & everyday apps that LTSC strips out",
             "Essentials": "— one-click runtime bundles: check them all, no version guessing",
         }
 
@@ -7167,12 +7358,14 @@ class InstallTab(tk.Frame):
         tasks = [s for kind, s in selected if kind == "task"]
         self.app.install_selected_mixed(apps, tasks)
 
-    def _row_icon(self, row, app_name, size=22):
+    def _row_icon(self, row, app_name, size=32):
         """App icon label for a catalog row (user call: logos next to
-        names, big enough to read). Loads app/assets/apps/<name>.png
-        once and caches the PhotoImage (anti-GC, tab-icon pattern);
-        subsamples to a ~22px box so every row stays the same height.
-        Missing file -> fixed-width spacer so names never misalign."""
+        names, big enough to read — bumped from 22 to 32px per user
+        feedback that the old size was hard to make out). Loads
+        app/assets/apps/<name>.png once and caches the PhotoImage (anti-GC,
+        tab-icon pattern); subsamples to a ~size px box so every row stays
+        the same height. Missing file -> fixed-width spacer so names
+        never misalign."""
         try:
             cache = self.__dict__.setdefault("_icon_cache", {})
             if app_name not in cache:
@@ -9642,6 +9835,13 @@ class GamepadDialog(ThemedModal):
         self._weak_var = None
         self._strong_var = None
         self._rumble_after = None
+        # UI fix: pad artwork read too small, and the LT/RT bars sat too
+        # thin/close under their %-text. Bumped the artwork's subsample
+        # from /4 (300px) to /3 (400px) — every overlay coordinate below
+        # (buttons, sticks, trigger bars) was measured at the old /4 scale
+        # and is multiplied by _SCALE at draw time so nothing drifts out
+        # of alignment with the bigger image.
+        self._SCALE = 4.0 / 3.0
         super().__init__(parent, title="Gamepad Tester",
                          accent=TAB_ACCENTS["Clean"])
         body = self.body
@@ -9653,10 +9853,11 @@ class GamepadDialog(ThemedModal):
         # drawn right above the shoulders (LT left, RT right). Artwork is
         # the white-outline Xbox stock (Noun Project, CC BY — credited in
         # code) at app/assets/gamepad_outline.png, 1200x1200, shown
-        # subsampled /4 (300px). Button zones were measured off the
-        # artwork's pixel clusters.
+        # subsampled /3 (400px). Button zones were measured off the
+        # artwork's pixel clusters at /4 and scaled up by _SCALE.
         self._trig_views = []  # (fill_id, track_tuple, pct_item, canvas)
-        self._pad_cv = tk.Canvas(body, width=300, height=300,
+        _pad_px = int(300 * self._SCALE)
+        self._pad_cv = tk.Canvas(body, width=_pad_px, height=_pad_px,
                                  bg=COLORS["bg"], bd=0, highlightthickness=0)
         self._pad_cv.pack(pady=(0, 2))
         self._overlay_triggers()
@@ -9736,29 +9937,33 @@ class GamepadDialog(ThemedModal):
             path = None
         if path is None:
             raise FileNotFoundError("gamepad_outline.png")
-        img = _tk.PhotoImage(file=str(path)).subsample(4, 4)
+        img = _tk.PhotoImage(file=str(path)).subsample(3, 3)
         self._pad_img = img  # kept: Tk unmaps otherwise
         self._pad_cv.create_image(0, 0, anchor="nw", image=img)
-        # overlays: transparent idle, green press (coords = orig/4)
+        S = self._SCALE
+        # overlays: transparent idle, green press (coords measured at
+        # orig/4, scaled up by S to line up with the bigger orig/3 image)
         for cx, cy, name in ((229, 84, "Y"), (209, 104, "X"),
                              (249, 104, "B"), (229, 124, "A")):
-            self._ov_circle(cx, cy, 12, name)
+            self._ov_circle(cx * S, cy * S, 12 * S, name)
         for x0, y0, x1, y1, name in ((105, 129, 124, 141, "Up"),
                                      (105, 163, 124, 175, "Down"),
                                      (91, 143, 103, 161, "Left"),
                                      (126, 143, 137, 161, "Right"),
                                      (124, 96, 139, 112, "Back"),
                                      (168, 96, 183, 112, "Start")):
-            self._ov_rect(x0, y0, x1, y1, name)
-        self._ov_poly(((68, 50), (89, 50), (98, 56), (98, 61),
-                       (63, 66), (49, 66), (44, 61), (46, 55)), "LB")
-        self._ov_poly(((233, 50), (211, 50), (202, 56), (202, 61),
-                       (238, 66), (252, 66), (256, 61), (254, 55)), "RB")
-        self._stick_l = self._ov_nub(78, 104)
-        self._stick_r = self._ov_nub(191, 149)
+            self._ov_rect(x0 * S, y0 * S, x1 * S, y1 * S, name)
+        self._ov_poly([(x * S, y * S) for x, y in
+                       ((68, 50), (89, 50), (98, 56), (98, 61),
+                        (63, 66), (49, 66), (44, 61), (46, 55))], "LB")
+        self._ov_poly([(x * S, y * S) for x, y in
+                       ((233, 50), (211, 50), (202, 56), (202, 61),
+                        (238, 66), (252, 66), (256, 61), (254, 55))], "RB")
+        self._stick_l = self._ov_nub(78 * S, 104 * S)
+        self._stick_r = self._ov_nub(191 * S, 149 * S)
         # stick-click flashes use the nub rings
-        self._ov_circle(78, 104, 11, "L-Stick")
-        self._ov_circle(191, 149, 11, "R-Stick")
+        self._ov_circle(78 * S, 104 * S, 11 * S, "L-Stick")
+        self._ov_circle(191 * S, 149 * S, 11 * S, "R-Stick")
 
     def _ov_circle(self, cx, cy, r, name):
         try:
@@ -9787,7 +9992,8 @@ class GamepadDialog(ThemedModal):
 
     def _ov_nub(self, cx, cy):
         try:
-            nub = self._pad_cv.create_oval(cx - 8, cy - 8, cx + 8, cy + 8,
+            r = 8 * self._SCALE
+            nub = self._pad_cv.create_oval(cx - r, cy - r, cx + r, cy + r,
                                            fill=COLORS["accent_green"], outline="")
             return (cx, cy, nub)
         except Exception:
@@ -9796,19 +10002,28 @@ class GamepadDialog(ThemedModal):
     def _overlay_triggers(self):
         """Horizontal LT/RT bars above the shoulders, drawn on the pad
         canvas itself: title + % share one caption row, fill sweeps
-        left-to-right with pressure."""
+        left-to-right with pressure.
+
+        UI fix: the bar used to be thin (8px) and sit right under the
+        title/% row (9px gap), reading as cramped. Thickened it and
+        pushed it further down for a clearer break from the text above —
+        same orig/4-then-scaled-by-S coordinate system as the rest of
+        the pad overlays."""
         cv = self._pad_cv
+        S = self._SCALE
+        text_y, bar_y0, bar_y1 = 13, 28, 40
         for title, x0, x1 in (("LT", 44, 140), ("RT", 160, 256)):
             try:
-                cv.create_text(x0, 13, text=title, font=(F, 9, "bold"),
+                x0s, x1s = x0 * S, x1 * S
+                cv.create_text(x0s, text_y * S, text=title, font=(F, 9, "bold"),
                                fill=COLORS["subtext"], anchor="w")
-                pct = cv.create_text(x1, 13, text="0%", font=(F, 9),
+                pct = cv.create_text(x1s, text_y * S, text="0%", font=(F, 9),
                                      fill=COLORS["subtext"], anchor="e")
-                cv.create_rectangle(x0, 22, x1, 30, fill=COLORS["surface"],
-                                    outline="")
-                fill = cv.create_rectangle(x0, 22, x0, 30,
+                cv.create_rectangle(x0s, bar_y0 * S, x1s, bar_y1 * S,
+                                    fill=COLORS["surface"], outline="")
+                fill = cv.create_rectangle(x0s, bar_y0 * S, x0s, bar_y1 * S,
                                            fill=COLORS["accent_green"], outline="")
-                self._trig_views.append((fill, (x0, 22, x1, 30), pct, cv))
+                self._trig_views.append((fill, (x0s, bar_y0 * S, x1s, bar_y1 * S), pct, cv))
             except Exception:
                 continue
 
@@ -9984,10 +10199,12 @@ class GamepadDialog(ThemedModal):
     def _paint_stick(self, view, x, y):
         try:
             cx, cy, nub = view
-            nx = max(-1.0, min(1.0, x / 32768.0)) * 10
-            ny = max(-1.0, min(1.0, y / 32768.0)) * 10
-            self._pad_cv.coords(nub, cx + nx - 8, cy - ny - 8,
-                                cx + nx + 8, cy - ny + 8)
+            S = getattr(self, "_SCALE", 1.0)
+            nx = max(-1.0, min(1.0, x / 32768.0)) * 10 * S
+            ny = max(-1.0, min(1.0, y / 32768.0)) * 10 * S
+            r = 8 * S
+            self._pad_cv.coords(nub, cx + nx - r, cy - ny - r,
+                                cx + nx + r, cy - ny + r)
         except Exception:
             pass
 
@@ -11150,103 +11367,88 @@ class MonitorTestDialog(ThemedModal):
 
     def __init__(self, parent, app):
         self.app = app
-        self._view = "info"
         self._color_idx = 0
         self._fullscreen_win = None
         super().__init__(parent, title="Monitor Test", accent=TAB_ACCENTS["Clean"])
         body = self.body
-        tabs = tk.Frame(body, bg=COLORS["bg"])
-        tabs.pack(fill="x", pady=(0, 8))
-        self._tab_btns = {}
-        for key, label in (("info", "Info"), ("pixels", "Dead Pixels")):
-            b = AnimatedButton(tabs, text=label, command=lambda k=key: self._switch(k),
-                               bg=COLORS["surface"], fg=COLORS["text"],
-                               font=(F, 9, "bold"), padx=14, pady=6)
-            b.pack(side="left", padx=(0, 6))
-            self._tab_btns[key] = b
-        self._content = tk.Frame(body, bg=COLORS["bg"])
-        self._content.pack(fill="both", expand=True)
+        # UI fix: this used to be two tab pages (Info / Dead Pixels) for
+        # what's really one small screen's worth of content — an extra
+        # click for nothing. Everything now lives on one row: resolution,
+        # max Hz at that resolution, and (when the panel's EDID is
+        # readable) the monitor's own model name, evenly spaced.
+        self._build_specs_row(body)
+        self._pixel_cv = tk.Canvas(body, width=680, height=260,
+                                   bg=self._COLORS_CYCLE[self._color_idx], bd=0,
+                                   highlightthickness=0)
+        self._pixel_cv.pack(pady=(4, 8))
+        row = tk.Frame(body, bg=COLORS["bg"])
+        row.pack()
+        AnimatedButton(row, text="Start Fullscreen",
+                       command=self._open_fullscreen_pixels,
+                       bg=COLORS["surface"], fg=COLORS["text"],
+                       font=(F, 9, "bold"), padx=16, pady=6).pack(side="left", padx=4)
+        AnimatedButton(row, text="Cycle Colors", command=self._next_pixel_color,
+                       bg=COLORS["surface"], fg=COLORS["text"],
+                       font=(F, 9, "bold"), padx=16, pady=6).pack(side="left", padx=4)
+        tk.Label(body,
+                 text="Fullscreen catches edge pixels a small swatch can miss. "
+                      "Click or Space to cycle color, Esc to close.",
+                 font=(F, 8), bg=COLORS["bg"], fg=COLORS["subtext"],
+                 wraplength=520).pack(pady=(8, 0))
         self.on_close(self._stop)
-        self._switch("info")
 
-    def _switch(self, key):
-        for child in self._content.winfo_children():
-            try:
-                child.destroy()
-            except Exception:
-                pass
-        self._view = key
-        if key == "info":
-            self._build_info()
-        else:
-            self._build_pixels()
-
-    def _build_info(self):
+    def _build_specs_row(self, body):
         try:
-            from app.tasks.tweak_tasks import _query_video_mode_list, _query_precise_refresh_rate
+            from app.tasks.tweak_tasks import (
+                _query_video_mode_list, _query_precise_refresh_rate,
+                _query_monitor_model)
             current, maximum = _query_video_mode_list()
             try:
                 precise = _query_precise_refresh_rate()
             except Exception:
                 precise = None
+            try:
+                model = _query_monitor_model()
+            except Exception:
+                model = None
         except Exception:
-            current, maximum, precise = None, None, None
-        rows = tk.Frame(self._content, bg=COLORS["bg"])
-        rows.pack(fill="x", pady=(12, 0))
-        for c in range(2):
+            current, maximum, precise, model = None, None, None, None
+        rows = tk.Frame(body, bg=COLORS["bg"])
+        rows.pack(fill="x", pady=(4, 2))
+        for c in range(3):
             rows.grid_columnconfigure(c, weight=1, uniform="moninfo")
 
         def stat(col, title, value):
             cell = tk.Frame(rows, bg=COLORS["bg"])
-            cell.grid(row=0, column=col, sticky="nsew", padx=20, pady=8)
+            cell.grid(row=0, column=col, sticky="nsew", padx=12, pady=6)
             tk.Label(cell, text=title, font=(F, 8), bg=COLORS["bg"],
                      fg=COLORS["subtext"]).pack()
-            tk.Label(cell, text=value, font=(F, 14, "bold"), bg=COLORS["bg"],
-                     fg=COLORS["text"]).pack()
+            tk.Label(cell, text=value, font=(F, 13, "bold"), bg=COLORS["bg"],
+                     fg=COLORS["text"], wraplength=180).pack()
 
-        if current:
+        if current and current[0] and current[1]:
             try:
                 w, h, hz, _bits = current
                 if precise and 20.0 < precise < 500.0:
-                    stat(0, "CURRENT MODE", f"{w}x{h} @ {precise:.2f}Hz")
+                    stat(0, "RESOLUTION", f"{w}x{h} @ {precise:.2f}Hz")
                 else:
-                    stat(0, "CURRENT MODE", f"{w}x{h} @ {hz}Hz")
+                    stat(0, "RESOLUTION", f"{w}x{h} @ {hz}Hz")
             except Exception:
-                stat(0, "CURRENT MODE", "?")
+                stat(0, "RESOLUTION", "?")
         else:
-            stat(0, "CURRENT MODE", "?")
+            stat(0, "RESOLUTION", "?")
         if maximum:
             try:
                 _mw, _mh, mhz, _b = maximum
-                stat(1, "MAX Hz AT THIS RES", f"{mhz}Hz" if mhz else "?")
+                stat(1, "MAX Hz HERE", f"{mhz}Hz" if mhz else "?")
             except Exception:
-                stat(1, "MAX Hz AT THIS RES", "?")
+                stat(1, "MAX Hz HERE", "?")
         else:
-            stat(1, "MAX Hz AT THIS RES", "?")
-        tk.Label(self._content,
+            stat(1, "MAX Hz HERE", "?")
+        stat(2, "MONITOR", model or "?")
+        tk.Label(body,
                  text="Unknown fields show '?' rather than a guess.",
-                 font=(F, 8), bg=COLORS["bg"], fg=COLORS["subtext"],
-                 wraplength=520).pack(pady=(12, 0))
-
-    def _build_pixels(self):
-        self._pixel_cv = tk.Canvas(self._content, width=680, height=320,
-                                   bg=self._COLORS_CYCLE[self._color_idx], bd=0,
-                                   highlightthickness=0)
-        self._pixel_cv.pack(pady=(8, 4))
-        row = tk.Frame(self._content, bg=COLORS["bg"])
-        row.pack()
-        AnimatedButton(row, text="Next Color", command=self._next_pixel_color,
-                       bg=COLORS["surface"], fg=COLORS["text"],
-                       font=(F, 9, "bold"), padx=14, pady=6).pack(side="left", padx=4)
-        AnimatedButton(row, text="Start Fullscreen",
-                       command=self._open_fullscreen_pixels,
-                       bg=COLORS["surface"], fg=COLORS["text"],
-                       font=(F, 9, "bold"), padx=14, pady=6).pack(side="left", padx=4)
-        tk.Label(self._content,
-                 text="Card view can miss edge pixels — Start opens a fullscreen "
-                      "color field. Click for next color, Esc to return.",
-                 font=(F, 8), bg=COLORS["bg"], fg=COLORS["subtext"],
-                 wraplength=520).pack(pady=(8, 0))
+                 font=(F, 8), bg=COLORS["bg"], fg=COLORS["subtext"]).pack(pady=(0, 2))
 
     def _next_pixel_color(self):
         self._color_idx = (self._color_idx + 1) % len(self._COLORS_CYCLE)
@@ -11316,6 +11518,26 @@ class SpeakerTestDialog(ThemedModal):
         self._out_var = tk.StringVar(value="")
         self._outs = []
         self._seq_after = None
+        # CT-005 audit fix: play_wav_on_device/play_wav_bytes block for the
+        # tone's duration + 2.0s in a busy-sleep. _play used to call them
+        # directly on the Tk callback thread, freezing the entire dialog
+        # (no repaint, no other clicks, can't even close it) for that whole
+        # time — and Sweep chained eight of these back-to-back. A lock
+        # keeps playback serialized (same audible behavior as before —
+        # never two tones on the device at once) while the actual wait
+        # happens off the Tk thread.
+        self._play_lock = threading.Lock()
+        self._sweep_active = False
+        # CT-005 audit fix (thread-safety refinement): calling self._dlg.after()
+        # directly FROM the background playback thread is not reliably safe —
+        # confirmed empirically (the scheduled callback silently never fired
+        # in testing) even though it raises no exception. Tkinter calls must
+        # come from the Tk thread. Use this codebase's own established
+        # pattern instead (see the test-tool worker/_poll pairs elsewhere in
+        # this file): the worker thread only appends to a plain list; a
+        # poll loop self-rescheduled FROM the Tk thread drains it.
+        self._audio_inbox = []
+        self._audio_poll_after = None
         super().__init__(parent, title="Speaker Test", accent=TAB_ACCENTS["Clean"])
         body = self.body
         tk.Label(body, text="Check each direction plays where it should.",
@@ -11336,22 +11558,34 @@ class SpeakerTestDialog(ThemedModal):
         _cells = {"FL": (0, 0), "FC": (0, 1), "FR": (0, 2),
                   "SL": (1, 0), "SR": (1, 2),
                   "RL": (2, 0), "RC": (2, 1), "RR": (2, 2)}
+        # UI fix (Rubik's-cube symmetry): AnimatedButton is a Canvas sized
+        # from its own text measurement — with no explicit width/height it
+        # sizes each glyph differently (↑ vs ↖ vs ● aren't the same width),
+        # and a Canvas doesn't repaint its contents to fill extra space a
+        # grid's sticky="nsew"/uniform stretching hands it. So every cell
+        # was the same OUTER size but each button's drawn pill inside it
+        # was a different size, reading as misaligned. Giving all nine
+        # buttons the exact same fixed pixel square sidesteps that
+        # entirely — no stretch/redraw mismatch is possible.
+        _SQ = 54
         for key, label, _pan, _db, _hz in _DIRS:
             r, c = _cells.get(key, (1, 1))
             b = AnimatedButton(grid, text=self._ARROWS.get(key, label),
                                command=lambda k=key: self._play(k),
                                bg=COLORS["surface"], fg=COLORS["text"],
-                               font=(F, 16, "bold"), padx=16, pady=6)
-            b.grid(row=r, column=c, padx=4, pady=4, sticky="nsew")
+                               font=(F, 16, "bold"), width=_SQ, height=_SQ)
+            b.grid(row=r, column=c, padx=4, pady=4)
             Tooltip(b, label)
         _ctr = AnimatedButton(grid, text="\u25cf",
                               command=lambda: self._play("FC"),
                               bg=COLORS["surface"], fg=COLORS["text"],
-                              font=(F, 16, "bold"), padx=16, pady=6)
-        _ctr.grid(row=1, column=1, padx=4, pady=4, sticky="nsew")
+                              font=(F, 16, "bold"), width=_SQ, height=_SQ)
+        _ctr.grid(row=1, column=1, padx=4, pady=4)
         Tooltip(_ctr, "Center channel")
         for ci in range(3):
             grid.grid_columnconfigure(ci, weight=1, uniform="spkdirs")
+        for ri in range(3):
+            grid.grid_rowconfigure(ri, weight=1, uniform="spkdirs")
         ctl = tk.Frame(body, bg=COLORS["bg"])
         ctl.pack(pady=(2, 0))
         AnimatedButton(ctl, text="Sweep",
@@ -11371,6 +11605,27 @@ class SpeakerTestDialog(ThemedModal):
                  wraplength=520).pack(pady=(2, 0))
         self._build_out_row()
         self.on_close(self._stop)
+        self._poll_audio()
+
+    def _poll_audio(self):
+        """Tk thread only: drain completions the background playback
+        thread(s) posted, then reschedule. Mirrors this file's existing
+        worker/_poll pairs — the only Tk-safe way to react to a background
+        thread's results."""
+        self._audio_poll_after = None
+        try:
+            inbox, self._audio_inbox = self._audio_inbox, []
+        except Exception:
+            inbox = []
+        for fn in inbox:
+            try:
+                fn()
+            except Exception:
+                pass
+        try:
+            self._audio_poll_after = self._dlg.after(80, self._poll_audio)
+        except Exception:
+            self._audio_poll_after = None
 
     def _build_out_row(self):
         """Test-target picker (NOT a default flip — playback goes to the
@@ -11435,7 +11690,7 @@ class SpeakerTestDialog(ThemedModal):
         except Exception:
             pass
 
-    def _play(self, key):
+    def _play(self, key, on_done=None):
         try:
             from app.audio_out import (DIRECTIONS as _DIRS,
                                        directional_wav as _wav,
@@ -11443,36 +11698,71 @@ class SpeakerTestDialog(ThemedModal):
                                        play_wav_bytes as _playdef)
         except Exception:
             self._say("Audio engine unavailable on this PC.")
+            if on_done:
+                on_done()
             return
         spec = next((d for d in _DIRS if d[0] == key), None)
         if spec is None:
+            if on_done:
+                on_done()
             return
         _k, label, pan, db, hz = spec
         want = (self._out_var.get() or "").strip()
         self._say(f"Playing: {label}" + (f" on {want}…" if want else "…"))
         try:
             data = _wav(pan, db, freq_hz=hz)
-            if not data:
-                self._say(f"Could not build {label} tone — check Sound Settings.")
-                return
-            idx = self._target_index()
-            if idx is None:
-                ok = _playdef(data)
-                self._say((f"Played: {label}" + (f" on {want}." if want else ".")
-                           + " Heard it in the wrong place? Check wiring.")
-                          if ok else f"Could not play {label} — check Sound Settings.")
-                return
-            ok, used_default = _playdev(data, idx)
-            if not ok:
-                self._say(f"Could not play {label} — check Sound Settings.")
-            elif used_default:
-                self._say(f"Played: {label} on the default output "
-                          f"(exact device not reachable) — heard it wrong? Check wiring.")
-            else:
-                self._say(f"Played: {label} on {want or 'picked output'} — "
-                          f"heard it in the wrong place? Check wiring.")
         except Exception:
-            self._say(f"Could not play {label} — check Sound Settings.")
+            data = None
+        if not data:
+            self._say(f"Could not build {label} tone — check Sound Settings.")
+            if on_done:
+                on_done()
+            return
+        idx = self._target_index()
+
+        # CT-005 audit fix: the actual device write + duration wait (up to
+        # several seconds, busy-sleep) now happens on a background thread
+        # instead of the Tk callback thread, so the dialog stays responsive
+        # (repaints, other buttons, Stop/close) while a tone plays. The
+        # lock keeps only one tone playing at a time, matching the old
+        # strictly-serial behavior; on_done (Sweep) is invoked only once
+        # this tone has actually finished, so the sweep's real cadence
+        # still matches the original — it doesn't just fire every 700ms
+        # regardless of whether the previous tone is still playing.
+        def _worker():
+            with self._play_lock:
+                try:
+                    if idx is None:
+                        ok = _playdef(data)
+                        msg = ((f"Played: {label}" + (f" on {want}." if want else ".")
+                               + " Heard it in the wrong place? Check wiring.")
+                              if ok else f"Could not play {label} — check Sound Settings.")
+                    else:
+                        ok, used_default = _playdev(data, idx)
+                        if not ok:
+                            msg = f"Could not play {label} — check Sound Settings."
+                        elif used_default:
+                            msg = (f"Played: {label} on the default output "
+                                   f"(exact device not reachable) — heard it wrong? Check wiring.")
+                        else:
+                            msg = (f"Played: {label} on {want or 'picked output'} — "
+                                   f"heard it in the wrong place? Check wiring.")
+                except Exception:
+                    msg = f"Could not play {label} — check Sound Settings."
+
+                def _finish():
+                    self._say(msg)
+                    if on_done:
+                        on_done()
+                # CT-005 refinement: post to the inbox (plain list append,
+                # safe from any thread under the GIL) instead of calling
+                # self._dlg.after() from this background thread directly.
+                try:
+                    self._audio_inbox.append(_finish)
+                except Exception:
+                    pass  # dialog already torn down — nothing left to update
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _play_all(self, idx=0):
         try:
@@ -11482,13 +11772,28 @@ class SpeakerTestDialog(ThemedModal):
         if idx >= len(_DIRS):
             self._say("Sweep done — every direction played once.")
             return
-        self._play(_DIRS[idx][0])
-        try:
-            self._seq_after = self._dlg.after(700, lambda: self._play_all(idx + 1))
-        except Exception:
-            pass
+        # CT-005 audit fix: previously scheduled the next step on a blind
+        # 700ms timer fired right after STARTING the current tone — now
+        # that _play returns immediately (audio moved off the Tk thread),
+        # that would race ahead of tones still actually playing. Chain off
+        # on_done (real completion) instead, so the sweep's cadence still
+        # matches the original one-at-a-time behavior. _sweep_active lets
+        # Stop interrupt the chain even between a tone finishing and its
+        # next 700ms gap elapsing.
+        self._sweep_active = True
+
+        def _advance():
+            if not self._sweep_active:
+                return
+            try:
+                self._seq_after = self._dlg.after(700, lambda: self._play_all(idx + 1))
+            except Exception:
+                pass
+
+        self._play(_DIRS[idx][0], on_done=_advance)
 
     def _stop_sweep(self):
+        self._sweep_active = False
         if self._seq_after is not None:
             try:
                 self._dlg.after_cancel(self._seq_after)
@@ -11498,12 +11803,19 @@ class SpeakerTestDialog(ThemedModal):
         self._say("Sweep stopped.")
 
     def _stop(self):
+        self._sweep_active = False
         if self._seq_after is not None:
             try:
                 self._dlg.after_cancel(self._seq_after)
             except Exception:
                 pass
             self._seq_after = None
+        if self._audio_poll_after is not None:
+            try:
+                self._dlg.after_cancel(self._audio_poll_after)
+            except Exception:
+                pass
+            self._audio_poll_after = None
 
 
 class WebcamDialog(ThemedModal):
@@ -12417,7 +12729,12 @@ class SpecsDialog(ThemedModal):
                 try:
                     from app.tasks.tweak_tasks import _query_video_mode_list
                     cur, _mx = _query_video_mode_list()
-                    if cur:
+                    # Audit fix: only show a real reading — the DEVMODE
+                    # struct bug that used to make this show "0x0 @ 0Hz" is
+                    # fixed at the source now, but keep this guard anyway
+                    # so a genuinely unreadable display never prints "0x0"
+                    # instead of just omitting the row.
+                    if cur and cur[0] and cur[1]:
                         rows.append(("Display now",
                                      f"{cur[0]}x{cur[1]} @ {cur[2]}Hz"))
                 except Exception:
@@ -12457,181 +12774,6 @@ class SpecsDialog(ThemedModal):
     def _stop(self):
         pass
 
-
-class GameNightDialog(ThemedModal):
-    """Game Night (feature 9): one press to get ready to play, one press
-    to put everything back.
-
-    The tweaks themselves are the existing "Game Session" preset, applied
-    and reverted through the normal run engine — so this dialog is a
-    front door, not a second way of changing Windows. What it adds over
-    picking that preset on the Tweak tab is the paired End: it remembers
-    exactly which tweaks IT turned on, so ending the session restores
-    those and leaves anything the user had already set alone.
-
-    Wording is deliberately flat and non-technical: someone about to play
-    a game should not have to read the words "registry" or "scheduler" to
-    decide whether this is safe.
-    """
-
-    def __init__(self, parent, app):
-        self.app = app
-        self._app_vars = {}
-        super().__init__(parent, title="Game Night",
-                         accent=TAB_ACCENTS["Tweak"])
-        body = self.body
-        active = self._active()
-
-        self._headline = tk.Label(
-            body, text="", font=(F, 13, "bold"), bg=COLORS["bg"],
-            fg=COLORS["text"], anchor="w")
-        self._headline.pack(fill="x", pady=(0, 2))
-        self._sub = tk.Label(
-            body, text="", font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
-            anchor="w", justify="left", wraplength=700)
-        self._sub.pack(fill="x", pady=(0, 14))
-
-        # what it does — four plain lines, no jargon
-        card = tk.Frame(body, bg=COLORS["bg_alt"])
-        card.pack(fill="x", pady=(0, 14))
-        for i, line in enumerate((
-                "\u2022  Switches Windows to its fastest power setting",
-                "\u2022  Gives games priority over background programs",
-                "\u2022  Turns off pop-ups, Sticky Keys and update restarts",
-                "\u2022  Puts every one of these back when you press End",
-        )):
-            tk.Label(card, text=line, font=(F, 9), bg=COLORS["bg_alt"],
-                     fg=COLORS["subtext"], anchor="w").pack(
-                         fill="x", padx=16, pady=(11 if i == 0 else 0, 9))
-
-        # optional quieting — off by default, per-app opt-in
-        tk.Label(body, text="Also close these while I play (optional)",
-                 font=(F, 9, "bold"), bg=COLORS["bg"], fg=COLORS["subtext"],
-                 anchor="w").pack(fill="x", pady=(0, 2))
-        tk.Label(body, text="Nothing is closed unless you switch it on here. "
-                            "Apps are asked to close normally, so you can still "
-                            "save your work.",
-                 font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
-                 anchor="w", justify="left", wraplength=700).pack(
-                     fill="x", pady=(0, 6))
-        self._apps_panel = ScrollableRoundedPanel(body)
-        self._apps_panel.config(height=140)
-        self._apps_panel.pack(fill="x")
-        self._build_app_rows()
-
-        self._status = tk.Label(body, text="", font=(F, 9), bg=COLORS["bg"],
-                                fg=COLORS["subtext"], wraplength=700,
-                                justify="center")
-        self._status.pack(pady=(10, 0))
-
-        brow = tk.Frame(body, bg=COLORS["bg"])
-        brow.pack(fill="x", pady=(10, 0))
-        AnimatedButton(brow, text="Close", command=self.close,
-                       bg=COLORS["surface"], fg=COLORS["text"],
-                       font=(F, 9, "bold"), padx=18,
-                       pady=7).pack(side="right", padx=(8, 0))
-        self._main_btn = AnimatedButton(
-            brow, text="", command=self._toggle,
-            bg=COLORS["accent_green"], fg=COLORS["black"],
-            font=(F, 11, "bold"), padx=28, pady=8)
-        self._main_btn.pack(side="right")
-
-        self._paint(active)
-
-    # ---- state ------------------------------------------------------ #
-
-    @staticmethod
-    def _active():
-        try:
-            from app.config_persist import get_game_night
-            return bool(get_game_night().get("active"))
-        except Exception:
-            return False
-
-    def _paint(self, active):
-        """Headline, sub-line and the big button, for one state."""
-        if active:
-            self._headline.config(text="Game Night is on",
-                                  fg=COLORS["accent_green"])
-            self._sub.config(text="Your PC is set up for gaming. Press End "
-                                  "Game Night when you're done to put your "
-                                  "normal settings back.")
-            self._main_btn.config_text("End Game Night")
-            # hover_bg passed explicitly: set_style only overwrites what it
-            # is given, so without it the pill would still hover-brighten
-            # toward the green it used to be.
-            self._main_btn.set_style(
-                bg=COLORS["accent_red"], fg="#FFFFFF",
-                hover_bg=_hex_lerp(COLORS["accent_red"], "#FFFFFF", 0.08))
-        else:
-            self._headline.config(text="Game Night is off", fg=COLORS["text"])
-            self._sub.config(text="One press gets your PC ready to play. "
-                                  "One press puts it back exactly as it was.")
-            self._main_btn.config_text("Start Game Night")
-            self._main_btn.set_style(
-                bg=COLORS["accent_green"], fg=COLORS["black"],
-                hover_bg=_hex_lerp(COLORS["accent_green"], "#FFFFFF", 0.08))
-
-    def _say(self, text):
-        try:
-            self._status.config(text=text)
-        except Exception:
-            pass
-
-    # ---- optional app list ------------------------------------------ #
-
-    def _build_app_rows(self):
-        try:
-            from app.game_night import CLOSEABLE_APPS
-            from app.config_persist import get_game_night
-            chosen = set(get_game_night().get("close_apps") or [])
-        except Exception:
-            return
-        holder = self._apps_panel.inner
-        for key, label, note, _exes in CLOSEABLE_APPS:
-            row = tk.Frame(holder, bg=COLORS["bg_alt"])
-            var = tk.BooleanVar(value=key in chosen)
-            self._app_vars[key] = var
-            ToggleSwitch(row, variable=var,
-                         command=self._save_app_choice).pack(
-                             side="left", padx=(10, 10), pady=6)
-            text = tk.Frame(row, bg=COLORS["bg_alt"])
-            text.pack(side="left", fill="x", expand=True)
-            tk.Label(text, text=label, font=(F, 9, "bold"),
-                     bg=COLORS["bg_alt"], fg=COLORS["text"],
-                     anchor="w").pack(fill="x")
-            tk.Label(text, text=note, font=(F, 8), bg=COLORS["bg_alt"],
-                     fg=COLORS["subtext"], anchor="w").pack(fill="x")
-            row.pack(fill="x", pady=1)
-        try:
-            self._apps_panel.refresh_scroll()
-        except Exception:
-            pass
-
-    def _save_app_choice(self, *_a):
-        try:
-            from app.config_persist import set_game_night_close_apps
-            set_game_night_close_apps(
-                [k for k, v in self._app_vars.items() if v.get()])
-        except Exception:
-            pass
-
-    # ---- the one button --------------------------------------------- #
-
-    def _toggle(self):
-        active = self._active()
-        # The run engine owns the progress bar and the log in the main
-        # window, so the dialog steps out of the way rather than sitting
-        # on top of its own run (run_tasks also refuses to start while a
-        # modal is open — same rule Session Pilot obeys).
-        self.close()
-        try:
-            if active:
-                self.app.end_game_night()
-            else:
-                self.app.start_game_night()
-        except Exception:
-            pass
 
 
 class DriveToolkitDialog(ThemedModal):
@@ -12711,9 +12853,10 @@ class DriveToolkitDialog(ThemedModal):
 
     def _build_health(self):
         c = self._content
-        tk.Label(c, text="Checks each drive's own reported health — the "
-                         "same signal Windows itself uses to warn you "
-                         "before a drive fails.",
+        # UI fix: shortened to one plain-language row (was wrapping to
+        # two lines) — same simpler-is-better pass as Speed/Capacity below.
+        tk.Label(c, text="Checks each drive's health — the same signal "
+                         "Windows uses to warn before it fails.",
                  font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
                  wraplength=700, justify="left").pack(anchor="w", pady=(0, 8))
         self._health_panel = ScrollableRoundedPanel(c)
@@ -12806,15 +12949,10 @@ class DriveToolkitDialog(ThemedModal):
 
     def _build_speed(self):
         c = self._content
-        tk.Label(c, text="A quick, real-world read/write test on any drive "
-                         "in your PC — handy for spotting a slow or failing "
-                         "drive, or comparing an old drive to a new one.",
+        # UI fix: shortened further to a plain one-row line, matching
+        # Health/Capacity's condensed style.
+        tk.Label(c, text="Tests real-world read/write speed to spot a slowdown.",
                  font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
-                 wraplength=700, justify="left").pack(anchor="w", pady=(0, 4))
-        tk.Label(c, text="This is a simple same-PC comparison, not a "
-                         "lab-grade benchmark — good for \"did my drive get "
-                         "slower\", not for marketing numbers.",
-                 font=(F, 8), bg=COLORS["bg"], fg=COLORS["subtext"],
                  wraplength=700, justify="left").pack(anchor="w", pady=(0, 10))
 
         row = tk.Frame(c, bg=COLORS["bg"])
@@ -12912,17 +13050,12 @@ class DriveToolkitDialog(ThemedModal):
 
     def _build_capacity(self):
         c = self._content
-        tk.Label(c, text="Checks whether a USB drive or SD card really "
-                         "holds what it claims. Fake/counterfeit cards "
-                         "report a bigger size than they actually have — "
-                         "once you fill past the real capacity, older "
-                         "files silently start getting corrupted.",
+        # UI fix: condensed to a single row (was two stacked lines) —
+        # same one-row treatment as Health/Speed above. The "don't unplug"
+        # safety note now rides the same line instead of its own row.
+        tk.Label(c, text="Checks if a USB drive or SD card is fake — your "
+                         "files are never touched, just don't unplug it mid-test.",
                  font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
-                 wraplength=700, justify="left").pack(anchor="w", pady=(0, 4))
-        tk.Label(c, text="Uses free space temporarily and cleans up after "
-                         "itself — your existing files are never touched. "
-                         "Don't remove the drive during the test.",
-                 font=(F, 8), bg=COLORS["bg"], fg=COLORS["subtext"],
                  wraplength=700, justify="left").pack(anchor="w", pady=(0, 10))
 
         self._cap_drives = []
@@ -13231,16 +13364,10 @@ class ToolsTab(tk.Frame):
          "Find your fastest DNS", TAB_ACCENTS["Tweak"]),
         ("pilot", "🎮", "Auto-Pilot",
          "Auto-tweaks for games", TAB_ACCENTS["Tweak"]),
-        ("gamenight", "🌙", "Game Night",
-         "Get ready to play in one press", TAB_ACCENTS["Tweak"]),
         ("drivetoolkit", "💽", "Drive Toolkit",
          "Health, speed & real capacity checks", TAB_ACCENTS["Clean"]),
-        ("startup", "🚀", "Startup Manager",
-         "Stop apps launching with Windows", TAB_ACCENTS["Tools"]),
         ("speed", "🚀", "Speed Test",
          "Check download, upload + ping", TAB_ACCENTS["Clean"]),
-        ("quick", "🧰", "Quick Tools",
-         "Windows tools + settings", TAB_ACCENTS["Tools"]),
         ("gamepad", "🕹️", "Gamepad Tester",
          "Test buttons, sticks + triggers", TAB_ACCENTS["Clean"]),
         ("miccheck", "🎙️", "Mic Check",
@@ -13446,16 +13573,10 @@ class ToolsTab(tk.Frame):
                 self.app._open_dns_tester()
             elif key == "pilot":
                 self.app._open_pilot_dialog()
-            elif key == "gamenight":
-                self.app._open_game_night()
             elif key == "drivetoolkit":
                 self.app._open_drive_toolkit()
-            elif key == "startup":
-                self.app._open_startup_manager()
             elif key == "speed":
                 self.app._open_speed_test()
-            elif key == "quick":
-                self.app._open_quick_tools()
             elif key == "gamepad":
                 self.app._open_gamepad_tester()
             elif key == "miccheck":
@@ -13617,9 +13738,15 @@ class Application:
         # thin, quiet strip.
         toolbar = tk.Frame(host, bg=COLORS["bg"])
         toolbar.pack(fill="x", padx=26, pady=(8, 0))
-        mode = "Administrator" if is_admin() else "Limited — cleaning only"
-        tk.Label(toolbar, text=mode, font=(F, 9), bg=COLORS["bg"],
-                 fg=COLORS["subtext"]).pack(side="right", anchor="se")
+        # Audit fix (Limited-mode clarity): this used to be a plain, inert
+        # label — the user had no way to get to Administrator rights again
+        # short of quitting and relaunching by hand. Clicking it in Limited
+        # mode now offers to restart elevated, same UAC flow AdminGateFrame
+        # already uses, just reachable after that first screen is gone.
+        self._mode_lbl = tk.Label(toolbar, text="", font=(F, 9),
+                                  bg=COLORS["bg"], fg=COLORS["subtext"])
+        self._mode_lbl.pack(side="right", anchor="se")
+        self._refresh_mode_label()
 
         # Per-tab icon, centered above the pill switcher (user request).
         # The image swaps on every tab switch; PhotoImages are kept on self
@@ -13735,6 +13862,30 @@ class Application:
                                 lambda e: self._corner_maint.config(fg=COLORS["text"]), add="+")
         self._corner_maint.bind("<Leave>",
                                 lambda e: self._corner_maint.config(fg=COLORS["subtext"]), add="+")
+
+        # Audit fix (Tools tab rebalance): Quick Tools + Startup Manager
+        # moved here from the card grid after Game Night's removal left an
+        # awkward single-card final row. Centered between the two existing
+        # corner icons — symmetric, same icon-label style, no new visual
+        # language introduced for just two buttons.
+        def _corner_icon(parent, icon, tip, command):
+            lbl = tk.Label(parent, text=icon, font=(F, 13),
+                           bg=COLORS["bg"], fg=COLORS["subtext"],
+                           cursor="hand2", bd=0, highlightthickness=0)
+            lbl.pack(side="left", padx=10)
+            Tooltip(lbl, tip)
+            lbl.bind("<Button-1>", lambda e: command(), add="+")
+            lbl.bind("<Enter>", lambda e: lbl.config(fg=COLORS["text"]), add="+")
+            lbl.bind("<Leave>", lambda e: lbl.config(fg=COLORS["subtext"]), add="+")
+            return lbl
+
+        corner_mid = tk.Frame(corners, bg=COLORS["bg"])
+        corner_mid.pack(side="left", expand=True)
+        self._corner_quick = _corner_icon(
+            corner_mid, "🧰", "Quick Tools", self._open_quick_tools)
+        self._corner_startup = _corner_icon(
+            corner_mid, "🚀", "Startup Manager", self._open_startup_manager)
+
         self._corner_logs = tk.Label(corners, text="📋", font=(F, 13),
                                      bg=COLORS["bg"], fg=COLORS["subtext"],
                                      cursor="hand2", bd=0, highlightthickness=0)
@@ -14244,6 +14395,77 @@ class Application:
         except Exception:
             pass
 
+    def _refresh_mode_label(self):
+        """Repaint the Administrator/Limited badge, and (re)bind the
+        click-to-unlock handler only when it's actually clickable."""
+        try:
+            self._mode_lbl.unbind("<Button-1>")
+            self._mode_lbl.unbind("<Enter>")
+            self._mode_lbl.unbind("<Leave>")
+        except Exception:
+            pass
+        if is_admin():
+            self._mode_lbl.config(text="Administrator", cursor="")
+            return
+        self._mode_lbl.config(text="Limited — cleaning only  🔓",
+                              cursor="hand2")
+        try:
+            Tooltip(self._mode_lbl, "Click to unlock full features "
+                                    "(restart as Administrator)")
+        except Exception:
+            pass
+        self._mode_lbl.bind("<Button-1>",
+                            lambda e: self._offer_restart_elevated(), add="+")
+        self._mode_lbl.bind("<Enter>",
+                            lambda e: self._mode_lbl.config(fg=COLORS["text"]), add="+")
+        self._mode_lbl.bind("<Leave>",
+                            lambda e: self._mode_lbl.config(fg=COLORS["subtext"]), add="+")
+
+    def _offer_restart_elevated(self):
+        """Limited-mode badge click: same UAC relaunch AdminGateFrame uses,
+        just reachable after that first screen is already gone. Confirms
+        first — this restarts the whole app, so an accidental click must
+        not surprise anyone mid-task."""
+        if not _themed_askyesno(
+                self.root, "Restart as Administrator?",
+                "This closes Cleaner Tool and reopens it with "
+                "Administrator rights (a UAC prompt will appear).\n\n"
+                "Repairs and tweaks that are greyed out or skipped in "
+                "Limited mode will then work.",
+                accent=COLORS["accent_yellow"]):
+            return
+        if not relaunch_as_admin():
+            messagebox.showerror(
+                "Elevation Failed",
+                "Could not request administrator rights. "
+                "You can keep using Limited mode.")
+            return
+
+        def _wait_thread():
+            from app.elevation import wait_for_elevated_process
+            success = wait_for_elevated_process(timeout=60.0)
+
+            def _on_done():
+                if success:
+                    try:
+                        self.root.destroy()
+                    except Exception:
+                        pass
+                    sys.exit(0)
+                else:
+                    try:
+                        messagebox.showwarning(
+                            "Elevation Cancelled",
+                            "Administrator elevation was cancelled or timed out.\n\n"
+                            "If an elevated window opened, use that one and close this.")
+                    except Exception:
+                        pass
+            try:
+                self.root.after(0, _on_done)
+            except Exception:
+                pass
+        threading.Thread(target=_wait_thread, daemon=True).start()
+
     def _open_quick_tools(self):
         """Quick Tools entry (Tools tab card). Opens the shortcuts
         popup (read-only launchers, no busy-guard needed)."""
@@ -14370,6 +14592,11 @@ class Application:
         try:
             from app.config_persist import set_game_night
             set_game_night(True, fresh)
+            # Stay-awake activates only once the session is actually
+            # recorded active (matches end_game_night's unconditional
+            # release below — the UI only ever calls end_game_night after
+            # a successful start, so these stay balanced).
+            self._set_stay_awake(True)
         except Exception:
             pass
         # Optional background quieting — only apps the user switched on.
@@ -14397,9 +14624,16 @@ class Application:
             self.run_tasks("Tweak", runnable, mode="run", quiet=quiet)
         except Exception:
             pass
+        self._refresh_pilot_dialog_manual_btn()
 
     def end_game_night(self):
         """Put back exactly the tweaks Game Night turned on."""
+        # Unconditional (covers the "already back" early-return path too):
+        # matches the single _set_stay_awake(True) in start_game_night, so
+        # the reference count stays balanced regardless of which path this
+        # takes. Only end_game_night ever calls this — never a bare
+        # decrement anywhere else for the manual session.
+        self._set_stay_awake(False)
         try:
             from app.config_persist import get_game_night, set_game_night
             saved = list(get_game_night().get("keys") or [])
@@ -14445,11 +14679,18 @@ class Application:
             self.run_tasks("Tweak", tasks, mode="revert", quiet=quiet)
         except Exception:
             pass
+        self._refresh_pilot_dialog_manual_btn()
 
-    def _open_game_night(self):
-        """Game Night entry (Tools tab card)."""
+    def _refresh_pilot_dialog_manual_btn(self):
+        """If Auto-Pilot's dialog (where the merged Game Night controls now
+        live) is open, keep its Start/End button in sync — it's the only
+        UI surface for this state now that the dialog can be reached from
+        two paths (its own button, or session_pilot's own auto-trigger
+        indirectly changing what's "already applied")."""
         try:
-            GameNightDialog(self.root, self).wait()
+            dlg = getattr(self, "_pilot_dialog", None)
+            if dlg is not None:
+                dlg._refresh_manual_btn()
         except Exception:
             pass
 
@@ -14830,10 +15071,51 @@ class Application:
             return False
         return True
 
+    def _set_stay_awake(self, on: bool):
+        """SetThreadExecutionState during a game session — audit fix
+        (stay-awake): neither the manual "Game Night" session nor
+        Auto-Pilot's automatic per-game trigger stopped Windows sleeping
+        or the display turning off mid-game (a real, common annoyance —
+        most games don't call this themselves, relying on the OS's normal
+        "user is active" idle detection, which a controller/gamepad-only
+        session doesn't feed).
+
+        Reference-counted rather than a bare on/off: the manual session
+        and the automatic trigger are independent and CAN overlap (a
+        manually-started session while a different tracked game also
+        launches) — SetThreadExecutionState itself is a single global flag
+        per process, not reference-counted, so naively calling it off when
+        EITHER session ends would cut the other's hold still in progress.
+        Only the count reaching zero actually releases it."""
+        if not IS_WINDOWS:
+            return
+        try:
+            import ctypes
+            count = getattr(self, "_stay_awake_count", 0)
+            count = max(0, count + (1 if on else -1))
+            self._stay_awake_count = count
+            ES_CONTINUOUS = 0x80000000
+            ES_SYSTEM_REQUIRED = 0x00000001
+            ES_DISPLAY_REQUIRED = 0x00000002
+            if count > 0:
+                ctypes.windll.kernel32.SetThreadExecutionState(
+                    ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)
+            else:
+                ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+        except Exception:
+            pass
+
     def _pilot_apply(self, hits):
         """Tk thread: apply the session preset (or defer quietly if the
         user is mid-run — the pilot retries nothing; the session simply
         runs untweaked and the exit path no-ops via registry check)."""
+        # Stay-awake covers every path below (busy/modal/no-tasks included)
+        # — a game IS being played the moment this fires, whether or not
+        # any tweak actually landed. session_pilot.py's own state machine
+        # guarantees this fires exactly once per idle->active transition
+        # (see _poll: only when leaving "idle"), so this can never
+        # over-increment from a single session.
+        self._set_stay_awake(True)
         try:
             tasks = self._pilot_preset_tasks()
         except Exception:
@@ -14921,6 +15203,10 @@ class Application:
         before the session (the user's persistent setup — reverting those
         would undo deliberate choices, not pilot work). Silent when
         there's nothing to do."""
+        # Release stay-awake unconditionally (before the fresh-keys early
+        # return below) — the game session is over either way, whether or
+        # not there happen to be any tweaks left to put back.
+        self._set_stay_awake(False)
         try:
             fresh = list(getattr(self, "_pilot_fresh_keys", []) or [])
         except Exception:
@@ -15046,6 +15332,32 @@ class Application:
             messagebox.showerror("Could Not Open", f"Couldn't open Windows Settings:\n{exc}")
 
     # ---------------- Auto Maintenance dialog ---------------- #
+
+    def _maybe_show_automaint_tip(self):
+        """One-time nudge toward Auto-Maintenance after the first
+        successful Clean run (see the audit-fix note at the call site).
+        Never shown again after this, and never shown at all if the user
+        already has a maintenance schedule set up."""
+        try:
+            from app.config_persist import has_seen_tip, mark_tip_seen
+            if has_seen_tip("automaint_after_first_clean"):
+                return
+            from app.scheduler import get_schedule_status
+            already_on, _ = get_schedule_status()
+            if already_on:
+                mark_tip_seen("automaint_after_first_clean")
+                return
+            mark_tip_seen("automaint_after_first_clean")
+            if _themed_askyesno(
+                    self.root, "Keep it clean automatically?",
+                    "Cleaner Tool can run this same clean on a schedule — "
+                    "no need to remember to open it.\n\n"
+                    "Set up Auto-Maintenance now? (You can always find this "
+                    "later via the 🛠️ icon, bottom-left.)",
+                    accent=TAB_ACCENTS["Clean"]):
+                self._show_schedule_dialog()
+        except Exception:
+            pass
 
     def _show_schedule_dialog(self):
         from app.config_persist import load_config
@@ -16264,7 +16576,7 @@ class Application:
         # spans the system SSD and a games drive).
         self._run_before_drives = _snapshot_all_drives(
             self._query_drives, self._query_drive_free_total)
-        self._run_results = []       # per-task (label, status, bytes) tuples
+        self._run_results = []       # per-task (label, status, bytes, reason) tuples
 
         thread = threading.Thread(target=self._run_tasks_worker,
                                   args=(tab_name, tasks, mode, quiet), daemon=True)
@@ -16352,7 +16664,7 @@ class Application:
             if status == "ok":
                 completed += 1
                 total_bytes += task_bytes
-                results.append((task.label, "ok", task_bytes))
+                results.append((task.label, "ok", task_bytes, None))
                 # Phase 2 (#14): keep the applied-tweak registry truthful
                 if mode == "revert":
                     mark_tweak_reverted(task.key)
@@ -16365,7 +16677,7 @@ class Application:
                 # reason, but do NOT record the tweak as applied (the
                 # '✓ Active' badge must show what is actually active).
                 skipped_n += 1
-                results.append((task.label, "skip", 0))
+                results.append((task.label, "skip", 0, str(exc) if exc else None))
                 self.log(f"  (skipped) {task.label}: {exc}")
             elif status == "stop":
                 # F-2 audit fix: utils.run_cmd_checked deliberately raises
@@ -16374,16 +16686,18 @@ class Application:
                 # reverted, remaining tasks are skipped by the next
                 # iteration's cancelled() check, summary reports 'stopped'.
                 cancelled = True
-                results.append((task.label, "stop", 0))
+                results.append((task.label, "stop", 0, None))
                 self.log(f"  (stopped) {task.label}: {exc}")
             else:  # "fail"
                 failed += 1
-                results.append((task.label, "fail", 0))
                 if exc is None:
                     # helper reports no run/revert function on the Task
+                    reason = f"No {'revert' if mode == 'revert' else 'run'} step defined for this task"
                     self.log(f"  ! No {'revert' if mode == 'revert' else 'run'} for '{task.label}'")
                 else:
+                    reason = str(exc)
                     self.log(f"  ! ERROR in '{task.label}': {exc}")
+                results.append((task.label, "fail", 0, reason))
             self._set_progress(idx + 1, len(tasks))
 
         for idx, task in enumerate(tasks):
@@ -16402,7 +16716,7 @@ class Application:
         # stop — a completed loop leaves nothing remaining.)
         if cancelled and len(results) < len(tasks):
             for t in tasks[len(results):]:
-                results.append((t.label, "stop", 0))
+                results.append((t.label, "stop", 0, None))
 
         # refresh applied state for badges
         try:
@@ -16543,6 +16857,16 @@ class Application:
                     after_drives=after_drives,
                 )
                 card.wait()
+                # Audit fix (Auto-Maintenance discoverability): the
+                # scheduler only lives behind a small corner wrench icon —
+                # easy to never notice it exists. A one-time tip (never
+                # shown again after this) after the first successful Clean
+                # run points new users at it, without adding a permanent
+                # banner or nagging every run.
+                if (tab_name == "Clean" and mode == "run" and not cancelled
+                        and self._run_results
+                        and any(r[1] == "ok" for r in self._run_results)):
+                    self._maybe_show_automaint_tip()
             except Exception:
                 # the scorecard must never mask a run's outcome — fall
                 # back to the old messagebox if building it fails

@@ -1185,6 +1185,256 @@ def install_webview2(ctx: TaskContext):
     ctx.log("WebView2 Runtime installed.")
 
 
+# --------------------------------------------------------------------------- #
+# LTSC everyday-app bundles (2026-09-20, user request + icons provided).
+# Pro-inbox Store apps that LTSC strips (or ships legacy-only). Same shape
+# as install_game_bar / install_video_codecs: skip-if-present via
+# capabilities.py, install via msstore source, verify afterwards, raise
+# honestly. Every Store ID below was live-verified (`winget show --exact
+# --id <id> --source msstore`) on 2026-09-20.
+#
+# Store-source note: on a Store-less LTSC the msstore source can fail until
+# the Store exists, so every bundle logs a hint pointing at the
+# 'Install Microsoft Store' row when the Store is missing (it does NOT
+# hard-fail — the per-user winget bootstrap covers many machines).
+# --------------------------------------------------------------------------- #
+
+def _store_hint(ctx: TaskContext) -> None:
+    """Log the Store-first hint when the Store itself is missing."""
+    if not cap.has_store():
+        ctx.log("  (note: the Microsoft Store app is missing — if this install "
+                "fails, run the 'Install Microsoft Store' row first, then retry)")
+
+
+def install_camera_app(ctx: TaskContext):
+    """Windows Camera — webcam photos/video on stripped Windows."""
+    if not has_network():
+        raise RuntimeError("No internet connection — Camera needs to download.")
+    if cap.has_camera_app():
+        ctx.log("Windows Camera already installed — nothing to do.")
+        return
+    _ensure_winget(ctx)
+    _store_hint(ctx)
+    _winget_install(ctx, "9WZDNCRFJBBG", "Windows Camera")
+    cap.invalidate_caches()
+    if not cap.has_camera_app():
+        raise RuntimeError("Windows Camera install did not verify — try rebooting and running again.")
+    ctx.log("Windows Camera installed and verified.")
+
+
+def install_photos_bundle(ctx: TaskContext):
+    """Photos + the image extensions around it — screenshots, JPG/PNG,
+    WebP, iPhone (HEIF) photos and camera RAWs all open afterwards."""
+    if not has_network():
+        raise RuntimeError("No internet connection — Photos needs to download.")
+    _ensure_winget(ctx)
+    _store_hint(ctx)
+    parts = [
+        ("9WZDNCRFJBH4", "Microsoft Photos", cap.has_photos_app),
+        ("9PG2DK419DRG", "WebP Image Extension", cap.has_webp_extension),
+        ("9PMMSR1CGPWG", "HEIF Image Extension", cap.has_heif_extension),
+        ("9NCTDW2W1BH8", "Raw Image Extension", cap.has_raw_image_extension),
+    ]
+    did = []
+    for pid, label, check in parts:
+        if check():
+            ctx.log(f"{label} already installed.")
+        else:
+            _winget_install(ctx, pid, label)
+            did.append(label)
+    cap.invalidate_caches()
+    if not did:
+        return
+    missing = [label for _, label, check in parts if not check()]
+    if missing:
+        raise RuntimeError(
+            f"Photos bundle did not verify — still missing: {', '.join(missing)}. "
+            "Try rebooting and running again.")
+    ctx.log(f"Installed and verified: {', '.join(did)}.")
+
+
+def install_snipping_tool(ctx: TaskContext):
+    """Snipping Tool, new Store build — screenshots plus the screen video
+    clipping LTSC's legacy build lacks (gamers clip kills with it)."""
+    if not has_network():
+        raise RuntimeError("No internet connection — Snipping Tool needs to download.")
+    if cap.has_snipping_tool():
+        ctx.log("Snipping Tool already installed — nothing to do.")
+        return
+    _ensure_winget(ctx)
+    _store_hint(ctx)
+    _winget_install(ctx, "9MZ95KL8MR0L", "Snipping Tool")
+    cap.invalidate_caches()
+    if not cap.has_snipping_tool():
+        raise RuntimeError("Snipping Tool install did not verify — try rebooting and running again.")
+    ctx.log("Snipping Tool installed and verified.")
+
+
+def install_media_player_bundle(ctx: TaskContext):
+    """Windows Media Player + MPEG-2 — local audio/video plays again on
+    stripped Windows (the top 'videos refuse to play' fix)."""
+    if not has_network():
+        raise RuntimeError("No internet connection — Media Player needs to download.")
+    _ensure_winget(ctx)
+    _store_hint(ctx)
+    parts = [
+        ("9WZDNCRFJ3PT", "Windows Media Player", cap.has_media_player),
+        ("9N95Q1ZZPMH4", "MPEG-2 Video Extension", cap.has_mpeg2_extension),
+    ]
+    did = []
+    for pid, label, check in parts:
+        if check():
+            ctx.log(f"{label} already installed.")
+        else:
+            _winget_install(ctx, pid, label)
+            did.append(label)
+    cap.invalidate_caches()
+    if not did:
+        return
+    missing = [label for _, label, check in parts if not check()]
+    if missing:
+        raise RuntimeError(
+            f"Media Player bundle did not verify — still missing: {', '.join(missing)}. "
+            "Try rebooting and running again.")
+    ctx.log(f"Installed and verified: {', '.join(did)}.")
+
+
+def install_notepad_app(ctx: TaskContext):
+    """Windows Notepad, new tabbed Store build (LTSC ships the legacy one —
+    modders editing configs expect tabs)."""
+    if not has_network():
+        raise RuntimeError("No internet connection — Notepad needs to download.")
+    if cap.has_notepad_app():
+        ctx.log("Notepad already installed — nothing to do.")
+        return
+    _ensure_winget(ctx)
+    _store_hint(ctx)
+    _winget_install(ctx, "9MSMLRH6LZF3", "Windows Notepad")
+    cap.invalidate_caches()
+    if not cap.has_notepad_app():
+        raise RuntimeError("Notepad install did not verify — try rebooting and running again.")
+    ctx.log("Notepad installed and verified.")
+
+
+def install_paint_app(ctx: TaskContext):
+    """Paint, new Store build with layers and background remover (LTSC
+    ships the legacy one — quick meme/thumbnail edits)."""
+    if not has_network():
+        raise RuntimeError("No internet connection — Paint needs to download.")
+    if cap.has_paint_app():
+        ctx.log("Paint already installed — nothing to do.")
+        return
+    _ensure_winget(ctx)
+    _store_hint(ctx)
+    _winget_install(ctx, "9PCFS5B6T72H", "Paint")
+    cap.invalidate_caches()
+    if not cap.has_paint_app():
+        raise RuntimeError("Paint install did not verify — try rebooting and running again.")
+    ctx.log("Paint installed and verified.")
+
+
+def install_everyday_apps_pack(ctx: TaskContext):
+    """Everyday Apps Pack — Calculator, Clock (alarms + focus), Sticky
+    Notes and Sound Recorder in one click. The apps non-technical users
+    expect to just be there."""
+    if not has_network():
+        raise RuntimeError("No internet connection — everyday apps need to download.")
+    _ensure_winget(ctx)
+    _store_hint(ctx)
+    parts = [
+        ("9WZDNCRFHVN5", "Windows Calculator", cap.has_calculator_app),
+        ("9WZDNCRFJ3PR", "Windows Clock", cap.has_clock_app),
+        ("9NBLGGH4QGHW", "Microsoft Sticky Notes", cap.has_sticky_notes),
+        ("9WZDNCRFHWKN", "Windows Sound Recorder", cap.has_sound_recorder),
+    ]
+    did = []
+    for pid, label, check in parts:
+        if check():
+            ctx.log(f"{label} already installed.")
+        else:
+            _winget_install(ctx, pid, label)
+            did.append(label)
+    cap.invalidate_caches()
+    if not did:
+        return
+    missing = [label for _, label, check in parts if not check()]
+    if missing:
+        raise RuntimeError(
+            f"Everyday Apps Pack did not verify — still missing: {', '.join(missing)}. "
+            "Try rebooting and running again.")
+    ctx.log(f"Installed and verified: {', '.join(did)}.")
+
+
+def install_phone_link(ctx: TaskContext):
+    """Phone Link — Android photos, SMS and calls on the PC (~395 MB).
+    Highest want among phone owners on stripped Windows."""
+    if not has_network():
+        raise RuntimeError("No internet connection — Phone Link needs to download.")
+    if cap.has_phone_link():
+        ctx.log("Phone Link already installed — nothing to do.")
+        return
+    _ensure_winget(ctx)
+    _store_hint(ctx)
+    _winget_install(ctx, "9NMPJ99VJBWV", "Phone Link")
+    cap.invalidate_caches()
+    if not cap.has_phone_link():
+        raise RuntimeError("Phone Link install did not verify — try rebooting and running again.")
+    ctx.log("Phone Link installed and verified — open it and pick Android or iPhone.")
+
+
+def install_quick_assist(ctx: TaskContext):
+    """Quick Assist — Microsoft's own 1-click remote help. The lightest
+    way to fix a family PC (pairs with the RustDesk/AnyDesk catalog rows)."""
+    if not has_network():
+        raise RuntimeError("No internet connection — Quick Assist needs to download.")
+    if cap.has_quick_assist():
+        ctx.log("Quick Assist already installed — nothing to do.")
+        return
+    _ensure_winget(ctx)
+    _store_hint(ctx)
+    _winget_install(ctx, "9P7BP5VNWKX5", "Quick Assist")
+    cap.invalidate_caches()
+    if not cap.has_quick_assist():
+        raise RuntimeError("Quick Assist install did not verify — try rebooting and running again.")
+    ctx.log("Quick Assist installed and verified.")
+
+
+def install_wsl_ubuntu(ctx: TaskContext):
+    """WSL + Ubuntu — the Windows Subsystem for Linux with Ubuntu for
+    modders and local-AI tinkerers (the Store distro path is broken
+    without the Store, so this uses Microsoft's own `wsl --install`).
+    Needs admin; a reboot finishes it."""
+    _require_admin_for_install("WSL + Ubuntu")
+    ctx.set_status("Installing WSL with Ubuntu (needs a reboot)...")
+    # Already have a distro? Honest skip — never reinstall over one.
+    already: "list[str]" = []
+    rc = run_cmd(ctx, [resolve_exe("wsl"), "--list", "--quiet"],
+                 shell=False, timeout=120, collect=already)
+    if rc == 0:
+        distros = [l.strip() for l in already if l.strip()]
+        if distros:
+            ctx.log(f"WSL already has distro(s): {', '.join(distros)} — nothing to do.")
+            return
+    rc2 = run_cmd(ctx, [resolve_exe("wsl"), "--install", "-d", "Ubuntu"],
+                  shell=False, timeout=1800)
+    if rc2 == -1 or ctx.cancelled():
+        raise TaskCancelled("WSL install cancelled by user.")
+    if rc2 != 0:
+        raise RuntimeError(
+            f"`wsl --install` exited with code {rc2} — virtualization may be off "
+            "in the BIOS (enable SVM/VT-x), or a reboot is pending.")
+    # Verify a distro registered (the first install usually needs the
+    # reboot before Ubuntu appears — say so honestly instead of claiming it).
+    verify: "list[str]" = []
+    run_cmd(ctx, [resolve_exe("wsl"), "--list", "--quiet"],
+            shell=False, timeout=120, collect=verify)
+    if any(l.strip() for l in verify):
+        ctx.log("WSL + Ubuntu installed and verified — open Ubuntu from Start to finish setup.")
+    else:
+        ctx.log("WSL install started — REBOOT, then open Ubuntu from Start to finish setup.")
+        ctx.log("(Ubuntu registers on first boot after the install; re-run this row if it is missing.)")
+
+
 # cached installed-app set for the catalog "installed" badges (winget list
 # is slow, so it is computed once per process, in a worker thread)
 _INSTALLED_CACHE: list = [None]   # [set-of-lowercase-ids-or-None]
@@ -1501,6 +1751,16 @@ TASKS = [
     Task("install_game_bar", "Install Game Bar (Win+G)", "Adds the Win+G overlay for clips, screenshots and performance info", install_game_bar, default=False, admin_required=True, group="LTSC Missing Components"),
     Task("install_codecs_bundle", "Install Windows Codecs (AV1, VP9 + Web Media)", "One click for the codecs behind broken or black in-game cutscenes", install_codecs_bundle, default=False, admin_required=False, group="LTSC Missing Components"),
     Task("install_webview2", "Install WebView2 Runtime", "Evergreen runtime required by EA App, CurseForge, Battle.net and more", install_webview2, default=False, admin_required=False, group="LTSC Missing Components"),
+    Task("install_camera", "Camera App", "Adds the Windows Camera app for webcam photos and video", install_camera_app, default=False, admin_required=False, group="LTSC Missing Components"),
+    Task("install_photos", "Photos", "Adds Photos plus WebP, HEIF and RAW extensions so screenshots and phone photos open", install_photos_bundle, default=False, admin_required=False, group="LTSC Missing Components"),
+    Task("install_snipping", "Snipping Tool", "Adds the new Snipping Tool with screen video clipping for game highlights", install_snipping_tool, default=False, admin_required=False, group="LTSC Missing Components"),
+    Task("install_mediaplayer", "Media Player", "Adds Windows Media Player plus MPEG-2 so local audio and video play again", install_media_player_bundle, default=False, admin_required=False, group="LTSC Missing Components"),
+    Task("install_notepad", "Notepad", "Adds the new tabbed Notepad for editing game configs and mods", install_notepad_app, default=False, admin_required=False, group="LTSC Missing Components"),
+    Task("install_paint", "Paint", "Adds the new Paint with layers and background remover for quick edits", install_paint_app, default=False, admin_required=False, group="LTSC Missing Components"),
+    Task("install_everyday", "Everyday Apps Pack", "One click for Calculator, Clock, Sticky Notes and Sound Recorder", install_everyday_apps_pack, default=False, admin_required=False, group="LTSC Missing Components"),
+    Task("install_phonelink", "Phone Link", "Links your Android/iPhone for photos, texts and calls on the PC", install_phone_link, default=False, admin_required=False, group="LTSC Missing Components"),
+    Task("install_quickassist", "Quick Assist", "Microsoft's 1-click remote help for fixing family PCs", install_quick_assist, default=False, admin_required=False, group="LTSC Missing Components"),
+    Task("install_wsl", "WSL (Ubuntu)", "Adds Linux + Ubuntu for modders and AI tinkerers (needs a reboot)", install_wsl_ubuntu, default=False, admin_required=True, group="LTSC Missing Components"),
     Task("install_vc_bundle", "Install ALL VC++ Runtimes (2005-2022)", "One click for every Visual C++ runtime — x64 + x86, all years; no guessing which one a game needs", task_install_vc_redists, default=False, admin_required=True),
     Task("install_vc_allinone", "Install Microsoft Visual C++ All-in-One", "The single latest VC++ 2015-2022 x64 runtime modern games and apps ask for", install_vcredist_allinone, default=False, admin_required=False),
     Task("install_directx_bundle", "Install ALL DirectX Runtimes", "One click for d3dx9/d3dx10/d3dx11, XAudio, XInput — fixes missing-DLL game errors", install_directx_bundle, default=False, admin_required=True),

@@ -527,14 +527,26 @@ def _wait_and_close_store_app(ctx: TaskContext, attempts: int = 10,
 
 def clean_store_cache(ctx: TaskContext):
     ctx.log("Resetting Microsoft Store cache...")
-    run_cmd(ctx, "wsreset.exe", timeout=60)
+    # muse_spark audit fix (honest return code): this used to discard
+    # run_cmd's return value and unconditionally `return 0`, so a failed
+    # wsreset.exe (blocked, missing, permission denied) still reported
+    # success. Same fix shape as the C2/C2b history on purge_ram_working_sets
+    # above — raise on a real failure so the runner counts it honestly.
+    rc = run_cmd(ctx, "wsreset.exe", timeout=60)
     _wait_and_close_store_app(ctx)
-    return 0
+    if rc == 0:
+        return 0
+    ctx.log(f"  ! Store cache reset failed (exit code {rc}) — reporting as a failed task.")
+    raise RuntimeError(f"wsreset.exe failed (exit code {rc}).")
 
 
 def flush_dns(ctx: TaskContext):
-    run_cmd(ctx, "ipconfig /flushdns")
-    return 0
+    # muse_spark audit fix (honest return code): see clean_store_cache above.
+    rc = run_cmd(ctx, "ipconfig /flushdns")
+    if rc == 0:
+        return 0
+    ctx.log(f"  ! DNS flush failed (exit code {rc}) — reporting as a failed task.")
+    raise RuntimeError(f"ipconfig /flushdns failed (exit code {rc}).")
 
 
 def purge_ram_working_sets(ctx: TaskContext):
@@ -812,7 +824,13 @@ _CLEANMGR_SAGE_NUM = 65432
 # Recycle Bin / temp files are already handled by our own direct-delete
 # tasks elsewhere, so they're deliberately left off this list.
 _CLEANMGR_SAGE_CATEGORIES = (
-    "Windows Update Cleanup",
+    # CT-003 audit fix: the real VolumeCaches handler for this category is
+    # named "Update Cleanup", not "Windows Update Cleanup". The old name
+    # doesn't match any real handler subkey, so `reg add` just created a
+    # harmless throwaway key that /sagerun never looks at — the single
+    # largest recoverable category (old WinSxS/update leftovers) was
+    # silently never actually flagged for cleanup.
+    "Update Cleanup",
     "Windows Upgrade Log Files",
     "Windows ESD installation files",
     "Delivery Optimization Files",
@@ -1135,6 +1153,56 @@ def clean_stream_app_logs(ctx: TaskContext):
     return _clean_many(ctx, [f for f in folders if f], "stream app logs")
 
 
+def clean_squirrel_staging(ctx: TaskContext):
+    """Clear Squirrel installer staging (%LOCALAPPDATA%\\SquirrelTemp) —
+    the version-delta packages Discord, Spotify, Slack and similar
+    Electron apps download for self-updates and never delete (often GBs).
+
+    Only the staging temp dir — installed apps, logins and settings live
+    elsewhere and are untouched. Skips honestly when nothing is staged."""
+    folder = os.path.join(_LOCALAPPDATA, "SquirrelTemp")
+    if not os.path.isdir(folder):
+        ctx.log("No Squirrel update staging found — nothing to do.")
+        return 0
+    total = _clean_many(ctx, [folder], "Squirrel update staging")
+    if total:
+        ctx.log("Squirrel staging cleared — apps re-download deltas with their next update.")
+    return total
+
+
+def clean_setup_logs(ctx: TaskContext):
+    """Clear Windows setup logs (C:\\Windows\\Panther + Logs\\MoSetup) —
+    pure post-upgrade diagnostic text (setupact/setuperr) Windows never
+    rotates. Rollback images (Windows.old) and live update state are
+    elsewhere and untouched. Admin (Windows dir)."""
+    folders = [
+        os.path.join(_WINDIR, "Panther"),
+        os.path.join(_WINDIR, "Logs", "MoSetup"),
+    ]
+    if not any(os.path.isdir(f) for f in folders):
+        ctx.log("No Windows setup logs found — nothing to do.")
+        return 0
+    return _clean_many(ctx, folders, "Windows setup logs")
+
+
+def clean_edge_update_downloads(ctx: TaskContext):
+    """Clear the Edge updater's downloaded payload cache
+    (EdgeUpdate\\Download under Program Files) — staged installers for
+    Edge/WebView2 updates that already applied. The Edge profile,
+    passwords and the updater itself are untouched. Admin."""
+    pf86 = os.environ.get("ProgramFiles(x86)", f"{_SYSTEMDRIVE_ROOT}Program Files (x86)")
+    pf64 = os.environ.get("ProgramFiles", f"{_SYSTEMDRIVE_ROOT}Program Files")
+    folders = [
+        os.path.join(pf86, "Microsoft", "EdgeUpdate", "Download") if pf86 else "",
+        os.path.join(pf64, "Microsoft", "EdgeUpdate", "Download") if pf64 else "",
+    ]
+    folders = [f for f in folders if f and os.path.isdir(f)]
+    if not folders:
+        ctx.log("No Edge update downloads found (Edge not installed?) — nothing to do.")
+        return 0
+    return _clean_many(ctx, folders, "Edge update downloads")
+
+
 from app.tasks import Task  # noqa: E402
 
 TASKS = [
@@ -1176,4 +1244,7 @@ TASKS = [
     Task("onedrive_logs", "Clear OneDrive Logs", "Removes diagnostic logs OneDrive leaves behind; files and settings untouched", clean_onedrive_logs, default=False, admin_required=False),
     Task("webview_cache", "Clear WebView App Caches", "Clears embedded-browser junk from EA App, CurseForge and similar launchers; logins kept", clean_webview_caches, default=False, admin_required=False),
     Task("stream_logs", "Clear Stream App Logs", "Clears Medal, Outplayed and SteelSeries logs; clips and settings kept", clean_stream_app_logs, default=False, admin_required=False),
+    Task("squirrel_staging", "Clear Update Staging", "Removes GBs of leftover Discord/Spotify updater packages; apps untouched", clean_squirrel_staging, default=False, admin_required=False),
+    Task("setup_logs", "Clear Setup Logs", "Removes old Windows upgrade diagnostic logs; rollback files untouched", clean_setup_logs, default=False, admin_required=True),
+    Task("edge_update_cache", "Clear Edge Update Downloads", "Removes staged Edge updater payloads; profile and passwords kept", clean_edge_update_downloads, default=False, admin_required=True),
 ]

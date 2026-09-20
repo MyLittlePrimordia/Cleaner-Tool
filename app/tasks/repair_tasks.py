@@ -1496,6 +1496,245 @@ def repair_nvidia_app_services(ctx: TaskContext):
     ctx.log(f"Restarted {ok}/{found} NVIDIA background service(s). Relaunch the NVIDIA App.")
 
 
+def restart_gameinput_service(ctx: TaskContext):
+    """Restart the GameInput service — the classic fix for a controller
+    that Windows sees but games don't (no input detected), without
+    rebooting. Same bounce shape as the audio/Bluetooth restarters:
+    missing service reports an honest skip, never a fake success."""
+    from app.utils import TaskSkipped, TaskCancelled
+    ctx.set_status("Restarting GameInput (controller input)...")
+    if run_cmd(ctx, "sc query GameInputSvc", timeout=15) != 0:
+        raise TaskSkipped("No GameInput service found on this PC — nothing to restart.")
+    if ctx.cancelled():
+        raise TaskCancelled("GameInput restart cancelled by user.")
+    run_cmd(ctx, "net stop GameInputSvc /y", timeout=60)  # best-effort; usually idle
+    if ctx.cancelled():
+        raise TaskCancelled("GameInput restart cancelled by user.")
+    rc = run_cmd(ctx, "net start GameInputSvc", timeout=60)
+    if rc not in (0, 1):
+        raise RuntimeError(
+            f"GameInput would not start again (exit {rc}) — reboot, then check "
+            "Services for its state.")
+    ctx.log("GameInput restarted. Unplug/replug the controller if the game still ignores it.")
+
+
+def restart_xbox_live_services(ctx: TaskContext):
+    """Bounce the Xbox Live auth/save/networking services (XblAuthManager,
+    XblGameSave, XboxNetApiSvc, XboxGipSvc) — fixes Game Pass sign-in
+    loops and 'can't connect to Xbox network' without reinstalling
+    anything. Complements the Teredo reset (network path) and the Xbox
+    app re-register (package path). Absent services are skipped; a box
+    with none gets an honest skip."""
+    from app.utils import TaskSkipped, TaskCancelled
+    ctx.set_status("Restarting Xbox Live services...")
+    services = ["XblAuthManager", "XblGameSave", "XboxNetApiSvc", "XboxGipSvc"]
+    found = ok = 0
+    for svc in services:
+        if ctx.cancelled():
+            raise TaskCancelled("Xbox Live repair cancelled by user.")
+        if run_cmd(ctx, f"sc query {svc}", timeout=15) != 0:
+            ctx.log(f"  {svc}: not present — skipped.")
+            continue
+        found += 1
+        run_cmd(ctx, f"net stop {svc} /y", timeout=60)  # best-effort; usually idle
+        if ctx.cancelled():
+            raise TaskCancelled("Xbox Live repair cancelled by user.")
+        rc = run_cmd(ctx, f"net start {svc}", timeout=60)
+        if rc in (0, 1):
+            ok += 1
+        else:
+            ctx.log(f"  ! {svc} did not restart cleanly (exit {rc})")
+    if found == 0:
+        raise TaskSkipped("No Xbox Live services found — nothing Xbox to repair.")
+    if ok == 0:
+        raise RuntimeError("Found Xbox Live services but none restarted cleanly — see log.")
+    ctx.log(f"Restarted {ok}/{found} Xbox Live service(s). Retry the Game Pass sign-in.")
+
+
+def restart_update_services(ctx: TaskContext):
+    """Light Update-service bounce: restart wuauserv/cryptSvc/bits WITHOUT
+    touching any folders — the safer first step before the full 'Fix Stuck
+    Updates' (which renames SoftwareDistribution). Fixes updates stuck at
+    0% after a failed resume. Only restarts services this run actually
+    stopped; honest failure if one won't come back."""
+    ctx.set_status("Restarting Windows Update services...")
+    services = ["wuauserv", "cryptSvc", "bits"]
+    stopped = []
+    for svc in services:
+        if ctx.cancelled():
+            from app.utils import TaskCancelled
+            raise TaskCancelled("Update-service bounce cancelled by user.")
+        rc = run_cmd(ctx, f"net stop {svc}", timeout=60)
+        if rc == 0:
+            stopped.append(svc)
+        else:
+            ctx.log(f"  ! could not stop {svc} (exit {rc}) — leaving it alone")
+    failed = []
+    for svc in reversed(stopped):
+        if ctx.cancelled():
+            from app.utils import TaskCancelled
+            raise TaskCancelled("Update-service bounce cancelled by user.")
+        rc = run_cmd(ctx, f"net start {svc}", timeout=60)
+        if rc not in (0, 1):
+            failed.append(svc)
+    if failed:
+        raise RuntimeError(
+            f"Update services restarted except: {', '.join(failed)} — reboot, then re-run.")
+    if not stopped:
+        ctx.log("Update services were already stopped — started nothing, changed nothing.")
+    else:
+        ctx.log(f"Update services bounced: {', '.join(stopped)}. Retry Windows Update.")
+
+
+def schedule_memory_test(ctx: TaskContext):
+    """Open the official Windows Memory Diagnostic scheduler (MdSched) —
+    the non-destructive RAM test behind random game crashes and BSODs.
+    Opens Microsoft's own dialog; YOU pick 'Restart now' or 'next restart'.
+    Nothing is changed until you choose — the task just gets you there in
+    one click and explains the result codes afterwards."""
+    ctx.set_status("Opening the Windows Memory Diagnostic scheduler...")
+    run_cmd(ctx, "MdSched.exe", timeout=300)
+    ctx.log("Memory Diagnostic scheduler was shown.")
+    ctx.log("Pick 'Restart now and check for problems' — the PC reboots into the test.")
+    ctx.log("No errors after the pass = RAM is fine; errors = reseat/replace a stick (back up saves first).")
+    return None
+
+
+def run_dxdiag_report(ctx: TaskContext):
+    """Generate a dxdiag report (DirectX + driver + system snapshot) to
+    Documents\\CleanerTool Backups — the file every support forum asks for
+    when a game crashes on launch. Report-only: reads everything, changes
+    nothing. Verifies the file landed before reporting success."""
+    import os as _os
+    docs = known_folder("Personal",
+                        _os.path.join(_os.environ.get("USERPROFILE", ""), "Documents"))
+    dest_dir = _os.path.join(docs or _os.path.join(_os.environ.get("USERPROFILE", ""), "Documents"),
+                             "CleanerTool Backups")
+    try:
+        _os.makedirs(dest_dir, exist_ok=True)
+    except OSError as exc:
+        raise RuntimeError(f"Could not create the backups folder: {exc}")
+    from datetime import datetime as _dt
+    dest = _os.path.join(dest_dir, f"DxDiag_{_dt.now().strftime('%Y-%m-%d_%H%M%S')}.txt")
+    ctx.set_status("Collecting DirectX diagnostics (a minute or so)...")
+    rc = run_cmd(ctx, f'dxdiag /t "{dest}"', timeout=600)
+    if rc != 0 or not _os.path.isfile(dest):
+        raise RuntimeError(
+            f"dxdiag did not produce a report (exit {rc}) — run `dxdiag` by hand to see why.")
+    try:
+        size = _os.path.getsize(dest)
+    except OSError:
+        size = 0
+    if size < 1024:
+        raise RuntimeError("dxdiag wrote an empty report — nothing useful was collected.")
+    from app.utils import format_bytes as _fmt
+    ctx.log(f"Diagnostics saved: {dest} ({_fmt(size)}) — attach it when asking for help.")
+    return None
+
+
+def check_xmp_status(ctx: TaskContext):
+    """Report-only RAM-speed audit: compares each stick's rated speed
+    (SMBIOS Speed) against what it actually runs at (ConfiguredClockSpeed).
+    A big gap means XMP/EXPO is OFF in the BIOS — the single most common
+    'my new PC feels slow' cause (e.g. 5600 kit running at 4800). Changes
+    NOTHING — enabling XMP is a 30-second BIOS toggle this task explains."""
+    ctx.set_status("Checking RAM speed (XMP/EXPO)...")
+    import subprocess as _sp
+    try:
+        out = _sp.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_PhysicalMemory | "
+             "Select-Object SMBIOSMemoryType, Speed, ConfiguredClockSpeed | "
+             "ConvertTo-Csv -NoTypeInformation"],
+            capture_output=True, text=True, timeout=60,
+            creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Could not query RAM info: {exc}")
+    lines = [l.strip() for l in (out.stdout or "").splitlines() if l.strip() and not l.startswith("#")]
+    if len(lines) < 2:
+        raise RuntimeError("No RAM sticks reported — memory info unavailable.")
+    import csv as _csv
+    import io as _io
+    _TYPES = {24: "DDR3", 26: "DDR4", 27: "LPDDR4", 30: "LPDDR5", 32: "LPDDR5X", 34: "DDR5"}
+    slow = []
+    seen = 0
+    try:
+        rows = list(_csv.reader(_io.StringIO("\n".join(lines))))
+    except Exception:
+        rows = []
+    for parts in rows[1:]:
+        if len(parts) < 3:
+            continue
+        try:
+            mtype, rated, configured = int(parts[0] or 0), int(parts[1] or 0), int(parts[2] or 0)
+        except ValueError:
+            continue
+        if not rated or not configured:
+            continue
+        seen += 1
+        label = _TYPES.get(mtype, f"type {mtype}")
+        ctx.log(f"  stick: {label} rated {rated} MT/s, running {configured} MT/s")
+        if rated - configured > 100:
+            slow.append(f"{rated}->{configured} MT/s")
+    if not seen:
+        raise RuntimeError("Could not parse any RAM speed rows — check the log.")
+    if slow:
+        raise RuntimeError(
+            f"XMP/EXPO looks OFF: RAM rated faster than it runs ({', '.join(slow)}). "
+            "Fix: reboot into BIOS (Del/F2) > enable XMP (Intel) / EXPO (AMD) > save. "
+            "Free performance — no Windows change needed.")
+    ctx.log(f"VERDICT: all {seen} stick(s) run at rated speed — XMP/EXPO is on (or JEDEC kit).")
+
+
+def check_rebar_status(ctx: TaskContext):
+    """Report-only Resizable BAR audit (NVIDIA auto-detect): reads BAR1
+    size via nvidia-smi — a full-VRAM BAR means ReBAR is ON (+5-10% FPS in
+    supported games), 256 MB means OFF (enable 'Above 4G Decoding' +
+    'ReBAR' in BIOS). Non-NVIDIA PCs get an honest skip with the manual
+    check. Changes NOTHING — ReBAR itself is a BIOS toggle."""
+    from app.utils import TaskSkipped
+    ctx.set_status("Checking Resizable BAR status...")
+    import subprocess as _sp
+    import shutil as _sh
+    if not _sh.which("nvidia-smi"):
+        raise TaskSkipped(
+            "No nvidia-smi found (no NVIDIA GPU/driver) — ReBAR can only be "
+            "auto-checked on NVIDIA. AMD/Intel: look for 'Above 4G Decoding' + "
+            "'ReBAR' in the BIOS.")
+    try:
+        out = _sp.run(
+            ["nvidia-smi", "-q"],
+            capture_output=True, text=True, timeout=60,
+            creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Could not query the GPU: {exc}")
+    text = out.stdout or ""
+    total_mb = None
+    in_bar1 = False
+    import re as _re
+    for line in text.splitlines():
+        if "BAR1 Memory Usage" in line:
+            in_bar1 = True
+            continue
+        if in_bar1:
+            m = _re.search(r"Total\s*:\s*(\d+)\s*MiB", line)
+            if m:
+                total_mb = int(m.group(1))
+                break
+            if line.strip().startswith("BAR") or "Memory Usage" in line and "BAR1" not in line:
+                break
+    if total_mb is None:
+        raise RuntimeError("Could not read the BAR1 size from nvidia-smi — check the log.")
+    ctx.log(f"  GPU BAR1 size: {total_mb} MiB")
+    if total_mb <= 512:
+        raise RuntimeError(
+            "ReBAR looks OFF (256 MB BAR). Fix: BIOS > enable 'Above 4G Decoding' "
+            "FIRST, then 'Resizable BAR' > save. +5-10% FPS in supported games.")
+    ctx.log("VERDICT: ReBAR is ON (large BAR) — no action needed.")
+
+
 # --------------------------------------------------------------------------- #
 # Installer tasks MOVED to app/tasks/install_tasks.py (Install tab) — every
 # internet-required task lives there now, per the user's 4th-tab request.
@@ -1553,4 +1792,11 @@ TASKS = [
     Task("startup_audit", "Check Startup Programs", "Shows what slows your boot; changes nothing, removes nothing", audit_startup_impact, default=False, admin_required=False),
     Task("micfix_audit", "Why Can't They Hear Me?", "Diagnoses mic-not-heard in games/chat from privacy + device state; changes nothing", audit_mic_consent, default=False, admin_required=False),
     Task("nvidia_app_fix", "Fix NVIDIA App Won't Open", "Restarts NVIDIA background services behind splash-screen hangs", repair_nvidia_app_services, default=False, admin_required=True),
+    Task("gameinput_restart", "Fix Controller Not Detected", "Restarts GameInput when games ignore your controller; no reboot", restart_gameinput_service, default=False, admin_required=True),
+    Task("xboxlive_restart", "Fix Xbox Sign-In Errors", "Restarts Xbox Live services behind Game Pass login loops", restart_xbox_live_services, default=False, admin_required=True),
+    Task("wu_bounce", "Restart Update Services", "Gentle update-service restart without touching files — try before full reset", restart_update_services, default=False, admin_required=True),
+    Task("ram_test", "Test RAM for Errors", "Opens the official memory test behind random crashes; you pick when to reboot", schedule_memory_test, default=False, admin_required=False),
+    Task("dxdiag_report", "Save Diagnostics Report", "Saves a dxdiag report for support forums; changes nothing", run_dxdiag_report, default=False, admin_required=False),
+    Task("xmp_check", "Is XMP/EXPO On?", "Checks your RAM runs at full speed; enabling it is a free BIOS toggle", check_xmp_status, default=False, admin_required=False),
+    Task("rebar_check", "Is ReBAR On?", "Checks Resizable BAR for free FPS (NVIDIA auto-detect); enabling it is a BIOS toggle", check_rebar_status, default=False, admin_required=False),
 ]

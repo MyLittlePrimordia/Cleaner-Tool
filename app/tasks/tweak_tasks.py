@@ -9,7 +9,7 @@ import time
 from app.utils import (
     TaskContext, TaskSkipped, TaskCancelled, reg_set_value, reg_set_value_checked, reg_delete_value, reg_delete_key, reg_get_value, run_cmd, run_cmd_checked, create_restore_point, IS_WINDOWS,
     resolve_asset_path, powercfg_query_indexes, sc_query_start_type, restart_explorer,
-    atomic_write_text,
+    atomic_write_text, exclusive_create_text,
 )
 from app.config_persist import save_tweak_snapshot, get_tweak_snapshot, clear_tweak_snapshot
 
@@ -1072,18 +1072,41 @@ def revert_ssd_prefetch(ctx: TaskContext):
 
 
 # Disables activity history #
+_ACTIVITY_HISTORY_SPECS = [
+    ("HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\System", "EnableActivityFeed"),
+    ("HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\System", "PublishUserActivities"),
+    ("HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\System", "UploadUserActivities"),
+]
+
 def apply_activity_history_disable(ctx: TaskContext):
     ctx.log("[Tweak] Activity History - Disable")
-    base = "SOFTWARE\\Policies\\Microsoft\\Windows\\System"
-    for name in ("EnableActivityFeed", "PublishUserActivities", "UploadUserActivities"):
-        reg_set_value_checked(ctx, "HKLM", base, name, 0)
-        ctx.log(f"  Set {base}\\{name}=0")
+    # CT-007 audit fix (double-owned EnableActivityFeed): privacy_baseline
+    # also writes EnableActivityFeed under this exact HKLM path, via proper
+    # snapshot/restore (_snap_reg_values/_restore_reg_values). This task
+    # used to unconditionally SET 0 on apply and DELETE on revert with no
+    # snapshot at all — undoing whichever of the two ran second could
+    # silently flip or delete a value the other tweak still considers
+    # "applied" (and the blind delete also lost any real prior GPO value on
+    # PublishUserActivities/UploadUserActivities in isolation). Snapshot the
+    # same way privacy_baseline and the MenuShowDelay fix above do. Same
+    # documented residual order-dependence as that fix: each undo restores
+    # what was there immediately before its OWN apply, not necessarily the
+    # machine's original state, if the two tweaks are applied in
+    # overlapping order — not fixable without merging the tweaks.
+    had_snapshot = bool(get_tweak_snapshot("activity_history_disable"))
+    _snap_reg_values(ctx, "activity_history_disable", _ACTIVITY_HISTORY_SPECS)
+    try:
+        for _, base, name in _ACTIVITY_HISTORY_SPECS:
+            reg_set_value_checked(ctx, "HKLM", base, name, 0)
+            ctx.log(f"  Set {base}\\{name}=0")
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("activity_history_disable")
+        raise
     ctx.log("Activity History disabled.")
 
 def revert_activity_history_disable(ctx: TaskContext):
-    base = "SOFTWARE\\Policies\\Microsoft\\Windows\\System"
-    for name in ("EnableActivityFeed", "PublishUserActivities", "UploadUserActivities"):
-        reg_delete_value(ctx, "HKLM", base, name)
+    _restore_reg_values(ctx, "activity_history_disable")
     ctx.log("Activity History reverted.")
 
 # Disables consumer features #
@@ -1198,6 +1221,14 @@ def apply_nvidia_max_performance(ctx: TaskContext):
     # C5: drop our snapshot if the sets below fail (else a false badge).
     had_snapshot = bool(get_tweak_snapshot("max_performance_gpu"))
     _snapshot_powercfg_pairs(ctx, "max_performance_gpu", _NVIDIA_MAX_PERF_PAIRS)
+    # CT-002 audit fix: this tweak also writes NVIDIA's own
+    # PowerMizerEnable=0 below, but only the powercfg pairs were ever
+    # snapshotted — Undo left PowerMizerEnable stuck at 0 permanently.
+    # Snapshot it under its own task id (distinct from the powercfg
+    # snapshot's shape/key) so revert can restore or remove it too.
+    had_pmz_snapshot = bool(get_tweak_snapshot("max_performance_gpu_pmz"))
+    _snap_reg_values(ctx, "max_performance_gpu_pmz",
+                     [("HKCU", "Software\\NVIDIA Corporation\\Global\\FTS", "PowerMizerEnable")])
     try:
         # Generic via powercfg + NVIDIA PowerMizer
         run_cmd_checked(ctx, "powercfg /setacvalueindex scheme_current sub_processor PROCTHROTTLEMAX 100", timeout=30)
@@ -1214,6 +1245,8 @@ def apply_nvidia_max_performance(ctx: TaskContext):
     except Exception:
         if not had_snapshot:
             clear_tweak_snapshot("max_performance_gpu")
+        if not had_pmz_snapshot:
+            clear_tweak_snapshot("max_performance_gpu_pmz")
         raise
     ctx.log("GPU prefer max performance set.")
 
@@ -1222,6 +1255,10 @@ def revert_nvidia_max_performance(ctx: TaskContext):
     # which is BELOW Windows' real default of 100 — Undo used to leave the
     # CPU throttled more than it was before the tweak ever ran).
     _restore_powercfg_pairs(ctx, "max_performance_gpu", _NVIDIA_MAX_PERF_PAIRS, _NVIDIA_MAX_PERF_FALLBACK)
+    # CT-002 audit fix: restore (or remove, if it was absent before) the
+    # PowerMizerEnable value apply_nvidia_max_performance wrote — previously
+    # left permanently at 0 with no revert path at all.
+    _restore_reg_values(ctx, "max_performance_gpu_pmz")
     ctx.log("GPU performance reverted.")
 
 # Disables fullscreen optimizations #
@@ -1799,13 +1836,15 @@ def apply_ad_blocker(ctx: TaskContext):
     # Back up the ORIGINAL hosts file exactly once. If we ever re-apply after
     # already having applied (e.g. to refresh the list), we must not overwrite
     # an existing backup with our own already-modified file.
-    if not os.path.isfile(_HOSTS_BACKUP_PATH):
-        try:
-            with open(_HOSTS_BACKUP_PATH, "w", encoding="utf-8") as f:
-                f.write(current)
+    # SEC-001 audit fix: exclusive-create instead of isfile()-check + plain
+    # open("w") — that was a racy check-then-write that also followed a
+    # symlink if one was already planted at the backup path.
+    try:
+        created = exclusive_create_text(_HOSTS_BACKUP_PATH, current)
+        if created:
             ctx.log(f"Backed up original hosts file to {_HOSTS_BACKUP_PATH}")
-        except Exception as exc:
-            raise RuntimeError(f"Could not back up hosts file, aborting for safety: {exc}")
+    except Exception as exc:
+        raise RuntimeError(f"Could not back up hosts file, aborting for safety: {exc}")
 
     # Strip any previous block first (idempotent re-apply / list refresh)
     base_content = _strip_adblock_block(current)
@@ -1958,6 +1997,83 @@ def apply_suppress_crash_popups(ctx: TaskContext):
 
 def revert_suppress_crash_popups(ctx: TaskContext):
     reg_delete_value(ctx, "HKCU", "Software\\Microsoft\\Windows\\Windows Error Reporting", "DontShowUI")
+
+
+_HIDE_RECENT_SPECS = [
+    ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer", "ShowRecent"),
+    ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer", "ShowFrequent"),
+]
+
+
+def apply_hide_recent(ctx: TaskContext):
+    """Stop Explorer Home from showing recent files and frequent folders —
+    the switch that stops re-creating what the 'Clear Activity Traces'
+    clean removes. Same values Settings writes when you untick both boxes
+    (Folder Options > Privacy). Fully reversible via snapshot."""
+    had_snapshot = bool(get_tweak_snapshot("hide_recent"))
+    _snap_reg_values(ctx, "hide_recent", _HIDE_RECENT_SPECS)
+    try:
+        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer",
+                              "ShowRecent", 0)
+        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer",
+                              "ShowFrequent", 0)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("hide_recent")
+        raise
+    if not _restart_explorer(ctx):
+        raise RuntimeError(
+            "Registry values set, but Explorer did not restart cleanly — "
+            "your taskbar may be missing. Press Ctrl+Shift+Esc > File > Run "
+            "new task > explorer.exe.")
+
+
+def revert_hide_recent(ctx: TaskContext):
+    snap = get_tweak_snapshot("hide_recent")
+    if snap and "specs" in snap:
+        _restore_reg_values(ctx, "hide_recent")
+    else:
+        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer",
+                              "ShowRecent", 1)
+        reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer",
+                              "ShowFrequent", 1)
+        ctx.log("  (no snapshot found — restored to documented Windows defaults instead)")
+    if not _restart_explorer(ctx):
+        ctx.log("  ! Explorer did not restart cleanly — your taskbar may be missing. "
+                "Press Ctrl+Shift+Esc > File > Run new task > explorer.exe.")
+
+
+_TDR_SPECS = [
+    ("HKLM", "SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers", "TdrDelay"),
+]
+
+
+def apply_tdr_delay(ctx: TaskContext):
+    """Raise the GPU hang timeout from 2s to 8s — the documented fix for
+    DXGI_ERROR_DEVICE_HUNG / driver-timeout crashes on overclocked or
+    heavy-RT GPUs. Windows waits longer before resetting the driver
+    instead of crashing the game. Reversible (delete = 2s default)."""
+    had_snapshot = bool(get_tweak_snapshot("tdr_delay"))
+    _snap_reg_values(ctx, "tdr_delay", _TDR_SPECS)
+    try:
+        reg_set_value_checked(ctx, "HKLM", "SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers",
+                              "TdrDelay", 8)
+    except Exception:
+        if not had_snapshot:
+            clear_tweak_snapshot("tdr_delay")
+        raise
+    ctx.log("GPU timeout raised to 8s. Reboot to take effect.")
+
+
+def revert_tdr_delay(ctx: TaskContext):
+    snap = get_tweak_snapshot("tdr_delay")
+    if snap and "specs" in snap:
+        _restore_reg_values(ctx, "tdr_delay")
+    else:
+        # Windows default is an ABSENT value (2s) — remove ours.
+        reg_delete_value(ctx, "HKLM", "SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers", "TdrDelay")
+        ctx.log("  (no snapshot found — removed the value; Windows then uses its 2s default)")
+    ctx.log("Reboot to take effect.")
     ctx.log("Crash popups restored.")
 
 
@@ -2349,40 +2465,103 @@ def revert_gaming_dns(ctx: TaskContext):
     ctx.log("DNS restored to previous settings.")
 
 
+_DEVMODE_CLS = None
+
+
+def _devmode_class():
+    """Build (and cache) the one correct, complete DEVMODEW ctypes layout
+    (wingdi.h) for EnumDisplaySettingsW / ChangeDisplaySettingsW.
+
+    Grok-assisted audit fix: this file previously had THREE separate inline
+    DEVMODE definitions (in _query_video_mode_list, apply_refresh_rate_fix,
+    revert_refresh_rate_fix), and all three were missing ~84 bytes in the
+    middle of the real struct — the dmColor/dmDuplex/dmYResolution/
+    dmTTOption/dmCollate SHORTs, the 32-WCHAR dmFormName, and dmLogPixels —
+    and had dmBitsPerPel positioned before dmPelsWidth/dmPelsHeight instead
+    of after. dmSize told Windows how big THIS (too-short) buffer was, but
+    EnumDisplaySettingsW/ChangeDisplaySettingsW write to the real struct's
+    fixed offsets regardless of what dmSize claims — so this code's
+    dmPelsWidth/dmPelsHeight fields were reading (and writing, in the
+    apply/revert direction) bytes from the wrong real field entirely,
+    producing the "0x0" resolution shown everywhere it's surfaced (Monitor
+    Test, PC Specs) while dmDisplayFrequency, positioned differently,
+    happened to still land close enough to read correctly. This is also
+    the exact class of bug the file's own comment above already worried
+    about ("a short struct lets a sloppy display driver write past the
+    buffer — heap corruption... observed on virtual GPUs") — the fix for
+    that is a COMPLETE struct (this one totals the documented 220 bytes),
+    not a slightly-larger-but-still-wrong one.
+    One shared, correct, size-verified definition now backs every caller
+    instead of three separately-maintained (and equally wrong) copies.
+    """
+    global _DEVMODE_CLS
+    if _DEVMODE_CLS is not None:
+        return _DEVMODE_CLS
+    import ctypes
+    from ctypes import wintypes
+
+    class DEVMODE(ctypes.Structure):
+        _fields_ = [
+            ("dmDeviceName", wintypes.WCHAR * 32),
+            ("dmSpecVersion", wintypes.WORD),
+            ("dmDriverVersion", wintypes.WORD),
+            ("dmSize", wintypes.WORD),
+            ("dmDriverExtra", wintypes.WORD),
+            ("dmFields", wintypes.DWORD),
+            # 16-byte union (display case: position + orientation/output).
+            ("dmPositionX", ctypes.c_long),
+            ("dmPositionY", ctypes.c_long),
+            ("dmDisplayOrientation", wintypes.DWORD),
+            ("dmDisplayFixedOutput", wintypes.DWORD),
+            ("dmColor", ctypes.c_short),
+            ("dmDuplex", ctypes.c_short),
+            ("dmYResolution", ctypes.c_short),
+            ("dmTTOption", ctypes.c_short),
+            ("dmCollate", ctypes.c_short),
+            ("dmFormName", wintypes.WCHAR * 32),
+            ("dmLogPixels", wintypes.WORD),
+            ("dmBitsPerPel", wintypes.DWORD),
+            ("dmPelsWidth", wintypes.DWORD),
+            ("dmPelsHeight", wintypes.DWORD),
+            ("dmDisplayFlags", wintypes.DWORD),
+            ("dmDisplayFrequency", wintypes.DWORD),
+            ("dmICMMethod", wintypes.DWORD),
+            ("dmICMIntent", wintypes.DWORD),
+            ("dmMediaType", wintypes.DWORD),
+            ("dmDitherType", wintypes.DWORD),
+            ("dmReserved1", wintypes.DWORD),
+            ("dmReserved2", wintypes.DWORD),
+            ("dmPanningWidth", wintypes.DWORD),
+            ("dmPanningHeight", wintypes.DWORD),
+        ]
+    assert ctypes.sizeof(DEVMODE) == 220, \
+        f"DEVMODE layout drifted from the documented 220 bytes: {ctypes.sizeof(DEVMODE)}"
+    _DEVMODE_CLS = DEVMODE
+    return DEVMODE
+
+
 def _query_video_mode_list():
     """Return (current, maximum) (width, height, hz, bits) tuples via
     EnumDisplaySettings, or (None, None) if anything fails."""
     if not IS_WINDOWS:
         return None, None
     import ctypes
-    from ctypes import wintypes
     try:
-        class DEVMODE(ctypes.Structure):
-            _fields_ = [
-                ("dmDeviceName", wintypes.WCHAR * 32),
-                ("dmSpecVersion", wintypes.WORD), ("dmDriverVersion", wintypes.WORD),
-                ("dmSize", wintypes.WORD), ("dmDriverExtra", wintypes.WORD),
-                ("dmFields", wintypes.DWORD),
-                ("dmPositionX", ctypes.c_long), ("dmPositionY", ctypes.c_long),
-                ("dmPelsWidth", wintypes.DWORD), ("dmPelsHeight", wintypes.DWORD),
-                ("dmBitsPerPel", wintypes.DWORD), ("dmDisplayFlags", wintypes.DWORD),
-                ("dmDisplayFrequency", wintypes.DWORD),
-                ("dmICMMethod", wintypes.DWORD), ("dmICMIntent", wintypes.DWORD),
-                ("dmMediaType", wintypes.DWORD), ("dmDitherType", wintypes.DWORD),
-                ("dmReserved1", wintypes.DWORD), ("dmReserved2", wintypes.DWORD),
-                ("dmPanningWidth", wintypes.DWORD), ("dmPanningHeight", wintypes.DWORD),
-                # Full DEVMODE size (a short struct lets a sloppy display
-                # driver write past the buffer — heap corruption detonating
-                # later at GC; observed on virtual GPUs).
-                ("dmDisplayFixedOutput", wintypes.DWORD),
-            ]
-
+        DEVMODE = _devmode_class()
         user32 = ctypes.windll.user32
         dm = DEVMODE()
         dm.dmSize = ctypes.sizeof(DEVMODE)
         if not user32.EnumDisplaySettingsW(None, ctypes.c_ulong(0xFFFFFFFF), ctypes.byref(dm)):  # ENUM_CURRENT_SETTINGS
             return None, None
-        current = (dm.dmPelsWidth, dm.dmPelsHeight, dm.dmDisplayFrequency, dm.dmBitsPerPel)
+        w, h = int(dm.dmPelsWidth), int(dm.dmPelsHeight)
+        # Grok-suggested defensive fallback: on the rare driver that still
+        # reports 0 even off the now-correct struct, GetSystemMetrics is a
+        # second, independent way to get the real desktop resolution rather
+        # than surfacing "0x0" to the user.
+        if w <= 0 or h <= 0:
+            w = int(user32.GetSystemMetrics(0))   # SM_CXSCREEN
+            h = int(user32.GetSystemMetrics(1))   # SM_CYSCREEN
+        current = (w, h, dm.dmDisplayFrequency, dm.dmBitsPerPel)
         # walk mode i=0.. until 0 to find the max frequency at current resolution+depth
         best = None
         i = 0
@@ -2450,6 +2629,50 @@ def _query_precise_refresh_rate():
         return None
 
 
+def _query_monitor_model():
+    """Best-effort monitor name from EDID via WmiMonitorID (root\\wmi
+    namespace) — the same data Device Manager reads. Returns a plain
+    string like 'AG276QZD2', or None if it can't be read: some
+    monitors/cables/KVMs don't carry usable EDID data, and the class can
+    be blocked on some locked-down images. Never guesses."""
+    if not IS_WINDOWS:
+        return None
+    import subprocess as _sp
+    try:
+        cmd = ("Get-CimInstance -Namespace root\\wmi -ClassName WmiMonitorID "
+               "-ErrorAction Stop | Select-Object UserFriendlyName,"
+               "UserFriendlyNameLength | ConvertTo-Json -Compress")
+        creationflags = getattr(_sp, "CREATE_NO_WINDOW", 0)
+        proc = _sp.run(
+            ["powershell", "-NoProfile", "-NonInteractive",
+             "-ExecutionPolicy", "Bypass", "-Command", cmd],
+            capture_output=True, text=True, timeout=4.0,
+            creationflags=creationflags)
+        raw = (proc.stdout or "").strip()
+        if not raw:
+            return None
+        import json as _json
+        data = _json.loads(raw)
+        if isinstance(data, dict):
+            data = [data]
+        for row in data or []:
+            codes = row.get("UserFriendlyName") or []
+            length = row.get("UserFriendlyNameLength")
+            if not codes:
+                continue
+            if not isinstance(length, int) or length <= 0:
+                length = len(codes)
+            try:
+                name = "".join(chr(c) for c in codes[:length] if c).strip()
+            except Exception:
+                continue
+            if name:
+                return name
+        return None
+    except Exception:
+        return None
+
+
 def apply_refresh_rate_fix(ctx: TaskContext):
     """Detect the monitor's maximum refresh rate at the CURRENT resolution
     and depth; if Windows is running it lower (the classic 144Hz panel stuck
@@ -2469,27 +2692,8 @@ def apply_refresh_rate_fix(ctx: TaskContext):
         # is raised BEFORE the snapshot so state stays untouched.
         raise TaskSkipped(f"Already running at the maximum ({max_hz} Hz) — nothing to change.")
     import ctypes
-    from ctypes import wintypes
     try:
-        class DEVMODE(ctypes.Structure):
-            _fields_ = [
-                ("dmDeviceName", wintypes.WCHAR * 32),
-                ("dmSpecVersion", wintypes.WORD), ("dmDriverVersion", wintypes.WORD),
-                ("dmSize", wintypes.WORD), ("dmDriverExtra", wintypes.WORD),
-                ("dmFields", wintypes.DWORD),
-                ("dmPositionX", ctypes.c_long), ("dmPositionY", ctypes.c_long),
-                ("dmPelsWidth", wintypes.DWORD), ("dmPelsHeight", wintypes.DWORD),
-                ("dmBitsPerPel", wintypes.DWORD), ("dmDisplayFlags", wintypes.DWORD),
-                ("dmDisplayFrequency", wintypes.DWORD),
-                ("dmICMMethod", wintypes.DWORD), ("dmICMIntent", wintypes.DWORD),
-                ("dmMediaType", wintypes.DWORD), ("dmDitherType", wintypes.DWORD),
-                ("dmReserved1", wintypes.DWORD), ("dmReserved2", wintypes.DWORD),
-                ("dmPanningWidth", wintypes.DWORD), ("dmPanningHeight", wintypes.DWORD),
-                # Full DEVMODE size (a short struct lets a sloppy display
-                # driver write past the buffer — heap corruption detonating
-                # later at GC; observed on virtual GPUs).
-                ("dmDisplayFixedOutput", wintypes.DWORD),
-            ]
+        DEVMODE = _devmode_class()
         user32 = ctypes.windll.user32
         dm = DEVMODE()
         dm.dmSize = ctypes.sizeof(DEVMODE)
@@ -2525,27 +2729,8 @@ def revert_refresh_rate_fix(ctx: TaskContext):
         clear_tweak_snapshot("refresh_rate_fix")
         return
     import ctypes
-    from ctypes import wintypes
     try:
-        class DEVMODE(ctypes.Structure):
-            _fields_ = [
-                ("dmDeviceName", wintypes.WCHAR * 32),
-                ("dmSpecVersion", wintypes.WORD), ("dmDriverVersion", wintypes.WORD),
-                ("dmSize", wintypes.WORD), ("dmDriverExtra", wintypes.WORD),
-                ("dmFields", wintypes.DWORD),
-                ("dmPositionX", ctypes.c_long), ("dmPositionY", ctypes.c_long),
-                ("dmPelsWidth", wintypes.DWORD), ("dmPelsHeight", wintypes.DWORD),
-                ("dmBitsPerPel", wintypes.DWORD), ("dmDisplayFlags", wintypes.DWORD),
-                ("dmDisplayFrequency", wintypes.DWORD),
-                ("dmICMMethod", wintypes.DWORD), ("dmICMIntent", wintypes.DWORD),
-                ("dmMediaType", wintypes.DWORD), ("dmDitherType", wintypes.DWORD),
-                ("dmReserved1", wintypes.DWORD), ("dmReserved2", wintypes.DWORD),
-                ("dmPanningWidth", wintypes.DWORD), ("dmPanningHeight", wintypes.DWORD),
-                # Full DEVMODE size (a short struct lets a sloppy display
-                # driver write past the buffer — heap corruption detonating
-                # later at GC; observed on virtual GPUs).
-                ("dmDisplayFixedOutput", wintypes.DWORD),
-            ]
+        DEVMODE = _devmode_class()
         user32 = ctypes.windll.user32
         dm = DEVMODE()
         dm.dmSize = ctypes.sizeof(DEVMODE)
@@ -2631,11 +2816,24 @@ def _snap_reg_values(ctx: TaskContext, task_id: str, specs: "list[tuple]"):
     arg restored every value as one type).
     """
     from app.config_persist import save_tweak_snapshot
-    from app.utils import _REG_DENIED
+    from app.utils import _REG_DENIED, reg_get_value_typed
     data: dict = {"specs": [list(s[:3]) for s in specs]}
     for i, spec in enumerate(specs):
         hive, path, name = spec[0], spec[1], spec[2]
-        prior = reg_get_value(ctx, hive, path, name)
+        # CT-001 audit fix: read the REAL prior type via QueryValueEx instead
+        # of guessing REG_DWORD for any spec that didn't spell out a 4th
+        # element. The old default silently mis-stamped REG_SZ priors (e.g.
+        # KeyboardDelay/KeyboardSpeed, WaitToKillAppTimeout — all natively
+        # REG_SZ on Windows) as REG_DWORD, so restoring the string prior
+        # under that type raised inside winreg.SetValueEx and revert failed
+        # outright for every tweak using a 3-element spec against a REG_SZ
+        # value (fast_app_close, keyboard_tuning, numlock_boot,
+        # visual_effects and any future 3-element spec against a string
+        # value). Precedence: real queried type first (it's what's actually
+        # there); an explicit spec[3] override only when nothing could be
+        # queried (value absent/denied); "REG_DWORD" as the last-resort
+        # fallback so legacy snapshots without recorded types keep working.
+        prior, queried_type = reg_get_value_typed(ctx, hive, path, name)
         # F13: denied reads are PRESENT-but-unreadable — never "absent"
         # (absent made revert delete a value the user already had).
         data[f"{i}:present"] = prior is not None and prior is not _REG_DENIED
@@ -2647,7 +2845,7 @@ def _snap_reg_values(ctx: TaskContext, task_id: str, specs: "list[tuple]"):
             data[f"{i}:value"] = {"__bytes_hex__": prior.hex()}
         else:
             data[f"{i}:value"] = None if prior is _REG_DENIED else prior
-        data[f"{i}:type"] = spec[3] if len(spec) > 3 else "REG_DWORD"
+        data[f"{i}:type"] = queried_type or (spec[3] if len(spec) > 3 else "REG_DWORD")
     save_tweak_snapshot(task_id, data)
 
 
@@ -3669,6 +3867,17 @@ def verify_suppress_crash_popups() -> "bool | None":
     return _verify_value("HKCU", "Software\\Microsoft\\Windows\\Windows Error Reporting", "DontShowUI", 1)
 
 
+def verify_hide_recent() -> "bool | None":
+    return _verify_all_values([
+        ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer", "ShowRecent", 0),
+        ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer", "ShowFrequent", 0),
+    ])
+
+
+def verify_tdr_delay() -> "bool | None":
+    return _verify_value("HKLM", "SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers", "TdrDelay", 8)
+
+
 def verify_no_update_reboot() -> "bool | None":
     return _verify_value("HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU",
                          "NoAutoRebootWithLoggedOnUsers", 1)
@@ -3839,4 +4048,6 @@ TASKS = [
     Task("long_paths", "Allow Long File Paths", "Lets games and mods use very long file names without errors", apply_long_paths, default=False, revert=revert_long_paths, verify=verify_long_paths, admin_required=True),
     Task("classic_shortcut_icons", "Classic Shortcut Icons", "Clean desktop icons: no arrow overlay, no ' - Shortcut' text", apply_classic_shortcut_icons, default=False, revert=revert_classic_shortcut_icons, verify=verify_classic_shortcut_icons, admin_required=False),
     Task("prefer_ipv4", "Prefer IPv4 For Gaming", "Fixes lag on bad IPv6 routers by preferring IPv4; IPv6 stays on", apply_prefer_ipv4, default=False, revert=revert_prefer_ipv4, verify=verify_prefer_ipv4, admin_required=True),
+    Task("hide_recent", "Hide Recent Files", "Stops Explorer showing recent files and frequent folders", apply_hide_recent, default=False, revert=revert_hide_recent, verify=verify_hide_recent, admin_required=False),
+    Task("tdr_delay", "Fix GPU Timeout Crashes", "Waits 8s instead of 2s before resetting a hung GPU — fixes DXGI hang crashes", apply_tdr_delay, default=False, revert=revert_tdr_delay, verify=verify_tdr_delay, admin_required=True, risk="REBOOT REQUIRED"),
 ]

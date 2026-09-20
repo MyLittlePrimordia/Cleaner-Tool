@@ -126,10 +126,122 @@ def has_web_media_extension() -> bool:
     return _appx_version("Microsoft.WebMediaExtension") is not None
 
 
+# --------------------------------------------------------------------------- #
+# LTSC everyday-app checks (2026-09): Pro-inbox Store apps that LTSC strips
+# (or ships legacy-only: Notepad/Paint/Snipping Tool). Same _appx_version
+# mechanism as above — never guess from the Windows edition. Every Store ID
+# below was live-verified via `winget show --exact --id <id> --source
+# msstore` on 2026-09-20 before being hardcoded.
+# --------------------------------------------------------------------------- #
+
+@functools.lru_cache(maxsize=None)
+def has_camera_app() -> bool:
+    """Windows Camera (9WZDNCRFJBBG) — webcam photos/video on stripped Windows."""
+    return _appx_version("Microsoft.WindowsCamera") is not None
+
+
+@functools.lru_cache(maxsize=None)
+def has_photos_app() -> bool:
+    """Microsoft Photos (9WZDNCRFJBH4) — screenshots won't open without it."""
+    return _appx_version("Microsoft.Windows.Photos") is not None
+
+
+@functools.lru_cache(maxsize=None)
+def has_webp_extension() -> bool:
+    """WebP Image Extension (9PG2DK419DRG) — thumbnails/photos need it."""
+    return _appx_version("Microsoft.WebPImageExtension") is not None
+
+
+@functools.lru_cache(maxsize=None)
+def has_heif_extension() -> bool:
+    """HEIF Image Extension (9PMMSR1CGPWG) — iPhone photos need it."""
+    return _appx_version("Microsoft.HEIFImageExtension") is not None
+
+
+@functools.lru_cache(maxsize=None)
+def has_raw_image_extension() -> bool:
+    """Raw Image Extension (9NCTDW2W1BH8) — camera RAWs need it."""
+    return _appx_version("Microsoft.RawImageExtension") is not None
+
+
+@functools.lru_cache(maxsize=None)
+def has_snipping_tool() -> bool:
+    """Snipping Tool, new Store build with video clipping (9MZ95KL8MR0L).
+    LTSC ships the legacy build only — detected via the shared ScreenSketch
+    package both builds register."""
+    return _appx_version("Microsoft.ScreenSketch") is not None
+
+
+@functools.lru_cache(maxsize=None)
+def has_media_player() -> bool:
+    """Windows Media Player, new Store build (9WZDNCRFJ3PT)."""
+    return _appx_version("Microsoft.ZuneMusic") is not None
+
+
+@functools.lru_cache(maxsize=None)
+def has_mpeg2_extension() -> bool:
+    """MPEG-2 Video Extension (9N95Q1ZZPMH4) — rare game cutscenes need it."""
+    return _appx_version("Microsoft.MPEG2VideoExtension") is not None
+
+
+@functools.lru_cache(maxsize=None)
+def has_notepad_app() -> bool:
+    """Windows Notepad, new tabbed Store build (9MSMLRH6LZF3)."""
+    return _appx_version("Microsoft.WindowsNotepad") is not None
+
+
+@functools.lru_cache(maxsize=None)
+def has_paint_app() -> bool:
+    """Paint, new Store build with layers (9PCFS5B6T72H)."""
+    return _appx_version("Microsoft.Paint") is not None
+
+
+@functools.lru_cache(maxsize=None)
+def has_calculator_app() -> bool:
+    """Windows Calculator (9WZDNCRFHVN5)."""
+    return _appx_version("Microsoft.WindowsCalculator") is not None
+
+
+@functools.lru_cache(maxsize=None)
+def has_clock_app() -> bool:
+    """Windows Clock, alarms + focus (9WZDNCRFJ3PR)."""
+    return _appx_version("Microsoft.WindowsAlarms") is not None
+
+
+@functools.lru_cache(maxsize=None)
+def has_sticky_notes() -> bool:
+    """Microsoft Sticky Notes (9NBLGGH4QGHW)."""
+    return _appx_version("Microsoft.MicrosoftStickyNotes") is not None
+
+
+@functools.lru_cache(maxsize=None)
+def has_sound_recorder() -> bool:
+    """Windows Sound Recorder (9WZDNCRFHWKN)."""
+    return _appx_version("Microsoft.WindowsSoundRecorder") is not None
+
+
+@functools.lru_cache(maxsize=None)
+def has_phone_link() -> bool:
+    """Phone Link (9NMPJ99VJBWV) — Android photos/SMS/calls on PC."""
+    return _appx_version("Microsoft.YourPhone") is not None
+
+
+@functools.lru_cache(maxsize=None)
+def has_quick_assist() -> bool:
+    """Quick Assist (9P7BP5VNWKX5) — 1-click MS remote help."""
+    return _appx_version("MicrosoftCorporationII.QuickAssist") is not None
+
+
 def invalidate_caches() -> None:
     """Clear capability caches — call after an installer ran, so presence
     checks reflect the new state."""
     for fn in (has_store, has_winget, has_game_bar, has_xbox_app,
                 has_gaming_services, has_av1_codec, has_vp9_codec,
-                has_web_media_extension, has_xbox_identity_provider):
+                has_web_media_extension, has_xbox_identity_provider,
+                has_camera_app, has_photos_app, has_webp_extension,
+                has_heif_extension, has_raw_image_extension,
+                has_snipping_tool, has_media_player, has_mpeg2_extension,
+                has_notepad_app, has_paint_app, has_calculator_app,
+                has_clock_app, has_sticky_notes, has_sound_recorder,
+                has_phone_link, has_quick_assist):
         fn.cache_clear()

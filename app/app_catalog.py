@@ -143,7 +143,13 @@ Standing rules (unchanged):
 
 MSSTORE_IDS = {"9MVZQVXJBQ9V", "9N4D0MSMP0PT", "9MV0B5HZVK9Z", "9NZKPSTSNW4P",
                "9N5TDP8VCMHS", "XP8CLZL93F5Z4P", "9NBLGGH30XJ3",
-               "9P4CLT2RJ1RS", "9NKSQGP7F2NH"}
+               "9P4CLT2RJ1RS", "9NKSQGP7F2NH",
+               # 2026-09-20 LTSC everyday-app bundles (all live-verified via
+               # `winget show --exact --id <id> --source msstore` on 2026-09-20)
+               "9WZDNCRFJBBG", "9WZDNCRFJBH4", "9MZ95KL8MR0L", "9WZDNCRFJ3PT",
+               "9MSMLRH6LZF3", "9PCFS5B6T72H", "9WZDNCRFHVN5", "9WZDNCRFJ3PR",
+               "9NBLGGH4QGHW", "9WZDNCRFHWKN", "9NMPJ99VJBWV", "9P7BP5VNWKX5",
+               "9PMMSR1CGPWG", "9PG2DK419DRG", "9NCTDW2W1BH8", "9N95Q1ZZPMH4"}
 
 # Apps with NO winget package — shown in the catalog as manual-download
 # links only (honest: we refuse to ship a fake installer entry).

@@ -671,6 +671,31 @@ def record_run(bytes_freed: int) -> None:
         pass
 
 
+def has_seen_tip(tip_id: str) -> bool:
+    """One-time-tip flags (audit fix: Auto-Maintenance discoverability —
+    the scheduler only lives behind a small corner icon; a one-time tip
+    after the first successful Clean run points new users at it). Generic
+    by tip_id so any future one-time tip can reuse this instead of adding
+    a dedicated config field each time."""
+    try:
+        return bool(load_config().get("seen_tips", {}).get(tip_id))
+    except Exception:
+        return True  # fail closed: never nag on a read error
+
+
+def mark_tip_seen(tip_id: str) -> None:
+    try:
+        def _mut(cfg):
+            seen = cfg.get("seen_tips")
+            if not isinstance(seen, dict):
+                seen = {}
+            seen[tip_id] = True
+            cfg["seen_tips"] = seen
+        update_config(_mut)
+    except Exception:
+        pass
+
+
 def freed_since(days: int = 30) -> "tuple[int, int]":
     """(total_bytes_freed, run_count) over the last `days` days.
 

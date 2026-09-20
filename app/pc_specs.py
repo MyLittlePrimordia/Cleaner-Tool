@@ -121,14 +121,40 @@ def os_info():
     """(caption, build_line) e.g. ('Windows 11 Pro 64-bit', '24H2 · build 26100.1')."""
     try:
         base = "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion"
-        name = _reg_str("HKLM", base, "ProductName") or platform.system()
+        name = _reg_str("HKLM", base, "ProductName")
+        if not name:
+            # PC Specs audit fix: LTSC/IoT editions have been seen with an
+            # unreadable ProductName value, showing the generic "Windows"
+            # fallback instead of the real edition. Win32_OperatingSystem's
+            # Caption carries the same string through WMI — a completely
+            # separate path from the registry read above — so try it
+            # before giving up.
+            rows = _ps_query("Win32_OperatingSystem", ["Caption"])
+            if rows:
+                name = str(rows[0].get("Caption") or "").strip()
+                # WMI captions come back "Microsoft Windows 11 ..." — trim
+                # the vendor prefix to match the plain style used here.
+                if name.lower().startswith("microsoft "):
+                    name = name[len("Microsoft "):]
+        name = name or platform.system()
         arch = platform.machine() or ""
         bits = "64-bit" if "64" in arch else ("32-bit" if arch else "")
         caption = f"{name} {bits}".strip()
         disp = _reg_str("HKLM", base, "DisplayVersion")
         build = _reg_str("HKLM", base, "CurrentBuildNumber")
         ubr = _reg_dword("HKLM", base, "UBR")
-        parts = [p for p in (disp, f"build {build}.{ubr}" if build else "") if p]
+        if not build:
+            # PC Specs audit fix: seen returning "Unknown build" on a real
+            # machine even though CurrentBuildNumber is normally reliable.
+            # Win32_OperatingSystem carries the same data through WMI, a
+            # completely separate path from the registry read above — try
+            # it before giving up rather than assuming the registry is the
+            # only source.
+            rows = _ps_query("Win32_OperatingSystem", ["Version", "BuildNumber"])
+            if rows:
+                build = str(rows[0].get("BuildNumber") or "").strip()
+        build_part = f"build {build}.{ubr}" if build and ubr is not None else (f"build {build}" if build else "")
+        parts = [p for p in (disp, build_part) if p]
         return caption or "Windows", " · ".join(parts) or "Unknown build"
     except Exception:
         return "Windows", "Unknown build"
@@ -227,10 +253,19 @@ def ram_sticks():
     out = []
     try:
         data = _smbios_table()
-        if len(data) < 8:
-            return []
-        pos = 0
+        # CT-004 audit fix: GetSystemFirmwareTable('RSMB') returns a
+        # RawSMBIOSData wrapper, NOT the SMBIOS structure table directly —
+        # an 8-byte header (Used20CallingMethod, SMBIOSMajorVersion,
+        # SMBIOSMinorVersion, DmiRevision, then a 4-byte Length) comes
+        # before the actual table data. Starting the parse at offset 0
+        # instead of 8 read the header's own bytes as a fake structure
+        # (type=Used20CallingMethod, length=SMBIOSMajorVersion, which is
+        # always 2 or 3 and so always < 4) and broke out of the loop
+        # immediately — ram_sticks() returned [] on every machine.
         n = len(data)
+        pos = 8
+        if n < pos + 4:
+            return []
         while pos + 4 <= n:
             _typ = data[pos]
             _ln = data[pos + 1]
@@ -239,12 +274,16 @@ def ram_sticks():
             if _typ == 17 and _ln >= 28:
                 size_raw = int.from_bytes(data[pos + 12:pos + 14], "little")
                 speed = int.from_bytes(data[pos + 21:pos + 23], "little")
-                # Configured Memory Speed (offset 0x1E) reflects what's
-                # actually running (post-XMP/DOCP); the plain Speed
+                # Configured Memory Speed (offset 0x20, a WORD) reflects
+                # what's actually running (post-XMP/DOCP); the plain Speed
                 # field above is only the module's rated maximum. Prefer
                 # the configured value when the structure carries it.
-                if _ln >= 0x20:
-                    cfg = int.from_bytes(data[pos + 0x1E:pos + 0x20], "little")
+                # (Second audit fix alongside CT-004: this used to read
+                # 0x1E:0x20, which is the tail of the adjacent Extended
+                # Size DWORD field at 0x1C, not Configured Memory Speed —
+                # confirmed against the SMBIOS Type 17 field layout.)
+                if _ln >= 0x22:
+                    cfg = int.from_bytes(data[pos + 0x20:pos + 0x22], "little")
                     if cfg not in (0, 0xFFFF):
                         speed = cfg
                 if size_raw not in (0, 0xFFFF, 0x7FFF):
@@ -296,6 +335,19 @@ def board_info():
         ver = _reg_str("HKLM", base, "BIOSVersion").strip()
         if ver.startswith("[") and ver.endswith("]"):
             ver = ver[1:-1].split(",")[0].strip()
+        if _is_placeholder(ver):
+            ver = ""
+        if not ver:
+            # PC Specs audit fix: BIOSVersion under this registry key comes
+            # back empty on some real machines (seen: a mini-PC/NUC-class
+            # system) even though the BIOS obviously has a version string.
+            # Win32_BIOS carries it through WMI — same fallback pattern
+            # already used above for maker/product on this function.
+            rows = _ps_query("Win32_BIOS", ["SMBIOSBIOSVersion"])
+            if rows:
+                v2 = str(rows[0].get("SMBIOSBIOSVersion") or "").strip()
+                if v2 and not _is_placeholder(v2):
+                    ver = v2
         if _is_placeholder(maker):
             maker = ""
         if _is_placeholder(product):

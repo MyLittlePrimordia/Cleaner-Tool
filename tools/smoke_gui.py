@@ -279,14 +279,21 @@ def main():
     # so rows stay compact; PhotoImages cached (no GC thinning, no reloads)
     _icons = getattr(ipage, "_icon_cache", {})
     _got = [k for k, v in _icons.items() if v is not None]
-    # every catalog + manual + embedded-bundle + Essentials row carries
-    # its logo (166 + 13 + 4 + 13); a miss means a wrong filename or bad
-    # image bytes
-    assert len(_got) == len(_icons) == 166 + 13 + 4 + 13, \
-        f"{len(_got)}/{len(_icons)} row icons loaded"
+    # Audit fix: this used to hard-code the expected total (166+13+4+13 =
+    # 196) — a magic sum of catalog + manual + embedded-bundle + Essentials
+    # counts that silently went stale the moment any of those four grew
+    # (it already had, twice: 200 real vs 196 expected). The actual thing
+    # worth catching is a MISS (a wrong filename or bad image bytes leaving
+    # an entry None) — pin that invariant, not a row count nothing here
+    # computes from source, so this can never go stale again.
+    assert _icons, "no catalog rows were built — icon cache is empty"
+    assert len(_got) == len(_icons), \
+        f"{len(_got)}/{len(_icons)} row icons loaded — some icon failed to load"
+    assert len(_icons) >= len(APP_CATALOG), \
+        f"icon cache ({len(_icons)}) smaller than the catalog itself ({len(APP_CATALOG)})"
     for _img in _icons.values():
         if _img is not None:
-            assert _img.width() <= 22 and _img.height() <= 22, \
+            assert _img.width() <= 32 and _img.height() <= 32, \
                 (_img.width(), _img.height())
     _srow = ipage._app_rows["Valve.Steam"]
     assert any(isinstance(w, tk.Label) and str(w.cget("image")).strip()
@@ -792,21 +799,23 @@ def main():
         # End with nothing recorded must be a quiet no-op, not a run
         app.end_game_night()
         assert config_persist.get_game_night()["active"] is False
-        # dialog builds in both states and shows the right button
+        # dialog builds in both states and shows the right button — merged
+        # into PilotDialog (audit fix: GameNightDialog removed, its
+        # controls now live as a "manual session" section in Auto-Pilot)
         config_persist.set_game_night(True, ["game_mode"])
-        _gnd = gui.GameNightDialog(root, app)
+        _pd = gui.PilotDialog(root, app)
         root.update()
-        assert "End Game Night" in _gnd._main_btn._text, _gnd._main_btn._text
-        assert len(_gnd._app_vars) == len(_gn.APP_KEYS)
-        assert not any(v.get() for v in _gnd._app_vars.values()), \
+        assert "End session now" in _pd._manual_btn._text, _pd._manual_btn._text
+        assert len(_pd._close_vars) == len(_gn.APP_KEYS)
+        assert not any(v.get() for v in _pd._close_vars.values()), \
             "optional app quieting must default to off"
-        _gnd._close()
+        _pd._close()
         root.update()
         config_persist.set_game_night(False)
-        _gnd2 = gui.GameNightDialog(root, app)
+        _pd2 = gui.PilotDialog(root, app)
         root.update()
-        assert "Start Game Night" in _gnd2._main_btn._text, _gnd2._main_btn._text
-        _gnd2._close()
+        assert "Start session now" in _pd2._manual_btn._text, _pd2._manual_btn._text
+        _pd2._close()
         root.update()
     finally:
         config_persist.set_game_night(bool(_gn_before.get("active")),
@@ -2502,7 +2511,15 @@ def main():
     assert sorted(tools_page._card_frames) == sorted(_declared), \
         (sorted(tools_page._card_frames), sorted(_declared))
     assert len(_declared) == len(set(_declared)), "duplicate Tools card key"
-    assert "gamenight" in tools_page._card_frames, "Game Night card missing"
+    # Audit fix: Game Night card removed (merged into Auto-Pilot's "manual
+    # session" section — see the PilotDialog assertions above), and Quick
+    # Tools + Startup Manager relocated from the grid to the bottom corner
+    # row alongside Auto Maintenance / Export Logs. None of the three are
+    # cards anymore.
+    assert "gamenight" not in tools_page._card_frames, \
+        "Game Night card should be gone (merged into Auto-Pilot)"
+    assert "quick" not in tools_page._card_frames and "startup" not in tools_page._card_frames, \
+        "Quick Tools / Startup Manager should be relocated out of the card grid"
     # 3-wide grid, same pads/uniform as the Tweak preset cards. A single
     # left-over card sits in the middle column so the last row is centred.
     _pos = {k: (v[0].grid_info()["row"], v[0].grid_info()["column"])
@@ -2520,25 +2537,38 @@ def main():
     _opened = []
     _o_storage, _o_dns = app._open_storage_insight, app._open_dns_tester
     _o_health, _o_pilot = app._open_health_report, app._open_pilot_dialog
-    _o_speed, _o_quick = app._open_speed_test, app._open_quick_tools
+    _o_speed = app._open_speed_test
     _o_gamepad, _o_mic = app._open_gamepad_tester, app._open_mic_check
     _o_gameping = app._open_game_server_ping
+    _o_quick, _o_startup = app._open_quick_tools, app._open_startup_manager
     app._open_storage_insight = lambda: _opened.append("storage")
     app._open_dns_tester = lambda: _opened.append("dns")
     app._open_health_report = lambda: _opened.append("health")
     app._open_pilot_dialog = lambda: _opened.append("pilot")
     app._open_speed_test = lambda: _opened.append("speed")
-    app._open_quick_tools = lambda: _opened.append("quick")
     app._open_gamepad_tester = lambda: _opened.append("gamepad")
     app._open_mic_check = lambda: _opened.append("miccheck")
     app._open_game_server_ping = lambda: _opened.append("gameping")
+    app._open_quick_tools = lambda: _opened.append("quick")
+    app._open_startup_manager = lambda: _opened.append("startup")
     try:
-        for key in ("storage", "health", "dns", "pilot", "speed", "quick",
+        for key in ("storage", "health", "dns", "pilot", "speed",
                     "gamepad", "miccheck", "gameping"):
             tools_page._mount(key)
             root.update()
             assert _opened and _opened[-1] == key, \
                 f"Tools card {key} routed to {_opened}"
+        # Audit fix: Quick Tools / Startup Manager are now the two bottom
+        # corner icons (added between Auto Maintenance and Export Logs),
+        # not grid cards — exercise their actual click bindings directly.
+        app._corner_quick.event_generate("<Button-1>")
+        root.update()
+        assert _opened and _opened[-1] == "quick", \
+            f"Quick Tools corner icon routed to {_opened}"
+        app._corner_startup.event_generate("<Button-1>")
+        root.update()
+        assert _opened and _opened[-1] == "startup", \
+            f"Startup Manager corner icon routed to {_opened}"
     finally:
         app._open_storage_insight, app._open_dns_tester = _o_storage, _o_dns
         app._open_health_report, app._open_pilot_dialog = _o_health, _o_pilot

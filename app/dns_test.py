@@ -133,6 +133,25 @@ def pick_winner(results: dict) -> "str | None":
     return best
 
 
+def is_valid_ipv4(ip: str) -> bool:
+    """True for a syntactically valid IPv4 address (four 0-255 octets,
+    no leading zeros). Used to validate what the user types into the
+    custom DNS fields — deliberately stricter than is_private_ip (which
+    also accepts malformed input, on purpose, to keep it unprobed)."""
+    try:
+        parts = str(ip).strip().split(".")
+        if len(parts) != 4:
+            return False
+        for p in parts:
+            if not p.isdigit() or not (0 <= int(p) <= 255):
+                return False
+            if len(p) > 1 and p[0] == "0":
+                return False
+        return True
+    except Exception:
+        return False
+
+
 def is_private_ip(ip: str) -> bool:
     """True for non-publicly-testable IPv4: RFC1918, loopback,
     link-local, reserved, or malformed. Router DNS servers

@@ -1825,6 +1825,43 @@ class DnsTesterDialog(ThemedModal):
         tk.Frame(body, bg=COLORS["hairline"], height=1).pack(
             fill="x", pady=(4, 0))
 
+        # Custom DNS (user-requested): test/apply a provider that isn't
+        # in the built-in list — some players run a household/VPN
+        # resolver, or just want to try one before committing. Primary
+        # is required; secondary is optional (falls back to primary-only
+        # if left blank, same as any single-address custom host).
+        custom_row = tk.Frame(body, bg=COLORS["bg"])
+        custom_row.pack(fill="x", pady=(6, 0))
+        tk.Label(custom_row, text="Custom:", font=(F, 9),
+                 bg=COLORS["bg"], fg=COLORS["subtext"]).pack(side="left")
+        self._custom_primary_entry = tk.Entry(
+            custom_row, bg=COLORS["surface"], fg=COLORS["text"],
+            insertbackground=COLORS["text"], font=(F, 9), bd=0,
+            highlightthickness=1, highlightbackground=COLORS["hairline"],
+            width=15)
+        self._custom_primary_entry.pack(side="left", padx=(6, 0))
+        Tooltip(self._custom_primary_entry, "Primary DNS IP (required)")
+        self._custom_secondary_entry = tk.Entry(
+            custom_row, bg=COLORS["surface"], fg=COLORS["text"],
+            insertbackground=COLORS["text"], font=(F, 9), bd=0,
+            highlightthickness=1, highlightbackground=COLORS["hairline"],
+            width=15)
+        self._custom_secondary_entry.pack(side="left", padx=(4, 0))
+        Tooltip(self._custom_secondary_entry, "Secondary DNS IP (optional)")
+        AnimatedButton(custom_row, text="Add & Test",
+                       command=self._add_custom_dns,
+                       bg=COLORS["surface"], fg=COLORS["text"],
+                       font=(F, 9, "bold"), padx=12,
+                       pady=4).pack(side="left", padx=(6, 0))
+        for _e in (self._custom_primary_entry, self._custom_secondary_entry):
+            try:
+                _e.bind("<Return>", lambda _ev: self._add_custom_dns())
+            except Exception:
+                pass
+        # per-ip (primary, secondary) overrides for custom entries whose
+        # secondary the built-in DNS_RESOLVERS table has no way to know
+        self._custom_pairs = {}
+
         # buttons (Apply stays a bare verb — the status line + the
         # highlighted row say WHAT it will apply; Restore reverts both
         # primary + secondary to the pre-apply snapshot via the real
@@ -1986,12 +2023,64 @@ class DnsTesterDialog(ThemedModal):
 
     # ---- paints (Tk thread only) ---------------------------------------- #
 
-    def _set_status(self, text):
+    def _set_status(self, text, error=False):
         try:
             if self._status_lbl.winfo_exists():
-                self._status_lbl.config(text=text)
+                self._status_lbl.config(
+                    text=text,
+                    fg=COLORS["accent_red"] if error else COLORS["subtext"])
         except Exception:
             pass
+
+    def _pair_for(self, ip):
+        """(primary, secondary) for a row — a user-typed custom secondary
+        (self._custom_pairs) wins over the built-in DNS_RESOLVERS lookup,
+        so Add & Test / Apply always use exactly what was entered."""
+        custom = (getattr(self, "_custom_pairs", None) or {}).get(ip)
+        if custom:
+            return (ip, custom)
+        try:
+            from app.dns_test import get_dns_pair as _pair
+            return _pair(ip)
+        except Exception:
+            return (ip, ip)
+
+    def _add_row(self, name, ip, is_current):
+        """Build one server row (shared by the built-in list and a
+        user-added Custom entry) and register it in self._row_widgets."""
+        row = tk.Frame(self._rows_body, bg=COLORS["bg_alt"])
+        try:
+            _pri, _sec = self._pair_for(ip)
+            _pair_txt = f"{_pri} / {_sec}" if _sec != _pri else _pri
+        except Exception:
+            _pair_txt = ip
+        title = f"{name}  {_pair_txt}" + ("  (current)" if is_current else "")
+        name_lbl = tk.Label(row, text=title, font=(F, 9, "bold"),
+                            bg=COLORS["bg_alt"], fg=COLORS["text"],
+                            anchor="w")
+        name_lbl.pack(side="left", padx=(8, 0), pady=6)
+        badge = tk.Label(row, text="", font=(F, 8, "bold"),
+                         bg=COLORS["bg_alt"], fg=COLORS["accent_green"])
+        badge.pack(side="left", padx=(6, 0))
+        pick = tk.Label(row, text="", font=(F, 10, "bold"),
+                        bg=COLORS["bg_alt"], fg=TAB_ACCENTS["Tweak"])
+        pick.pack(side="left", padx=(6, 0))
+        ms = tk.Label(row, text="…", font=(F, 9, "bold"),
+                      bg=COLORS["bg_alt"], fg=COLORS["subtext"])
+        ms.pack(side="right", padx=(0, 8))
+        self._row_widgets[ip] = {"row": row, "ms": ms, "badge": badge,
+                                 "pick": pick, "name": name,
+                                 "current": is_current}
+        # rows become clickable once they answer (unanswered rows
+        # ignore clicks — picking a dead server can only fail Apply)
+        for w in (row, name_lbl, badge, pick, ms):
+            try:
+                w.bind("<Button-1>",
+                       lambda e, _ip=ip: self._select_ip(_ip), add="+")
+            except Exception:
+                pass
+        row.pack(fill="x", pady=2)
+        return row
 
     def _build_rows(self, targets, skipped_current=None, _gen=None):
         # stale-round guard: a previous round's late hop must never
@@ -2005,51 +2094,90 @@ class DnsTesterDialog(ThemedModal):
                 pass
         self._row_widgets = {}
         self._selected_ip = None
+        self._custom_pairs = {}
         try:
             self._apply_btn.set_enabled(False)
             self._apply_btn.config_text("Apply")
         except Exception:
             pass
         for name, ip, is_current in targets:
-            row = tk.Frame(self._rows_body, bg=COLORS["bg_alt"])
-            try:
-                from app.dns_test import get_dns_pair as _pair
-                _pri, _sec = _pair(ip)
-                _pair_txt = f"{_pri} / {_sec}" if _sec != _pri else _pri
-            except Exception:
-                _pair_txt = ip
-            title = f"{name}  {_pair_txt}" + ("  (current)" if is_current else "")
-            name_lbl = tk.Label(row, text=title, font=(F, 9, "bold"),
-                                bg=COLORS["bg_alt"], fg=COLORS["text"],
-                                anchor="w")
-            name_lbl.pack(side="left", padx=(8, 0), pady=6)
-            badge = tk.Label(row, text="", font=(F, 8, "bold"),
-                             bg=COLORS["bg_alt"], fg=COLORS["accent_green"])
-            badge.pack(side="left", padx=(6, 0))
-            pick = tk.Label(row, text="", font=(F, 10, "bold"),
-                            bg=COLORS["bg_alt"], fg=TAB_ACCENTS["Tweak"])
-            pick.pack(side="left", padx=(6, 0))
-            ms = tk.Label(row, text="…", font=(F, 9, "bold"),
-                          bg=COLORS["bg_alt"], fg=COLORS["subtext"])
-            ms.pack(side="right", padx=(0, 8))
-            self._row_widgets[ip] = {"row": row, "ms": ms, "badge": badge,
-                                     "pick": pick, "name": name,
-                                     "current": is_current}
-            # rows become clickable once they answer (unanswered rows
-            # ignore clicks — picking a dead server can only fail Apply)
-            for w in (row, name_lbl, badge, pick, ms):
-                try:
-                    w.bind("<Button-1>",
-                           lambda e, _ip=ip: self._select_ip(_ip), add="+")
-                except Exception:
-                    pass
-            row.pack(fill="x", pady=2)
+            self._add_row(name, ip, is_current)
         # (user call 2026-09: the router-DNS footnote is gone — held-back
         # router IPs are simply absent from the list, no explanation owed)
         try:
             self._set_status(f"Testing {len(targets)} servers…")
         except Exception:
             pass
+
+    def _probe_custom(self, ip, gen):
+        """Time one user-added custom IP — same TCP:53 probe as the
+        built-in rows, just launched outside the initial round's batch
+        so Add & Test can fire any time without disturbing it."""
+        def dead():
+            try:
+                return bool(self._stop_token[0])
+            except Exception:
+                return True
+
+        def _run():
+            if dead():
+                return
+            try:
+                from app.dns_test import time_resolver
+                ms = time_resolver(ip, cancelled=dead)
+            except Exception:
+                ms = None
+            if dead():
+                return
+            self._ui(self._paint_result, ip, ms, gen)
+
+        try:
+            import threading as _th
+            _th.Thread(target=_run, daemon=True).start()
+        except Exception:
+            pass
+
+    def _add_custom_dns(self):
+        """Add & Test: validate the typed primary/secondary, add a row
+        for it (reusing the same click-to-select / Apply / Restore flow
+        every built-in row already has), and start its probe."""
+        try:
+            from app.dns_test import is_valid_ipv4
+        except Exception:
+            return
+        try:
+            primary = (self._custom_primary_entry.get() or "").strip()
+            secondary = (self._custom_secondary_entry.get() or "").strip()
+            if not is_valid_ipv4(primary):
+                self._set_status(
+                    "Enter a valid primary DNS IP (e.g. 9.9.9.9).", error=True)
+                return
+            if secondary and not is_valid_ipv4(secondary):
+                self._set_status(
+                    "Secondary IP doesn't look valid — leave it blank to skip.",
+                    error=True)
+                return
+            if primary in (self._row_widgets or {}):
+                self._set_status(f"{primary} is already in the list above.",
+                                 error=True)
+                return
+            if secondary:
+                self._custom_pairs = getattr(self, "_custom_pairs", None) or {}
+                self._custom_pairs[primary] = secondary
+            self._add_row("Custom", primary, False)
+            self._expected = getattr(self, "_expected", 0) + 1
+            gen = getattr(self, "_scan_gen", None)
+            try:
+                self._custom_primary_entry.delete(0, "end")
+                self._custom_secondary_entry.delete(0, "end")
+            except Exception:
+                pass
+            self._set_status(f"Testing {primary}…")
+            self._probe_custom(primary, gen)
+        except Exception:
+            pass
+
+
 
     def _paint_result(self, ip, ms, _gen=None):
         if _gen is not None and _gen != getattr(self, "_scan_gen", _gen):
@@ -2130,8 +2258,7 @@ class DnsTesterDialog(ThemedModal):
             handles = (self._row_widgets or {}).get(ip, {})
             name = handles.get("name", ip)
             try:
-                from app.dns_test import get_dns_pair as _pair
-                _pri, _sec = _pair(ip)
+                _pri, _sec = self._pair_for(ip)
                 _pair_txt = f"{_pri} / {_sec}" if _sec != _pri else _pri
             except Exception:
                 _pair_txt = ip
@@ -2201,11 +2328,10 @@ class DnsTesterDialog(ThemedModal):
         dataclasses.replace keeps the applied key 'gaming_dns' so
         badges, Undo and Tweak Health all work."""
         try:
-            from app.dns_test import get_dns_pair
             winner = self._selected_ip
             if not winner or self._results.get(winner) is None:
                 return
-            primary, secondary = get_dns_pair(winner)
+            primary, secondary = self._pair_for(winner)
         except Exception:
             return
         try:
@@ -9864,21 +9990,32 @@ class GamepadDialog(ThemedModal):
         self._pad_btns = {}   # name -> (shape_id, None); paint floods green
         self._stick_l = None
         self._stick_r = None
-        # stats strip: three evenly spaced blocks + re-zero cell
+        # Re-zero sits in its own row directly above the stat strip,
+        # centered over the DRIFT column (it calibrates drift, so it
+        # reads as that column's control) rather than packed to the
+        # dialog's outer right edge, which crowded the rounded corner
+        # and read as clipped (audit fix). It uses its own 3-column
+        # uniform group so it can't force the stat row's columns wider
+        # the way sharing DRIFT's cell did previously.
+        rez_row = tk.Frame(body, bg=COLORS["bg"])
+        rez_row.pack(fill="x", pady=(4, 0))
+        for c in range(3):
+            rez_row.grid_columnconfigure(c, weight=1, uniform="padstats_rez")
+        _rez = AnimatedButton(rez_row, text="Re-zero",
+                              command=self._calibrate,
+                              bg=COLORS["surface"], fg=COLORS["text"],
+                              font=(F, 8, "bold"), padx=10, pady=3)
+        _rez.grid(row=0, column=2)
+        Tooltip(_rez, "Learns the sticks' rest position to measure drift — "
+                      "take your thumbs off first.")
+        # stats strip: three evenly spaced blocks
         stats = tk.Frame(body, bg=COLORS["bg"])
-        stats.pack(fill="x", pady=(4, 0))
+        stats.pack(fill="x", pady=(2, 0))
         for c in range(3):
             stats.grid_columnconfigure(c, weight=1, uniform="padstats")
         self._stat_rate_val, _ = self._stat_block(stats, 0, "POLLING")
         self._stat_ms_val, _ = self._stat_block(stats, 1, "INTERVAL")
         self._stat_drift_val, _drift_cell = self._stat_block(stats, 2, "DRIFT")
-        _rez = AnimatedButton(_drift_cell, text="Re-zero",
-                              command=self._calibrate,
-                              bg=COLORS["surface"], fg=COLORS["text"],
-                              font=(F, 8, "bold"), padx=10, pady=3)
-        _rez.pack(pady=(2, 0))
-        Tooltip(_rez, "Learns the sticks' rest position to measure drift — "
-                      "take your thumbs off first.")
         # rumble row: themed sliders + test share one line
         rumble = tk.Frame(body, bg=COLORS["bg"])
         rumble.pack(fill="x", pady=(6, 0))
@@ -10828,7 +10965,14 @@ class GameServerPingDialog(ThemedModal):
         self._poll_after = None
         try:
             from app import gameping as _gp0
-            _games = tuple(t for t, _k in sorted(_gp0.GAME_TABS, key=lambda r: r[0].casefold()))
+            # user-reported: "Custom" sorted alphabetically landed in the
+            # middle of the list (near the C's) instead of standing out as
+            # the catch-all option. Sort everything else A-Z, then pin
+            # Custom to the end where users expect a catch-all/"other"
+            # entry to live.
+            _rest = sorted((t for t, k in _gp0.GAME_TABS if k != "custom"),
+                           key=lambda t: t.casefold())
+            _games = tuple(_rest) + ("Custom",)
         except Exception:
             _games = ("Fortnite",)
         self._game_var = tk.StringVar(value=_games[0])

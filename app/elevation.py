@@ -17,6 +17,26 @@ import tempfile
 import time
 
 
+def _log_or_swallow_fallback(msg: str, exc: BaseException | None = None) -> None:
+    """REL-001: elevation.py runs before the GUI/TaskContext exist, so it
+    can't use app.utils.log_or_swallow directly. This mirrors it — best
+    effort, never raises — so state-changing cookie/token I/O failures
+    leave a trail (stderr + the security event log) instead of vanishing.
+    """
+    try:
+        text = f"  ! {msg}"
+        if exc is not None:
+            text += f" ({type(exc).__name__}: {exc})"
+        print(text, file=sys.stderr)
+        try:
+            from app.config_persist import log_security_event
+            log_security_event("ops", text.strip())
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 def is_admin() -> bool:
     """Return True if the current process is running with administrator rights."""
     try:
@@ -68,8 +88,12 @@ def _write_elevation_cookie(pid: int, token: str = "") -> None:
     """Write the elevated process PID and token to the cookie file."""
     try:
         _exclusive_write(_get_elevation_cookie_path(), f"{pid}:{token}" if token else str(pid))
-    except Exception:
-        pass
+    except Exception as exc:
+        # REL-001: a failed write here means the unelevated side can never
+        # recognize the elevated helper came back, silently stranding the
+        # user mid-handshake. Log it (best-effort — never raises) so a
+        # support session has a trail instead of a mystery hang.
+        _log_or_swallow_fallback("could not write elevation cookie", exc)
 
 
 def _read_elevation_cookie() -> tuple[int | None, str]:
@@ -81,7 +105,11 @@ def _read_elevation_cookie() -> tuple[int | None, str]:
                 pid_s, token = raw.split(":", 1)
                 return int(pid_s.strip()), token.strip()
             return int(raw), ""
-    except Exception:
+    except FileNotFoundError:
+        # Normal — no elevation is pending. Not worth logging.
+        return None, ""
+    except Exception as exc:
+        _log_or_swallow_fallback("could not read elevation cookie", exc)
         return None, ""
 
 
@@ -96,15 +124,18 @@ def _clear_elevation_cookie() -> None:
 def _write_pending_token(token: str) -> None:
     try:
         _exclusive_write(_get_elevation_token_path(), token)
-    except Exception:
-        pass
+    except Exception as exc:
+        _log_or_swallow_fallback("could not write pending elevation token", exc)
 
 
 def _read_pending_token() -> str | None:
     try:
         with open(_get_elevation_token_path(), "r") as f:
             return f.read().strip()
-    except Exception:
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        _log_or_swallow_fallback("could not read pending elevation token", exc)
         return None
 
 

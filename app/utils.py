@@ -295,6 +295,37 @@ class TaskContext:
     with zero changes to any task module."""
 
 
+def log_or_swallow(ctx: "TaskContext | None", msg: str, exc: BaseException | None = None, *, level: str = "!") -> None:
+    """Best-effort log for state-changing paths. Never raises.
+    level '!' = important failure the user should see in the run log.
+
+    REL-001: several state-changing paths (snapshot/restore, deletions,
+    elevation cookie I/O, restore-point creation, install verification)
+    used to swallow exceptions completely silently, so the UI/log could
+    claim success while the underlying action partially failed. This
+    helper gives those paths a consistent, non-fatal way to surface the
+    failure without changing any control flow or success/failure
+    semantics.
+    """
+    try:
+        text = f"  {level} {msg}"
+        if exc is not None:
+            text += f" ({type(exc).__name__}: {exc})"
+        if ctx is not None and hasattr(ctx, "log"):
+            ctx.log(text)
+        else:
+            # fallback when no context (elevation, early init)
+            print(text, file=sys.stderr)
+        # also feed the existing security event log when available
+        try:
+            from app.config_persist import log_security_event
+            log_security_event("ops", text.strip())
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 class TaskSkipped(RuntimeError):
     """Raised by an APPLY task when there is genuinely nothing to do on
     this machine (no SSD, no NVIDIA software, monitor already at max Hz,
@@ -516,6 +547,42 @@ def run_cmd_checked(ctx: TaskContext, command: str, shell: bool = True, timeout:
 # --------------------------------------------------------------------------- #
 # Filesystem helpers
 # --------------------------------------------------------------------------- #
+
+def format_run_summary(succeeded: int, failed: int, skipped: int, freed_bytes: int = 0) -> "tuple[str, str]":
+    """Return (title, body) for the run-complete toast.
+
+    UX-001: single source of truth for "what just happened" copy, so the
+    toast and the scorecard chips never disagree, and an all-skipped run
+    (nothing needed cleaning) doesn't get told it "finished" like real
+    work happened. Pure function — no side effects, easy to unit-test.
+    """
+    freed = format_bytes(freed_bytes) if freed_bytes else None
+
+    if failed == 0 and succeeded == 0 and skipped > 0:
+        title = "Cleaner Tool - Nothing to Clean"
+        body = f"All {skipped} selected item(s) were already clean."
+    elif failed == 0 and succeeded > 0:
+        title = "Cleaner Tool - Clean Complete"
+        body = f"{succeeded} task(s) finished"
+        if freed:
+            body += f". Freed {freed}"
+        if skipped:
+            body += f" ({skipped} already clean)"
+        body += "."
+    elif failed > 0 and succeeded > 0:
+        title = "Cleaner Tool - Finished With Errors"
+        body = f"{succeeded} succeeded, {failed} failed"
+        if freed:
+            body += f". Freed {freed}"
+        body += ". See the run log."
+    elif failed > 0 and succeeded == 0:
+        title = "Cleaner Tool - Clean Failed"
+        body = f"All {failed} task(s) failed — see the run log for details."
+    else:
+        title = "Cleaner Tool - Run Finished"
+        body = "No tasks ran."
+    return title, body
+
 
 def format_bytes(size_bytes: float) -> str:
     if size_bytes <= 0:

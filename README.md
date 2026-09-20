@@ -2,6 +2,13 @@
 
 A free Windows 10/11 utility for gamers: cleans junk, fixes common Windows problems, and applies safe performance tweaks. Pick a preset, press Run, done.
 
+## Safety guarantees
+
+- Cleaning never touches game saves, documents, or user profiles.
+- Every tweak ships with a one-click Undo (snapshot + restore). One documented exception: "No Explorer Auto Discovery".
+- The app starts unelevated and only requests admin when a selected task actually needs it.
+- Junctions / reparse points are refused — the cleaner will not follow them.
+
 ## 📸 Screenshots
 
 <table>

@@ -68,27 +68,16 @@ def notify_clean_complete(freed_bytes: int, task_count: int, failed: int = 0,
     NOTE: returncode==0 from the PowerShell host only means the COM call
     was issued — notifications-disabled / Focus Assist / dropped delivery
     still return 0. Best-effort, no delivery guarantee.
+
+    UX-001: copy now comes from the single format_run_summary() helper
+    (app.utils) so this toast can never disagree with the Scorecard's
+    own chip counts, and an all-skipped run ("0 tasks finished") reads
+    honestly as "nothing needed cleaning" instead of implying work was
+    done.
     """
-    from app.utils import format_bytes
-    skip_copy = f" ({skipped} skipped — already clean)" if skipped and not failed else ""
-    if not failed:
-        show_toast(
-            "Cleaner Tool - Clean Complete",
-            f"{task_count} tasks finished. Freed {format_bytes(freed_bytes)}.{skip_copy}",
-            "short"
-        )
-    elif task_count:
-        show_toast(
-            "Cleaner Tool - Clean Finished With Errors",
-            f"{task_count} task(s) succeeded, {failed} failed. Freed {format_bytes(freed_bytes)}.",
-            "short"
-        )
-    else:
-        show_toast(
-            "Cleaner Tool - Clean Failed",
-            f"All {failed} task(s) failed — see the run log for details.",
-            "short"
-        )
+    from app.utils import format_run_summary
+    title, body = format_run_summary(task_count, failed, skipped, freed_bytes)
+    show_toast(title, body, "short")
 
 
 def notify_scheduled_run():

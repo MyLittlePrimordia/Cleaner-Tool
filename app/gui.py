@@ -15643,6 +15643,23 @@ class Application:
         thread for seconds on toggle/boot. Now the pilot builds + starts
         immediately on layers 1-2 (fast, config-only) and layer 3 merges
         in from a worker thread (generation-guarded, see below)."""
+        # Event handoff: the watcher thread used to call root.after(0,
+        # ...) directly on detect/exit — an occasional cross-thread Tcl
+        # notifier race could drop that call and leave the apply/revert
+        # pending forever (seen hanging tools.smoke_async's
+        # poll_pilot_applied step). The watcher now only ever touches a
+        # plain thread-safe queue.Queue; a self-rescheduling Tk-thread
+        # pump (_pilot_pump) drains it on a cheap fixed cadence — no
+        # cross-thread Tcl call is ever made.
+        try:
+            import queue as _q
+            if not hasattr(self, "_pilot_evt_q"):
+                self._pilot_evt_q = _q.Queue()
+            if not getattr(self, "_pilot_pump_started", False):
+                self._pilot_pump_started = True
+                self._pilot_pump()
+        except Exception:
+            pass
         try:
             from app.config_persist import load_config as _load
             from app.session_pilot import (KNOWN_GAME_EXES, SessionPilot,
@@ -15880,12 +15897,42 @@ class Application:
             pass
 
     def _pilot_on_detect(self, hits):
-        """Watcher thread → hop to Tk. Records the session keys FIRST so
-        a later exit always has something truthful to reconcile."""
-        # F10: no winfo_exists off-thread — after() on a dead root raises
-        # and is swallowed below.
+        """Watcher thread → hand off via the thread-safe event queue
+        (never call root.after() directly from this thread — see
+        _pilot_pump). Records the session keys FIRST so a later exit
+        always has something truthful to reconcile."""
         try:
-            self.root.after(0, lambda: self._pilot_apply(list(hits or [])))
+            q = getattr(self, "_pilot_evt_q", None)
+            if q is not None:
+                q.put(("apply", list(hits or [])))
+        except Exception:
+            pass
+
+    def _pilot_pump(self):
+        """Tk thread only: drains pilot events queued by the watcher
+        thread and reschedules itself. Runs for the life of the app once
+        started (cheap — an empty queue.get_nowait() loop) so apply/revert
+        are never at the mercy of a cross-thread Tcl notifier wakeup."""
+        try:
+            q = getattr(self, "_pilot_evt_q", None)
+            if q is not None:
+                while True:
+                    try:
+                        kind, payload = q.get_nowait()
+                    except Exception:
+                        break
+                    try:
+                        if kind == "apply":
+                            self._pilot_apply(payload)
+                        elif kind == "revert":
+                            self._pilot_revert()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        try:
+            if self.root.winfo_exists():
+                self.root.after(50, self._pilot_pump)
         except Exception:
             pass
 
@@ -16055,10 +16102,12 @@ class Application:
             pass
 
     def _pilot_on_exit(self):
-        """Watcher thread → hop to Tk."""
-        # F10: no winfo_exists off-thread (see _pilot_on_detect).
+        """Watcher thread → hand off via the thread-safe event queue
+        (see _pilot_on_detect / _pilot_pump)."""
         try:
-            self.root.after(0, self._pilot_revert)
+            q = getattr(self, "_pilot_evt_q", None)
+            if q is not None:
+                q.put(("revert", None))
         except Exception:
             pass
 

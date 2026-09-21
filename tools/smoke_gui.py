@@ -1601,7 +1601,7 @@ def main():
         _sd._stop_token[0] = True
         _settle(_sd)
         assert (_sd._modal_w, _sd._modal_h) == (800, 600), (_sd._modal_w, _sd._modal_h)
-        assert set(_sd._row_values) == {"ping", "download", "upload"}
+        assert set(_sd._row_values) == {"ping", "download", "upload", "stability"}
         # no-clipping guard (user bug: Upload row cut, Re-test unreachable):
         # content must leave 40px+ headroom in the fixed 538px body so
         # larger system fonts still fit without scrolling.
@@ -1647,10 +1647,10 @@ def main():
         _hub = [_it for _it in _sd._gauge.find_all()
                 if _sd._gauge.type(_it) == "oval"]
         assert _hub and _sd._gauge.itemcget(_hub[-1], "fill").lower() == "#f472b6"
-        # single stats row: 3 even cells, leg -> value contract intact
-        assert set(_sd._row_values) == {"ping", "download", "upload"}
+        # single stats row: 4 even cells, leg -> value contract intact
+        assert set(_sd._row_values) == {"ping", "download", "upload", "stability"}
         _cells = _sd._rows_body.grid_slaves(row=0)
-        assert len(_cells) == 3, len(_cells)
+        assert len(_cells) == 4, len(_cells)
         # Re-test highlights on hover + press (no Tooltip allowed here:
         # its plain binds would wipe the button's own animation binds)
         _sd._retest_btn.event_generate("<Enter>")

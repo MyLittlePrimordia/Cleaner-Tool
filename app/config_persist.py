@@ -135,6 +135,11 @@ DEFAULT_CONFIG = {
     # merge onto old configs like every other additive key below.
     "auto_elevate": False,
     "remember_limited": False,
+    # When True (default), an elevated launch will add a Windows Defender
+    # exclusion for this executable (and its folder). Offered as a
+    # default-checked checkbox on the Admin Gate so users aren't forced
+    # to manually exclude a clean app that Defender sometimes flags.
+    "add_defender_exclusion": True,
     # Startup tray (Phase 5): boot hidden with --tray at logon. Same
     # additive-merge + junk-coercion contract as its neighbors.
     "startup_tray_enabled": False,
@@ -368,12 +373,16 @@ def _load_config_from_disk() -> dict:
                     DEFAULT_CONFIG["session_pilot_preset"])
             if not isinstance(data.get("session_pilot_enabled"), bool):
                 data["session_pilot_enabled"] = False
-            # Auto-elevate / remember-limited (Admin Gate prefs): same
-            # junk-degrades-to-False contract, never raises.
+            # Auto-elevate / remember-limited / Defender exclusion (Admin Gate
+            # prefs): same junk-degrades-to-default contract, never raises.
             if not isinstance(data.get("auto_elevate"), bool):
                 data["auto_elevate"] = False
             if not isinstance(data.get("remember_limited"), bool):
                 data["remember_limited"] = False
+            if not isinstance(data.get("add_defender_exclusion"), bool):
+                # Default True so existing users get the convenience unless
+                # they explicitly turn the checkbox off.
+                data["add_defender_exclusion"] = True
             if not isinstance(data.get("startup_tray_enabled"), bool):
                 data["startup_tray_enabled"] = False
             if not isinstance(data.get("close_to_tray_enabled"), bool):

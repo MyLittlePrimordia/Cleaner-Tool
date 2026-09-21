@@ -4536,18 +4536,22 @@ class AdminGateFrame(tk.Frame):
             btn_row, text="Skip", command=self._continue_limited,
             bg=COLORS["surface"], fg=COLORS["text"], font=(F, 10),
         ).pack(side="left", padx=6)
-        # auto-elevate ("stop asking me") + remember-limited prefs. Saved
-        # on either button click (see _save_gate_prefs); auto_elevate wins
-        # on read paths when both end up set.
+        # auto-elevate ("stop asking me") + remember-limited + Defender
+        # exclusion prefs. Saved on either button click (see
+        # _save_gate_prefs); auto_elevate wins on read paths when both
+        # end up set. Defender exclusion defaults to ON so users don't
+        # have to fight false positives by hand.
         try:
             from app.config_persist import load_config as _load_cfg
             _cfg = _load_cfg()
             _auto0 = bool(_cfg.get("auto_elevate", False))
             _lim0 = bool(_cfg.get("remember_limited", False))
+            _def0 = bool(_cfg.get("add_defender_exclusion", True))
         except Exception:
-            _auto0, _lim0 = False, False
+            _auto0, _lim0, _def0 = False, False, True
         self._auto_elevate_var = tk.BooleanVar(value=_auto0)
         self._remember_limited_var = tk.BooleanVar(value=_lim0)
+        self._defender_excl_var = tk.BooleanVar(value=_def0)
         try:
             from app import elevated_launch as _el
             _notice = _el.notice_for_gate()
@@ -4563,16 +4567,19 @@ class AdminGateFrame(tk.Frame):
         for _text, _var in (
                 ("Always start as Admin",
                  self._auto_elevate_var),
+                ("Add Windows Defender exclusion (recommended)",
+                 self._defender_excl_var),
                 ("Don't show this again",
                  self._remember_limited_var)):
             try:
+                _pady = (10 if _var is self._auto_elevate_var else 2, 0)
                 tk.Checkbutton(wrapper, text=_text, variable=_var,
                                font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
                                selectcolor=COLORS["surface"],
                                activebackground=COLORS["bg"],
                                activeforeground=COLORS["text"],
                                anchor="w", justify="left",
-                               wraplength=420).pack(fill="x", pady=(10 if _var is self._auto_elevate_var else 2, 0),
+                               wraplength=420).pack(fill="x", pady=_pady,
                                                     padx=20)
             except Exception:
                 pass
@@ -4582,7 +4589,8 @@ class AdminGateFrame(tk.Frame):
             from app import elevated_launch as _el
             _el.save_gate_prefs(
                 bool(self._auto_elevate_var.get()),
-                bool(self._remember_limited_var.get()))
+                bool(self._remember_limited_var.get()),
+                bool(self._defender_excl_var.get()))
         except Exception:
             pass
 

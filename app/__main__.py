@@ -168,6 +168,8 @@ def main():
     # Reconciler (elevated only, off-thread so startup never waits on
     # schtasks): converges the live helper task with the opt-in flag in
     # both directions — creates after opt-in, deletes after opt-out.
+    # Also applies the optional Windows Defender exclusion (same elevated
+    # window, same off-thread so the UI is never blocked).
     try:
         from app.elevation import is_admin as _is_admin2
         if _is_admin2():
@@ -177,6 +179,11 @@ def main():
                 try:
                     from app import elevated_launch as _el2
                     _el2.reconcile()
+                except Exception:
+                    pass
+                try:
+                    from app.elevation import apply_defender_exclusion_if_wanted
+                    apply_defender_exclusion_if_wanted()
                 except Exception:
                     pass
             _th.Thread(target=_rec, daemon=True,

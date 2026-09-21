@@ -413,3 +413,117 @@ def signal_elevated_startup() -> None:
     except Exception:
         return
     _write_elevation_cookie(os.getpid(), token)
+
+
+def _current_exe_path() -> str:
+    """Absolute path of the running executable (frozen .exe or script)."""
+    try:
+        if getattr(sys, "frozen", False):
+            return os.path.abspath(sys.executable)
+        return os.path.abspath(sys.argv[0] or sys.executable)
+    except Exception:
+        try:
+            return os.path.abspath(sys.executable)
+        except Exception:
+            return ""
+
+
+def ensure_defender_exclusion(paths: list[str] | None = None) -> tuple[bool, str]:
+    """
+    Add Windows Defender exclusion(s) for this app.
+
+    Requires administrator rights. Safe to call repeatedly (Add-MpPreference
+    is idempotent for the same path). Never raises.
+
+    Returns (ok, message). ok is False when not admin, Defender is absent,
+    or the command failed; the message is always human-readable.
+    """
+    try:
+        if not is_admin():
+            return False, "not running as administrator"
+    except Exception:
+        return False, "could not check elevation"
+
+    targets: list[str] = []
+    if paths:
+        for p in paths:
+            if p and isinstance(p, str):
+                try:
+                    ap = os.path.abspath(p)
+                    if ap and ap not in targets:
+                        targets.append(ap)
+                except Exception:
+                    continue
+    else:
+        exe = _current_exe_path()
+        if exe:
+            targets.append(exe)
+            try:
+                parent = os.path.dirname(exe)
+                if parent and parent not in targets:
+                    targets.append(parent)
+            except Exception:
+                pass
+
+    if not targets:
+        return False, "no path to exclude"
+
+    # Build a single PowerShell command that adds every path. Quote each
+    # path with single quotes and double any embedded single quotes so
+    # spaces / apostrophes cannot break the command.
+    def _ps_quote(s: str) -> str:
+        return "'" + (s or "").replace("'", "''") + "'"
+
+    parts = [
+        f"Add-MpPreference -ExclusionPath {_ps_quote(p)} -ErrorAction SilentlyContinue"
+        for p in targets
+    ]
+    ps_script = "; ".join(parts)
+
+    try:
+        # Prefer the full path to powershell so PATH tricks can't redirect us.
+        ps_exe = os.path.join(
+            os.environ.get("SystemRoot", r"C:\Windows"),
+            "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+        if not os.path.isfile(ps_exe):
+            ps_exe = "powershell.exe"
+
+        result = subprocess.run(
+            [
+                ps_exe,
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy", "Bypass",
+                "-Command", ps_script,
+            ],
+            shell=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        out = ((result.stdout or "") + (result.stderr or "")).strip()
+        if result.returncode == 0:
+            return True, f"exclusion added for {len(targets)} path(s)"
+        # Non-zero can still mean partial success (Defender not installed,
+        # policy blocked, etc.). Surface the message for diagnostics.
+        return False, out or f"Add-MpPreference exit {result.returncode}"
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def apply_defender_exclusion_if_wanted() -> None:
+    """
+    Best-effort: if the user opted in (config add_defender_exclusion) and
+    we are elevated, add the exclusion. Called once early on elevated
+    startup. Never raises, never blocks the UI for long.
+    """
+    try:
+        if not is_admin():
+            return
+        from app.config_persist import load_config
+        if not bool(load_config().get("add_defender_exclusion", True)):
+            return
+        ensure_defender_exclusion()
+    except Exception:
+        pass

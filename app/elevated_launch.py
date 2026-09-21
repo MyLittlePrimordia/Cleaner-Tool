@@ -193,16 +193,21 @@ def is_wanted() -> bool:
         return False
 
 
-def save_gate_prefs(auto_elevate: bool, remember_limited: bool) -> None:
+def save_gate_prefs(auto_elevate: bool, remember_limited: bool,
+                    add_defender_exclusion: bool | None = None) -> None:
     """Persist the Admin Gate checkboxes. Single-lock RMW via
     update_config (never a stale whole-dict save). auto_elevate wins on
-    read paths when both are somehow set. Never raises."""
+    read paths when both are somehow set. Never raises.
+    `add_defender_exclusion` is optional so older call sites still work."""
     try:
         from app.config_persist import update_config
 
-        def _mut(cfg, _a=bool(auto_elevate), _r=bool(remember_limited)):
+        def _mut(cfg, _a=bool(auto_elevate), _r=bool(remember_limited),
+                 _d=add_defender_exclusion):
             cfg["auto_elevate"] = _a
             cfg["remember_limited"] = _r
+            if _d is not None:
+                cfg["add_defender_exclusion"] = bool(_d)
         update_config(_mut)
     except Exception:
         pass

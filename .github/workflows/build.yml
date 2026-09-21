@@ -35,15 +35,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run smoke tests
-        # audit fix: the build never ran any test — regressions (like the
-        # ToggleSwitch duplicate-def bug) shipped silently. The harness
-        # checks run headless-safe; Tk is present on windows-latest runners.
+      - name: Run GUI smoke tests
+        # Split from the async suite so the Actions UI names the failing
+        # suite directly instead of one shared step failing opaquely.
+        run: |
+          python -X utf8 -m tools.smoke_gui
+
+      - name: Run async smoke tests
         # smoke_async is the mainloop-driven twin: worker-thread after()
         # delivery (run engine -> scorecard, health check worker) only
         # works under a real mainloop, never under a manual update() pump.
         run: |
-          python -X utf8 -m tools.smoke_gui
           python -X utf8 -m tools.smoke_async
 
       - name: Build with PyInstaller

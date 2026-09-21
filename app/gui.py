@@ -7438,7 +7438,16 @@ class InstallTab(tk.Frame):
                 except Exception:
                     pass
             # then tick what the profile asks for
+            # NOTE: self.vars also holds "task:<key>" aliases for every
+            # Essentials var (registered alongside self.ess_vars so the
+            # shared "Install Selected Apps" count includes them) —
+            # skip those here so a task id doesn't get counted once via
+            # this loop and again via the ess_vars loop right below
+            # (the double-count bug: (applied, missing) coming back as
+            # (2, 0) for a single saved Essentials task).
             for app_id, var in getattr(self, "vars", {}).items():
+                if str(app_id).startswith("task:"):
+                    continue
                 if str(app_id) in wanted:
                     try:
                         var.set(True)

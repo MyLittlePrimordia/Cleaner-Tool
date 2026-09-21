@@ -14769,6 +14769,17 @@ class Application:
             lbl.bind("<Button-1>", lambda e: command(), add="+")
             lbl.bind("<Enter>", lambda e: lbl.config(fg=COLORS["text"]), add="+")
             lbl.bind("<Leave>", lambda e: lbl.config(fg=COLORS["subtext"]), add="+")
+            # Headless-harness hook: event_generate("<Button-1>") is never
+            # delivered to an unmapped widget (proven: withdrawn root leaves
+            # these corner labels with winfo_ismapped()==0, so the synth
+            # click silently no-ops while canvas-hosted Install arrows —
+            # mapped via create_window — do fire). The smoke test must
+            # exercise the EXACT callable the click would invoke, so keep
+            # it reachable without depending on Tk event delivery.
+            try:
+                lbl._corner_cmd = command
+            except Exception:
+                pass
             return lbl
 
         corner_mid = tk.Frame(corners, bg=COLORS["bg"])
@@ -16280,6 +16291,20 @@ class Application:
         Never shown again after this, and never shown at all if the user
         already has a maintenance schedule set up."""
         try:
+            # Headless guard (CI/harness): the smoke suites drive real
+            # Clean runs with the root withdrawn — an invisible modal would
+            # still register in ThemedModal._MODAL_OPEN and make the pilot
+            # defer every later apply ("a dialog is open — session runs
+            # untweaked"), stalling poll_pilot_applied forever on fresh
+            # configs. A tip nobody can see must never block automation;
+            # return WITHOUT marking so a real user run still shows it.
+            try:
+                if self.root is None or not self.root.winfo_exists():
+                    return
+                if not self.root.winfo_ismapped():
+                    return
+            except Exception:
+                return
             from app.config_persist import has_seen_tip, mark_tip_seen
             if has_seen_tip("automaint_after_first_clean"):
                 return

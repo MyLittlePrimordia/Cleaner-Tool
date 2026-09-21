@@ -91,6 +91,27 @@ def _restore_clean_selection():
     return False
 
 
+def _restore_tip_seen():
+    """Write back the snapshotted seen_tips dict (best-effort, never raises).
+
+    The suite pre-marks the one-time automaint tip so a fresh config can
+    never pop its modal mid-run (that modal registers in
+    ThemedModal._MODAL_OPEN and makes the pilot defer every apply,
+    stalling poll_pilot_applied — the exact CI failure). The user's real
+    tip state must survive the suite either way."""
+    try:
+        saved = _state.get("saved_tips", None)
+        if saved is None:
+            return
+        import copy as _copy
+        cfg = config_persist.load_config()
+        cfg["seen_tips"] = _copy.deepcopy(saved)
+        config_persist.save_config(cfg)
+        config_persist._config_cache = None
+    except Exception:
+        pass
+
+
 def fail(msg):
     if _state["failed"]:
         return
@@ -102,6 +123,10 @@ def fail(msg):
         # without this any stub selection persists in the user's file.
         # Pure file I/O, no Tk — safe even when the mainloop is wedged.
         _restore_clean_selection()
+    except Exception:
+        pass
+    try:
+        _restore_tip_seen()
     except Exception:
         pass
     try:
@@ -167,13 +192,77 @@ def main():
                              .get("selected_tasks", {}).get("Clean", []))
     except Exception:
         _saved_clean = None
+    # One-time automaint tip: a fresh config pops its modal after the
+    # first successful Clean run. That modal registers in
+    # ThemedModal._MODAL_OPEN, and the pilot defers every apply while any
+    # modal is open — stalling poll_pilot_applied forever on CI (fresh
+    # runner) while passing locally (tip already seen). Pre-mark it so no
+    # run in this suite can ever pop it; restore the user's real flag on
+    # exit (both paths). The app also suppresses the tip when the root is
+    # withdrawn — belt and suspenders.
+    try:
+        import copy as _copy
+        _saved_tips = _copy.deepcopy(config_persist.load_config().get("seen_tips", {}) or {})
+    except Exception:
+        _saved_tips = None
+    try:
+        cfg = config_persist.load_config()
+        seen = dict(cfg.get("seen_tips", {}) or {})
+        seen["automaint_after_first_clean"] = True
+        cfg["seen_tips"] = seen
+        config_persist.save_config(cfg)
+        config_persist._config_cache = None
+    except Exception:
+        pass
 
     before_tops = set()
     stop_tops = set()  # toplevel baseline for the mid-run/stop regression step
     _state["saved_clean"] = _saved_clean  # module-level restore helper reads it
+    _state["saved_tips"] = _saved_tips
+
+    def _close_stray_modals(exclude_ids=()):
+        """Best-effort drain of any open ThemedModal + raw Toplevels.
+
+        Scorecard cleanup used to destroy exactly one Toplevel — a second
+        modal (e.g. the automaint tip that follows the first Clean card)
+        survived, keeping any_open() True and deferring every later pilot
+        apply. Close via the modal registry first (runs on_close hooks,
+        drops the scrim), then destroy any leftover raw Toplevels."""
+        try:
+            mods = list(getattr(gui.ThemedModal, "_MODAL_OPEN", {}).values())
+        except Exception:
+            mods = []
+        for m in mods:
+            try:
+                if id(m) in (exclude_ids or ()):
+                    continue
+                m.close()
+            except Exception:
+                pass
+        try:
+            root.update()
+        except Exception:
+            pass
+        try:
+            for w in list(root.winfo_children()):
+                try:
+                    if isinstance(w, tk.Toplevel) and id(w) not in (exclude_ids or ()):
+                        w.destroy()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            root.update()
+        except Exception:
+            pass
 
     def restore_and_exit(code):
         restored_ok = _restore_clean_selection()
+        try:
+            _restore_tip_seen()
+        except Exception:
+            pass
         try:
             root.destroy()
         except Exception:
@@ -218,9 +307,22 @@ def main():
         assert results[0][1] == "ok", results
         assert results[0][2] == 123, results
         print("  run engine: worker captured (label, ok, 123) OK", flush=True)
-        # close whatever dialog is up (scorecard, or the themed fallback)
+        # close whatever dialog is up (scorecard, or the themed fallback).
+        # Drain ALL new toplevels, not just the first: the one-time
+        # automaint tip can follow the first Clean card on fresh configs,
+        # and any survivor keeps any_open() True, deferring every later
+        # pilot apply (the CI stall). Registry-first so on_close/scrim run.
         try:
-            dlg.destroy()
+            _close_stray_modals(exclude_ids=tuple(before_tops))
+        except Exception as exc:
+            fail(f"dialog destroy raised: {exc!r}")
+            return
+        try:
+            assert gui.ThemedModal.any_open() is False, \
+                f"modal leaked after run step: {list(getattr(gui.ThemedModal, '_MODAL_OPEN', {}))}"
+        except AssertionError as exc:
+            fail(f"post-run modal drain: {exc!r}")
+            return
         except Exception as exc:
             fail(f"dialog destroy raised: {exc!r}")
             return
@@ -293,7 +395,16 @@ def main():
             return
         print("  run stop: 'stop' classification, UI restored OK", flush=True)
         try:
-            cards[0].destroy()
+            _close_stray_modals(exclude_ids=tuple(stop_tops))
+        except Exception as exc:
+            fail(f"stop scorecard destroy raised: {exc!r}")
+            return
+        try:
+            assert gui.ThemedModal.any_open() is False, \
+                f"modal leaked after stop step: {list(getattr(gui.ThemedModal, '_MODAL_OPEN', {}))}"
+        except AssertionError as exc:
+            fail(f"post-stop modal drain: {exc!r}")
+            return
         except Exception as exc:
             fail(f"stop scorecard destroy raised: {exc!r}")
             return
@@ -497,6 +608,21 @@ def main():
     # the whole session reproducible.
     def step_pilot():
         _state["step"] = "pilot"
+        # The pilot defers every apply while ANY modal is open (by design:
+        # no run UI over a dialog). A leaked modal here stalls
+        # poll_pilot_applied until the watchdog — fail fast instead, after
+        # one best-effort drain so a transient closer can't flake the suite.
+        try:
+            if gui.ThemedModal.any_open():
+                _close_stray_modals()
+            assert gui.ThemedModal.any_open() is False, \
+                f"modal still open at pilot start: {list(getattr(gui.ThemedModal, '_MODAL_OPEN', {}))}"
+        except AssertionError as exc:
+            fail(f"pilot preflight: {exc!r}")
+            return
+        except Exception as exc:
+            fail(f"pilot preflight raised: {exc!r}")
+            return
         try:
             import app.session_pilot as _sp
             from app import session_pilot as _spm

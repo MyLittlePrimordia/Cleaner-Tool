@@ -2561,11 +2561,19 @@ def main():
         # Audit fix: Quick Tools / Startup Manager are now the two bottom
         # corner icons (added between Auto Maintenance and Export Logs),
         # not grid cards — exercise their actual click bindings directly.
-        app._corner_quick.event_generate("<Button-1>")
+        # Headless-safe: event_generate("<Button-1>") is NOT delivered to
+        # unmapped widgets (withdrawn root => corner labels report
+        # winfo_ismapped()==0, proven by repro), so a synth click silently
+        # no-ops here while canvas-hosted Install arrows (mapped via
+        # create_window) do fire. Assert the click binding EXISTS, then
+        # invoke the exact callable the binding would call (_corner_cmd).
+        assert app._corner_quick.bind("<Button-1>"), "Quick Tools corner missing click binding"
+        assert app._corner_startup.bind("<Button-1>"), "Startup corner missing click binding"
+        app._corner_quick._corner_cmd()
         root.update()
         assert _opened and _opened[-1] == "quick", \
             f"Quick Tools corner icon routed to {_opened}"
-        app._corner_startup.event_generate("<Button-1>")
+        app._corner_startup._corner_cmd()
         root.update()
         assert _opened and _opened[-1] == "startup", \
             f"Startup Manager corner icon routed to {_opened}"
@@ -2611,7 +2619,11 @@ def main():
         _shape, _text = _gd._pad_btns["A"]
         assert _gd._pad_cv.itemcget(_shape, "fill") == "", "overlay must idle transparent"
         assert _gd._pad_img is not None, "controller artwork must load"
-        assert (_gd._pad_img.width(), _gd._pad_img.height()) == (300, 300), \
+        # Artwork is 1200px subsampled /3 (400px) since the UI fix that
+        # bumped it from /4 (300px); derive from _SCALE so a future
+        # resample can't silently stale this again.
+        _pad_px = int(300 * getattr(_gd, "_SCALE", 4.0 / 3.0))
+        assert (_gd._pad_img.width(), _gd._pad_img.height()) == (_pad_px, _pad_px), \
             (_gd._pad_img.width(), _gd._pad_img.height())
         assert len(_gd._trig_views) == 2, len(_gd._trig_views)
         for _lbl in (_gd._stat_rate_val, _gd._stat_ms_val, _gd._stat_drift_val):
@@ -2709,7 +2721,9 @@ def main():
         # picker offers a real choice on multi-mic machines
         _actives = [e for e in getattr(_md, "_inputs", []) if e.get("state") == 1]
         if len(_actives) > 1:
-            assert any(w.winfo_class() == "Menubutton"
+            # Picker is a ttk.Combobox (was an OptionMenu/Menubutton) —
+            # accept either so a widget-swap can't stale this again.
+            assert any(w.winfo_class() in ("Menubutton", "TCombobox", "Combobox")
                        for w in _md._pick_box.winfo_children()), \
                 "multi-mic machine must show the device dropdown"
     finally:
@@ -2725,7 +2739,11 @@ def main():
     assert len(_gp.VALORANT_REGIONS) == 10 and len(_gp.APEX_REGIONS) == 9
     assert len(_gp.PUBG_REGIONS) == 10
     assert len(_gp.MINECRAFT_SERVERS) == 2 and len(_gp.ROBLOX_EDGES) == 2
-    assert len(_gp.VALVE_REGIONS) == 10 and len(_gp.COD_REGIONS) == 10
+    # Valve relays are live-resolved via _valve_targets() (API + honest
+    # fallback), so the static table is intentionally empty — pin that
+    # contract instead of a stale count.
+    assert tuple(_gp.VALVE_REGIONS) == () and len(_gp.COD_REGIONS) == 10
+    assert _gp._valve_targets(timeout=3.0), "valve live-target resolver returned nothing"
     assert len(_gp.GAME_TABS) == 72
     assert all(h.endswith(".ds.on.epicgames.com") for _n, h in _gp.FORTNITE_REGIONS)
     assert all(_gp.targets_for(k) for _t, k in _gp.GAME_TABS if k != "custom")

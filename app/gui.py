@@ -4983,6 +4983,13 @@ class TaskTab(tk.Frame):
         # frame used to push the Run button off-screen).
         self.run_row = tk.Frame(self, bg=COLORS["bg"])
         self.run_row.pack(side="bottom", fill="x", padx=26, pady=(4, 10))
+        # Tweak run-row pills (3-card symmetry, 2026-09): the entries that
+        # used to be Tweak's 2nd card row live beside Run as secondary
+        # pills — Check, conditional Undo, Game Session preset. Built in
+        # _build_run_row, painted by _refresh_tweak_pills. Tweak-only.
+        self._rr_check = None
+        self._rr_undo = None
+        self._rr_session = None
         self.body_area.pack(side="top", fill="both", expand=True, padx=26, pady=4)
 
         self._build_preset_cards()
@@ -4997,30 +5004,27 @@ class TaskTab(tk.Frame):
             w.destroy()
         accent = TAB_ACCENTS[self.tab_name]
 
-        # (Phase 2 #15) Tweak tab gets the red Undo card on the end.
-        # Health card (user-approved feature 2, 2026-09): Tweak also gets a
-        # 6th card — completing the 3x2 grid (Minimal/Recommended/Game
-        # Session over Custom/Undo/Health) so the second row is symmetric
-        # with the first at every window width.
-        cards = list(self.presets.keys()) + ["Custom"] + (["Undo Tweaks", "Tweak Health"] if self.tab_name == "Tweak" else [])
+        # Tweak tab is 3 cards like every other tab (Minimal / Recommended /
+        # Custom). Game Session lives in the Auto-Pilot dialog's manual
+        # session; Undo Tweaks + Tweak Health live in the context strip
+        # above the run row (see _build_context_strip) — cards are for
+        # runnable presets, modes are not presets.
+        cards = list(self.presets.keys())
+        if self.tab_name == "Tweak":
+            cards = [c for c in cards if c != "Game Session"] + ["Custom"]
+        else:
+            cards = cards + ["Custom"]
         self.preset_cards = {}
         # WRAP AT 3 PER ROW (user-reported clipping: a 5th card squeezed the
         # whole row). 3 across keeps every card readable at min window size;
         # extra cards flow to a second row instead of shrinking the rest.
-        # Clean/Repair have 3 cards (one row, unchanged); Tweak has 6 (3+2 -> 3+3).
+        # Every tab has exactly 3 cards (one row): Clean 2 presets + Custom,
+        # Repair 2 presets + Custom, Tweak Minimal/Recommended + Custom.
         PER_ROW = 3
         for col, name in enumerate(cards):
             if name == "Custom":
                 blurb, icon, color, fg = "Pick exactly what runs.", "⚙", COLORS["surface"], COLORS["text"]
                 command = lambda: self._enter_custom()
-            elif name == "Undo Tweaks":
-                blurb, icon, color, fg = "Put back what the tweaks changed.", "↩", COLORS["surface"], COLORS["text"]
-                command = lambda: self._enter_undo()
-            elif name == "Tweak Health":
-                blurb = "See what's still applied — fix what Windows undid."
-                icon = "🩺"
-                color, fg = COLORS["surface"], COLORS["text"]
-                command = lambda: self._enter_health()
             else:
                 blurb = self.PRESET_BLURBS.get(name, "")
                 icons = {"Quick Clean": "🧹", "Deep Clean": "🧼", "Quick Repair": "🩺",
@@ -5074,6 +5078,89 @@ class TaskTab(tk.Frame):
     def _card_hover(self, inner, outer, accent, on):
         # subtle: hairline border brightens toward accent on hover
         outer.config(bg=accent if on else COLORS["hairline"])
+
+    # ---------------- Tweak run-row pills (3-card symmetry) ---------------- #
+
+    def _build_tweak_pills(self, btns):
+        """Secondary pills beside the Tweak Run hero (same AnimatedButton
+        language as Run/Preview, stepped down to 10pt so Run dominates).
+        Commands are stable bound methods; each keeps a `._cmd` alias so
+        the headless harness invokes the exact callable a click would run
+        (event_generate is never delivered to unmapped widgets)."""
+        self._rr_check = AnimatedButton(
+            btns, text="Check", command=self._enter_health,
+            bg=COLORS["surface"], fg=COLORS["text"],
+            font=(F, 10, "bold"), padx=20, pady=11)
+        self._rr_check._cmd = self._enter_health
+        self._rr_undo = AnimatedButton(
+            btns, text="", command=self._enter_undo,
+            bg=COLORS["surface"], fg=COLORS["accent_red"],
+            font=(F, 10, "bold"), padx=20, pady=11)
+        self._rr_undo._cmd = self._enter_undo
+        self._rr_session = AnimatedButton(
+            btns, text="\U0001f3ae Game Session",
+            command=lambda: self._select_preset("Game Session"),
+            bg=COLORS["surface"], fg=COLORS["text"],
+            font=(F, 10, "bold"), padx=20, pady=11)
+        self._rr_session._cmd = lambda: self._select_preset("Game Session")
+        self._refresh_tweak_pills()
+
+    def _context_applied_count(self) -> int:
+        """Applied tweaks that still map to a real reversible task (same
+        filter the health body uses — counts only what Undo/Health can
+        actually act on). Reads the live registry from disk (the app-level
+        cache can lag a run-completion hop); never raises."""
+        try:
+            state = get_tweak_state() or {}
+        except Exception:
+            try:
+                state = getattr(self.app, "tweak_state", None) or {}
+            except Exception:
+                return 0
+        n = 0
+        try:
+            for key in state:
+                t = self.task_by_key.get(key)
+                if t is not None and t.revert is not None:
+                    n += 1
+        except Exception:
+            pass
+        return n
+
+    def _refresh_tweak_pills(self):
+        """Paint the Tweak run-row pills: Check always (its empty state is
+        useful guidance, not a dead end), Undo only when applied tweaks
+        exist, Game Session always. No-op on other tabs / modes (their run
+        rows have no pills). Order is re-asserted every pass so the
+        conditional Undo never jumps position."""
+        if self.tab_name != "Tweak":
+            return
+        try:
+            c = self._rr_check
+            if c is None or not c.winfo_exists():
+                return
+        except Exception:
+            return
+        if getattr(self, "mode", "preset") not in ("preset", "custom"):
+            return
+        n = self._context_applied_count()
+        try:
+            for w in (self._rr_check, self._rr_undo, self._rr_session):
+                try:
+                    if w is not None and w.winfo_exists() and w.winfo_manager() == "pack":
+                        w.pack_forget()
+                except Exception:
+                    pass
+            c.config_text(f"Check ({n})" if n > 0 else "Check")
+            c.pack(side="left", padx=6)
+            if n > 0:
+                u = self._rr_undo
+                u.config_text(f"\u21a9 Undo ({n})")
+                u.pack(side="left", padx=6)
+            s = self._rr_session
+            s.pack(side="left", padx=6)
+        except Exception:
+            pass
 
     def _build_body(self):
         """Body cache (user feedback: mode switches redrew ~50 toggle
@@ -5173,6 +5260,11 @@ class TaskTab(tk.Frame):
                 self._update_run_row()
             except Exception:
                 pass
+        # context strip counts follow post-run registry state
+        try:
+            self._refresh_tweak_pills()
+        except Exception:
+            pass
 
     def _prewarm_body(self, mode: str) -> bool:
         """F6(b): build one body (custom/undo) into the cache WITHOUT
@@ -5274,12 +5366,16 @@ class TaskTab(tk.Frame):
         self._regrid(panel, force=True)
 
     def _regrid(self, panel, force=False):
-        """Re-grid existing cells (built once) into the best column count
-        for the current panel size. No widget rebuilds -> no toggle redraw
-        flicker, no state loss. Column choice tries to make content fit
-        WITHOUT scrolling: it walks column counts from 3 up and picks the
-        first whose resulting content height fits the view; only if none
-        fit does scrolling engage.
+        """Re-grid existing summary cells into a fixed 3-column flow.
+
+        No widget rebuilds -> no toggle redraw flicker, no state loss.
+        Columns are FIXED at 3 (not fitted 3-5): the fitter squeezed wide
+        presets (Recommended, Deep Clean) into 4-5 narrow columns whose
+        labels wrapped mid-word, while small presets sat at 3 — every
+        summary now shares one density and longer lists simply scroll in
+        the panel that already exists for exactly that. Column width still
+        retargets each cell's wraplength every pass, so text never clips
+        into its neighbor at any window size.
 
         Layout unit is self._cell_blocks: [(header_or_None, [(cell, task)])].
         Headers span the full width; each block's cells flow below its
@@ -5300,38 +5396,12 @@ class TaskTab(tk.Frame):
             return
         panel.update_idletasks()
         inner_w = max(10, panel.winfo_width() - panel.INSET_X - panel.SB_W - 2)
-        view_h = panel.view_height()
-        # per-cell height measured from the first cell (stable once mapped)
-        try:
-            cell_h = max(20, cells[0][0].winfo_reqheight() + 8)  # +pady
-        except Exception:
-            cell_h = 44
-        n_headers = sum(1 for h, _bc in blocks if h is not None)
-
-        best = None
-        for cols in (3, 4, 5):
-            col_w = inner_w // cols
-            if col_w < 170:
-                continue  # cells would be unreadably narrow
-            data_rows = sum((len(bc) + cols - 1) // cols for _h, bc in blocks)
-            content_h = data_rows * cell_h + n_headers * 30 + panel.INSET_Y * 2
-            if content_h <= view_h:
-                best = cols
-                break
-        if best is None:
-            # nothing fits height-wise: use the widest count that keeps
-            # cells >= 170px so scrolling distance is minimized
-            best = max(3, min(5, inner_w // 170))
-            if best < 3:
-                best = 3
-        cols = best
+        cols = 3
         r = 0
         # Audit fix (text clipping): retarget every cell's label to the
         # REAL width this layout pass just chose for `cols`, instead of the
         # fixed 150/215px guess set at cell-creation time. Recomputed fresh
-        # from inner_w/cols here (not the loop's col_w variable above,
-        # which can be stale in the "nothing fit, use the widest that keeps
-        # cells readable" fallback branch). 12 = the cell's own grid padx
+        # Recomputed fresh from inner_w/3 every pass. 12 = the cell's own grid padx
         # (6+6); ~30 = the dot canvas (8px) + its padx (6) + slack for the
         # optional trailing 🔄 reboot-required icon, so text never runs
         # into either neighbor.
@@ -5645,6 +5715,13 @@ class TaskTab(tk.Frame):
     def _build_run_row(self):
         for w in self.run_row.winfo_children():
             w.destroy()
+        # the health-mode Re-apply button and the Tweak secondary pills die
+        # with the row above — drop the references so _update_run_row can
+        # detect their absence and rebuild for the incoming mode
+        self._health_reapply_btn = None
+        self._rr_check = None
+        self._rr_undo = None
+        self._rr_session = None
         accent = TAB_ACCENTS[self.tab_name]
         if self.mode == "undo":
             label, bg, fg = "Undo Selected", COLORS["accent_red"], "#FFFFFF"
@@ -5696,6 +5773,18 @@ class TaskTab(tk.Frame):
                     font=(F, 12, "bold"), padx=24, pady=11,
                 )
                 # not packed here — _refresh_run_count shows/hides it
+            elif self.tab_name == "Tweak":
+                # Tweak secondaries live beside the hero (never above it):
+                # Check + conditional Undo + Game Session preset entry, all
+                # stepped down to 10pt so Run stays the obvious money action.
+                btns = tk.Frame(self.run_row, bg=COLORS["bg"])
+                btns.pack(anchor="center")
+                self.run_btn = AnimatedButton(
+                    btns, text=label, command=self._run_selected,
+                    bg=bg, fg=fg, font=(F, 12, "bold"), padx=42, pady=11,
+                )
+                self.run_btn.pack(side="left", padx=6)
+                self._build_tweak_pills(btns)
             else:
                 self.run_btn = AnimatedButton(
                     self.run_row, text=label, command=self._run_selected,
@@ -5860,8 +5949,8 @@ class TaskTab(tk.Frame):
         self._highlight_cards()
 
     def _enter_health(self):
-        """Tweak Health (user-approved feature 2, 2026-09): the 6th Tweak
-        card. Shows every tweak the app believes is applied on this PC
+        """Tweak Health (user-approved feature 2, 2026-09): entered from the
+        context strip above the run row. Shows every tweak the app believes is applied on this PC
         and checks whether Windows still honors it. Same enter pattern as
         _enter_undo — except the body is ALWAYS rebuilt fresh (rows depend
         on live applied-state; plain labels are cheap, unlike the animated
@@ -6243,15 +6332,57 @@ class TaskTab(tk.Frame):
         paid a temp-label font measure). The command never changes —
         _run_selected dispatches on self.mode — so only the colors and the
         base label differ per mode; _refresh_run_count adds the live count.
-        Health mode is the exception: its two-button row (Check Health /
-        Re-apply All) is rebuilt here so the applied-count label is always
-        fresh — mode switches are rare, the body builds dominate cost."""
-        if self.mode == "health":
+        Two modes always rebuild: health (its two-button row carries a live
+        applied-count label) and undo (its dedicated row must shed the
+        Tweak secondary pills, which belong to preset/custom only). Mode
+        switches are rare; the body builds dominate cost."""
+        if self.mode in ("health", "undo"):
             try:
                 self._build_run_row()
             except Exception:
                 pass
+            try:
+                self._refresh_tweak_pills()
+            except Exception:
+                pass
             return
+        # linger fix: leaving health mode restyles the persistent Run
+        # button in place below — but the health-only Re-apply button was
+        # packed beside it and is NOT part of any other mode's row. If its
+        # ghost survived (built pre-fix, or any path that skipped the
+        # rebuild), rebuild the row cleanly instead of restyling around it.
+        try:
+            _ghost = getattr(self, "_health_reapply_btn", None)
+            if _ghost is not None and _ghost.winfo_exists():
+                self._health_reapply_btn = None
+                self._build_run_row()
+                try:
+                    self._refresh_tweak_pills()
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
+        # Tweak pills ride with preset/custom rows only: arriving from
+        # undo/health rebuilt the row without them — rebuild again with
+        # them rather than restyling a pill-less row.
+        if self.tab_name == "Tweak" and self.mode in ("preset", "custom"):
+            try:
+                _pills_gone = True
+                for _pn in ("_rr_check", "_rr_undo", "_rr_session"):
+                    _pw = getattr(self, _pn, None)
+                    if _pw is not None and _pw.winfo_exists():
+                        _pills_gone = False
+                        break
+                if _pills_gone:
+                    self._build_run_row()
+                    try:
+                        self._refresh_tweak_pills()
+                    except Exception:
+                        pass
+                    return
+            except Exception:
+                pass
         btn = getattr(self, "run_btn", None)
         try:
             if btn is None or not btn.winfo_exists():
@@ -6268,6 +6399,11 @@ class TaskTab(tk.Frame):
             btn.set_style(bg=accent, fg=COLORS["black"],
                           hover_bg=_hex_lerp(accent, "#FFFFFF", 0.08))
         self._refresh_run_count()
+        # context strip follows every mode switch (it hides in undo/health)
+        try:
+            self._refresh_tweak_pills()
+        except Exception:
+            pass
 
     def _refresh_undo_badges(self):
         """F3: repaint the Undo grid's '✓ Active' badges IN PLACE from the
@@ -6300,12 +6436,13 @@ class TaskTab(tk.Frame):
                 continue
 
     def _highlight_cards(self):
-        active = {"preset": self._selected_preset, "custom": "Custom", "undo": "Undo Tweaks",
-                  "health": "Tweak Health"}.get(self.mode)
+        # Undo/health are modes, not cards — nothing highlights while in
+        # them (highlighting an unrelated preset would lie about state).
+        active = {"preset": self._selected_preset, "custom": "Custom"}.get(self.mode)
         for name, card in getattr(self, "preset_cards", {}).items():
             inner = card.winfo_children()[0]
             if name == active:
-                accent = COLORS["accent_red"] if name == "Undo Tweaks" else TAB_ACCENTS[self.tab_name]
+                accent = TAB_ACCENTS[self.tab_name]
                 inner.config(bg=COLORS["surface_hover"])
                 for child in inner.winfo_children():
                     try:
@@ -14309,8 +14446,8 @@ class ToolsTab(tk.Frame):
     # ---------------- structure ---------------- #
 
     def _build(self):
-        # Six cards in a 3+3 grid — byte-identical geometry to Tweak's
-        # 6 preset cards (TaskTab._build_preset_cards): same parent
+        # Cards in a 3-wide grid — byte-identical geometry to the task
+        # tabs' 3 preset cards (TaskTab._build_preset_cards): same parent
         # pack (fill=x, padx=26, pady=(14, 4)), same PER_ROW=3 divmod,
         # same card grid pads (padx=5, pady=4) and uniform columns, so
         # every card lands at the exact same size + position. The old
@@ -15180,6 +15317,13 @@ class Application:
         if target.winfo_manager() != "place":
             target.place(relx=0, rely=0, relwidth=1, relheight=1)
         target.tkraise()
+        # Tweak context strip follows tab shows (the registry may have
+        # changed while another tab owned the screen)
+        if name == "Tweak":
+            try:
+                target._refresh_tweak_pills()
+            except Exception:
+                pass
         # progress bar may not exist yet during initial build
         if hasattr(self, "progress_bar"):
             accent = TAB_ACCENTS[name]

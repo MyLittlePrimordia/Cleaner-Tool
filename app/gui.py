@@ -2409,9 +2409,18 @@ class _CatalogPickerDialog(ThemedModal):
 
         self._search_var = tk.StringVar()
         self._search_var.trace_add("write", lambda *_: self._apply_filter())
-        entry = RoundedEntry(body, textvariable=self._search_var,
-                             placeholder="Type to filter…")
+        entry = RoundedEntry(body, textvariable=self._search_var)
         entry.pack(fill="x", pady=(2, 6))
+        # placeholder text (RoundedEntry has no -placeholder option — Tk's
+        # Entry doesn't support one; same convention as the Install tab's
+        # search box: insert literal text, clear/restore on focus, and
+        # _apply_filter treats it as an empty query)
+        self._search_entry = entry.entry
+        self._search_placeholder = "Type to filter…"
+        self._search_entry.insert(0, self._search_placeholder)
+        self._search_focused = False
+        self._search_entry.bind("<FocusIn>", self._filter_focus_in)
+        self._search_entry.bind("<FocusOut>", self._filter_focus_out)
 
         self._list_panel = panel = ScrollableRoundedPanel(body)
         panel.pack(fill="both", expand=True, pady=(0, 4))
@@ -2494,8 +2503,24 @@ class _CatalogPickerDialog(ThemedModal):
         except Exception:
             pass
 
+    def _filter_focus_in(self, _e):
+        if not self._search_focused:
+            self._search_focused = True
+            if self._search_var.get() == self._search_placeholder:
+                self._search_var.set("")
+
+    def _filter_focus_out(self, _e):
+        self._search_focused = False
+        if not self._search_var.get().strip():
+            self._search_var.set(self._search_placeholder)
+
     def _apply_filter(self):
+        if not hasattr(self, "_list_body"):
+            return   # trace can fire while inserting the placeholder,
+                     # before the list panel exists yet — nothing to do
         q = (self._search_var.get() or "").strip().lower()
+        if q == self._search_placeholder.lower():
+            q = ""
         for w in list(self._list_body.winfo_children()):
             try:
                 w.destroy()

@@ -33,9 +33,17 @@ from app import config_persist
 from app import gui
 from app.elevation import is_admin
 
-WATCHDOG_MS = 150000   # generous: the nudge phase runs a REAL full
-                       # allowlist estimate scan (stat-only, but TEMP +
-                       # browser caches can be large on lived-in PCs)
+WATCHDOG_MS = 150000   # generous PER-STEP budget: the nudge phase runs a
+                       # REAL full allowlist estimate scan (stat-only, but
+                       # TEMP + browser caches can be large on lived-in
+                       # PCs), and DNS testing makes real network probes.
+                       # This is the ceiling for any ONE step, not the
+                       # whole script — see _watchdog_tick: a one-shot
+                       # timer for the total runtime blamed whichever step
+                       # happened to be current when a handful of earlier,
+                       # legitimately-slow-but-still-progressing steps ate
+                       # the shared budget, which is misleading on a loaded
+                       # CI box and not what "a step stalled" should mean.
 _state = {"failed": False, "step": "init"}
 
 
@@ -679,7 +687,27 @@ def main():
         print("  health report: mid-scan close safe OK", flush=True)
         restore_and_exit(0)  # prints ALL PASS itself once restore is verified
 
-    root.after(WATCHDOG_MS, lambda: fail("watchdog timeout — a step stalled"))
+    def _watchdog_tick():
+        """Recurring check (not a one-shot timer): fails only when
+        _state['step'] has not CHANGED for WATCHDOG_MS — i.e. a genuine
+        stall — instead of when the script's total runtime crosses a
+        fixed ceiling. A step that's still legitimately working (a real
+        disk scan, a real DNS probe) keeps the clock reset just by
+        progressing; only a step that never advances trips this."""
+        import time as _t
+        if _state.get("failed"):
+            return
+        now = _t.monotonic()
+        step = _state.get("step")
+        if step != _state.get("_wd_step"):
+            _state["_wd_step"] = step
+            _state["_wd_since"] = now
+        elif now - _state.get("_wd_since", now) > WATCHDOG_MS / 1000.0:
+            fail(f"watchdog timeout — step {step!r} stalled")
+            return
+        root.after(1000, _watchdog_tick)
+
+    root.after(1000, _watchdog_tick)
     root.after(400, step_run)   # let construction + prewarm settle first
     root.mainloop()
     return 0

@@ -14735,18 +14735,14 @@ class Application:
             lbl.bind("<Button-1>", lambda e: command(), add="+")
             lbl.bind("<Enter>", lambda e: lbl.config(fg=COLORS["text"]), add="+")
             lbl.bind("<Leave>", lambda e: lbl.config(fg=COLORS["subtext"]), add="+")
-            # Kept for the smoke suite: the click binding above calls this
-            # (late-bound lambdas at the call sites dereference the CURRENT
-            # app opener, so monkeypatched openers are honored).
-            lbl._corner_command = command
             return lbl
 
         corner_mid = tk.Frame(corners, bg=COLORS["bg"])
         corner_mid.pack(side="left", expand=True)
         self._corner_quick = _corner_icon(
-            corner_mid, "🧰", "Quick Tools", lambda: self._open_quick_tools())
+            corner_mid, "🧰", "Quick Tools", self._open_quick_tools)
         self._corner_startup = _corner_icon(
-            corner_mid, "🚀", "Startup Manager", lambda: self._open_startup_manager())
+            corner_mid, "🚀", "Startup Manager", self._open_startup_manager)
 
         self._corner_logs = tk.Label(corners, text="📋", font=(F, 13),
                                      bg=COLORS["bg"], fg=COLORS["subtext"],

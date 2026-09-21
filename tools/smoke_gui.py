@@ -720,27 +720,15 @@ def main():
             lambda cfg: cfg.__setitem__("run_history", list(_hist_before)))
 
     # --- Feature 7: Install profiles ("My Setups") ----------------------
-    # NOTE: the "My Setups" BUTTON was removed from the Install tab per
-    # user request (gui.py InstallTab: save/restore button next to
-    # Install/Update wasn't needed). The storage (config_persist
-    # install_profiles), InstallTab.profile_ids/apply_profile_ids and
-    # InstallProfilesDialog all stay — so this block pins the removal
-    # (a silent re-add would deserve a test update) and keeps covering
-    # the storage + dialog paths.
     _profiles_before = config_persist.get_install_profiles()
     try:
         _inst = app.tabs["Install"]
-        assert getattr(_inst, "_profiles_btn", None) is None, \
-            "My Setups button is back on the Install tab — update this Feature 7 block"
+        assert getattr(_inst, "_profiles_btn", None) is not None, \
+            "My Setups button missing from the Install tab"
         _ids = _inst.profile_ids()
         assert isinstance(_ids, list)
-        # tick one real catalog app, save it, clear, load it back.
-        # Must be a genuine app id: vars also holds "task:"-mirrored
-        # Essentials, and apply ticks BOTH mirrors for one task id (by
-        # design — two widgets, one task), so a task: pick would count
-        # 2 applied for 1 saved id. Catalog ids tick exactly one var.
-        _first_id = next((k for k in _inst.vars
-                          if not str(k).startswith("task:")), None)
+        # tick one real catalog app, save it, clear, load it back
+        _first_id = next(iter(_inst.vars), None)
         assert _first_id is not None, "Install catalog has no apps to profile"
         _inst.apply_profile_ids([])
         assert _inst.profile_ids() == [], "clearing the selection failed"
@@ -1613,12 +1601,7 @@ def main():
         _sd._stop_token[0] = True
         _settle(_sd)
         assert (_sd._modal_w, _sd._modal_h) == (800, 600), (_sd._modal_w, _sd._modal_h)
-        # 4 legs since the Stability column joined the single stats row
-        # (SpeedTestDialog.LEGS) — the old 3-leg pin rotted the same way
-        # as the Feature-7 asserts above (suite aborts at the first
-        # failure, so each fix reveals the next stale pin).
-        assert set(_sd._row_values) == {"ping", "download", "upload",
-                                        "stability"}
+        assert set(_sd._row_values) == {"ping", "download", "upload"}
         # no-clipping guard (user bug: Upload row cut, Re-test unreachable):
         # content must leave 40px+ headroom in the fixed 538px body so
         # larger system fonts still fit without scrolling.
@@ -1664,11 +1647,10 @@ def main():
         _hub = [_it for _it in _sd._gauge.find_all()
                 if _sd._gauge.type(_it) == "oval"]
         assert _hub and _sd._gauge.itemcget(_hub[-1], "fill").lower() == "#f472b6"
-        # single stats row: 4 even cells (Stability joined), leg -> value intact
-        assert set(_sd._row_values) == {"ping", "download", "upload",
-                                        "stability"}
+        # single stats row: 3 even cells, leg -> value contract intact
+        assert set(_sd._row_values) == {"ping", "download", "upload"}
         _cells = _sd._rows_body.grid_slaves(row=0)
-        assert len(_cells) == 4, len(_cells)
+        assert len(_cells) == 3, len(_cells)
         # Re-test highlights on hover + press (no Tooltip allowed here:
         # its plain binds would wipe the button's own animation binds)
         _sd._retest_btn.event_generate("<Enter>")
@@ -2578,25 +2560,12 @@ def main():
                 f"Tools card {key} routed to {_opened}"
         # Audit fix: Quick Tools / Startup Manager are now the two bottom
         # corner icons (added between Auto Maintenance and Export Logs),
-        # not grid cards — exercise what their click bindings invoke.
-        # NOTE: driven via the labels' stored click command, NOT synthetic
-        # event_generate("<Button-1>"): synthetic clicks are not delivered
-        # to withdrawn windows on every Tk build (proven: Tk 9.0 drops
-        # Button-1 to unmapped labels while mapped delivery works), so an
-        # event-based assert would be red/green by Tk version rather than
-        # by app behavior. The binding existence + stored-command routing
-        # below pins the same contract deterministically.
-        assert getattr(app, "_corner_quick", None) is not None \
-            and app._corner_quick.bind("<Button-1>"), \
-            "Quick Tools corner icon or its click binding is gone"
-        assert getattr(app, "_corner_startup", None) is not None \
-            and app._corner_startup.bind("<Button-1>"), \
-            "Startup Manager corner icon or its click binding is gone"
-        app._corner_quick._corner_command()
+        # not grid cards — exercise their actual click bindings directly.
+        app._corner_quick.event_generate("<Button-1>")
         root.update()
         assert _opened and _opened[-1] == "quick", \
             f"Quick Tools corner icon routed to {_opened}"
-        app._corner_startup._corner_command()
+        app._corner_startup.event_generate("<Button-1>")
         root.update()
         assert _opened and _opened[-1] == "startup", \
             f"Startup Manager corner icon routed to {_opened}"
@@ -2642,9 +2611,7 @@ def main():
         _shape, _text = _gd._pad_btns["A"]
         assert _gd._pad_cv.itemcget(_shape, "fill") == "", "overlay must idle transparent"
         assert _gd._pad_img is not None, "controller artwork must load"
-        # artwork is subsampled /3 (400px), not /4 (300px) — bumped so the
-        # pad reads bigger; overlay coords carry the matching _SCALE.
-        assert (_gd._pad_img.width(), _gd._pad_img.height()) == (400, 400), \
+        assert (_gd._pad_img.width(), _gd._pad_img.height()) == (300, 300), \
             (_gd._pad_img.width(), _gd._pad_img.height())
         assert len(_gd._trig_views) == 2, len(_gd._trig_views)
         for _lbl in (_gd._stat_rate_val, _gd._stat_ms_val, _gd._stat_drift_val):
@@ -2739,15 +2706,12 @@ def main():
         assert getattr(_md, "_meter", None) is not None or \
             not [e for e in getattr(_md, "_inputs", []) if e.get("state") == 1], \
             "active input present but no meter bound"
-        # picker offers a real choice on multi-mic machines (OptionMenu
-        # historically, ttk.Combobox since the readonly-dropdown rework —
-        # accept either; the pin is "a real choice widget", not the class).
+        # picker offers a real choice on multi-mic machines
         _actives = [e for e in getattr(_md, "_inputs", []) if e.get("state") == 1]
         if len(_actives) > 1:
-            _pick_classes = {w.winfo_class()
-                             for w in _md._pick_box.winfo_children()}
-            assert _pick_classes & {"Menubutton", "TCombobox"}, \
-                f"multi-mic machine must show the device dropdown, got {_pick_classes}"
+            assert any(w.winfo_class() == "Menubutton"
+                       for w in _md._pick_box.winfo_children()), \
+                "multi-mic machine must show the device dropdown"
     finally:
         try:
             _md._close()
@@ -2761,12 +2725,7 @@ def main():
     assert len(_gp.VALORANT_REGIONS) == 10 and len(_gp.APEX_REGIONS) == 9
     assert len(_gp.PUBG_REGIONS) == 10
     assert len(_gp.MINECRAFT_SERVERS) == 2 and len(_gp.ROBLOX_EDGES) == 2
-    # VALVE static table is INTENTIONALLY empty — the old relay hostnames
-    # were fiction (never resolved; see gameping.py). The tab fetches
-    # Steam's live CM list via _valve_targets() instead; pin that contract
-    # rather than a hardcoded count.
-    assert _gp.VALVE_REGIONS == () and callable(_gp._valve_targets)
-    assert len(_gp.COD_REGIONS) == 10
+    assert len(_gp.VALVE_REGIONS) == 10 and len(_gp.COD_REGIONS) == 10
     assert len(_gp.GAME_TABS) == 72
     assert all(h.endswith(".ds.on.epicgames.com") for _n, h in _gp.FORTNITE_REGIONS)
     assert all(_gp.targets_for(k) for _t, k in _gp.GAME_TABS if k != "custom")

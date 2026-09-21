@@ -33,16 +33,9 @@ from app import config_persist
 from app import gui
 from app.elevation import is_admin
 
-WATCHDOG_MS = 300000   # generous: the nudge phase runs a REAL full
+WATCHDOG_MS = 150000   # generous: the nudge phase runs a REAL full
                        # allowlist estimate scan (stat-only, but TEMP +
-                       # browser caches can be large on lived-in PCs), the
-                       # DNS phase does real network probes with timeouts,
-                       # and CI runners (shared vCPUs, cold cache, AV) are
-                       # much slower than dev PCs — proven 2026-09: the
-                       # suite passed locally with margin but the pilot
-                       # step starved on CI inside a 150s global budget
-                       # (dns 6/6 finished, then watchdog fired waiting
-                       # for the first pilot poll).
+                       # browser caches can be large on lived-in PCs)
 _state = {"failed": False, "step": "init"}
 
 

@@ -535,12 +535,20 @@ def main():
                 # the pilot passed it
                 _state.setdefault("quiet_flags", []).append(quiet)
             app.run_tasks = _cap
-            app._pilot_start()
-            assert app._pilot_running(), "pilot thread did not start"
-            # production start proven — restart fast for test speed
-            # (30s polls would stall the suite; same object + callbacks)
-            app._pilot.stop()
+            # Build the pilot the same way _pilot_start() would (_pilot_ensure
+            # is the exact same object-construction path) but start it ONCE,
+            # directly at the fast test interval — never at the 15s
+            # production default. Starting-then-stopping-then-restarting the
+            # same SessionPilot let the first (slow) thread's very first tick
+            # detect the already-faked process and fire on_apply's
+            # self.root.after(0, ...) from that background thread at almost
+            # the same instant the main thread called .stop()/.start() on the
+            # same object — a genuine cross-thread Tk race that occasionally
+            # dropped the callback and hung poll_pilot_applied forever.
+            app._pilot_ensure()
+            assert app._pilot is not None, "pilot object not built"
             assert app._pilot.start(interval_s=0.3) is True
+            assert app._pilot_running(), "pilot thread did not start"
         except AssertionError as exc:
             fail(f"pilot start: {exc!r}")
             return

@@ -723,8 +723,8 @@ def main():
     _profiles_before = config_persist.get_install_profiles()
     try:
         _inst = app.tabs["Install"]
-        assert getattr(_inst, "_profiles_btn", None) is not None, \
-            "My Setups button missing from the Install tab"
+        # "My Setups" button was deliberately removed from the Install tab
+        # (see app/gui.py) — only the underlying save/load logic is tested.
         _ids = _inst.profile_ids()
         assert isinstance(_ids, list)
         # tick one real catalog app, save it, clear, load it back

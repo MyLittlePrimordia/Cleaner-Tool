@@ -15143,6 +15143,8 @@ class Application:
         tray menu really exits. A run in flight always confirms first;
         confirming from X stops the run then hides (never kills).
         Tray unavailable (no shell) -> old behavior: X quits for real.
+        "Close to Tray" (Auto Maintenance dialog, default on) can turn
+        this off per-user: when it's off, X quits for real too.
         """
         if self._busy:
             proceed = _themed_askyesno(
@@ -15162,7 +15164,13 @@ class Application:
                 self._worker_thread.join(timeout=8.0)
                 if self._worker_thread.is_alive():
                     self._log_full("  ! Task did not stop in time — closing anyway.")
-        if not force_quit and self._hide_to_tray():
+        _close_to_tray = True
+        try:
+            from app.config_persist import load_config as _load_ctr
+            _close_to_tray = bool(_load_ctr().get("close_to_tray_enabled", True))
+        except Exception:
+            pass
+        if not force_quit and _close_to_tray and self._hide_to_tray():
             return
         try:
             self._stop_tray()
@@ -17004,6 +17012,10 @@ class Application:
             _tray0 = bool(config.get("startup_tray_enabled", False))
         except Exception:
             _tray0 = False
+        try:
+            _closetray0 = bool(config.get("close_to_tray_enabled", True))
+        except Exception:
+            _closetray0 = True
 
         enabled_var = _toggle_row("Auto Clean", enabled,
                                   "Runs your last selected tasks on a schedule")
@@ -17013,6 +17025,8 @@ class Application:
                                "Approve once, then no UAC prompt at launch")
         tray_var = _toggle_row("Start with Windows", _tray0,
                                "Boots minimized to the tray at logon")
+        closetray_var = _toggle_row("Close to Tray", _closetray0,
+                               "Window X hides to the tray instead of quitting")
 
         tk.Frame(col, height=1, bg=COLORS["hairline"]).pack(fill="x", pady=(10, 6))
 
@@ -17149,6 +17163,18 @@ class Application:
                                    if _ok5 else f"Start with Windows off failed: {_msg5}")
             except Exception as exc:
                 results.append(f"Start with Windows unset ({exc})")
+            # close-to-tray: a plain flag, no helper task — load fresh
+            # (same reason as the note above: never save a stale whole
+            # config) and persist just this one field.
+            try:
+                from app.config_persist import save_config as _save_ctr
+                _fresh = load_config()
+                _fresh["close_to_tray_enabled"] = bool(closetray_var.get())
+                _save_ctr(_fresh)
+                results.append("Close to Tray on" if closetray_var.get()
+                               else "Close to Tray off")
+            except Exception as exc:
+                results.append(f"Close to Tray unset ({exc})")
             refresh_status()
             # short + quiet: "Saved." unless something failed or is pending
             _attn = [r for r in results

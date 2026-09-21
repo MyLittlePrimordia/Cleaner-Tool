@@ -138,6 +138,9 @@ DEFAULT_CONFIG = {
     # Startup tray (Phase 5): boot hidden with --tray at logon. Same
     # additive-merge + junk-coercion contract as its neighbors.
     "startup_tray_enabled": False,
+    # Close to tray: window X hides to the tray instead of quitting.
+    # Default True preserves the existing behavior for upgrades.
+    "close_to_tray_enabled": True,
 }
 
 _STARTUP_MAX = 200
@@ -373,6 +376,8 @@ def _load_config_from_disk() -> dict:
                 data["remember_limited"] = False
             if not isinstance(data.get("startup_tray_enabled"), bool):
                 data["startup_tray_enabled"] = False
+            if not isinstance(data.get("close_to_tray_enabled"), bool):
+                data["close_to_tray_enabled"] = True
             # Phase-5 keys: same coercion contract (strings scatter;
             # junk degrades to defaults, never raises)
             if not isinstance(data.get("session_pilot_paths"), list):

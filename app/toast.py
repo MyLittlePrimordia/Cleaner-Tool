@@ -182,9 +182,15 @@ def show_toast(title: str, message: str, duration: str = "short",
             acquired = _toast_sem.acquire(blocking=False)
             if not acquired:
                 return
+            # No -ExecutionPolicy flag: execution policy governs running
+            # saved .ps1 script files, not an inline -Command string, so
+            # this was never actually needed here — and "-ExecutionPolicy
+            # Bypass" from an unsigned exe is one of the most heavily
+            # weighted strings in AV/EDR PowerShell-abuse heuristics
+            # (Behavior:Win32/Execution.A!ml and similar), so dropping it
+            # removes a false-positive trigger with no behavior change.
             subprocess.Popen(
-                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                 "-Command", ps_script],
+                ["powershell", "-NoProfile", "-Command", ps_script],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)

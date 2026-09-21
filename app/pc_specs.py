@@ -103,7 +103,7 @@ def _ps_query(class_name, props, timeout=4.0):
         creationflags = getattr(_sp, "CREATE_NO_WINDOW", 0)
         proc = _sp.run(
             ["powershell", "-NoProfile", "-NonInteractive",
-             "-ExecutionPolicy", "Bypass", "-Command", cmd],
+             "-Command", cmd],
             capture_output=True, text=True, timeout=timeout,
             creationflags=creationflags)
         raw = (proc.stdout or "").strip()

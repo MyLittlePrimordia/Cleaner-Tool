@@ -2645,7 +2645,7 @@ def _query_monitor_model():
         creationflags = getattr(_sp, "CREATE_NO_WINDOW", 0)
         proc = _sp.run(
             ["powershell", "-NoProfile", "-NonInteractive",
-             "-ExecutionPolicy", "Bypass", "-Command", cmd],
+             "-Command", cmd],
             capture_output=True, text=True, timeout=4.0,
             creationflags=creationflags)
         raw = (proc.stdout or "").strip()

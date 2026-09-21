@@ -14707,6 +14707,7 @@ class Application:
 
         self._busy = False
         self._busy_lock = threading.Lock()
+        self._tray_action_lock = threading.Lock()
         self._cancel_requested = False
         self._worker_thread = None
         self.tweak_state = get_tweak_state()   # Applied-badge source (#14)
@@ -14848,6 +14849,26 @@ class Application:
         tray can exist (caller quits for real instead)."""
         try:
             if not self._ensure_tray():
+                # Do NOT withdraw if there's no way back — leaving the
+                # window open beats trapping the user with no tray icon
+                # and no visible window (previously: silent no-op).
+                try:
+                    from app.config_persist import log_security_event
+                    log_security_event("tray", "tray icon creation failed; "
+                                       "keeping window open instead of hiding")
+                except Exception:
+                    pass
+                try:
+                    _themed_showinfo(
+                        self.root,
+                        "System Tray Unavailable",
+                        "Could not create the system-tray icon.\n\n"
+                        "The window will stay open so you can still use the app.\n"
+                        "If this keeps happening, try restarting Explorer or the PC.",
+                        accent=COLORS["accent_yellow"],
+                    )
+                except Exception:
+                    pass
                 return False
         except Exception:
             return False
@@ -15019,9 +15040,10 @@ class Application:
         or unreachable network must never freeze the tray or the window —
         and answers with a toast, no window required. A second click
         while one is in flight is a no-op rather than stacking probes."""
-        if getattr(self, "_tray_ping_busy", False):
-            return
-        self._tray_ping_busy = True
+        with self._tray_action_lock:
+            if getattr(self, "_tray_ping_busy", False):
+                return
+            self._tray_ping_busy = True
         def _work():
             try:
                 from app.gameping import probe_icmp, verdict
@@ -15038,10 +15060,14 @@ class Application:
             except Exception:
                 pass
             finally:
+                def _clear():
+                    with self._tray_action_lock:
+                        self._tray_ping_busy = False
                 try:
-                    self.root.after(0, lambda: setattr(self, "_tray_ping_busy", False))
+                    self.root.after(0, _clear)
                 except Exception:
-                    self._tray_ping_busy = False
+                    with self._tray_action_lock:
+                        self._tray_ping_busy = False
         import threading as _th
         _th.Thread(target=_work, daemon=True, name="TrayPingCheck").start()
 
@@ -15056,9 +15082,10 @@ class Application:
         Same off-UI-thread + toast pattern as Check My Ping: a starting
         toast first since this takes longer than a ping, then the result;
         never freezes the tray or the window either way."""
-        if getattr(self, "_tray_speedtest_busy", False):
-            return
-        self._tray_speedtest_busy = True
+        with self._tray_action_lock:
+            if getattr(self, "_tray_speedtest_busy", False):
+                return
+            self._tray_speedtest_busy = True
         def _start_toast():
             # own thread: show_toast blocks ~1-2s on PowerShell startup and
             # neither the UI thread nor the test itself should wait on it.
@@ -15093,10 +15120,14 @@ class Application:
                 _toast2(title, msg)
             except Exception:
                 pass
+            def _clear():
+                with self._tray_action_lock:
+                    self._tray_speedtest_busy = False
             try:
-                self.root.after(0, lambda: setattr(self, "_tray_speedtest_busy", False))
+                self.root.after(0, _clear)
             except Exception:
-                self._tray_speedtest_busy = False
+                with self._tray_action_lock:
+                    self._tray_speedtest_busy = False
         import threading as _th2
         _th2.Thread(target=_start_toast, daemon=True,
                     name="TraySpeedStartToast").start()

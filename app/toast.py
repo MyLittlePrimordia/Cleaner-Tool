@@ -15,6 +15,7 @@ still appears (just with the old attribution) rather than vanishing.
 import os
 import subprocess
 import sys
+import time
 import threading
 
 _APP_NAME = "Cleaner Tool"
@@ -26,24 +27,73 @@ _aumid_cache = None
 
 
 def _esc(s: str) -> str:
-    return s.replace("'", "''").replace("\n", " ").replace("\r", " ")
+    """Escape for PowerShell single-quoted string. Also neutralizes
+    control characters (not just \\n/\\r) that could otherwise break the
+    one-liner or, in a future template change, become an injection
+    vector — title/message can carry game names, drive labels, or other
+    semi-external text."""
+    if not isinstance(s, str):
+        s = str(s)
+    # Single-quote doubling is the only legal escape inside '...'
+    s = s.replace("'", "''")
+    # Strip all control chars (not just \n/\r) that could break the
+    # one-liner if they ever reach it.
+    s = "".join(ch if ord(ch) >= 32 else " " for ch in s)
+    return s
 
 
-def _icon_file():
-    """Bundled app icon as a .png (works for source runs and PyInstaller
-    builds — --add-data puts app/assets next to this module)."""
+def _stable_icon_path():
+    """Persistent path for the toast icon, reused across launches.
+
+    A onefile PyInstaller build unpacks to a fresh temp dir every run, so
+    writing that path into HKCU (as IconUri) leaves a dangling reference
+    the moment the process exits — Windows then falls back to a generic
+    icon until the next successful launch. Instead, copy the bundled icon
+    once into the app's own persistent config dir (the same
+    %LOCALAPPDATA%\\CleanerTool used for config.json / events.log, with
+    the same missing-LOCALAPPDATA / redirected-profile fallback already
+    handled there) and reuse that copy.
+    """
     try:
-        here = os.path.dirname(os.path.abspath(__file__))
-        p = os.path.join(here, "assets", "icon.png")
-        return p if os.path.isfile(p) else None
+        import shutil
+        from pathlib import Path
+        from app.config_persist import CONFIG_DIR
+
+        here = Path(__file__).resolve().parent
+        src = here / "assets" / "icon.png"
+        if not src.is_file():
+            # Frozen fallback: PyInstaller layout can put bundled data
+            # under either <_MEIPASS>/app/assets or <_MEIPASS>/assets
+            # depending on build config — the rest of the codebase's
+            # icon lookups (_set_window_icon and friends) check both, so
+            # this does too.
+            meipass = getattr(sys, "_MEIPASS", None)
+            if meipass:
+                for cand in (Path(meipass) / "app" / "assets" / "icon.png",
+                            Path(meipass) / "assets" / "icon.png"):
+                    if cand.is_file():
+                        src = cand
+                        break
+            if not src.is_file():
+                return None
+
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        dest = CONFIG_DIR / "toast_icon.png"
+
+        # Copy only when missing or size differs (cheap, avoids a write
+        # on every single launch).
+        if not dest.is_file() or dest.stat().st_size != src.stat().st_size:
+            shutil.copy2(src, dest)
+        return str(dest)
     except Exception:
         return None
 
 
 def _ensure_aumid() -> str:
     """Register the app's toast identity once per run and return the id to
-    use. Rewritten every launch on purpose: a onefile build unpacks to a
-    fresh temp folder each run, so the stored icon path must follow it."""
+    use. The icon path is now a stable, reused copy under CONFIG_DIR
+    rather than the onefile temp-extraction path, so it survives past the
+    process that registered it (see _stable_icon_path)."""
     global _aumid_cache
     with _aumid_lock:
         if _aumid_cache is not None:
@@ -55,7 +105,7 @@ def _ensure_aumid() -> str:
             with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, path, 0,
                                     winreg.KEY_SET_VALUE) as k:
                 winreg.SetValueEx(k, "DisplayName", 0, winreg.REG_SZ, _APP_NAME)
-                icon = _icon_file()
+                icon = _stable_icon_path()
                 if icon:
                     winreg.SetValueEx(k, "IconUri", 0, winreg.REG_SZ, icon)
             aumid = _AUMID
@@ -86,7 +136,7 @@ def _build_script(title: str, message: str, long_duration: bool,
         "$toast = [Windows.UI.Notifications.ToastNotification]::new($xml); "
         f"$toast.Duration = [Windows.UI.Notifications.ToastDuration]::{'Long' if long_duration else 'Short'}; "
         f"{tag_line}"
-        f"$notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{aumid}'); "
+        f"$notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{_esc(aumid)}'); "
         "$notifier.Show($toast); "
         # Auto-dismiss: some setups leave a toast on screen until the X is
         # clicked, so this same process waits out the toast's duration and
@@ -94,6 +144,11 @@ def _build_script(title: str, message: str, long_duration: bool,
         f"Start-Sleep -Seconds {hide_after}; "
         "$notifier.Hide($toast)"
     )
+
+
+# Bounds concurrent PowerShell hide-helper processes (TOAST-001): a burst
+# of toasts can otherwise spawn one long-lived process each.
+_toast_sem = threading.Semaphore(3)
 
 
 def show_toast(title: str, message: str, duration: str = "short",
@@ -115,15 +170,42 @@ def show_toast(title: str, message: str, duration: str = "short",
 
     ps_script = _build_script(title, message, duration == "long",
                               _ensure_aumid(), tag)
+
+    def _run():
+        acquired = False
+        try:
+            # Cap concurrent hide-helpers so a burst of toasts (e.g. a
+            # misbehaving watcher, repeated low-space checks) can't spawn
+            # unbounded long-lived PowerShell processes. A dropped toast
+            # under heavy burst is an acceptable trade — there's no
+            # delivery guarantee here to begin with.
+            acquired = _toast_sem.acquire(blocking=False)
+            if not acquired:
+                return
+            subprocess.Popen(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                 "-Command", ps_script],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            )
+            # The helper itself lives for hide_after seconds (see
+            # _build_script); hold the slot a little past that so we
+            # don't release while it's still technically starting up.
+            time.sleep(12 if duration == "long" else 6)
+        except Exception:
+            pass
+        finally:
+            if acquired:
+                try:
+                    _toast_sem.release()
+                except Exception:
+                    pass
+
     try:
         # Fire-and-forget: the helper stays alive for the toast's duration
         # (to hide it), so never wait on it — callers must not block.
-        subprocess.Popen(
-            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        )
+        threading.Thread(target=_run, daemon=True, name="ToastHelper").start()
         return True
     except Exception:
         return False

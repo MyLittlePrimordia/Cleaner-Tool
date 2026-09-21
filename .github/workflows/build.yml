@@ -3,6 +3,16 @@ name: Build Windows Executable
 # Build a standalone .exe on every push to main / PR / manual run, and
 # continuously overwrite a rolling "latest" release with the raw .exe
 # (no zip). Version tags (e.g. v2.0.0) still create their own release too.
+#
+# Defender / SmartScreen notes (DEF-001):
+#   - Every build now embeds a full VERSIONINFO resource (CompanyName,
+#     ProductName, FileVersion, etc.). This removes one of the heuristic
+#     signals that contributed to "Behavior:Win32/Persistence.A!ml".
+#   - Code signing is the single highest-leverage remaining fix. The
+#     "Sign the executable" step below is ready and only runs when you
+#     have uploaded the two secrets listed in the comments. Until then
+#     the build is unsigned (same as today) but already has proper
+#     version metadata.
 on:
   push:
     branches: [ "main" ]
@@ -53,13 +63,100 @@ jobs:
         #              and uses its in-app Admin Gate / restart handshake to
         #              elevate only when needed (cleanups work without admin)
         # --icon / --add-data : bundle colored 🧼 icon from app/assets
+        # --version-file : embed Win32 VERSIONINFO (CompanyName, ProductName,
+        #                  FileVersion, LegalCopyright, …). Required for
+        #                  reducing Defender/SmartScreen heuristic score.
         run: >
           pyinstaller --onefile --windowed
           --name "Cleaner-Tool"
           --icon "app/assets/icon.ico"
           --add-data "app/assets;app/assets"
           --manifest "app/assets/app_manifest.xml"
+          --version-file "version_info.txt"
           app/__main__.py
+
+      # ------------------------------------------------------------------
+      # Optional Authenticode signing (DEF-001 highest-leverage fix)
+      # ------------------------------------------------------------------
+      # This step is SKIPPED automatically until you add the two secrets
+      # below. Once the secrets exist, every future build is signed with
+      # no further action from you.
+      #
+      # How to enable (one-time):
+      #   1. Buy a code-signing certificate (OV or EV). EV is stronger
+      #      against SmartScreen but more expensive. Popular cheap options:
+      #      Certum, SSL.com, Sectigo, DigiCert.
+      #   2. Export the cert as a .pfx (PKCS#12) protected by a password.
+      #   3. In the GitHub repo → Settings → Secrets and variables → Actions
+      #      create two repository secrets:
+      #        CODE_SIGNING_PFX_BASE64   = base64 of the entire .pfx file
+      #                                   (PowerShell: [Convert]::ToBase64String(
+      #                                      [IO.File]::ReadAllBytes("cert.pfx")))
+      #        CODE_SIGNING_PASSWORD     = the password you set on the .pfx
+      #   4. Push any change. The next build will be signed.
+      #
+      # After the first signed build, also submit the .exe once to
+      # https://www.microsoft.com/wdsi/filesubmission so Microsoft’s
+      # reputation system learns the new signature faster.
+      - name: Sign the executable (Authenticode)
+        # This step is a no-op until you add the two secrets listed in the
+        # comments at the top of this file. Once the secrets exist, every
+        # future build is signed automatically — you never have to touch
+        # the workflow again.
+        env:
+          CODE_SIGNING_PFX_BASE64: ${{ secrets.CODE_SIGNING_PFX_BASE64 }}
+          CODE_SIGNING_PASSWORD: ${{ secrets.CODE_SIGNING_PASSWORD }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrEmpty($env:CODE_SIGNING_PFX_BASE64) -or
+              [string]::IsNullOrEmpty($env:CODE_SIGNING_PASSWORD)) {
+            Write-Host "No code-signing secrets found — skipping Authenticode signing."
+            Write-Host "(Add CODE_SIGNING_PFX_BASE64 + CODE_SIGNING_PASSWORD to enable.)"
+            exit 0
+          }
+
+          Write-Host "Signing Cleaner-Tool.exe …"
+
+          # Decode the PFX from the secret
+          $pfxBytes = [Convert]::FromBase64String($env:CODE_SIGNING_PFX_BASE64)
+          $pfxPath  = Join-Path $env:RUNNER_TEMP "codesign.pfx"
+          [IO.File]::WriteAllBytes($pfxPath, $pfxBytes)
+
+          # Prefer the modern Windows SDK signtool if present, otherwise fall
+          # back to the one that ships with the Visual Studio build tools.
+          $signtool = Get-Command signtool.exe -ErrorAction SilentlyContinue
+          if (-not $signtool) {
+            $candidates = @(
+              "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe",
+              "${env:ProgramFiles}\Windows Kits\10\bin\*\x64\signtool.exe"
+            )
+            $found = Get-ChildItem -Path $candidates -ErrorAction SilentlyContinue |
+                     Sort-Object FullName -Descending |
+                     Select-Object -First 1
+            if ($found) { $signtool = $found.FullName }
+          }
+          if (-not $signtool) {
+            throw "signtool.exe not found on the runner. Cannot sign."
+          }
+
+          & $signtool sign `
+            /f $pfxPath `
+            /p $env:CODE_SIGNING_PASSWORD `
+            /fd sha256 `
+            /tr http://timestamp.digicert.com `
+            /td sha256 `
+            /v `
+            "dist\Cleaner-Tool.exe"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "signtool failed with exit code $LASTEXITCODE"
+          }
+          Write-Host "Signing completed successfully."
+
+          # Clean up the temporary PFX
+          Remove-Item $pfxPath -Force -ErrorAction SilentlyContinue
 
       - name: Upload build artifact (raw .exe, no zip)
         uses: actions/upload-artifact@v4

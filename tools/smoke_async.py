@@ -570,6 +570,27 @@ def main():
         calls = _state.get("calls", [])
         runs = [c for c in calls if c[1] == "run"]
         if not runs:
+            # Diagnostics: this step has stalled on Windows CI with no
+            # local repro despite the queue-based cross-thread fix. Rather
+            # than guess again, print WHY every ~3s so the next CI run
+            # tells us directly instead of just "it stalled".
+            n = _state.get("_pilot_poll_n", 0) + 1
+            _state["_pilot_poll_n"] = n
+            if n % 10 == 0:
+                try:
+                    pilot = app._pilot
+                    print(f"  [diag] poll_pilot_applied poll {n}: "
+                          f"pilot.state={pilot.state!r} "
+                          f"running={pilot.running()} "
+                          f"thread_alive={pilot._thread.is_alive() if pilot._thread else None} "
+                          f"calls={calls!r} "
+                          f"evt_q_size={app._pilot_evt_q.qsize() if hasattr(app, '_pilot_evt_q') else 'N/A'} "
+                          f"any_open={gui.ThemedModal.any_open()} "
+                          f"busy={getattr(app, '_busy', '?')}",
+                          flush=True)
+                except Exception as exc:
+                    print(f"  [diag] poll_pilot_applied poll {n}: "
+                          f"diag raised {exc!r}", flush=True)
             root.after(300, poll_pilot_applied)
             return
         try:

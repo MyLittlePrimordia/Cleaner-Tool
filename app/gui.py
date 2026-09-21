@@ -14774,9 +14774,9 @@ class Application:
         corner_mid = tk.Frame(corners, bg=COLORS["bg"])
         corner_mid.pack(side="left", expand=True)
         self._corner_quick = _corner_icon(
-            corner_mid, "🧰", "Quick Tools", self._open_quick_tools)
+            corner_mid, "🧰", "Quick Tools", lambda: self._open_quick_tools())
         self._corner_startup = _corner_icon(
-            corner_mid, "🚀", "Startup Manager", self._open_startup_manager)
+            corner_mid, "🚀", "Startup Manager", lambda: self._open_startup_manager())
 
         self._corner_logs = tk.Label(corners, text="📋", font=(F, 13),
                                      bg=COLORS["bg"], fg=COLORS["subtext"],

@@ -2745,8 +2745,8 @@ class PilotDialog(ThemedModal):
         tk.Frame(body, bg=COLORS["hairline"], height=1).pack(
             fill="x", pady=(12, 8))
         tk.Label(body,
-                 text="Start a session now (optional) — same tweaks, "
-                      "End puts them back.",
+                 text="Game Mode — boosts FPS now; turning it off "
+                      "puts everything back.",
                  font=(F, 9, "bold"), bg=COLORS["bg"], fg=COLORS["text"],
                  wraplength=680, justify="left", anchor="w").pack(
                      fill="x", pady=(0, 6))
@@ -3111,16 +3111,17 @@ class PilotDialog(ThemedModal):
         started/ended from somewhere other than this dialog's own button."""
         try:
             on = self._active_manual()
+            # plain On/Off switch look: green when on, neutral when off
             if on:
-                self._manual_btn.config_text("End session now")
-                self._manual_btn.set_style(
-                    bg=COLORS["accent_red"], fg="#FFFFFF",
-                    hover_bg=_hex_lerp(COLORS["accent_red"], "#FFFFFF", 0.08))
-            else:
-                self._manual_btn.config_text("Start session now")
+                self._manual_btn.config_text("Game Mode: On")
                 self._manual_btn.set_style(
                     bg=COLORS["accent_green"], fg=COLORS["black"],
                     hover_bg=_hex_lerp(COLORS["accent_green"], "#FFFFFF", 0.08))
+            else:
+                self._manual_btn.config_text("Game Mode: Off")
+                self._manual_btn.set_style(
+                    bg=COLORS["surface"], fg=COLORS["text"],
+                    hover_bg=_hex_lerp(COLORS["surface"], "#FFFFFF", 0.08))
         except Exception:
             pass
 
@@ -4503,26 +4504,75 @@ class AdminGateFrame(tk.Frame):
         wrapper.place(relx=0.5, rely=0.5, anchor="center")
         tk.Label(wrapper, text="🛡️", font=("Segoe UI Emoji", 40), bg=COLORS["bg"],
                  fg=COLORS["accent_yellow"]).pack(pady=(0, 10))
-        tk.Label(wrapper, text="Administrator Privileges Required", font=(F, 15, "bold"),
+        tk.Label(wrapper, text="Admin Needed", font=(F, 15, "bold"),
                  bg=COLORS["bg"], fg=COLORS["text"]).pack()
         tk.Label(
             wrapper,
-            text=("Most cleaning works without admin, but repairs and tweaks need it.\n"
-                  "Click below to restart as Administrator (UAC will appear)."),
+            text="Repairs and tweaks need admin.",
             font=(F, 10), bg=COLORS["bg"], fg=COLORS["subtext"], justify="center",
         ).pack(pady=(8, 18))
         btn_row = tk.Frame(wrapper, bg=COLORS["bg"])
         btn_row.pack()
         AnimatedButton(
-            btn_row, text="Restart as Administrator", command=self._restart_elevated,
+            btn_row, text="Restart as Admin", command=self._restart_elevated,
             bg=COLORS["accent_green"], fg=COLORS["black"], font=(F, 10, "bold"),
         ).pack(side="left", padx=6)
         AnimatedButton(
-            btn_row, text="Continue Without Admin", command=self._continue_limited,
+            btn_row, text="Skip", command=self._continue_limited,
             bg=COLORS["surface"], fg=COLORS["text"], font=(F, 10),
         ).pack(side="left", padx=6)
+        # auto-elevate ("stop asking me") + remember-limited prefs. Saved
+        # on either button click (see _save_gate_prefs); auto_elevate wins
+        # on read paths when both end up set.
+        try:
+            from app.config_persist import load_config as _load_cfg
+            _cfg = _load_cfg()
+            _auto0 = bool(_cfg.get("auto_elevate", False))
+            _lim0 = bool(_cfg.get("remember_limited", False))
+        except Exception:
+            _auto0, _lim0 = False, False
+        self._auto_elevate_var = tk.BooleanVar(value=_auto0)
+        self._remember_limited_var = tk.BooleanVar(value=_lim0)
+        try:
+            from app import elevated_launch as _el
+            _notice = _el.notice_for_gate()
+        except Exception:
+            _notice = None
+        if _notice:
+            try:
+                tk.Label(wrapper, text=_notice, font=(F, 9),
+                         bg=COLORS["bg"], fg=COLORS["accent_yellow"],
+                         wraplength=420, justify="center").pack(pady=(12, 0))
+            except Exception:
+                pass
+        for _text, _var in (
+                ("Always start as Admin",
+                 self._auto_elevate_var),
+                ("Don't show this again",
+                 self._remember_limited_var)):
+            try:
+                tk.Checkbutton(wrapper, text=_text, variable=_var,
+                               font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
+                               selectcolor=COLORS["surface"],
+                               activebackground=COLORS["bg"],
+                               activeforeground=COLORS["text"],
+                               anchor="w", justify="left",
+                               wraplength=420).pack(fill="x", pady=(10 if _var is self._auto_elevate_var else 2, 0),
+                                                    padx=20)
+            except Exception:
+                pass
+
+    def _save_gate_prefs(self):
+        try:
+            from app import elevated_launch as _el
+            _el.save_gate_prefs(
+                bool(self._auto_elevate_var.get()),
+                bool(self._remember_limited_var.get()))
+        except Exception:
+            pass
 
     def _restart_elevated(self):
+        self._save_gate_prefs()
         if relaunch_as_admin():
             self._set_elevate_buttons_state("disabled")
             self._wait_status = tk.Label(self, text="Waiting for elevation — click Yes on the UAC prompt, then wait...", font=(F, 9),
@@ -4580,6 +4630,7 @@ class AdminGateFrame(tk.Frame):
             pass
 
     def _continue_limited(self):
+        self._save_gate_prefs()
         self.destroy()
         self.on_continue_limited()
 
@@ -14671,11 +14722,397 @@ class Application:
         if is_admin():
             self._build_main_ui()
         else:
-            AdminGateFrame(self.root, on_continue_limited=self._build_main_ui)
+            # Gate triage (auto-elevate project): the Gate only earns its
+            # screen when it can change something. remember_limited (and
+            # not auto_elevate, which wins) or a selection with no admin
+            # tasks -> straight to limited mode, no interrogation. An
+            # opted-in auto_elevate whose task is broken still shows the
+            # Gate (with its notice line) — approving once more repairs it.
+            _show_gate = True
+            _elevate_pending = False
+            try:
+                from app import elevated_launch as _el
+                from app.config_persist import load_config as _load_cfg2
+                _cfg2 = _load_cfg2()
+                if bool(_cfg2.get("remember_limited", False)) \
+                        and not bool(_cfg2.get("auto_elevate", False)):
+                    _show_gate = False
+                elif not _el.saved_selection_needs_admin():
+                    _show_gate = False
+                    try:
+                        _elevate_pending = bool(_cfg2.get("auto_elevate", False)) \
+                            and _el.notice_for_gate() is not None
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            if _show_gate:
+                AdminGateFrame(self.root, on_continue_limited=self._build_main_ui)
+            else:
+                self._build_main_ui()
+                if _elevate_pending:
+                    try:
+                        self.set_status("Auto-elevate is on but needs one more approval "
+                                        "(click the 🔓 badge when ready).")
+                    except Exception:
+                        pass
+        # single-instance focus handoff (tray/auto-elevate foundation): a
+        # second launch pulses our show-event instead of opening a twin —
+        # surface here when it arrives. Best-effort, self-rescheduling.
+        self._start_single_instance_poll()
+
+    def _start_single_instance_poll(self):
+        """Begin the show-event poll (see app/single_instance). A second
+        launch focuses this window instead of opening a twin. Cheap
+        (~one kernel wait per 500ms), runs for app life, never raises."""
+        try:
+            from app import single_instance as _si
+            if not _si.poll_enabled():
+                return
+        except Exception:
+            return
+        self._si_poll()
+
+    def _si_poll(self):
+        try:
+            from app import single_instance as _si
+            if _si.check_signalled():
+                for _fn in (self.root.deiconify, self.root.lift,
+                            self.root.focus_force):
+                    try:
+                        _fn()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        try:
+            if self.root.winfo_exists():
+                self.root.after(500, self._si_poll)
+        except Exception:
+            pass
+
+    # ---------------- system tray (resident watchdog UI) ---------------- #
+
+    def _ensure_tray(self) -> bool:
+        """Start the tray icon on first need (lazy: no icon until the
+        window hides once or --tray boots hidden — the suites never hide,
+        so they never sprout icons). True while the icon lives."""
+        try:
+            tray = getattr(self, "_tray", None)
+            if tray is not None and tray.running:
+                return True
+        except Exception:
+            pass
+        try:
+            from app import tray as _traymod
+            icon = _traymod.TrayIcon(
+                tooltip="Cleaner Tool",
+                items=[(101, "Open Cleaner Tool", self.tray_open),
+                       (102, self._tray_game_label, self.tray_toggle_game_session),
+                       (103, "\U0001f9f9 Quick Clean", self.tray_quick_clean),
+                       (105, "\U0001f4f6 Check My Ping", self.tray_check_ping),
+                       (106, "\U0001f680 Speed Test", self.tray_speed_test),
+                       (None, None, None),
+                       (104, "Quit", self.tray_quit)],
+                on_ui_thread=lambda fn: self._tray_ui_hop(fn))
+            if icon.start():
+                self._tray = icon
+                return True
+            self._tray = None
+        except Exception:
+            try:
+                self._tray = None
+            except Exception:
+                pass
+        return False
+
+    def _tray_ui_hop(self, fn) -> None:
+        """Marshal a tray-thread callback onto the Tk thread. Best-effort:
+        post-quit calls land nowhere instead of raising."""
+        try:
+            self.root.after(0, fn)
+        except Exception:
+            pass
+
+    def _stop_tray(self) -> None:
+        try:
+            tray = getattr(self, "_tray", None)
+            self._tray = None
+            if tray is not None:
+                tray.stop()
+        except Exception:
+            pass
+
+    def _hide_to_tray(self) -> bool:
+        """Withdraw the window into the resident tray icon. False when no
+        tray can exist (caller quits for real instead)."""
+        try:
+            if not self._ensure_tray():
+                return False
+        except Exception:
+            return False
+        try:
+            self.root.withdraw()
+        except Exception:
+            return False
+        # first-hide explainer (once ever): X hides, Quit quits — never
+        # trap a user who expected Close to mean close.
+        try:
+            from app.config_persist import has_seen_tip, mark_tip_seen
+            if not has_seen_tip("tray_hide_once"):
+                mark_tip_seen("tray_hide_once")
+                try:
+                    from app.toast import show_toast as _toast
+                    _toast("Cleaner Tool keeps running",
+                           "Minimized to the tray — monitors and Auto-Pilot "
+                           "stay on. Quit from the tray icon menu.")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return True
+
+    def _maybe_hide_for_tray(self) -> None:
+        """--tray boot: withdraw right after the main UI builds (pre-
+        mainloop, so nothing flashes). The Gate path never reaches here
+        hidden — it builds the UI through its own callback first."""
+        try:
+            import sys as _sys
+            if "--tray" in _sys.argv:
+                self._hide_to_tray()
+        except Exception:
+            pass
+
+    def tray_open(self) -> None:
+        """Tray menu / single-click / second-launch focus target."""
+        try:
+            self.root.deiconify()
+        except Exception:
+            return
+        try:
+            self.root.lift()
+        except Exception:
+            pass
+        try:
+            self.root.focus_force()
+        except Exception:
+            pass
+
+    def tray_quit(self) -> None:
+        """The one true exit while resident (goes through the busy guard)."""
+        try:
+            self._on_close(force_quit=True)
+        except Exception:
+            pass
+
+    def _tray_game_label(self) -> str:
+        """Live tray label: shows the current state so the item reads as a
+        plain On/Off switch. Evaluated each time the menu opens."""
+        try:
+            from app.config_persist import get_game_night
+            on = bool(get_game_night().get("active"))
+        except Exception:
+            on = False
+        return "\U0001f3ae Game Mode: " + ("On" if on else "Off")
+
+    def tray_toggle_game_session(self) -> None:
+        """Tray Game Mode: one click flips it. On applies the Game Session
+        FPS tweaks, Off puts back exactly what it changed. Runs quietly (a
+        tray click may come from inside a game — no modal over it) and
+        reports the REAL outcome in one toast when the work is done."""
+        try:
+            if getattr(self, "_busy", False):
+                self._toast_async("Cleaner Tool is busy",
+                                  "A run is in progress — open the app to watch it.")
+                self.tray_open()
+                return
+            from app.config_persist import get_game_night
+            if bool(get_game_night().get("active")):
+                self.end_game_night(quiet=True)
+            else:
+                self.start_game_night(quiet=True)
+        except Exception:
+            pass
+
+    def _toast_async(self, title, msg) -> None:
+        """Fire a toast without ever blocking the caller."""
+        try:
+            threading.Thread(target=show_toast, args=(title, msg),
+                             daemon=True).start()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _result_toast(kind, extra, total_bytes, completed, failed,
+                      skipped_n, cancelled):
+        """(title, body) for a finished tray-started run. Numbers come from
+        the run itself — never a canned "done"."""
+        extra = extra or {}
+        if cancelled:
+            return ("Stopped", "The run was stopped early.")
+        if kind == "clean":
+            if total_bytes and total_bytes > 0:
+                body = "Quick Clean finished"
+                if failed:
+                    body += f" ({failed} failed)"
+                return (f"{format_bytes(total_bytes)} freed", body)
+            if failed and not completed:
+                return ("Clean failed", "Open the app to see why.")
+            return ("Nothing to clean", "Your PC is already tidy.")
+        if kind == "gm_on":
+            if completed > 0:
+                body = f"{completed} settings boosted"
+                if extra.get("admin_missing"):
+                    body += " · run as admin for the rest"
+                return ("\U0001f3ae Game Mode on", body)
+            if failed:
+                return ("Game Mode failed", "Open the app to see why.")
+            return ("\U0001f3ae Game Mode on", "Already set up for gaming.")
+        if kind == "gm_off":
+            if failed and not completed:
+                return ("Game Mode off failed", "Open the app to see why.")
+            return ("Game Mode off", "Normal settings are back.")
+        return ("Done", "")
+
+    def tray_quick_clean(self) -> None:
+        """Tray Quick Clean: the curated preset through the standard run
+        engine (scorecard waits in the app for later — never a modal over
+        a game). Bounces busily with a toast + open like its sibling."""
+        try:
+            if getattr(self, "_busy", False):
+                try:
+                    from app.toast import show_toast as _toast
+                    _toast("Cleaner Tool is busy",
+                           "A run is in progress — open the app to watch it.")
+                except Exception:
+                    pass
+                self.tray_open()
+                return
+            from app.tab_presets import PRESETS as _PR
+            by_key = {t.key: t for t in TABS.get("Clean", [])}
+            keys = _PR.get("Clean", {}).get("Quick Clean", [])
+            tasks = [by_key[k] for k in keys if k in by_key]
+            if not tasks:
+                try:
+                    from app.toast import show_toast as _toast
+                    _toast("Quick Clean", "No clean tasks available.")
+                except Exception:
+                    pass
+                return
+            self._toast_async("Quick Clean started", "Working on it\u2026")
+            # quiet: no modal scorecard over a game, and the tray run never
+            # overwrites the user's saved Clean selection. The result
+            # toast reports how much space was actually freed.
+            self.run_tasks("Clean", tasks, mode="run", quiet=True,
+                           toast_kind="clean")
+        except Exception:
+            pass
+
+    def tray_check_ping(self) -> None:
+        """Tray quick action: one honest ICMP ping to a fast, reliable
+        anycast host (Cloudflare 1.1.1.1) — a "how's my connection right
+        now" glance for before you queue up, not a per-game/region test
+        (that's the full Game Ping tool on the Tools tab, which needs a
+        window to show its results table). Reuses gameping.probe_icmp and
+        its verdict() bands so "Excellent"/"Playable"/"Poor" mean the same
+        thing here as they do there. Runs off the UI thread — a stalled
+        or unreachable network must never freeze the tray or the window —
+        and answers with a toast, no window required. A second click
+        while one is in flight is a no-op rather than stacking probes."""
+        if getattr(self, "_tray_ping_busy", False):
+            return
+        self._tray_ping_busy = True
+        def _work():
+            try:
+                from app.gameping import probe_icmp, verdict
+                _sent, _recv, avg = probe_icmp("1.1.1.1", count=4)
+                word, good = verdict(avg)
+                if avg is None:
+                    title, msg = "No reply", "Couldn't reach the internet just now."
+                else:
+                    title = f"Ping: {avg:.0f} ms \u2014 {word}"
+                    msg = ("Good time to queue up." if good
+                           else "Might be a rough match right now.")
+                from app.toast import show_toast as _toast
+                _toast(title, msg)
+            except Exception:
+                pass
+            finally:
+                try:
+                    self.root.after(0, lambda: setattr(self, "_tray_ping_busy", False))
+                except Exception:
+                    self._tray_ping_busy = False
+        import threading as _th
+        _th.Thread(target=_work, daemon=True, name="TrayPingCheck").start()
+
+    def tray_speed_test(self) -> None:
+        """Tray quick action: one real download + upload round through the
+        same Cloudflare-edge engine (app/speed_test.py) the Tools tab's
+        Speed Test card uses — not a separate/fake number. Uses that
+        engine's smallest round size (the same one the full dialog opens
+        with before escalating on a fast link) so a tray click answers in
+        a few seconds instead of running the full multi-round climb,
+        which needs the dialog's live progress bar to make sense of.
+        Same off-UI-thread + toast pattern as Check My Ping: a starting
+        toast first since this takes longer than a ping, then the result;
+        never freezes the tray or the window either way."""
+        if getattr(self, "_tray_speedtest_busy", False):
+            return
+        self._tray_speedtest_busy = True
+        def _start_toast():
+            # own thread: show_toast blocks ~1-2s on PowerShell startup and
+            # neither the UI thread nor the test itself should wait on it.
+            try:
+                from app.toast import show_toast as _toast
+                _toast("Speed Test started",
+                       "Checking your download and upload speed\u2026")
+            except Exception:
+                pass
+        def _work():
+            title, msg = "Speed Test", "Couldn't finish the test. Try again."
+            try:
+                from app import speed_test as _st
+                down = _st.download_parallel(_st.DOWNLOAD_ROUNDS[0], streams=_st.PARALLEL_STREAMS)
+                if down is None:
+                    down = _st.download_parallel(_st.DOWNLOAD_ROUNDS[0],
+                                                 streams=_st.PARALLEL_STREAMS,
+                                                 url=_st.FALLBACK_DOWNLOAD_URL)
+                up = _st.upload_parallel(_st.UPLOAD_ROUNDS[0], streams=_st.PARALLEL_STREAMS)
+                if down is None and up is None:
+                    msg = "Couldn't reach the test server just now."
+                else:
+                    # numbers go in the bold title line (same pattern as the
+                    # ping toast) so the result is the first thing you read
+                    title = (f"{_st.format_mbps(down)} down \u00b7 "
+                             f"{_st.format_mbps(up)} up")
+                    msg = "Your internet speed just now."
+            except Exception:
+                pass
+            try:
+                from app.toast import show_toast as _toast2
+                _toast2(title, msg)
+            except Exception:
+                pass
+            try:
+                self.root.after(0, lambda: setattr(self, "_tray_speedtest_busy", False))
+            except Exception:
+                self._tray_speedtest_busy = False
+        import threading as _th2
+        _th2.Thread(target=_start_toast, daemon=True,
+                    name="TraySpeedStartToast").start()
+        _th2.Thread(target=_work, daemon=True, name="TraySpeedTest").start()
 
     # ---------------- close guard (Phase 1 M3, kept) ---------------- #
 
-    def _on_close(self):
+    def _on_close(self, force_quit=False):
+        """Window X (or tray Quit with force_quit=True).
+
+        The tray owns this app's lifetime: X hides to the tray (monitors
+        and pilot keep running — the point of the tray), Quit from the
+        tray menu really exits. A run in flight always confirms first;
+        confirming from X stops the run then hides (never kills).
+        Tray unavailable (no shell) -> old behavior: X quits for real.
+        """
         if self._busy:
             proceed = _themed_askyesno(
                 self.root,
@@ -14694,6 +15131,12 @@ class Application:
                 self._worker_thread.join(timeout=8.0)
                 if self._worker_thread.is_alive():
                     self._log_full("  ! Task did not stop in time — closing anyway.")
+        if not force_quit and self._hide_to_tray():
+            return
+        try:
+            self._stop_tray()
+        except Exception:
+            pass
         self._stop_disk_monitor()
         # cancel any in-flight nudge estimate walk (phase-6: the scan
         # coordinator's cancelled() consults this token between tasks)
@@ -14880,63 +15323,38 @@ class Application:
         # Quick Tools popup. Click opens the dialog; hover names it.
         corners = tk.Frame(host, bg=COLORS["bg"])
         corners.pack(fill="x", padx=26, pady=(0, 8))
-        self._corner_maint = tk.Label(corners, text="🛠️", font=(F, 13),
-                                      bg=COLORS["bg"], fg=COLORS["subtext"],
-                                      cursor="hand2", bd=0, highlightthickness=0)
-        self._corner_maint.pack(side="left")
-        Tooltip(self._corner_maint, "Auto Maintenance")
-        self._corner_maint.bind("<Button-1>",
-                                lambda e: self._show_schedule_dialog(), add="+")
-        self._corner_maint.bind("<Enter>",
-                                lambda e: self._corner_maint.config(fg=COLORS["text"]), add="+")
-        self._corner_maint.bind("<Leave>",
-                                lambda e: self._corner_maint.config(fg=COLORS["subtext"]), add="+")
+        # Four equal-width columns, each icon centered in its own column:
+        # the gaps between the icons are identical (the old layout pinned
+        # two icons to the edges and floated the other two in the middle).
+        for _ci in range(4):
+            corners.columnconfigure(_ci, weight=1, uniform="corner")
 
-        # Audit fix (Tools tab rebalance): Quick Tools + Startup Manager
-        # moved here from the card grid after Game Night's removal left an
-        # awkward single-card final row. Centered between the two existing
-        # corner icons — symmetric, same icon-label style, no new visual
-        # language introduced for just two buttons.
-        def _corner_icon(parent, icon, tip, command):
-            lbl = tk.Label(parent, text=icon, font=(F, 13),
+        def _corner_icon(col, icon, tip, command):
+            lbl = tk.Label(corners, text=icon, font=(F, 13),
                            bg=COLORS["bg"], fg=COLORS["subtext"],
                            cursor="hand2", bd=0, highlightthickness=0)
-            lbl.pack(side="left", padx=10)
+            lbl.grid(row=0, column=col)
             Tooltip(lbl, tip)
             lbl.bind("<Button-1>", lambda e: command(), add="+")
             lbl.bind("<Enter>", lambda e: lbl.config(fg=COLORS["text"]), add="+")
             lbl.bind("<Leave>", lambda e: lbl.config(fg=COLORS["subtext"]), add="+")
             # Headless-harness hook: event_generate("<Button-1>") is never
-            # delivered to an unmapped widget (proven: withdrawn root leaves
-            # these corner labels with winfo_ismapped()==0, so the synth
-            # click silently no-ops while canvas-hosted Install arrows —
-            # mapped via create_window — do fire). The smoke test must
-            # exercise the EXACT callable the click would invoke, so keep
-            # it reachable without depending on Tk event delivery.
+            # delivered to an unmapped widget, so the smoke test invokes
+            # this exact callable instead of depending on Tk event delivery.
             try:
                 lbl._corner_cmd = command
             except Exception:
                 pass
             return lbl
 
-        corner_mid = tk.Frame(corners, bg=COLORS["bg"])
-        corner_mid.pack(side="left", expand=True)
+        self._corner_maint = _corner_icon(
+            0, "🛠️", "Auto Maintenance", lambda: self._show_schedule_dialog())
         self._corner_quick = _corner_icon(
-            corner_mid, "🧰", "Quick Tools", lambda: self._open_quick_tools())
+            1, "🧰", "Quick Tools", lambda: self._open_quick_tools())
         self._corner_startup = _corner_icon(
-            corner_mid, "🚀", "Startup Manager", lambda: self._open_startup_manager())
-
-        self._corner_logs = tk.Label(corners, text="📋", font=(F, 13),
-                                     bg=COLORS["bg"], fg=COLORS["subtext"],
-                                     cursor="hand2", bd=0, highlightthickness=0)
-        self._corner_logs.pack(side="right")
-        Tooltip(self._corner_logs, "Export Logs")
-        self._corner_logs.bind("<Button-1>",
-                               lambda e: self.export_logs(), add="+")
-        self._corner_logs.bind("<Enter>",
-                               lambda e: self._corner_logs.config(fg=COLORS["text"]), add="+")
-        self._corner_logs.bind("<Leave>",
-                               lambda e: self._corner_logs.config(fg=COLORS["subtext"]), add="+")
+            2, "🚀", "Startup Manager", lambda: self._open_startup_manager())
+        self._corner_logs = _corner_icon(
+            3, "📋", "Export Logs", lambda: self.export_logs())
 
         self._build_log(bottom)
         self._start_disk_monitor()
@@ -14981,6 +15399,14 @@ class Application:
                 self._pilot_start()
         except Exception:
             pass
+
+        # --tray boot hides here (pre-mainloop, nothing flashes). The Gate
+        # path converges here too, through its own continue callback.
+        try:
+            self._tray = None
+        except Exception:
+            pass
+        self._maybe_hide_for_tray()
 
     # ---------------- F6: idle pre-warm chain ---------------- #
 
@@ -15612,11 +16038,18 @@ class Application:
         except Exception:
             return False
 
-    def start_game_night(self):
-        """Apply the Game Session preset and remember what we turned on."""
+    def start_game_night(self, quiet=None):
+        """Apply the Game Session preset and remember what we turned on.
+
+        quiet=None (default) preserves the old contract: a modal scorecard
+        unless a game is already in progress. The tray passes quiet=True
+        explicitly — a tray click may come from inside a game, so it never
+        risks a modal over it (one state toast instead)."""
         tasks = self._game_night_tasks()
         if not tasks:
             self.set_status("Game Night: no gaming tweaks available.")
+            if quiet:
+                self._toast_async("Game Mode", "No gaming settings available.")
             return
         runnable = list(tasks)
         if not is_admin():
@@ -15628,6 +16061,9 @@ class Application:
                          f"applying {len(runnable)} of {len(tasks)} settings.")
         if not runnable:
             self.set_status("Game Night needs Administrator for these settings.")
+            if quiet:
+                self._toast_async("Game Mode needs admin",
+                                  "Restart as Administrator to turn it on.")
             return
         # Fresh keys only (the pilot's rule): tweaks already applied before
         # this press stay applied when Game Night ends.
@@ -15658,23 +16094,21 @@ class Application:
                     self.log("Game Night: closed " + ", ".join(closed) + ".")
         except Exception:
             pass
-        quiet = self._game_in_progress()
+        quiet = self._game_in_progress() if quiet is None else bool(quiet)
         try:
             self.log("===== Game Night: getting your PC ready to play =====")
-            if quiet:
-                import threading as _th
-                _th.Thread(target=show_toast,
-                           args=("🎮 Game Night on",
-                                 "Your PC is set up for gaming. End it in "
-                                 "Tools when you're done."),
-                           daemon=True).start()
-            self.run_tasks("Tweak", runnable, mode="run", quiet=quiet)
+            self.run_tasks("Tweak", runnable, mode="run", quiet=quiet,
+                           toast_kind=("gm_on" if quiet else None),
+                           toast_extra={"admin_missing": len(tasks) - len(runnable)})
         except Exception:
             pass
         self._refresh_pilot_dialog_manual_btn()
 
-    def end_game_night(self):
-        """Put back exactly the tweaks Game Night turned on."""
+    def end_game_night(self, quiet=None):
+        """Put back exactly the tweaks Game Night turned on.
+
+        quiet=None preserves the old auto contract; the tray passes
+        quiet=True explicitly (same no-modal-over-games rationale)."""
         # Unconditional (covers the "already back" early-return path too):
         # matches the single _set_stay_awake(True) in start_game_night, so
         # the reference count stays balanced regardless of which path this
@@ -15692,6 +16126,8 @@ class Application:
             except Exception:
                 pass
             self.set_status("Game Night ended — your settings were already back.")
+            if quiet:
+                self._toast_async("Game Mode off", "Normal settings are back.")
             return
         # Intersect with what is STILL applied: the user may have undone
         # some of it manually in the meantime, and reverting a tweak that
@@ -15713,17 +16149,14 @@ class Application:
             pass
         if not tasks:
             self.set_status("Game Night ended — your settings were already back.")
+            if quiet:
+                self._toast_async("Game Mode off", "Normal settings are back.")
             return
-        quiet = self._game_in_progress()
+        quiet = self._game_in_progress() if quiet is None else bool(quiet)
         try:
             self.log("===== Game Night: putting your settings back =====")
-            if quiet:
-                import threading as _th
-                _th.Thread(target=show_toast,
-                           args=("Game Night off",
-                                 "Your normal settings are back."),
-                           daemon=True).start()
-            self.run_tasks("Tweak", tasks, mode="revert", quiet=quiet)
+            self.run_tasks("Tweak", tasks, mode="revert", quiet=quiet,
+                           toast_kind=("gm_off" if quiet else None))
         except Exception:
             pass
         self._refresh_pilot_dialog_manual_btn()
@@ -16487,113 +16920,124 @@ class Application:
                             accent=COLORS["accent_green"])
         dlg = modal._dlg
 
-        enabled_var = tk.BooleanVar(value=enabled)
-        # audit fix: held reference instead of dlg.winfo_children()[0] —
-        # the positional lookup silently retargets if a widget is ever
-        # added before the button (the label below was packed AFTER, but
-        # the pattern was one reorder away from corrupting the wrong widget)
-        main_toggle_btn = AnimatedButton(
-            modal.body, text="On" if enabled else "Off",
-            command=lambda: enabled_var.set(not enabled_var.get()),
-            bg=COLORS["accent_green"] if enabled else COLORS["surface"],
-            fg=COLORS["black"] if enabled else COLORS["text"], font=(F, 10, "bold"),
-        )
-        main_toggle_btn.pack(pady=(4, 4))
-        # keep the button label in sync without recursion
-        def _sync_toggle(*_):
-            on = enabled_var.get()
-            main_toggle_btn.config_text("Maintenance: On" if on else "Maintenance: Off")
-            main_toggle_btn.set_style(bg=COLORS["accent_green"] if on else COLORS["surface"],
-                                      fg=COLORS["black"] if on else COLORS["text"])
-        enabled_var.trace_add("write", _sync_toggle)
-        _sync_toggle()
+        # Simplified layout: one centered column, every row = label on the
+        # left + a control of the SAME size on the right, so the edges line
+        # up. Only the essentials are shown; long explanations are gone.
+        col = tk.Frame(modal.body, bg=COLORS["bg"])
+        col.pack(fill="x", padx=70, pady=(12, 0))
+        _CTL_W, _CTL_H = 120, 34
 
-        # --- Update Everything schedule (user request: scheduler expansion):
-        # a second scheduled task that runs winget upgrade --all headless. ---
-        upd_frame = tk.Frame(modal.body, bg=COLORS["bg"])
-        upd_frame.pack(fill="x", padx=16, pady=(6, 2))
-        upd_var = tk.BooleanVar(value=update_enabled)
-        def _sync_upd(*_):
-            on = upd_var.get()
-            upd_btn.config_text("Update Everything: On" if on else "Update Everything: Off")
-            upd_btn.set_style(bg=COLORS["accent_green"] if on else COLORS["surface"],
+        def _row():
+            r = tk.Frame(col, bg=COLORS["bg"])
+            r.pack(fill="x", pady=6)
+            return r
+
+        def _toggle_row(label, initial, tip=None):
+            var = tk.BooleanVar(value=bool(initial))
+            r = _row()
+            lbl = tk.Label(r, text=label, bg=COLORS["bg"], fg=COLORS["text"],
+                           font=(F, 11))
+            lbl.pack(side="left")
+            btn = AnimatedButton(
+                r, text="On" if var.get() else "Off",
+                command=lambda: var.set(not var.get()),
+                bg=COLORS["surface"], fg=COLORS["text"],
+                font=(F, 10, "bold"), width=_CTL_W, height=_CTL_H)
+            btn.pack(side="right")
+            def _sync(*_):
+                on = var.get()
+                btn.config_text("On" if on else "Off")
+                btn.set_style(bg=COLORS["accent_green"] if on else COLORS["surface"],
                               fg=COLORS["black"] if on else COLORS["text"])
-        upd_btn = AnimatedButton(
-            upd_frame, text="Update Everything: On" if update_enabled else "Update Everything: Off",
-            command=lambda: upd_var.set(not upd_var.get()),
-            bg=COLORS["accent_green"] if update_enabled else COLORS["surface"],
-            fg=COLORS["black"] if update_enabled else COLORS["text"], font=(F, 9, "bold"),
-        )
-        upd_btn.pack(anchor="w")
-        upd_var.trace_add("write", _sync_upd)
-        _sync_upd()
-        tk.Label(upd_frame, text="also runs 'winget upgrade --all' on the schedule below — apps stay current automatically",
-                 font=(F, 8), bg=COLORS["bg"], fg=COLORS["subtext"],
-                 wraplength=380, justify="left").pack(anchor="w")
-        # 'update now' shortcut: headless update without scheduling anything
-        # C-1 audit fix: close through the modal (scrim + bindings + closed
-        # flag), not by destroying its Toplevel — the old _run_update_now(dlg)
-        # leaked a mapped scrim + 3 root bindings behind the run.
-        AnimatedButton(upd_frame, text="Update Everything Now", command=lambda: self._run_update_now(modal),
-                       bg=COLORS["surface"], fg=COLORS["text"], font=(F, 9),
-                       padx=12, pady=5).pack(anchor="w", pady=(4, 0))
+            var.trace_add("write", _sync)
+            _sync()
+            if tip:
+                try:
+                    Tooltip(lbl, tip)
+                    Tooltip(btn, tip)
+                except Exception:
+                    pass
+            return var
 
-        freq_frame = tk.Frame(modal.body, bg=COLORS["bg"])
-        freq_frame.pack(fill="x", padx=16, pady=6)
-        tk.Label(freq_frame, text="How often:", bg=COLORS["bg"], fg=COLORS["text"],
-                 font=(F, 9)).pack(side="left")
+        def _holder(r):
+            h = tk.Frame(r, width=_CTL_W, height=_CTL_H, bg=COLORS["surface"])
+            h.pack(side="right")
+            h.pack_propagate(False)
+            return h
+
+        try:
+            _elev0 = bool(config.get("auto_elevate", False))
+        except Exception:
+            _elev0 = False
+        try:
+            _tray0 = bool(config.get("startup_tray_enabled", False))
+        except Exception:
+            _tray0 = False
+
+        enabled_var = _toggle_row("Auto Clean", enabled,
+                                  "Runs your last selected tasks on a schedule")
+        upd_var = _toggle_row("Update Apps", update_enabled,
+                              "Also runs 'winget upgrade --all' on the schedule")
+        elev_var = _toggle_row("Start as Admin", _elev0,
+                               "Approve once, then no UAC prompt at launch")
+        tray_var = _toggle_row("Start with Windows", _tray0,
+                               "Boots minimized to the tray at logon")
+
+        tk.Frame(col, height=1, bg=COLORS["hairline"]).pack(fill="x", pady=(10, 6))
+
+        freq_row = _row()
+        tk.Label(freq_row, text="How often", bg=COLORS["bg"], fg=COLORS["text"],
+                 font=(F, 11)).pack(side="left")
         freq_var = tk.StringVar(value=freq)
-        freq_combo = tk.OptionMenu(freq_frame, freq_var, "daily", "weekly", "monthly")
+        freq_combo = tk.OptionMenu(_holder(freq_row), freq_var, "daily", "weekly", "monthly")
         freq_combo.config(bg=COLORS["surface"], fg=COLORS["text"],
                           activebackground=COLORS["surface_hover"], activeforeground=COLORS["text"],
                           highlightthickness=0, bd=0, relief="flat",
-                          font=(F, 9), width=12, indicatoron=True)
+                          font=(F, 10), indicatoron=True)
         try:
             menu = freq_combo["menu"]
             menu.config(bg=COLORS["surface"], fg=COLORS["text"],
                         activebackground=COLORS["surface_hover"], activeforeground=COLORS["text"],
-                        bd=0, relief="flat", font=(F, 9))
+                        bd=0, relief="flat", font=(F, 10))
         except Exception:
             pass
-        freq_combo.pack(side="right")
+        freq_combo.pack(fill="both", expand=True)
 
-        time_frame = tk.Frame(modal.body, bg=COLORS["bg"])
-        time_frame.pack(fill="x", padx=16, pady=6)
-        tk.Label(time_frame, text="Time (24h):", bg=COLORS["bg"], fg=COLORS["text"],
-                 font=(F, 9)).pack(side="left")
+        time_row = _row()
+        tk.Label(time_row, text="Time (24h)", bg=COLORS["bg"], fg=COLORS["text"],
+                 font=(F, 11)).pack(side="left")
         time_var = tk.StringVar(value=time_str)
-        tk.Entry(time_frame, textvariable=time_var, width=10,
+        tk.Entry(_holder(time_row), textvariable=time_var, justify="center",
                  bg=COLORS["surface"], fg=COLORS["text"], insertbackground=COLORS["text"],
-                 font=(F, 9), bd=0, highlightthickness=1,
-                 highlightbackground=COLORS["hairline"], highlightcolor=COLORS["accent_green"]).pack(side="right")
+                 font=(F, 10), bd=0, highlightthickness=1,
+                 highlightbackground=COLORS["hairline"],
+                 highlightcolor=COLORS["accent_green"]).pack(fill="both", expand=True)
 
-        task_frame = tk.Frame(modal.body, bg=COLORS["bg"])
-        task_frame.pack(fill="x", padx=16, pady=8)
         total_selected = sum(len(v) for v in config.get("selected_tasks", {}).values())
-        tk.Label(task_frame, text=f"Tasks to run: {total_selected}",
-                 bg=COLORS["bg"], fg=COLORS["subtext"], font=(F, 9)).pack(anchor="w")
-        tk.Label(task_frame, text="(Tasks come from the last thing you ran)",
-                 bg=COLORS["bg"], fg=COLORS["subtext"], font=(F, 9)).pack(anchor="w")
+        tk.Label(modal.body, text=f"Runs {total_selected} tasks from your last run",
+                 bg=COLORS["bg"], fg=COLORS["subtext"], font=(F, 9)).pack(pady=(10, 0))
 
         status_var = tk.StringVar(value="")
         tk.Label(modal.body, textvariable=status_var, bg=COLORS["bg"],
-                 fg=COLORS["accent_blue"], font=(F, 9), wraplength=340, justify="left").pack(anchor="w", padx=16)
+                 fg=COLORS["accent_blue"], font=(F, 9), wraplength=440,
+                 justify="center").pack(pady=(4, 0))
 
         def refresh_status():
             # F14: reconcile live schtasks state into config (external
-            # /Delete no longer leaves the toggle stale-True).
+            # /Delete no longer leaves the toggle stale-True). No status
+            # text any more — the dialog stays quiet unless something needs
+            # the user's attention (see apply()).
             try:
                 from app.scheduler import resync_schedule_flag as _resync
                 _resync()
                 _resync(["--auto-update"])
             except Exception:
                 pass
-            ok, out = get_schedule_status()
-            ok_upd, _ = get_schedule_status(["--auto-update"])
-            parts = []
-            parts.append("Auto maintenance: scheduled." if ok else "Auto maintenance: not scheduled.")
-            parts.append("Update Everything: scheduled." if ok_upd else "Update Everything: not scheduled.")
-            status_var.set("  ".join(parts))
+            try:
+                from app.scheduler import resync_startup_flag as _resync_tray
+                _resync_tray()
+            except Exception:
+                pass
 
         def apply():
             results = []
@@ -16629,18 +17073,71 @@ class Application:
                 ok, msg = disable_schedule(["--auto-update"])
                 if ok:
                     results.append("Update Everything disabled")
-            if results:
-                status_var.set("; ".join(results))
+            # always-start-as-admin: flag first (single source of truth),
+            # then converge the helper task immediately when possible.
+            # Unelevated creation fails honestly here (needs admin once);
+            # the reconciler finishes the job on the next elevated launch.
+            try:
+                from app import elevated_launch as _el3
+                from app.elevation import is_admin as _is_admin3
+                _el3.save_gate_prefs(bool(elev_var.get()),
+                                     bool(config.get("remember_limited", False)))
+                if bool(elev_var.get()):
+                    if _is_admin3():
+                        _ok3, _msg3 = _el3.reconcile()
+                        results.append("Auto-elevate on"
+                                       if _ok3 else f"Auto-elevate flag on (task: {_msg3})")
+                    else:
+                        results.append("Auto-elevate will activate next time you run as admin")
+                else:
+                    if _is_admin3():
+                        _ok3, _msg3 = _el3.reconcile()
+                        results.append("Auto-elevate off"
+                                       if _ok3 else f"Auto-elevate flag off (task: {_msg3})")
+                    else:
+                        # best-effort now (fails without admin, silently);
+                        # the reconciler removes it on the next elevated run
+                        try:
+                            _el3.delete_task()
+                        except Exception:
+                            pass
+                        results.append("Auto-elevate off (helper task removed next time you run as admin)")
+            except Exception as exc:
+                results.append(f"Auto-elevate setting saved ({exc})")
+            # startup tray (Phase 5): same honest-reporting contract as the
+            # schedules above — flag persists through the helper either way.
+            try:
+                from app.scheduler import enable_startup_tray, disable_startup_tray
+                if bool(tray_var.get()):
+                    _ok5, _msg5 = enable_startup_tray()
+                    results.append("Start with Windows on"
+                                   if _ok5 else f"Start with Windows failed: {_msg5}")
+                else:
+                    _ok5, _msg5 = disable_startup_tray()
+                    results.append("Start with Windows off"
+                                   if _ok5 else f"Start with Windows off failed: {_msg5}")
+            except Exception as exc:
+                results.append(f"Start with Windows unset ({exc})")
             refresh_status()
+            # short + quiet: "Saved." unless something failed or is pending
+            _attn = [r for r in results
+                     if any(k in r.lower() for k in ("fail", "next time", "will activate"))]
+            status_var.set("; ".join(_attn) if _attn else "Saved.")
 
         btn_frame = tk.Frame(modal.body, bg=COLORS["bg"])
-        btn_frame.pack(fill="x", padx=16, pady=(10, 16))
+        btn_frame.pack(fill="x", padx=70, pady=(12, 16))
+        # C-1 audit fix: close through the modal (scrim + bindings + closed
+        # flag), not by destroying its Toplevel.
+        AnimatedButton(btn_frame, text="Update Apps Now",
+                       command=lambda: self._run_update_now(modal),
+                       bg=COLORS["surface"], fg=COLORS["text"], font=(F, 10),
+                       ).pack(side="left")
         AnimatedButton(btn_frame, text="Apply", command=apply,
                        bg=COLORS["accent_green"], fg=COLORS["black"], font=(F, 10, "bold"),
-                       ).pack(side="right", padx=4)
+                       ).pack(side="right")
         AnimatedButton(btn_frame, text="Close", command=modal.close,
-                      bg=COLORS["surface"], fg=COLORS["text"], font=(F, 10),
-                      ).pack(side="right")
+                       bg=COLORS["surface"], fg=COLORS["text"], font=(F, 10),
+                       ).pack(side="right", padx=(0, 8))
         refresh_status()
         # C-5 audit fix: enter the modal wait like every other dialog (grab +
         # wait_window). Without this the schedule dialog floated grab-less:
@@ -17562,7 +18059,8 @@ class Application:
         self._worker_thread = thread
         thread.start()
 
-    def run_tasks(self, tab_name, tasks, mode="run", quiet=False):
+    def run_tasks(self, tab_name, tasks, mode="run", quiet=False,
+                  toast_kind=None, toast_extra=None):
         """quiet=True: pilot/headless mode — no interactive popups of any
         kind (preflight askyesno, warnings, admin gates) and no modal
         Scorecard at completion; the run reports via status line + toast
@@ -17584,6 +18082,9 @@ class Application:
                         accent=COLORS["accent_yellow"],
                     )
             if not tasks:
+                if toast_kind:
+                    self._toast_async("Needs Administrator",
+                                      "Restart as Administrator to run this.")
                 if not quiet:
                     _themed_showinfo(
                         self.root,
@@ -17689,7 +18190,8 @@ class Application:
         self._run_results = []       # per-task (label, status, bytes, reason) tuples
 
         thread = threading.Thread(target=self._run_tasks_worker,
-                                  args=(tab_name, tasks, mode, quiet), daemon=True)
+                                  args=(tab_name, tasks, mode, quiet,
+                                        toast_kind, toast_extra), daemon=True)
         self._worker_thread = thread
         thread.start()
 
@@ -17744,7 +18246,8 @@ class Application:
             pass
         self.log("Stop requested — finishing the current task, then stopping.")
 
-    def _run_tasks_worker(self, tab_name, tasks, mode, quiet=False):
+    def _run_tasks_worker(self, tab_name, tasks, mode, quiet=False,
+                          toast_kind=None, toast_extra=None):
         verb = "Undoing" if mode == "revert" else "Running"
         self.log(f"===== {verb} {len(tasks)} {tab_name} task(s) =====")
 
@@ -17891,7 +18394,16 @@ class Application:
         # the state() read and the toast fire on the Tk thread; the
         # worker only schedules. Headless scheduled runs never reach this
         # code at all (scheduler.py runs its own path, gui not imported).
-        if not cancelled and tab_name == "Clean" and mode == "run":
+        if toast_kind:
+            # tray-started run: always report the real outcome
+            try:
+                _tt, _tm = self._result_toast(
+                    toast_kind, toast_extra, total_bytes, completed, failed,
+                    skipped_n, cancelled)
+                self._toast_async(_tt, _tm)
+            except Exception:
+                pass
+        if not cancelled and tab_name == "Clean" and mode == "run" and not toast_kind:
             def _toast_if_minimized():
                 try:
                     if self.root.state() != "iconic":
@@ -17931,8 +18443,13 @@ class Application:
                     pass
             if quiet:
                 try:
-                    verb = "restored" if mode == "revert" else "applied"
-                    self.set_status(f"Auto-Pilot: session tweaks {verb}.")
+                    if tab_name == "Clean":
+                        self.set_status(
+                            f"Freed {format_bytes(total_bytes)}." if total_bytes
+                            else "Nothing to clean.")
+                    else:
+                        verb = "restored" if mode == "revert" else "applied"
+                        self.set_status(f"Auto-Pilot: session tweaks {verb}.")
                 except Exception:
                     pass
                 return

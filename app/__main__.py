@@ -93,6 +93,97 @@ def main():
             code |= 0 if success else 1
         sys.exit(code)
 
+    # Single instance (tray/auto-elevate foundation): normal GUI launches
+    # exit quietly when a copy already runs (it gets focused instead).
+    # The elevation-handshake child and headless runs are exempt by design
+    # (see app/single_instance.should_enforce); the child claims the mutex
+    # off-thread once the starter exits.
+    _owner = None
+    try:
+        from app import single_instance as _si
+        if _si.is_elevation_child():
+            _si.claim_in_background()
+        elif _si.should_enforce():
+            _owner = _si.acquire()
+            if _owner is None:
+                try:
+                    _si.signal_existing()
+                except Exception:
+                    pass
+                print("Cleaner Tool is already running.")
+                # headsup for double-clickers with no visible window (tray-
+                # hidden first copy): best-effort, never raises, then exit.
+                try:
+                    from app.toast import show_toast as _toast
+                    _toast("Cleaner Tool is already running",
+                           "The open copy was brought forward.")
+                except Exception:
+                    pass
+                return
+            _si.set_owner(_owner)
+            _si.ensure_show_event()
+    except Exception:
+        _owner = None
+
+    # Auto-elevate handoff ("stop asking me"): unelevated + opted in +
+    # helper task points at this exe -> fire it and exit quietly. The
+    # elevated copy is a normal launch (skips the Gate by is_admin), so
+    # the user lands straight in the full app with zero prompts. The
+    # mutex is released first so the elevated copy can claim it; a raced
+    # twin converges via the same checks on its own startup. ANY failure
+    # (or --no-elevate-handoff) falls through to the normal launch below.
+    try:
+        from app.elevation import is_admin as _is_admin
+        from app import elevated_launch as _el
+        from app import single_instance as _si2
+        if (not _is_admin() and _owner is not None
+                and "--no-elevate-handoff" not in sys.argv
+                and not _si2.is_elevation_child()
+                and not _si2.is_headless_run()):
+            _ready, _why = _el.handoff_ready()
+            if _ready:
+                try:
+                    _si2.release(_owner)
+                except Exception:
+                    pass
+                _owner = None
+                _ok, _msg = _el.run_task()
+                if _ok:
+                    return
+                try:
+                    _owner = _si2.acquire()
+                    if _owner is None:
+                        try:
+                            _si2.signal_existing()
+                        except Exception:
+                            pass
+                        return
+                    _si2.set_owner(_owner)
+                    _si2.ensure_show_event()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # Reconciler (elevated only, off-thread so startup never waits on
+    # schtasks): converges the live helper task with the opt-in flag in
+    # both directions — creates after opt-in, deletes after opt-out.
+    try:
+        from app.elevation import is_admin as _is_admin2
+        if _is_admin2():
+            import threading as _th
+
+            def _rec():
+                try:
+                    from app import elevated_launch as _el2
+                    _el2.reconcile()
+                except Exception:
+                    pass
+            _th.Thread(target=_rec, daemon=True,
+                       name="AutoElevateReconcile").start()
+    except Exception:
+        pass
+
     _launch_gui()
 
 

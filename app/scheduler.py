@@ -13,6 +13,138 @@ from app.utils import resolve_exe
 TASK_NAME = "CleanerTool_AutoMaintenance"
 TASK_DESC = "Cleaner Tool automatic maintenance run"
 
+# Startup tray (Phase 5): logon task booting the app hidden with --tray
+# (resident monitors + Auto-Pilot from login). Deliberately WITHOUT /RL
+# HIGHEST — a permanently-elevated desktop process is a security posture
+# downgrade; the boot copy runs standard-rights and the user elevates
+# per-session (or via auto-elevate) exactly as today. Same per-user /IT
+# shape as the maintenance tasks: no stored credentials, ever.
+TASK_STARTUP = "CleanerTool_StartupTray"
+TASK_STARTUP_DESC = "Cleaner Tool tray at logon (minimized)"
+
+
+def _build_startup_cmd(exe_override: str | None = None) -> "list[str]":
+    """schtasks /Create for the logon tray task. Pure builder (exe_override
+    is the test seam for space-containing paths)."""
+    if exe_override is not None:
+        import subprocess as _sp
+        task_run = _sp.list2cmdline([exe_override, "--tray"])
+    else:
+        exe, args = _get_executable_and_args(["--tray"])
+        task_run = subprocess.list2cmdline([exe] + args)
+    return [
+        resolve_exe("schtasks"), "/Create", "/TN", TASK_STARTUP,
+        "/TR", task_run,
+        "/SC", "ONLOGON", "/IT", "/F",
+    ]
+
+
+def _build_startup_delete_cmd() -> "list[str]":
+    return [resolve_exe("schtasks"), "/Delete", "/TN", TASK_STARTUP, "/F"]
+
+
+def _build_startup_query_cmd() -> "list[str]":
+    return [resolve_exe("schtasks"), "/Query", "/TN", TASK_STARTUP,
+            "/V", "/FO", "LIST"]
+
+
+def _want_startup_tr(exe_override: str | None = None) -> str:
+    """Expected /TR string (drift comparison)."""
+    if exe_override is not None:
+        import subprocess as _sp
+        return _sp.list2cmdline([exe_override, "--tray"])
+    exe, args = _get_executable_and_args(["--tray"])
+    return subprocess.list2cmdline([exe] + args)
+
+
+def _run_schtasks(cmd) -> "tuple[bool, str]":
+    try:
+        result = subprocess.run(
+            cmd, shell=False, capture_output=True, text=True, timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return result.returncode == 0, (result.stdout or "") + (result.stderr or "")
+    except Exception as exc:
+        return False, str(exc)
+
+
+def get_startup_status() -> "tuple[bool, str]":
+    """(task exists, raw query output). Read-only probe, never raises."""
+    return _run_schtasks(_build_startup_query_cmd())
+
+
+def _startup_tr_matches(out: str, exe_override: str | None = None) -> "bool | None":
+    """True/False when the query output names a runnable; None when the
+    output carries no Task-To-Run row to judge by."""
+    try:
+        for line in (out or "").splitlines():
+            if line.strip().lower().startswith("task to run"):
+                if ":" not in line:
+                    return None
+                live = line.split(":", 1)[1].strip().strip('"')
+                return live == _want_startup_tr(exe_override).strip().strip('"')
+    except Exception:
+        pass
+    return None
+
+
+def _set_startup_flag(on: bool) -> None:
+    """Persist the startup checkbox (single-lock RMW, never a stale whole
+    save). Split out so tests cover the flag without touching schtasks."""
+    try:
+        def _mut(cfg, _on=bool(on)):
+            cfg["startup_tray_enabled"] = _on
+        update_config(_mut)
+    except Exception:
+        pass
+
+
+def enable_startup_tray() -> "tuple[bool, str]":
+    """Create (or refresh, /F) the logon tray task. F14-style: skip the
+    rewrite when the live task already matches."""
+    try:
+        ok, out = get_startup_status()
+        if ok and _startup_tr_matches(out) is True:
+            _set_startup_flag(True)
+            return True, "Startup entry already up to date."
+    except Exception:
+        pass
+    ok, msg = _run_schtasks(_build_startup_cmd())
+    if ok:
+        _set_startup_flag(True)
+        return True, msg or "Startup entry created."
+    return False, msg
+
+
+def disable_startup_tray() -> "tuple[bool, str]":
+    """Delete the logon tray task. Missing task counts as success."""
+    ok, msg = _run_schtasks(_build_startup_delete_cmd())
+    if ok:
+        _set_startup_flag(False)
+        return True, msg or "Startup entry removed."
+    # deleting what isn't there is the desired end state too
+    try:
+        exists, _out = get_startup_status()
+        if not exists:
+            _set_startup_flag(False)
+            return True, "Startup entry already absent."
+    except Exception:
+        pass
+    return False, msg
+
+
+def resync_startup_flag() -> bool:
+    """Reconcile config with live Task Scheduler state (same stale-flag
+    hazard resync_schedule_flag covers for the maintenance tasks)."""
+    try:
+        ok, _out = get_startup_status()
+    except Exception:
+        ok = False
+    try:
+        _set_startup_flag(bool(ok))
+    except Exception:
+        pass
+    return bool(ok)
+
 
 def _get_executable_and_args(extra_args=None):
     """Return (executable, arguments) for the current run. `extra_args`

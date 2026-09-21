@@ -129,6 +129,15 @@ DEFAULT_CONFIG = {
     # name, command} where command is the held file's path under this
     # app's own config directory (never the user's Startup folder).
     "startup_disabled": [],
+    # Auto-elevate ("stop asking me"): opt-in once on the Admin Gate, then
+    # an on-demand elevated scheduled task relaunches the app without UAC.
+    # remember_limited is the opposite crowd (never show the Gate). Both
+    # merge onto old configs like every other additive key below.
+    "auto_elevate": False,
+    "remember_limited": False,
+    # Startup tray (Phase 5): boot hidden with --tray at logon. Same
+    # additive-merge + junk-coercion contract as its neighbors.
+    "startup_tray_enabled": False,
 }
 
 _STARTUP_MAX = 200
@@ -356,6 +365,14 @@ def _load_config_from_disk() -> dict:
                     DEFAULT_CONFIG["session_pilot_preset"])
             if not isinstance(data.get("session_pilot_enabled"), bool):
                 data["session_pilot_enabled"] = False
+            # Auto-elevate / remember-limited (Admin Gate prefs): same
+            # junk-degrades-to-False contract, never raises.
+            if not isinstance(data.get("auto_elevate"), bool):
+                data["auto_elevate"] = False
+            if not isinstance(data.get("remember_limited"), bool):
+                data["remember_limited"] = False
+            if not isinstance(data.get("startup_tray_enabled"), bool):
+                data["startup_tray_enabled"] = False
             # Phase-5 keys: same coercion contract (strings scatter;
             # junk degrades to defaults, never raises)
             if not isinstance(data.get("session_pilot_paths"), list):

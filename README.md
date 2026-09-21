@@ -87,6 +87,12 @@ restored. Every other tweak's Undo is a full, verified revert.</sub>
 - Auto Maintenance scheduler (daily/weekly/monthly)
 - Dark mode UI, log export via the 📋 corner icon
 
+**Runs in the background, on your terms** (all opt-in, all in the Auto Maintenance dialog)
+- **Tray icon**: close the window and the app keeps watching from the tray instead of quitting — Storage Insight's low-space alerts and Auto-Pilot's game-session detection keep working. Right-click for Open, 🎮 Game Session now, 🧹 Quick Clean now, and Quit.
+- **Start with Windows**: boots straight to the tray at login, standard-rights, so monitoring is live from the moment you sign in.
+- **Auto-elevate ("stop asking me")**: approve elevation once and the app relaunches with admin rights with no further UAC prompts, without ever holding elevated rights while idle in the background. Off switch always available on the same screen.
+- **Windows toast notifications**: clean-complete, low-space, and game-session alerts now come from the app's own identity, so clicking one brings the window forward.
+
 ---
 
 ## Requirements

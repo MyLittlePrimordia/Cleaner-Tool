@@ -159,6 +159,332 @@ def run_checks():
             import shutil
             shutil.rmtree(tmp, ignore_errors=True)
     check("junction guard detects reparse points", _junction_guard)
+    def _single_instance():
+        # hermetic by construction: unique names per run (pid + random),
+        # always released in finally — can never collide with a real
+        # running app or leak a kernel object. Kernel-only, no Tk/shell.
+        import os as _os
+        import random as _rnd
+        import sys as _sys
+        from app import single_instance as _si
+        # exemptions are pure-python: always asserted, any platform
+        assert _si.should_enforce([]) is True
+        assert _si.should_enforce(["app", "--elevation-token=abc"]) is False
+        assert _si.is_elevation_child(["app", "--elevation-token=abc"]) is True
+        assert _si.should_enforce(["app", "--auto-clean"]) is False
+        assert _si.should_enforce(["app", "--auto-update"]) is False
+        assert _si.is_headless_run(["app", "--auto-clean"]) is True
+        assert _si.should_enforce(["app", "--no-single-instance"]) is False
+        if not _sys.platform.startswith("win"):
+            return
+        _tag = f"test_{_os.getpid()}_{_rnd.randrange(1 << 30)}"
+        _mname, _ename = f"si_mutex_{_tag}", f"si_evt_{_tag}"
+        _h1 = _si.acquire(_mname)
+        try:
+            assert _h1 is not None, "first acquire failed"
+            assert _si.acquire(_mname) is None, "second acquire must lose"
+            # show-event loopback on an isolated name (never the real one)
+            _eh = _si.ensure_show_event(_ename)
+            assert _eh is not None, "event create failed"
+            try:
+                assert _si.check_signalled(_ename) is False, "fresh event must be quiet"
+                assert _si.signal_existing(_ename) is True, "signal failed"
+                assert _si.check_signalled(_ename) is True, "pulse lost"
+                assert _si.check_signalled(_ename) is False, "auto-reset did not drain"
+            finally:
+                try:
+                    from app.single_instance import _kernel32 as _k
+                    _k().CloseHandle(_eh)
+                except Exception:
+                    pass
+        finally:
+            _si.release(_h1)
+        # released handle is acquirable again (no leak, no ghost owner)
+        _h2 = _si.acquire(_mname)
+        try:
+            assert _h2 is not None, "re-acquire after release failed"
+        finally:
+            _si.release(_h2)
+    check("single-instance mutex + exemptions + loopback", _single_instance)
+    def _auto_elevate():
+        # builders are pure (no schtasks writes); the only live call is a
+        # read-only /Query probe asserting types, never state.
+        import subprocess as _sp
+        from app import elevated_launch as _el
+        assert _el.TASK_NAME == "CleanerTool_ElevatedLaunch"
+        _spaced = "C:\\Program Files\\Cleaner Tool\\Cleaner-Tool.exe"
+        _cmd = _el.build_create_cmd(exe_override=_spaced)
+        assert _cmd[0].lower().endswith("schtasks.exe"), _cmd[0]
+        assert "/RL" in _cmd and "HIGHEST" in _cmd, "must run elevated"
+        assert "/IT" in _cmd, "must stay interactive (visible GUI, same user)"
+        assert "/SC" in _cmd and "ONCE" in _cmd, "must be on-demand only"
+        _tr = _cmd[_cmd.index("/TR") + 1]
+        assert _tr == _sp.list2cmdline([_spaced]), f"/TR quoting broken: {_tr!r}"
+        assert _el.build_run_cmd()[1:3] == ["/Run", "/TN"]
+        assert _el.build_delete_cmd()[1:3] == ["/Delete", "/TN"]
+        # query-parse on synthetic output (never the live service)
+        _fake = ('Folder: \\\r\nTaskName: \\CleanerTool_ElevatedLaunch\r\n'
+                 'Task To Run: "C:\\Tools\\Cleaner-Tool.exe"\r\nStatus: Ready\r\n')
+        assert _el.parse_task_run(_fake) == '"C:\\Tools\\Cleaner-Tool.exe"'
+        assert _el.parse_task_run("no such task") is None
+        assert _el.parse_task_run("") is None
+        # Gate-skip decision is pure over injected tables
+        class _T:
+            def __init__(self, key, adm):
+                self.key = key
+                self.admin_required = adm
+        _tabs = {"Clean": [_T("a", False)], "Tweak": [_T("b", True)]}
+        assert _el.selection_needs_admin({"Clean": ["a"]}, _tabs) is False
+        assert _el.selection_needs_admin({"Tweak": ["b"]}, _tabs) is True
+        assert _el.selection_needs_admin({"Tweak": ["ghost"]}, _tabs) is False
+        assert _el.selection_needs_admin({}, _tabs) is False
+        # prefs round-trip with exact restore (never leak harness marks)
+        try:
+            _cfg0 = config_persist.load_config()
+            _a0 = bool(_cfg0.get("auto_elevate", False))
+            _r0 = bool(_cfg0.get("remember_limited", False))
+        except Exception:
+            _a0, _r0 = False, False
+        try:
+            _el.save_gate_prefs(True, False)
+            config_persist._config_cache = None
+            assert config_persist.load_config().get("auto_elevate") is True
+            _el.save_gate_prefs(False, True)
+            config_persist._config_cache = None
+            _c = config_persist.load_config()
+            assert _c.get("auto_elevate") is False and _c.get("remember_limited") is True
+            # handoff pre-check degrades honestly with no task present
+            _ready, _why = _el.handoff_ready()
+            assert isinstance(_ready, bool) and isinstance(_why, str)
+            assert _el.notice_for_gate() is None or isinstance(_el.notice_for_gate(), str)
+        finally:
+            _el.save_gate_prefs(_a0, _r0)
+            config_persist._config_cache = None
+        # live read-only probe: types only (True/False regardless of the
+        # machine's scheduler state — asserts plumbing, never outcome)
+        _ex, _match, _out = _el.status()
+        assert isinstance(_ex, bool) and isinstance(_match, bool) and isinstance(_out, str)
+    check("auto-elevate builders + gate prefs + probe", _auto_elevate)
+    def _tray():
+        # hermetic: private message-only flow is untestable headless, so
+        # this covers the contract surface — unique tooltip per run, icon
+        # lifecycle (add -> tooltip -> stop, always released), routing via
+        # fire() (no synthesized clicks), and the Application wiring.
+        import sys as _sys
+        if not _sys.platform.startswith("win"):
+            return
+        from app import tray as _tm
+        _seen = []
+        _icon = _tm.TrayIcon(
+            tooltip=f"CleanerTool smoke {__import__('os').getpid()}",
+            items=[(5001, "Open", lambda: _seen.append("open")),
+                   (None, None, None),
+                   (5002, "Quit", lambda: _seen.append("quit"))],
+            on_ui_thread=None)
+        try:
+            _started = _icon.start()
+            if not _started:
+                # no shell (exotic runner): stop() must still be safe,
+                # then soft-pass — the lifecycle below needs a real tray.
+                print("  tray: no shell, lifecycle skipped (stop-safe only)",
+                      flush=True)
+                _icon.stop()
+                _icon.stop()
+                return
+            assert _icon.running is True
+            assert _icon.update_tooltip("probe") is True
+            assert _icon.fire(5001) is True and _seen == ["open"]
+            assert _icon.fire(9999) is False
+            assert _icon.fire(5002) is True and _seen == ["open", "quit"]
+        finally:
+            _icon.stop()
+            _icon.stop()  # idempotent
+        assert _icon.running is False
+        # Application wiring: actions exist, quiet overrides keep defaults
+        from app import gui as _gui
+        import inspect as _insp
+        for _m in ("tray_open", "tray_quit", "tray_toggle_game_session",
+                   "tray_quick_clean", "tray_check_ping", "tray_speed_test",
+                   "_ensure_tray", "_hide_to_tray", "_stop_tray",
+                   "_maybe_hide_for_tray"):
+            assert callable(getattr(_gui.Application, _m, None)), f"missing {_m}"
+        assert "quiet" in _insp.signature(_gui.Application.start_game_night).parameters
+        assert "quiet" in _insp.signature(_gui.Application.end_game_night).parameters
+    check("tray lifecycle + routing + wiring", _tray)
+    def _startup_tray():
+        # Phase 5 (startup tray): pure builders + read-only probe only —
+        # never a live /Create or /Delete here, same discipline as the
+        # auto-elevate check above (CleanerTool_StartupTray is a fixed
+        # global task name; a live write would leave CI's scheduler
+        # state dirty). enable_/disable_startup_tray themselves are
+        # exercised manually per the Phase 2-5 QA matrix, not headlessly.
+        import subprocess as _sp
+        from app import scheduler as _sch
+        assert _sch.TASK_STARTUP == "CleanerTool_StartupTray"
+        _spaced = "C:\\Program Files\\Cleaner Tool\\Cleaner-Tool.exe"
+        _cmd = _sch._build_startup_cmd(exe_override=_spaced)
+        assert _cmd[0].lower().endswith("schtasks.exe"), _cmd[0]
+        assert "/Create" in _cmd and "/TN" in _cmd and _sch.TASK_STARTUP in _cmd
+        assert "/SC" in _cmd and "ONLOGON" in _cmd, "must be a logon task"
+        assert "/IT" in _cmd, "must stay interactive (visible tray, same user)"
+        # deliberately standard-rights: a boot-time /RL HIGHEST would be a
+        # permanently-elevated desktop process, which the design notes
+        # in scheduler.py explicitly reject.
+        assert "/RL" not in _cmd, "startup tray task must not request HIGHEST"
+        _tr = _cmd[_cmd.index("/TR") + 1]
+        assert _tr == _sp.list2cmdline([_spaced, "--tray"]), f"/TR quoting broken: {_tr!r}"
+        assert _sch._build_startup_delete_cmd()[1:3] == ["/Delete", "/TN"]
+        assert _sch._build_startup_query_cmd()[1:3] == ["/Query", "/TN"]
+        # query-parse on synthetic output — matches, mismatches, and the
+        # "no such row" case all resolve without touching a real task
+        _want = _sch._want_startup_tr(_spaced)
+        _fake_match = f'Folder: \\\r\nTaskName: \\{_sch.TASK_STARTUP}\r\nTask To Run: {_want}\r\nStatus: Ready\r\n'
+        _fake_stale = ('Folder: \\\r\nTaskName: \\CleanerTool_StartupTray\r\n'
+                       'Task To Run: "C:\\Old\\Cleaner-Tool.exe" --tray\r\nStatus: Ready\r\n')
+        assert _sch._startup_tr_matches(_fake_match, _spaced) is True
+        assert _sch._startup_tr_matches(_fake_stale, _spaced) is False
+        assert _sch._startup_tr_matches("no such task", _spaced) is None
+        assert _sch._startup_tr_matches("", _spaced) is None
+        # flag round-trip with exact restore (never leak a harness mark
+        # into the user's real config, same contract as auto_elevate above)
+        try:
+            _t0 = bool(config_persist.load_config().get("startup_tray_enabled", False))
+        except Exception:
+            _t0 = False
+        try:
+            _sch._set_startup_flag(True)
+            config_persist._config_cache = None
+            assert config_persist.load_config().get("startup_tray_enabled") is True
+            _sch._set_startup_flag(False)
+            config_persist._config_cache = None
+            assert config_persist.load_config().get("startup_tray_enabled") is False
+        finally:
+            _sch._set_startup_flag(_t0)
+            config_persist._config_cache = None
+        # live read-only probe only (types, never outcome — the CI runner
+        # almost certainly has no such task, and that's fine either way)
+        _ok, _out = _sch.get_startup_status()
+        assert isinstance(_ok, bool) and isinstance(_out, str)
+        # resync is itself read-probe + flag-write; restore afterward
+        try:
+            _live = _sch.resync_startup_flag()
+            assert isinstance(_live, bool)
+        finally:
+            _sch._set_startup_flag(_t0)
+            config_persist._config_cache = None
+        # GUI wiring: the Auto Maintenance dialog's checkbox handlers exist
+        from app import scheduler as _sch2
+        for _f in ("enable_startup_tray", "disable_startup_tray", "resync_startup_flag"):
+            assert callable(getattr(_sch2, _f, None)), f"missing {_f}"
+    check("startup tray builders + probe + flag round-trip", _startup_tray)
+    def _maintenance_schedule():
+        # Original Auto Maintenance scheduler (predates Phase 5, never had
+        # builder-level coverage): pure builders + validation + read-only
+        # probes only. enable_/disable_schedule themselves touch real
+        # schtasks state under TASK_NAME, so — same discipline as the
+        # auto-elevate and startup-tray checks above — this exercises the
+        # command shape and the fail-fast validation path (which returns
+        # False before ever calling schtasks), never a live /Create.
+        import datetime as _dt
+        from app import scheduler as _sch
+        # frequency/time validation (F14: typos used to silently -> WEEKLY)
+        assert _sch._validate_frequency("Daily") == "daily"
+        assert _sch._validate_frequency(" WEEKLY ") == "weekly"
+        for _bad in ("fortnightly", "", None, "dailyish"):
+            try:
+                _sch._validate_frequency(_bad)
+                assert False, f"expected ValueError for {_bad!r}"
+            except ValueError:
+                pass
+        assert _sch._validate_time_str("03:00") == "03:00"
+        assert _sch._validate_time_str("23:59") == "23:59"
+        for _bad in ("3:00", "24:00", "12:60", "noon", ""):
+            try:
+                _sch._validate_time_str(_bad)
+                assert False, f"expected ValueError for {_bad!r}"
+            except ValueError:
+                pass
+        # /D pinning: locale-independent weekday tokens, month clamped to
+        # 28 so /D never silently skips a short month (schtasks quirk)
+        _mon = _dt.date(2024, 1, 1)   # known Monday
+        _sun = _dt.date(2024, 1, 7)   # known Sunday
+        assert _sch._schedule_day_args("WEEKLY", _mon) == ["/D", "MON"]
+        assert _sch._schedule_day_args("WEEKLY", _sun) == ["/D", "SUN"]
+        assert _sch._schedule_day_args("MONTHLY", _dt.date(2024, 1, 31)) == ["/D", "28"]
+        assert _sch._schedule_day_args("MONTHLY", _dt.date(2024, 1, 15)) == ["/D", "15"]
+        assert _sch._schedule_day_args("DAILY", _mon) == []
+        # full command shape, injected `today` for determinism
+        _cmd = _sch._build_schtasks_cmd("weekly", "03:00", today=_mon)
+        assert _cmd[0].lower().endswith("schtasks.exe"), _cmd[0]
+        assert "/Create" in _cmd and "/TN" in _cmd
+        assert _cmd[_cmd.index("/TN") + 1] == _sch.TASK_NAME
+        assert "/SC" in _cmd and "WEEKLY" in _cmd
+        assert _cmd[_cmd.index("/ST") + 1] == "03:00"
+        assert "/D" in _cmd and _cmd[_cmd.index("/D") + 1] == "MON"
+        assert "/F" in _cmd and "/IT" in _cmd
+        # H1 fix: /RL HIGHEST only when the CREATING process already runs
+        # elevated — never requested unconditionally (that would make
+        # non-admin users' Enable silently fail with Access Denied).
+        assert ("/RL" in _cmd) == bool(is_admin())
+        # a distinct task name per schedule kind (--auto-update coexists
+        # with the default clean/repair task rather than overwriting it)
+        _cmd_upd = _sch._build_schtasks_cmd("daily", "04:30", extra_args=["--auto-update"], today=_mon)
+        assert _cmd_upd[_cmd_upd.index("/TN") + 1] == _sch.TASK_NAME + "_auto_update"
+        assert "/D" not in _cmd_upd, "DAILY must not carry a /D"
+        # invalid input fails fast and never reaches schtasks
+        assert _sch._build_schtasks_cmd_str("weekly", "03:00", today=_mon)  # legacy string form is quoted, non-empty
+        _ok_bad, _msg_bad = _sch.enable_schedule("never", "03:00")
+        assert _ok_bad is False and "Unknown schedule frequency" in _msg_bad
+        _ok_bad2, _msg_bad2 = _sch.enable_schedule("daily", "3pm")
+        assert _ok_bad2 is False and "schedule time" in _msg_bad2
+        # live read-only probes only (types, never outcome)
+        _ok, _out = _sch.get_schedule_status()
+        assert isinstance(_ok, bool) and isinstance(_out, str)
+        _ok_upd, _out_upd = _sch.get_schedule_status(["--auto-update"])
+        assert isinstance(_ok_upd, bool) and isinstance(_out_upd, str)
+        # resync is read-probe + single-lock flag-write; restore after
+        try:
+            _cfg0 = config_persist.load_config()
+            _s0 = bool(_cfg0.get("schedule_enabled", False))
+            _u0 = bool(_cfg0.get("schedule_update_enabled", False))
+        except Exception:
+            _s0, _u0 = False, False
+        try:
+            _live = _sch.resync_schedule_flag()
+            assert isinstance(_live, bool)
+            _live_upd = _sch.resync_schedule_flag(["--auto-update"])
+            assert isinstance(_live_upd, bool)
+        finally:
+            def _restore(cfg, _s0=_s0, _u0=_u0):
+                cfg["schedule_enabled"] = _s0
+                cfg["schedule_update_enabled"] = _u0
+            from app.config_persist import update_config as _upd
+            try:
+                _upd(_restore)
+            except Exception:
+                pass
+            config_persist._config_cache = None
+    check("maintenance schedule builders + validation + probe", _maintenance_schedule)
+    def _tray_icon_path():
+        # Cross-platform on purpose: this is exactly the part of icon
+        # loading that has no ctypes in it, and the part that broke once
+        # already (a stray `os.path...` instead of `_os.path...` inside a
+        # broad except — NameError, silently swallowed, tray fell back to
+        # the plain stock icon on every run). Runs on every OS/CI, not
+        # just windows-latest, so this class of bug can't ship silently
+        # again regardless of which runner catches it first.
+        import os as _os
+        from app import tray as _tm
+        icon = _tm.TrayIcon(icon_path=None)
+        cands = icon._icon_candidates()
+        assert cands, "no icon candidates at all — tray will always fall back to the stock icon"
+        bundled = [c for c in cands if c.replace("\\", "/").endswith("assets/icon.ico")]
+        assert bundled, f"bundled icon.ico missing from candidates: {cands}"
+        assert _os.path.isfile(bundled[0]), f"candidate path does not exist on disk: {bundled[0]}"
+        # an explicit icon_path is tried first
+        icon2 = _tm.TrayIcon(icon_path="/some/override.ico")
+        assert icon2._icon_candidates()[0] == "/some/override.ico"
+    check("tray icon candidate paths resolve to a real file", _tray_icon_path)
 
 
 def main():
@@ -805,7 +1131,7 @@ def main():
         config_persist.set_game_night(True, ["game_mode"])
         _pd = gui.PilotDialog(root, app)
         root.update()
-        assert "End session now" in _pd._manual_btn._text, _pd._manual_btn._text
+        assert "Game Mode: On" in _pd._manual_btn._text, _pd._manual_btn._text
         assert len(_pd._close_vars) == len(_gn.APP_KEYS)
         assert not any(v.get() for v in _pd._close_vars.values()), \
             "optional app quieting must default to off"
@@ -814,7 +1140,7 @@ def main():
         config_persist.set_game_night(False)
         _pd2 = gui.PilotDialog(root, app)
         root.update()
-        assert "Start session now" in _pd2._manual_btn._text, _pd2._manual_btn._text
+        assert "Game Mode: Off" in _pd2._manual_btn._text, _pd2._manual_btn._text
         _pd2._close()
         root.update()
     finally:

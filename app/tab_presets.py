@@ -175,6 +175,10 @@ PRESETS = {
             "ultimate_performance", "game_mode", "games_priority",
             "max_cpu_power", "background_apps", "no_update_reboot",
             "disable_sticky_keys", "suppress_crash_popups", "fullscreen_opt",
+            # FPS pass: stop Xbox background recording, smoother windowed /
+            # borderless games, and lift the network + multimedia throttle.
+            # All snapshot-based, instant (no reboot) and undone by End.
+            "disable_game_dvr", "windowed_optimize", "network_throttling",
         ],
     },
     # Install tab: no curated presets — its 'preset card' row is the catalog

@@ -191,13 +191,32 @@ def _run_report_task(ctx, fn):
 
 
 def sense_gpu(ctx) -> tuple:
-    from app.tasks.repair_tasks import repair_gpu_driver_age
+    from app.tasks.repair_tasks import repair_gpu_driver_age, get_gpu_manufacturer_download_url
+    import subprocess as _sp
+    
+    # First, get GPU name for manufacturer URL detection
+    gpu_name = ""
+    try:
+        out = _sp.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_VideoController | "
+             "Select-Object -ExpandProperty Name | Select-Object -First 1"],
+            capture_output=True, text=True, timeout=30,
+            creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
+        )
+        gpu_name = (out.stdout or "").strip()
+    except Exception:
+        pass
+    
     outcome, msg = _run_report_task(ctx, repair_gpu_driver_age)
     if outcome == "pass":
         return ("A", "GPU drivers current", "No update nudge needed.", "")
     if outcome == "fail":
+        # Get manufacturer download URL
+        download_url = get_gpu_manufacturer_download_url(gpu_name) if gpu_name else ""
+        note = download_url if download_url else ""
         return ("C", "Driver update suggested",
-                msg or "Your GPU driver is over a year old.", "")
+                msg or "Your GPU driver is over a year old.", note)
     return ("?", "Couldn't check drivers",
             msg or "Driver info unavailable on this PC.", "")
 

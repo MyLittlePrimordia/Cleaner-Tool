@@ -3354,7 +3354,14 @@ class HealthReportDialog(ThemedModal):
                 show = (key == "gpu" and grade in ("B", "C", "D", "F"))
                 if show and btn.winfo_exists():
                     btn.config_text("Update driver →")
-                    self._card_actions[key] = self._goto_install
+                    # Check if we have a manufacturer download URL
+                    download_url = card.get("note", "")
+                    if download_url:
+                        # Direct download URL available
+                        self._card_actions[key] = lambda u=download_url: self._open_gpu_download_url(u)
+                    else:
+                        # Fall back to Install tab
+                        self._card_actions[key] = self._goto_install
                     btn.pack(fill="both", expand=True)
                 elif btn.winfo_exists() and btn.winfo_manager() != "":
                     btn.pack_forget()
@@ -3552,6 +3559,14 @@ class HealthReportDialog(ThemedModal):
         self.close()
         try:
             self.app._switch_to("Install")
+        except Exception:
+            pass
+    
+    def _open_gpu_download_url(self, url: str):
+        """Open the GPU manufacturer's download page in browser."""
+        import webbrowser
+        try:
+            webbrowser.open(url)
         except Exception:
             pass
 
@@ -15249,6 +15264,41 @@ class Application:
         # thin, quiet strip.
         toolbar = tk.Frame(host, bg=COLORS["bg"])
         toolbar.pack(fill="x", padx=26, pady=(8, 0))
+        
+        # Update notification banner (hidden by default, shown when update available)
+        self._update_banner_frame = tk.Frame(toolbar, bg=COLORS["accent_yellow"])
+        self._update_banner_lbl = tk.Label(
+            self._update_banner_frame, 
+            text="🔄 Update available", 
+            font=(F, 9, "bold"),
+            bg=COLORS["accent_yellow"], 
+            fg=COLORS["black"],
+            cursor="hand2"
+        )
+        self._update_banner_lbl.pack(side="left", padx=10, pady=4)
+        self._update_banner_lbl.bind("<Button-1>", lambda e: self._show_update_dialog())
+        self._update_banner_frame.pack(side="left", padx=(0, 8))
+        self._update_banner_frame.pack_forget()  # Hidden by default
+        
+        # Health score badge (shows overall PC health grade)
+        self._health_badge_frame = tk.Frame(toolbar, bg=COLORS["bg"])
+        self._health_badge = tk.Label(
+            self._health_badge_frame,
+            text="?",
+            font=(F, 12, "bold"),
+            bg=COLORS["surface"],
+            fg=COLORS["subtext"],
+            width=3,
+            relief="solid",
+            bd=1,
+            cursor="hand2"
+        )
+        self._health_badge.pack(padx=6, pady=2)
+        self._health_badge.bind("<Button-1>", lambda e: self._show_health_report())
+        Tooltip(self._health_badge, "Click to check PC health")
+        self._health_badge_frame.pack(side="left", padx=(0, 8))
+        self._health_grade = "?"  # Current health grade
+        
         # Audit fix (Limited-mode clarity): this used to be a plain, inert
         # label — the user had no way to get to Administrator rights again
         # short of quitting and relaunching by hand. Clicking it in Limited
@@ -15425,6 +15475,12 @@ class Application:
 
         self.set_status("Ready. Pick a preset and press Run.")
 
+        # Check for updates in the background (non-blocking)
+        self._schedule_update_check()
+        
+        # Schedule periodic health check for the badge
+        self._schedule_health_check()
+
         # F6: the window is up — pre-warm the first-entry Custom/Undo
         # bodies and the Install catalog in idle time instead of on the
         # user's first click / tab switch.
@@ -15446,6 +15502,153 @@ class Application:
         except Exception:
             pass
         self._maybe_hide_for_tray()
+
+    # ---------------- Update checker ---------------- #
+
+    def _schedule_update_check(self):
+        """Schedule a background check for app updates."""
+        # Check after 2 seconds to let the app start up smoothly
+        self.root.after(2000, self._check_for_updates)
+    
+    def _check_for_updates(self):
+        """Background check for updates using a worker thread."""
+        def _worker():
+            try:
+                from app.update_checker import check_for_updates
+                # Replace with your actual GitHub repo when ready
+                result = check_for_updates("MyLittlePrimordia/Cleaner-Tool", timeout=10)
+                if result.get('update_available'):
+                    # Show update banner on main thread
+                    self.root.after(0, lambda: self._show_update_banner(result))
+            except Exception:
+                # Silently fail - update check is optional
+                pass
+        
+        # Run in background thread to avoid blocking UI
+        import threading
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+    
+    def _show_update_banner(self, update_info: dict):
+        """Show the update notification banner."""
+        try:
+            if hasattr(self, '_update_banner_frame') and self._update_banner_frame.winfo_exists():
+                self._update_banner_frame.pack(side="left", padx=(0, 8))
+                self._update_info = update_info
+        except Exception:
+            pass
+    
+    def _show_update_dialog(self):
+        """Show the update dialog with download link."""
+        try:
+            update_info = getattr(self, '_update_info', None)
+            if not update_info:
+                return
+            
+            latest_ver = update_info.get('latest_version', 'unknown')
+            current_ver = update_info.get('current_version', 'unknown')
+            download_url = update_info.get('download_url', '')
+            notes = update_info.get('release_notes', '')
+            
+            message = f"A new version of Cleaner Tool is available!\n\n"
+            message += f"Current version: {current_ver}\n"
+            message += f"Latest version: {latest_ver}\n\n"
+            
+            if notes:
+                # Truncate very long release notes
+                if len(notes) > 500:
+                    notes = notes[:500] + "..."
+                message += f"What's new:\n{notes}\n\n"
+            
+            message += "Click OK to open the download page in your browser."
+            
+            if messagebox.askyesno("Update Available", message):
+                if download_url:
+                    import webbrowser
+                    webbrowser.open(download_url)
+        except Exception:
+            pass
+    
+    def _show_health_report(self):
+        """Show the PC Health Report dialog."""
+        try:
+            HealthReportDialog(self.root, self).wait()
+        except Exception:
+            pass
+    
+    def _update_health_badge(self, grade: str):
+        """Update the health badge with the given grade."""
+        try:
+            if not hasattr(self, '_health_badge') or not self._health_badge.winfo_exists():
+                return
+            
+            self._health_grade = grade
+            self._health_badge.config(text=grade)
+            
+            # Update color based on grade
+            grade_colors = {
+                "A": COLORS["accent_green"],
+                "B": COLORS["accent_sky"],
+                "C": COLORS["accent_yellow"],
+                "D": COLORS["accent_yellow"],
+                "F": COLORS["accent_red"],
+                "?": COLORS["subtext"]
+            }
+            color = grade_colors.get(grade, COLORS["subtext"])
+            self._health_badge.config(fg=color)
+        except Exception:
+            pass
+    
+    def _schedule_health_check(self):
+        """Schedule a periodic health check to update the badge."""
+        # Check health every 5 minutes
+        self._health_check_worker()
+    
+    def _health_check_worker(self):
+        """Background health check to update the badge."""
+        def _worker():
+            try:
+                from app.health_scan import run_health_scan, SENSORS
+                import logging
+                
+                # Create a simple context for the health scan
+                log_list = []
+                cancelled_flag = [False]
+                
+                def set_status(msg):
+                    pass  # We don't need status updates for badge
+                
+                def cancelled():
+                    return cancelled_flag[0]
+                
+                ctx = type('TaskContext', (), {
+                    'log': log_list.append,
+                    'set_status': set_status,
+                    'cancelled': cancelled
+                })()
+                
+                # Run a quick health scan (disk + GPU only for speed)
+                quick_sensors = [s for s in SENSORS if s[0] in ('disk', 'gpu')]
+                cards = run_health_scan(ctx, sensors=quick_sensors)
+                
+                # Calculate overall grade
+                from app.health_scan import overall_grade
+                grades = {k: v.get('grade', '?') for k, v in cards.items()}
+                overall = overall_grade(grades)
+                
+                # Update badge on main thread
+                self.root.after(0, lambda: self._update_health_badge(overall))
+            except Exception:
+                # If health check fails, show unknown
+                self.root.after(0, lambda: self._update_health_badge("?"))
+        
+        # Run in background thread
+        import threading
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+        
+        # Schedule next check in 5 minutes
+        self.root.after(300000, self._health_check_worker)
 
     # ---------------- F6: idle pre-warm chain ---------------- #
 

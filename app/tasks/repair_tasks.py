@@ -555,6 +555,33 @@ def repair_gpu_driver_age(ctx: TaskContext):
     ctx.log("VERDICT: GPU drivers reasonably current — no nudge needed.")
 
 
+def get_gpu_manufacturer_download_url(gpu_name: str) -> str:
+    """Get the appropriate driver download URL based on GPU manufacturer.
+    
+    Args:
+        gpu_name: Name of the GPU from WMI
+        
+    Returns:
+        URL to the manufacturer's driver download page
+    """
+    gpu_lower = gpu_name.lower()
+    
+    # NVIDIA
+    if any(keyword in gpu_lower for keyword in ['nvidia', 'geforce', 'rtx', 'gtx', 'quadro']):
+        return "https://www.nvidia.com/Download/index.aspx"
+    
+    # AMD
+    if any(keyword in gpu_lower for keyword in ['amd', 'radeon', 'rx', 'hd']):
+        return "https://www.amd.com/support"
+    
+    # Intel
+    if any(keyword in gpu_lower for keyword in ['intel', 'arc', 'iris', 'uhd', 'hd graphics']):
+        return "https://www.intel.com/content/www/us/en/download-center/home.html"
+    
+    # Default to Install tab
+    return ""
+
+
 from app.tasks import Task  # noqa: E402
 
 # --------------------------------------------------------------------------- #

@@ -83,6 +83,140 @@ _FRIENDLY = {
 }
 
 
+def is_system_process(name: str) -> bool:
+    """True if `name` is a core Windows process we must never offer to close.
+
+    Single source of truth for the protected set — the dialog's All-filter
+    uses this to render read-only shield rows instead of Close buttons.
+    Pure, never raises, headless-safe (used by smoke tests)."""
+    try:
+        low = (name or "").lower()
+        return low in _PROTECTED or low.replace(".exe", "") in _PROTECTED
+    except Exception:
+        return False
+
+
+def _window_pids() -> set:
+    """PIDs that own at least one visible top-level window.
+
+    Used to split Apps (user sees a window) from Background (no window) —
+    100% Win32-observable, unlike install-registry heuristics which lie
+    about portable/store apps. Never raises: any failure → empty set
+    (everything reads as Background, still safe)."""
+    if not IS_WINDOWS:
+        return set()
+    try:
+        import ctypes as _ct
+        from ctypes import wintypes as _wt
+        user32 = _ct.windll.user32
+        pids: set = set()
+        try:
+            _CB = _ct.WINFUNCTYPE(_ct.c_bool, _ct.c_void_p, _ct.c_void_p)
+        except Exception:
+            return set()
+
+        def _cb(hwnd, _lp):
+            try:
+                if user32.IsWindowVisible(hwnd):
+                    pid = _wt.DWORD(0)
+                    user32.GetWindowThreadProcessId(
+                        hwnd, _ct.byref(pid))
+                    if pid.value > 0:
+                        pids.add(int(pid.value))
+            except Exception:
+                pass
+            return True
+
+        user32.EnumWindows(_CB(_cb), 0)
+        return pids
+    except Exception:
+        return set()
+
+
+def classify_process(name: str, pid: int, window_pids=None) -> str:
+    """'system' | 'apps' | 'background'. Pure, never raises.
+
+    * system — in the protected set (read-only in the UI, no Close).
+    * apps — has a visible window (user-installed or not, the user SEES it).
+    * background — everything else safe-to-close (helpers, updaters)."""
+    try:
+        if is_system_process(name):
+            return "system"
+        if window_pids is not None and pid in window_pids:
+            return "apps"
+        return "background"
+    except Exception:
+        return "background"
+
+
+def group_processes(items: List[dict]) -> List[dict]:
+    """Group per-PID rows by friendly display label.
+
+    Returns [{key, display, total_cpu, total_ram, count, safe, kind,
+    items:[per-pid dicts sorted heaviest-first]}] sorted heaviest-group
+    first by the same (cpu*2 + ram/50) weight the sampler uses. Pure —
+    no Win32, fully unit-testable. Never raises (empty in → empty out).
+
+    Group key is the display label's lowercase: 'Steam (helper) x2'
+    collapses, while 'Steam' vs 'Steam (helper)' stay distinct (different
+    executables, different kill semantics). A group is safe only if ALL
+    members are safe; kind is 'system' only if ALL members are system
+    (mixed groups — rare — stay closable per-PID, header Close-all is
+    hidden unless every child is safe)."""
+    try:
+        buckets: Dict[str, dict] = {}
+        for it in items or []:
+            try:
+                disp = it.get("display") or it.get("name") or "?"
+                key = str(disp).strip().lower() or "?"
+                b = buckets.get(key)
+                if b is None:
+                    b = buckets[key] = {
+                        "key": key, "display": str(disp),
+                        "total_cpu": 0.0, "total_ram": 0.0,
+                        "count": 0, "safe": True,
+                        "all_system": True, "items": [],
+                    }
+                b["items"].append(it)
+                b["count"] += 1
+                try:
+                    b["total_cpu"] += float(it.get("cpu_percent") or 0)
+                except Exception:
+                    pass
+                try:
+                    b["total_ram"] += float(it.get("ram_mb") or 0)
+                except Exception:
+                    pass
+                if not it.get("safe", True):
+                    b["safe"] = False
+                if it.get("kind", "background") != "system":
+                    b["all_system"] = False
+            except Exception:
+                continue
+        groups = list(buckets.values())
+        for g in groups:
+            try:
+                g["items"].sort(
+                    key=lambda r: (float(r.get("cpu_percent") or 0) * 2.0
+                                   + float(r.get("ram_mb") or 0) / 50.0),
+                    reverse=True)
+            except Exception:
+                pass
+            g["kind"] = "system" if g["all_system"] else "mixed" if not g["safe"] else "app"
+            # 'mixed' (some system members) still renders per-PID Close for
+            # safe children only; header Close-all requires all-safe.
+            try:
+                del g["all_system"]
+            except Exception:
+                pass
+        groups.sort(
+            key=lambda g: (g["total_cpu"] * 2.0 + g["total_ram"] / 50.0),
+            reverse=True)
+        return groups
+    except Exception:
+        return []
+
+
 def _friendly_name(exe: str) -> str:
     low = (exe or "").lower()
     if low in _FRIENDLY:
@@ -243,8 +377,9 @@ class ProcessSampler:
     single GUI tick thread.
     """
 
-    def __init__(self, top_n: int = 12):
+    def __init__(self, top_n: int = 12, include_system: bool = False):
         self.top_n = max(3, int(top_n))
+        self.include_system = bool(include_system)
         self._prev_cpu: Dict[int, int] = {}   # pid → cpu ticks
         self._prev_wall: float = 0.0
         self._lock = threading.Lock()
@@ -260,7 +395,12 @@ class ProcessSampler:
             "cpu_percent": float, # 0–100-ish (multi-core can exceed 100)
             "ram_mb": float,
             "safe": bool,         # True if not in protected set
+            "kind": str,          # 'apps' | 'background' | 'system'
         }
+
+        include_system=False (default) preserves the legacy contract:
+        protected rows are dropped. True keeps them as safe=False /
+        kind='system' for the All-filter's read-only shield rows.
         """
         with self._lock:
             return self._sample_unlocked()
@@ -274,29 +414,33 @@ class ProcessSampler:
         wall_delta = max(0.001, now - self._prev_wall) if self._prev_wall else 0.0
         self._prev_wall = now
 
-        # Build candidate set, skip protected + self
+        # Build candidate set, skip self; protected kept iff include_system
+        try:
+            _win_pids = _window_pids()
+        except Exception:
+            _win_pids = set()
         candidates = []
         for name, pid, mem_str in rows:
-            low = (name or "").lower()
             if pid == self._own_pid:
-                continue
-            if low in _PROTECTED or low.replace(".exe", "") in _PROTECTED:
                 continue
             # Skip 0-pid / system-ish
             if pid <= 4:
+                continue
+            _sys = is_system_process(name)
+            if _sys and not self.include_system:
                 continue
             ram_kb = _parse_mem_kb(mem_str)
             # Prefer live WorkingSet when available (more accurate)
             ws = _working_set_bytes(pid)
             if ws is not None:
                 ram_kb = ws // 1024
-            candidates.append((name, pid, ram_kb))
+            candidates.append((name, pid, ram_kb, _sys))
 
         # CPU deltas
         new_cpu: Dict[int, int] = {}
         results = []
         n_cores = os.cpu_count() or 1
-        for name, pid, ram_kb in candidates:
+        for name, pid, ram_kb, _sys in candidates:
             times = _process_times(pid)
             cpu_ticks = times[0] if times else 0
             new_cpu[pid] = cpu_ticks
@@ -310,13 +454,16 @@ class ProcessSampler:
                 cpu_pct = 0.0
             # Cap display; multi-core processes can exceed 100
             cpu_pct = min(cpu_pct, 100.0 * n_cores)
+            _kind = "system" if _sys else (
+                "apps" if pid in _win_pids else "background")
             results.append({
                 "pid": pid,
                 "name": name,
                 "display": _friendly_name(name),
                 "cpu_percent": round(cpu_pct, 1),
                 "ram_mb": round(ram_kb / 1024.0, 1),
-                "safe": True,
+                "safe": not _sys,
+                "kind": _kind,
             })
         self._prev_cpu = new_cpu
 

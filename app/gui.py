@@ -3770,6 +3770,238 @@ class AnimatedButton(tk.Canvas):
         self._draw()
 
 
+class SegmentedTabs(tk.Canvas):
+    """One-pill tab switcher for dialogs (Drive Toolkit + Process Manager).
+
+    Same visual language as the main Clean/Repair/Tweak pill
+    (Application._build_tab_switch): one bg_alt track, one accent thumb
+    that slides + recolors, active label black/bold, inactive subtext.
+    Items are created ONCE and only moved/recolored (no flicker), motion
+    is time-based ease-out cubic at ~60fps, 160ms like the main switcher.
+
+    API: SegmentedTabs(parent, labels=[...], keys=[...]|None,
+    initial=0|key, accent=COLORS[...], command=fn(key), seg_w=None)
+    .select(key_or_index), .selected_key, .selected_index.
+    Never raises out of __init__ (dialog must always open).
+    """
+
+    ANIM_MS = 160
+
+    def __init__(self, parent, labels, keys=None, initial=0,
+                 accent=None, command=None, seg_w=None, height=36,
+                 font=None, **kw):
+        try:
+            bg = parent["bg"] if isinstance(
+                parent, (tk.Frame, tk.Canvas)) else COLORS["bg"]
+        except Exception:
+            bg = COLORS["bg"]
+        self._labels = list(labels or ["One"])
+        n = len(self._labels)
+        self._keys = list(keys) if keys and len(keys) == n else list(
+            range(n))
+        self._accent = accent or COLORS["accent_blue"]
+        self._command = command
+        self._font = font or (F, 9, "bold")
+        self._font_off = (self._font[0], self._font[1]) \
+            if len(self._font) >= 2 else (F, 9)
+        # Segment width: caller override, else measured max label + padding.
+        # Measured with the shared cached font (no throwaway widgets).
+        if seg_w is not None:
+            self._seg = max(72, int(seg_w))
+        else:
+            try:
+                fnt = _measure_font(parent.winfo_toplevel(), self._font)
+                widest = max((fnt.measure(t) for t in self._labels),
+                             default=60)
+                self._seg = max(96, min(200, int(widest) + 44))
+            except Exception:
+                self._seg = 148
+        # NOTE: _w/_h are tkinter's reserved widget-path attribute names
+        # (see AnimatedButton._measure) — pixel size lives under _bw/_bh.
+        self._bw = self._seg * n
+        self._bh = int(height)
+        super().__init__(parent, width=self._bw, height=self._bh,
+                         highlightthickness=0, bd=0, bg=bg, **kw)
+        try:
+            if isinstance(initial, str) and initial in self._keys:
+                idx = self._keys.index(initial)
+            else:
+                idx = max(0, min(n - 1, int(initial)))
+        except Exception:
+            idx = 0
+        self._index = idx
+        self._pos = float(idx)
+        self._anim = None
+        self._anim_after = None
+        # persistent items — created once, never deleted (flicker fix)
+        try:
+            self._track = self.create_polygon(
+                _round_rect_points(0, 0, self._bw, self._bh,
+                                   self._bh // 2),
+                smooth=True, fill=COLORS["bg_alt"], outline="")
+            x = self._thumb_x(self._pos)
+            self._thumb = self.create_polygon(
+                _round_rect_points(x, 3, x + self._seg - 6,
+                                   self._bh - 3, (self._bh - 6) // 2),
+                smooth=True, fill=self._accent, outline="")
+            self._texts = []
+            for i, lab in enumerate(self._labels):
+                cx = self._seg * i + self._seg / 2
+                self._texts.append(self.create_text(cx, self._bh // 2,
+                                                    text=lab))
+            self._style_labels()
+        except Exception:
+            self._track = self._thumb = None
+            self._texts = []
+        try:
+            self.bind("<Button-1>", self._on_click)
+            self.bind("<Motion>", self._on_motion)
+            self.bind("<Leave>",
+                      lambda e: self.config(cursor="arrow"))
+            self.configure(takefocus=1, highlightthickness=0)
+            self.bind("<Left>", lambda e: self.select(
+                max(0, self._index - 1)))
+            self.bind("<Right>", lambda e: self.select(
+                min(len(self._labels) - 1, self._index + 1)))
+            self.bind("<Return>", lambda e: None)
+            self.bind("<space>", lambda e: None)
+        except Exception:
+            pass
+
+    # -- geometry -------------------------------------------------- #
+
+    def _thumb_x(self, t):
+        return 3 + t * self._seg + 3
+
+    def _place_thumb(self, t, fill=None):
+        try:
+            x = self._thumb_x(t)
+            pts = _round_rect_points(x, 3, x + self._seg - 6,
+                                     self._bh - 3, (self._bh - 6) // 2)
+            self.coords(self._thumb, *pts)
+            if fill is not None:
+                self.itemconfigure(self._thumb, fill=fill)
+        except Exception:
+            pass
+
+    def _style_labels(self):
+        for i, tid in enumerate(self._texts):
+            try:
+                active = (i == self._index)
+                self.itemconfigure(
+                    tid,
+                    fill=COLORS["black"] if active else COLORS["subtext"],
+                    font=self._font if active else self._font_off)
+            except Exception:
+                pass
+
+    # -- interaction ------------------------------------------------ #
+
+    def _on_click(self, event):
+        try:
+            seg = min(len(self._labels) - 1,
+                      max(0, int(event.x // self._seg)))
+            self.select(seg)
+        except Exception:
+            pass
+
+    def _on_motion(self, event):
+        try:
+            seg = min(len(self._labels) - 1,
+                      max(0, int(event.x // self._seg)))
+            self.config(cursor="hand2" if seg != self._index else "arrow")
+        except Exception:
+            pass
+
+    @property
+    def selected_key(self):
+        try:
+            return self._keys[self._index]
+        except Exception:
+            return None
+
+    @property
+    def selected_index(self):
+        return getattr(self, "_index", 0)
+
+    def select(self, key_or_index, _fire=True):
+        """Select by key or index. Fires command(key) unless _fire=False
+        (used internally to sync without re-entering the switch)."""
+        try:
+            if key_or_index in self._keys and not isinstance(
+                    key_or_index, int):
+                target = self._keys.index(key_or_index)
+            else:
+                target = max(0, min(len(self._labels) - 1,
+                                    int(key_or_index)))
+        except Exception:
+            return
+        if target == getattr(self, "_index", -1) and self._anim is None:
+            return
+        self._index = target
+        try:
+            self._style_labels()
+        except Exception:
+            pass
+        # cancel in-flight animation so fast re-clicks retarget cleanly
+        try:
+            if self._anim_after is not None:
+                self.after_cancel(self._anim_after)
+                self._anim_after = None
+        except Exception:
+            pass
+        try:
+            self._anim = {"from": self._pos, "to": float(target),
+                          "start": time.monotonic()}
+            self._tick()
+        except Exception:
+            try:
+                self._pos = float(target)
+                self._place_thumb(self._pos, self._accent)
+            except Exception:
+                pass
+        if _fire and self._command is not None:
+            try:
+                self._command(self._keys[target])
+            except Exception:
+                pass
+
+    def set_accent(self, accent):
+        try:
+            self._accent = accent
+            self._place_thumb(self._pos, accent)
+        except Exception:
+            pass
+
+    def _tick(self):
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
+        anim = getattr(self, "_anim", None)
+        if anim is None:
+            return
+        try:
+            p = (time.monotonic() - anim["start"]) * 1000.0 / self.ANIM_MS
+        except Exception:
+            p = 1.0
+        if p >= 1.0:
+            self._pos = anim["to"]
+            self._place_thumb(self._pos, self._accent)
+            self._anim = None
+            self._anim_after = None
+            return
+        eased = 1 - (1 - p) ** 3
+        t = anim["from"] + (anim["to"] - anim["from"]) * eased
+        self._pos = t
+        self._place_thumb(t, self._accent)
+        try:
+            self._anim_after = self.after(16, self._tick)
+        except Exception:
+            self._anim_after = None
+
+
 class ToggleSwitch(tk.Canvas):
     """iOS-style toggle, MK3 (user feedback: 'low-res, unpolished, hover
     shows a framework outline').
@@ -14155,16 +14387,17 @@ class DriveToolkitDialog(ThemedModal):
         super().__init__(parent, title="Drive Toolkit",
                          accent=TAB_ACCENTS["Clean"])
         body = self.body
+        # One centered pill (same language as the main Clean/Repair/Tweak
+        # switcher) — replaces the old three separate left-packed buttons.
         tabs = tk.Frame(body, bg=COLORS["bg"])
         tabs.pack(fill="x", pady=(0, 10))
-        self._tab_btns = {}
-        for key, label in self._VIEWS:
-            b = AnimatedButton(tabs, text=label,
-                               command=lambda k=key: self._switch(k),
-                               bg=COLORS["surface"], fg=COLORS["text"],
-                               font=(F, 9, "bold"), padx=14, pady=6)
-            b.pack(side="left", padx=(0, 6))
-            self._tab_btns[key] = b
+        self._tab_btns = {}  # kept for harness compat (no longer styled)
+        self._seg_tabs = SegmentedTabs(
+            tabs, labels=[label for _, label in self._VIEWS],
+            keys=[key for key, _ in self._VIEWS],
+            initial="health", accent=TAB_ACCENTS["Clean"],
+            command=self._switch)
+        self._seg_tabs.pack(anchor="center")
         self._content = tk.Frame(body, bg=COLORS["bg"])
         self._content.pack(fill="both", expand=True)
         self.on_close(self._stop)
@@ -14181,13 +14414,14 @@ class DriveToolkitDialog(ThemedModal):
                 child.destroy()
             except Exception:
                 pass
-        for k, b in self._tab_btns.items():
-            try:
-                b.set_style(bg=(TAB_ACCENTS["Clean"] if k == key
-                               else COLORS["surface"]),
-                           fg=(COLORS["black"] if k == key else COLORS["text"]))
-            except Exception:
-                pass
+        # Sync the pill without re-firing command (click already fired it;
+        # programmatic _switch("health") on open must still move the thumb).
+        try:
+            if getattr(self, "_seg_tabs", None) is not None and \
+                    self._seg_tabs.selected_key != key:
+                self._seg_tabs.select(key, _fire=False)
+        except Exception:
+            pass
         if key == "health":
             self._build_health()
         elif key == "speed":
@@ -14404,10 +14638,10 @@ class DriveToolkitDialog(ThemedModal):
         # UI fix: condensed to a single row (was two stacked lines) —
         # same one-row treatment as Health/Speed above. The "don't unplug"
         # safety note now rides the same line instead of its own row.
-        tk.Label(c, text="Checks if a USB drive or SD card is fake — your "
-                         "files are never touched, just don't unplug it mid-test.",
-                 font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
-                 wraplength=700, justify="left").pack(anchor="w", pady=(0, 10))
+        tk.Label(c, text="Checks if a USB drive or SD card is fake — "
+                         "your files are never touched.",
+                  font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
+                  wraplength=700, justify="left").pack(anchor="w", pady=(0, 10))
 
         self._cap_drives = []
         row = tk.Frame(c, bg=COLORS["bg"])
@@ -15561,57 +15795,91 @@ class StartupManagerDialog(ThemedModal):
 
 
 class ProcessManagerDialog(ThemedModal):
-    """Process Manager (Tools tab card): what's using CPU/RAM right now,
-    plain names, one-click Close. Minimal text, auto-refreshes every 2s,
-    fixed 800×600 popup like every other Tools dialog.
+    """Process Manager (Tools tab card): gamer-friendly task manager.
 
-    Filters core Windows processes so nothing offered can brick the PC.
-    Close uses taskkill /PID /F (same path Game Night already trusts).
+    One row per app — processes from the same program are summed into a
+    single row (CPU + RAM totals, "· N processes" when N > 1), ordered
+    heaviest-first. One Close per row closes the whole group. Core
+    Windows processes are never listed at all (nothing shown that you
+    can't close). No filter pill, no search, no Refresh/Close buttons —
+    the list refreshes itself quietly and the X closes the popup.
+
+    Flicker fix: rows are built once and updated IN PLACE on every
+    tick (labels + button commands only). A full rebuild happens only
+    when the grouped set actually changes (app opened/closed). Close
+    uses taskkill /PID /F (same path Game Night already trusts).
     """
 
-    _TICK_MS = 2000
-    _TOP_N = 10
+    _TICK_MS = 3000
+    _TOP_N = 80
+    _MAX_GROUPS = 60
 
     def __init__(self, parent, app):
         self.app = app
         self._tick_after = None
         self._sampler = None
-        self._rows = {}  # pid -> row frame widgets
+        self._rows = {}  # group key -> row frame (harness compat)
+        self._row_widgets = {}  # group key -> {"name","detail","btn","pids"}
+        self._displayed_keys = []  # key order currently on screen
+        self._last_items = []
+        self._shown_groups = []
         super().__init__(parent, title="Process Manager",
                          accent=TAB_ACCENTS["Tools"])
         body = self.body
 
-        tk.Label(body, text="What's using your PC — close anything you don't need.",
-                 font=(F, 10, "bold"), bg=COLORS["bg"], fg=COLORS["text"],
-                 anchor="w").pack(fill="x", pady=(0, 8))
-
         self._panel = ScrollableRoundedPanel(body)
-        self._panel.config(height=380)
+        self._panel.config(height=460)
         self._panel.pack(fill="both", expand=True)
 
-        brow = tk.Frame(body, bg=COLORS["bg"])
-        brow.pack(fill="x", pady=(10, 0))
-        self._status = tk.Label(brow, text="Scanning…", font=(F, 9),
+        # Bottom-center stats (single clean line, replaces the old
+        # "Top 10 · heaviest:" footer and the Refresh/Close buttons —
+        # the dialog auto-refreshes and the title-bar X closes it).
+        self._status = tk.Label(body, text="Scanning…", font=(F, 9),
                                 bg=COLORS["bg"], fg=COLORS["subtext"],
-                                wraplength=560, justify="left")
-        self._status.pack(side="left", fill="x", expand=True)
-        AnimatedButton(brow, text="Refresh", command=self._force_refresh,
-                       bg=COLORS["surface"], fg=COLORS["text"],
-                       font=(F, 9, "bold"), padx=16, pady=6).pack(
-            side="right", padx=(8, 0))
-        AnimatedButton(brow, text="Close", command=self.close,
-                       bg=TAB_ACCENTS["Tools"], fg=COLORS["black"],
-                       font=(F, 9, "bold"), padx=20, pady=6).pack(side="right")
+                                anchor="center", justify="center")
+        self._status.pack(fill="x", pady=(10, 0))
 
         try:
             from app.process_manager import ProcessSampler
-            self._sampler = ProcessSampler(top_n=self._TOP_N)
+            # include_system=False: system rows are never listed — no
+            # point showing what can't be closed.
+            self._sampler = ProcessSampler(top_n=self._TOP_N,
+                                           include_system=False)
         except Exception:
             self._sampler = None
 
+        try:
+            self.on_close(self._cancel_tick)
+        except Exception:
+            pass
         # Prime + first paint, then tick
-        self._force_refresh()
+        self._refresh_list(first=True)
         self._schedule_tick()
+
+    @staticmethod
+    def _detail_text(group):
+        try:
+            cpu = float(group.get("total_cpu") or 0)
+            ram = float(group.get("total_ram") or 0)
+            count = int(group.get("count") or 1)
+        except Exception:
+            return ""
+        text = f"{cpu:.0f}% CPU  ·  {ram:.0f} MB RAM"
+        if count > 1:
+            text += f"  ·  {count} processes"
+        return text
+
+    @staticmethod
+    def _stats_text(groups):
+        try:
+            n_apps = len(groups)
+            n_proc = sum(int(g.get("count") or 0) for g in groups)
+            gb = sum(float(g.get("total_ram") or 0)
+                     for g in groups) / 1024.0
+            return (f"{n_apps} apps  ·  {n_proc} processes  ·  "
+                    f"{gb:.1f} GB RAM")
+        except Exception:
+            return ""
 
     def _say(self, text):
         try:
@@ -15619,124 +15887,220 @@ class ProcessManagerDialog(ThemedModal):
         except Exception:
             pass
 
-    def _schedule_tick(self):
+    def _cancel_tick(self):
         try:
-            if self._tick_after is not None:
-                self.after_cancel(self._tick_after)
+            if self._tick_after is not None and self._dlg is not None \
+                    and self._dlg.winfo_exists():
+                self._dlg.after_cancel(self._tick_after)
         except Exception:
             pass
+        self._tick_after = None
+
+    def _schedule_tick(self):
+        self._cancel_tick()
         try:
-            self._tick_after = self.after(self._TICK_MS, self._on_tick)
+            if self._dlg is not None and self._dlg.winfo_exists():
+                self._tick_after = self._dlg.after(self._TICK_MS,
+                                                   self._on_tick)
         except Exception:
             self._tick_after = None
 
     def _on_tick(self):
         self._tick_after = None
-        if not self.winfo_exists():
-            return
-        self._refresh_list(quiet=True)
-        self._schedule_tick()
-
-    def _force_refresh(self):
-        self._say("Scanning…")
-        self._refresh_list(quiet=False)
-
-    def _refresh_list(self, quiet=False):
-        holder = self._panel.inner
         try:
-            for w in list(holder.winfo_children()):
-                w.destroy()
+            if self._dlg is None or not self._dlg.winfo_exists():
+                return
         except Exception:
             return
-        self._rows = {}
+        self._refresh_list()
+        self._schedule_tick()
+
+    def _refresh_list(self, first=False):
         items = []
         try:
             if self._sampler is not None:
                 items = self._sampler.sample()
         except Exception:
             items = []
-        if not items:
-            tk.Label(holder, text="Nothing heavy found right now.",
-                     font=(F, 9), bg=COLORS["bg_alt"],
-                     fg=COLORS["subtext"]).pack(pady=20)
+        self._last_items = list(items or [])
+        try:
+            from app.process_manager import group_processes
+            groups = group_processes(self._last_items)[: self._MAX_GROUPS]
+        except Exception:
+            groups = []
+        self._shown_groups = groups
+        new_keys = [g.get("key") for g in groups]
+        # Steady state (same apps, same order): update values in place —
+        # no destroy/rebuild, no flicker. Structure changed (app opened
+        # or closed): rebuild once.
+        if not first and new_keys == self._displayed_keys \
+                and self._row_widgets:
+            self._update_rows_in_place(groups)
+        else:
+            self._rebuild_rows(groups)
+        # Transient "Closed X." messages are overwritten here by the
+        # fresh stats — unless this tick found nothing new to say.
+        try:
+            if groups:
+                self._say(self._stats_text(groups))
+            elif not first:
+                self._say("Nothing running right now.")
+        except Exception:
+            pass
+
+    def _rebuild_rows(self, groups):
+        try:
+            holder = self._panel.inner
+        except Exception:
+            return
+        try:
+            for w in list(holder.winfo_children()):
+                w.destroy()
+        except Exception:
+            return
+        self._rows = {}
+        self._row_widgets = {}
+        self._displayed_keys = [g.get("key") for g in groups]
+        if not groups:
             try:
+                tk.Label(holder, text="Nothing running right now.",
+                         font=(F, 9), bg=COLORS["bg_alt"],
+                         fg=COLORS["subtext"]).pack(pady=20)
                 self._panel.refresh_scroll()
             except Exception:
                 pass
-            if not quiet:
-                self._say("Ready.")
             return
-        for it in items:
-            self._build_row(holder, it)
+        for g in groups:
+            try:
+                self._build_row(holder, g)
+            except Exception:
+                continue
         try:
             self._panel.refresh_scroll()
         except Exception:
             pass
-        n = len(items)
-        top = items[0]
-        if not quiet:
-            self._say(f"Top {n} · heaviest: {top['display']}")
 
-    def _build_row(self, parent, item):
+    def _update_rows_in_place(self, groups):
+        """Refresh labels + Close targets without touching the widget
+        tree — this is what makes the 3s tick flicker-free."""
+        for g in groups:
+            try:
+                refs = self._row_widgets.get(g.get("key"))
+                if not refs:
+                    continue
+                refs["name"].config(text=g.get("display") or "?")
+                refs["detail"].config(text=self._detail_text(g))
+                try:
+                    pids = tuple(int(r.get("pid"))
+                                 for r in g.get("items", [])
+                                 if r.get("pid")
+                                 and int(r.get("pid")) != os.getpid())
+                except Exception:
+                    pids = ()
+                refs["pids"] = pids
+                disp = g.get("display") or "?"
+                try:
+                    refs["btn"]._command = (
+                        lambda ps=pids, d=disp:
+                        self._confirm_close_group(ps, d))
+                except Exception:
+                    pass
+            except Exception:
+                continue
+
+    def _build_row(self, parent, group):
+        key = group.get("key")
+        disp = group.get("display") or "?"
+        try:
+            pids = tuple(int(r.get("pid")) for r in group.get("items", [])
+                         if r.get("pid")
+                         and int(r.get("pid")) != os.getpid())
+        except Exception:
+            pids = ()
+        if not pids:
+            return
         row = tk.Frame(parent, bg=COLORS["bg_alt"])
         row.pack(fill="x", padx=4, pady=3)
-
         left = tk.Frame(row, bg=COLORS["bg_alt"])
         left.pack(side="left", fill="x", expand=True, padx=(10, 6), pady=8)
-
-        name = tk.Label(left, text=item.get("display") or item.get("name") or "?",
-                        font=(F, 11, "bold"), bg=COLORS["bg_alt"],
-                        fg=COLORS["text"], anchor="w")
+        name = tk.Label(left, text=disp, font=(F, 11, "bold"),
+                        bg=COLORS["bg_alt"], fg=COLORS["text"], anchor="w")
         name.pack(fill="x")
-
-        cpu = item.get("cpu_percent", 0) or 0
-        ram = item.get("ram_mb", 0) or 0
-        detail = f"{cpu:.0f}% CPU  ·  {ram:.0f} MB RAM"
-        tk.Label(left, text=detail, font=(F, 9), bg=COLORS["bg_alt"],
-                 fg=COLORS["subtext"], anchor="w").pack(fill="x")
-
-        pid = item.get("pid")
+        detail = tk.Label(left, text=self._detail_text(group), font=(F, 9),
+                          bg=COLORS["bg_alt"], fg=COLORS["subtext"],
+                          anchor="w")
+        detail.pack(fill="x")
         btn = AnimatedButton(
             row, text="Close",
-            command=lambda p=pid, d=item.get("display"): self._confirm_close(p, d),
+            command=lambda ps=pids,
+            d=disp: self._confirm_close_group(ps, d),
             bg=COLORS["surface"], fg=COLORS["text"],
             font=(F, 9, "bold"), padx=14, pady=5)
         btn.pack(side="right", padx=(0, 10), pady=8)
-        self._rows[pid] = row
+        self._rows[key] = row
+        self._row_widgets[key] = {"frame": row, "name": name,
+                                  "detail": detail, "btn": btn,
+                                  "pids": pids}
 
-    def _confirm_close(self, pid, display):
-        if not pid:
-            return
-        # Tiny one-line confirm — same fixed-size dialog language
+    def _confirm_close_group(self, pids, display):
         try:
-            from tkinter import messagebox
-            ok = messagebox.askyesno(
-                "Close process?",
-                f"Close {display or 'this process'}?",
-                parent=self,
-            )
+            pids = tuple(int(p) for p in (pids or [])
+                         if int(p) != os.getpid())
+        except Exception:
+            return
+        if not pids:
+            return
+        # Safety net: never touch a protected PID through a stale
+        # callback, even though system rows are no longer listed.
+        try:
+            from app.process_manager import close_process
+            protected = set()
+            for _it in (self._last_items or []):
+                if not _it.get("safe", True):
+                    try:
+                        protected.add(int(_it.get("pid")))
+                    except Exception:
+                        pass
+            pids = tuple(p for p in pids if p not in protected)
+        except Exception:
+            from app.process_manager import close_process
+        if not pids:
+            return
+        if len(pids) > 1:
+            title, msg = ("Close all?",
+                          f"Close all {len(pids)} {display or 'process'} "
+                          "processes?\n\nUnsaved work in those windows "
+                          "will be lost.")
+            yes = "Close all"
+        else:
+            title, msg = ("Close process?",
+                          f"Close {display or 'this process'}?\n\nUnsaved "
+                          "work in that app will be lost.")
+            yes = "Close"
+        try:
+            ok = _themed_askyesno(
+                self._dlg, title, msg, accent=TAB_ACCENTS["Tools"],
+                yes_text=yes, no_text="Keep running")
         except Exception:
             ok = True
         if not ok:
             return
         try:
-            from app.process_manager import close_process
-            ok = close_process(int(pid), force=True)
+            done = sum(1 for p in pids if close_process(p, force=True))
         except Exception:
-            ok = False
-        if ok:
+            done = 0
+        if done:
             self._say(f"Closed {display}.")
-            self.after(300, self._force_refresh)
         else:
             self._say(f"Couldn't close {display}.")
-
-    def close(self):
         try:
-            if self._tick_after is not None:
-                self.after_cancel(self._tick_after)
-                self._tick_after = None
+            if self._dlg is not None and self._dlg.winfo_exists():
+                self._dlg.after(600, lambda: self._refresh_list())
         except Exception:
             pass
+
+    def close(self):
+        self._cancel_tick()
         try:
             super().close()
         except Exception:

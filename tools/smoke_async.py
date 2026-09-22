@@ -794,7 +794,7 @@ def main():
         _state["step"] = "close_process_manager"
         dlg = _state.get("hd")
         try:
-            assert dlg is not None and dlg.winfo_exists()
+            assert dlg is not None and dlg._dlg is not None and dlg._dlg.winfo_exists()
         except AssertionError as exc:
             fail(f"process manager dialog vanished: {exc!r}")
             return

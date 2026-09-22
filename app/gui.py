@@ -7181,7 +7181,12 @@ class InstallTab(tk.Frame):
         try:
             cache = self.__dict__.setdefault("_icon_cache", {})
             if app_name not in cache:
+                # Placeholder first so a slow/failed load can't be retried
+                # forever, then always overwrite with a real image below —
+                # either the app's own logo or a generic fallback swatch —
+                # so no row is ever left permanently without an icon.
                 cache[app_name] = None
+                img = None
                 try:
                     import math as _math
                     import re as _re
@@ -7196,9 +7201,17 @@ class InstallTab(tk.Frame):
                             f = max(1, int(_math.ceil(max(w, h) / float(size))))
                             if f > 1:
                                 img = img.subsample(f, f)
-                            cache[app_name] = img
+                        else:
+                            img = None
                 except Exception:
-                    cache[app_name] = None
+                    img = None
+                if img is None:
+                    try:
+                        from app.icon_extract import default_icon_ppm
+                        img = tk.PhotoImage(data=default_icon_ppm(size, (90, 96, 104)))
+                    except Exception:
+                        img = None
+                cache[app_name] = img
             img = cache.get(app_name)
             if img is not None:
                 lbl = tk.Label(row, image=img, bg=COLORS["bg_alt"],

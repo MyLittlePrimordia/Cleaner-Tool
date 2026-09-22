@@ -118,8 +118,12 @@ def check_for_updates(repo: str = "owner/repo", timeout: int = 10) -> dict:
         return result
     
     # Extract version from tag (e.g., "v2.0.0" -> "2.0.0")
-    tag_name = release_info.get('tag_name', '')
-    latest_version = tag_name.lstrip('v') if tag_name else ''
+    # BUG-002: strip a single leading "v" only (lstrip would eat "vv2")
+    tag_name = release_info.get('tag_name', '') or ''
+    if tag_name.startswith("v") and len(tag_name) > 1 and tag_name[1].isdigit():
+        latest_version = tag_name[1:]
+    else:
+        latest_version = tag_name
     result['latest_version'] = latest_version
     
     # Get download URL for the exe asset
@@ -148,14 +152,17 @@ def check_for_updates(repo: str = "owner/repo", timeout: int = 10) -> dict:
                     result['update_available'] = True
                     break
         elif latest_version == 'latest' and download_url:
-            # For rolling "latest" releases, compare SHA256 hashes
-            # Download the remote exe and compare with current exe
+            # For rolling "latest" releases, compare SHA256 hashes.
+            # REL-002: if the remote body is too large or the download
+            # fails, report no update rather than hanging the worker.
             try:
                 current_hash = get_current_exe_hash()
                 if current_hash:
                     remote_hash = get_remote_exe_hash(download_url, timeout)
                     if remote_hash and remote_hash != current_hash:
                         result['update_available'] = True
+                    elif not remote_hash:
+                        result['error'] = "rolling build — manual check (hash unavailable or file too large)"
             except Exception:
                 # If hash comparison fails, assume no update
                 pass
@@ -168,14 +175,13 @@ def check_for_updates(repo: str = "owner/repo", timeout: int = 10) -> dict:
 
 def get_remote_exe_hash(url: str, timeout: int = 30) -> str:
     """Download and calculate SHA256 hash of remote exe.
-    
-    Args:
-        url: URL to the exe file
-        timeout: Download timeout in seconds
-        
-    Returns:
-        SHA256 hash string or empty string on failure
+
+    REL-002: refuse to stream more than 150 MB (Content-Length or
+    cumulative) so a rolling-latest check cannot burn bandwidth or hang
+    the worker on a multi-hundred-MB binary. Prefer publishing a .sha256
+    asset long-term; until then this is a hard safety cap.
     """
+    _MAX_BYTES = 150 * 1024 * 1024
     try:
         sha256 = hashlib.sha256()
         req = urllib.request.Request(
@@ -183,8 +189,18 @@ def get_remote_exe_hash(url: str, timeout: int = 30) -> str:
             headers={"User-Agent": "CleanerTool/2.0"}
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            # Download in chunks to handle large files
+            cl = resp.headers.get("Content-Length")
+            if cl is not None:
+                try:
+                    if int(cl) > _MAX_BYTES:
+                        return ""
+                except (TypeError, ValueError):
+                    pass
+            total = 0
             for chunk in iter(lambda: resp.read(8192), b''):
+                total += len(chunk)
+                if total > _MAX_BYTES:
+                    return ""
                 sha256.update(chunk)
         return sha256.hexdigest()
     except Exception:

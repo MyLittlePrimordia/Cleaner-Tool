@@ -777,62 +777,35 @@ def main():
                 app._pilot_stop()
             except Exception:
                 pass
-        root.after(400, step_health_report)
+        root.after(400, step_process_manager)
 
-    # ---- step 7: health report streams live cards, cancel is safe ------ #
-    # Full scans (DISM + junk walk) take minutes — this phase proves the
-    # risky machinery instead: real worker start, live card-paint hops
-    # under mainloop, then close mid-scan (worker must stop, no crash,
-    # no wedge). Sensor LOGIC is covered by sync stub tests.
-    def step_health_report():
-        _state["step"] = "health_report"
+    # ---- step 7: Process Manager dialog builds + closes cleanly -------- #
+    # PC Health was removed; Process Manager is the replacement Tools card.
+    def step_process_manager():
+        _state["step"] = "process_manager"
         try:
-            _state["hd"] = gui.HealthReportDialog(root, app)
+            _state["hd"] = gui.ProcessManagerDialog(root, app)
         except Exception as exc:
-            fail(f"health dialog build raised: {exc!r}")
+            fail(f"process manager dialog build raised: {exc!r}")
             return
-        root.after(150, poll_health_cards)
+        root.after(300, close_process_manager)
 
-    def poll_health_cards():
-        _state["step"] = "poll_health_cards"
+    def close_process_manager():
+        _state["step"] = "close_process_manager"
         dlg = _state.get("hd")
         try:
-            assert dlg is not None and dlg._dlg.winfo_exists()
+            assert dlg is not None and dlg.winfo_exists()
         except AssertionError as exc:
-            fail(f"health dialog vanished: {exc!r}")
+            fail(f"process manager dialog vanished: {exc!r}")
             return
         try:
-            cards = getattr(dlg, "_cards", {}) or {}
-        except Exception:
-            cards = {}
-        # instant sensors (disk + reboot-folded windows note path) land
-        # in seconds; GPU/SMART PowerShell calls follow. Two painted
-        # cards prove the worker->paint pipeline end-to-end.
-        if len(cards) < 2:
-            root.after(500, poll_health_cards)
-            return
-        try:
-            for key, card in cards.items():
-                assert isinstance(card, dict), (key, card)
-                assert card.get("grade", "?") in "ABCDF?", (key, card)
-                assert card.get("headline"), (key, card)
-            print(f"  health report: {len(cards)} live cards streamed OK "
-                  f"({sorted(cards)})", flush=True)
-        except AssertionError as exc:
-            fail(f"health cards: {exc!r}")
-            return
-        except Exception as exc:
-            fail(f"health cards raised: {exc!r}")
-            return
-        # close MID-SCAN (slow sensors still running): must stop cleanly
-        try:
-            dlg._close()
+            dlg.close()
             root.update()
         except Exception as exc:
-            fail(f"health close raised: {exc!r}")
+            fail(f"process manager close raised: {exc!r}")
             return
-        print("  health report: mid-scan close safe OK", flush=True)
-        restore_and_exit(0)  # prints ALL PASS itself once restore is verified
+        print("  process manager: open + close OK", flush=True)
+        restore_and_exit(0)
 
     def _watchdog_tick():
         """Recurring check (not a one-shot timer): fails only when

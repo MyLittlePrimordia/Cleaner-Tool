@@ -1294,7 +1294,8 @@ def main():
     assert "Tweak Health" not in app.tabs["Tweak"].preset_cards
     # ...but the Game Session preset DATA stays (pilot + game-night engine)
     from app.tab_presets import PRESETS as _PR2
-    assert "Game Session" in _PR2["Tweak"] and len(_PR2["Tweak"]["Game Session"]) == 9
+    assert "Game Session" in _PR2["Tweak"] and len(_PR2["Tweak"]["Game Session"]) == 12, \
+        f"Game Session preset: {len(_PR2['Tweak']['Game Session'])} tasks (9 base + 3 FPS pass)"
     assert len(app.tabs["Clean"].preset_cards) == 3   # 2 presets + Custom
     assert len(app.tabs["Repair"].preset_cards) == 3  # 2 presets + Custom
     # summary density is uniform: small AND large presets all flow 3
@@ -2018,8 +2019,8 @@ def main():
     # neighbor labels sit >=40px apart at the label ring, ticks end 22px
     # outside the label ring (glow halo is 5.5) — pure geometry, no Tk
     import math as _math
-    _R = min(360 / 2.0 - 34.0, 225 - 58.0)
-    assert _R >= 140, _R
+    _R = min(340 / 2.0 - 34.0, 200 - 58.0)
+    assert _R >= 130, _R
     _lp = []
     for _t in gui.GaugeDial.TICKS:
         _f = gui.GaugeDial.fraction_for(float(_t))
@@ -2046,6 +2047,23 @@ def main():
         _settle(_sd)
         assert (_sd._modal_w, _sd._modal_h) == (800, 600), (_sd._modal_w, _sd._modal_h)
         assert set(_sd._row_values) == {"ping", "download", "upload", "stability"}
+        # Ookla-style idle stage (user call): NO auto-start — the popup
+        # waits on GO. Dial hidden, GO parked where the gauge will be,
+        # headline dashed, status hint centered.
+        assert _sd._stage_mode == "go", _sd._stage_mode
+        assert _sd._gauge.winfo_manager() == "", "dial hidden while idle"
+        assert _sd._go_btn.winfo_manager() == "pack", "GO on stage while idle"
+        assert _sd._phase_bar.winfo_manager() == "", "phase bar hidden while idle"
+        assert _sd._big_lbl.cget("text") == "—"
+        assert "GO" in _sd._status_lbl.cget("text"), _sd._status_lbl.cget("text")
+        assert _sd._status_lbl.cget("anchor") == "center"
+        # no description label anywhere on the popup (user call)
+        for _w in _sd.body.winfo_children():
+            try:
+                _t = _w.cget("text")
+            except Exception:
+                continue
+            assert "uses up to" not in _t and "Tests your connection" not in _t, _t
         # no-clipping guard (user bug: Upload row cut, Re-test unreachable):
         # content must leave 40px+ headroom in the fixed 538px body so
         # larger system fonts still fit without scrolling.
@@ -2053,9 +2071,41 @@ def main():
         assert _sd.body.winfo_reqheight() <= _sd.body.winfo_height() - 40, \
             (_sd.body.winfo_reqheight(), _sd.body.winfo_height())
         assert hasattr(_sd, "_retest_btn") and _sd._retest_btn.winfo_exists()
+        assert _sd._retest_btn is _sd._go_btn, "harness alias tracks the GO button"
+        # GO starts the run: dial + phase bar take the stage (the worker
+        # is orphaned instantly — real probe threads belong to manual).
+        _sd._start_test()
+        assert _sd._stage_mode == "gauge", _sd._stage_mode
+        assert _sd._gauge.winfo_manager() == "pack", "dial on stage while running"
+        assert _sd._go_btn.winfo_manager() == "", "GO hidden while running"
+        assert _sd._phase_bar.winfo_manager() == "pack"
+        assert "server" in _sd._status_lbl.cget("text").lower()
+        _sd._stop_token[0] = True
+        _sd._scan_gen += 1
+        try:
+            root.after_cancel(_sd._watchdog_after)
+        except Exception:
+            pass
+        _sd._watchdog_after = None
+        # phase switches: download parks needle + opens its span, upload
+        # RESETS the needle with a fresh headline (two-climb behavior).
+        _sd._set_phase("ping", _sd._scan_gen)
+        assert _sd._phase_bar._indeterminate is True, "early legs shimmer"
+        _sd._set_phase("download", _sd._scan_gen)
+        assert _sd._active_leg == "download"
+        assert _sd._phase_span == tuple(gui.SpeedTestDialog._SPAN_DOWN)
+        assert _sd._phase_bar._indeterminate is False
         _sd._paint_live("download", 42.5, 0.5, _sd._scan_gen)
         root.update()
         assert "42" in _sd._big_lbl.cget("text"), _sd._big_lbl.cget("text")
+        assert abs(_sd._phase_bar._fraction -
+                   (0.12 + 0.5 * (0.60 - 0.12))) < 1e-6, _sd._phase_bar._fraction
+        _sd._set_phase("upload", _sd._scan_gen)
+        assert _sd._active_leg == "upload"
+        assert _sd._big_lbl.cget("text") == "—", "fresh climb for upload"
+        _sd._paint_live("upload", 11.9, 0.5, _sd._scan_gen)
+        root.update()
+        assert "11.9" in _sd._big_lbl.cget("text"), _sd._big_lbl.cget("text")
         _sd._paint_result("ping", 18.0, _sd._scan_gen)
         _sd._paint_result("download", 94.5, _sd._scan_gen)
         _sd._paint_result("upload", 12.3, _sd._scan_gen)
@@ -2135,8 +2185,30 @@ def main():
         _sd._finish(False, _sd._scan_gen)
         root.update()
         assert _sd._finished
+        # run over: dial hides, GO returns to the stage (next click
+        # replays the animation); verdict stays on the headline.
+        assert _sd._stage_mode == "go", _sd._stage_mode
+        assert _sd._gauge.winfo_manager() == "", "dial hidden when done"
+        assert _sd._go_btn.winfo_manager() == "pack", "GO back when done"
+        assert _sd._phase_bar._indeterminate is False, "shimmer parked"
         _st = _sd._status_lbl.cget("text")
-        assert "94" in _st and "12" in _st and "18" in _st, _st.encode("ascii", "replace")
+        # server line is centered and names the server ONLY (user call):
+        # the stat cells carry the numbers, so no metrics repeat here.
+        assert "Server:" in _st and "complete" in _st, _st.encode("ascii", "replace")
+        assert "94" not in _st and "12.3" not in _st, _st.encode("ascii", "replace")
+        assert _sd._status_lbl.cget("anchor") == "center", "server line centered"
+        # numbers still land on the cards + headline, not the server line
+        assert "Mbps" in _sd._row_values["download"].cget("text")
+        assert "94" in _sd._big_lbl.cget("text")
+        # partial honesty: one missing leg names itself, still no numbers
+        _sd._finished = False
+        _sd._results = {"ping": 18.0, "download": None, "upload": 12.3}
+        _sd._finish(False, _sd._scan_gen)
+        root.update()
+        _stp = _sd._status_lbl.cget("text")
+        assert "Server:" in _stp and "download unavailable" in _stp, \
+            _stp.encode("ascii", "replace")
+        _sd._results = {"ping": 18.0, "download": 94.5, "upload": 12.3}
         _sd._paint_result("download", 1.0, _sd._scan_gen - 99)  # stale hop ignored
         assert _sd._results["download"] == 94.5
         # all-None honesty: no fake zeros, headline back to dash
@@ -2144,6 +2216,8 @@ def main():
         try:
             _sd2._stop_token[0] = True
             _settle(_sd2)
+            assert _sd2._stage_mode == "go", "fresh popup waits on GO"
+            assert "GO" in _sd2._status_lbl.cget("text")
             _sd2._paint_result("ping", None, _sd2._scan_gen)
             _sd2._paint_result("download", None, _sd2._scan_gen)
             _sd2._paint_result("upload", None, _sd2._scan_gen)
@@ -2151,6 +2225,7 @@ def main():
             root.update()
             assert "Couldn't reach" in _sd2._status_lbl.cget("text")
             assert _sd2._big_lbl.cget("text") == "\u2014"
+            assert _sd2._stage_mode == "go", "failed run also returns GO"
             assert _sd2._usage["browsing"]["dots"].cget("text") == "☆☆☆☆☆"
             assert "No result" in _sd2._usage["browsing"]["tips"][0].text
         finally:
@@ -2170,6 +2245,16 @@ def main():
                                       url="http://127.0.0.1:9/nope") is None
         assert _stm.upload_parallel(1024, streams=2, timeout=0.5,
                                     url="http://127.0.0.1:9/nope") is None
+        assert _stm.warmup(url="http://127.0.0.1:9/nope", num_bytes=100,
+                           timeout=0.2) is None
+        # Ookla-style sustained rounds: 3 upload sizes with scaled gates,
+        # chunk-reported upload progress, ?bytes detection by host
+        assert len(_stm.UPLOAD_ROUNDS) == 3 and _stm.UPLOAD_ROUNDS[0] >= 1_000_000
+        assert _stm.UP_MIN_MBPS < _stm.ROUND_MIN_MBPS
+        assert _stm.UP_FAST_MBPS < _stm.ROUND_FAST_MBPS
+        assert _stm._is_cloudflare_url(_stm.DOWNLOAD_URL)
+        assert not _stm._is_cloudflare_url(_stm.FALLBACK_DOWNLOAD_URL)
+        assert round(_stm.ESTIMATED_MAX_MB) >= 200
         _race = _stm.race_endpoints(timeout=0.2, attempts=1)
         assert isinstance(_race, tuple) and len(_race) == 3, _race
         assert _race[1] in (_stm.DOWNLOAD_URL, _stm.FALLBACK_DOWNLOAD_URL), _race
@@ -2180,6 +2265,113 @@ def main():
             pass
         root.update()
     print("  speed dialog: gauge + rows + honesty OK")
+
+    # --- Hardware Monitor (3x2 Task-Manager grid, user redesign) ----
+    import app.hw_monitor as _hw
+    # pure math + offline-safe constructors (never raise, never fake)
+    assert _hw.cpu_percent_from_deltas(100, 1000, 1000) == 95.0
+    assert _hw.cpu_percent_from_deltas(0, 0, 0) == 0.0
+    assert _hw._phys_index_from_path(
+        r"\GPU Engine(pid_1_luid_0x1_phys_2_eng_0_engtype_3D)") == 2
+    assert _hw._phys_index_from_path(r"\GPU Engine(pid_1_engtype_3D)") is None
+    assert _hw._is_loopback_iface("Loopback Pseudo-Interface") is True
+    assert _hw._is_loopback_iface("Intel Wi-Fi 6E") is False
+    _gpus = _hw.gpu_list()
+    assert isinstance(_gpus, list) and _gpus, "gpu_list must enumerate adapters"
+    _gs0 = _hw.gpu_static_info()
+    assert _gs0["name"] == _gpus[0]["name"], "static = largest-VRAM entry"
+    _nv = _hw.NvmlTemp()
+    try:
+        assert isinstance(_nv.available, bool) and isinstance(_nv.device_count, int)
+        if not _nv.available:
+            assert _nv.sample() is None and _nv.sample_at(0) is None
+    finally:
+        try:
+            _nv.close()
+        except Exception:
+            pass
+    _hd = gui.HardwareMonitorDialog(root, app)
+    try:
+        _settle(_hd)
+        assert (_hd._modal_w, _hd._modal_h) == (800, 600)
+        # six cards, Health-chrome (hairline outer + bg_alt inner),
+        # 2 columns x 3 rows (GPU above VRAM), everything centered
+        assert _hd._grid.grid_size() == (2, 3), _hd._grid.grid_size()
+        assert _hd._grid.grid_slaves(row=2, column=0), "disk row present"
+        assert _hd._grid.grid_slaves(row=2, column=1), "network row present"
+        for _key in ("_cpu", "_ram", "_gpu", "_vram", "_disk", "_net"):
+            _card = getattr(_hd, _key)
+            assert set(_card) >= {"outer", "inner", "title", "val", "bar",
+                                  "name", "sub", "pick"}, _key
+            assert _card["outer"].cget("bg").lower() == "#232b38", _key
+            assert _card["inner"].cget("bg").lower() == "#151b24", _key
+            for _lbl in ("title", "val", "name", "sub"):
+                assert _card[_lbl].cget("anchor") == "center", (_key, _lbl)
+        # no Close button: the popup X already closes it
+        _btn_texts = [getattr(_w, "_text", "")
+                      for _w in _hd.body.winfo_children()
+                      for _w in (_w,) + tuple(_w.winfo_children())]
+        assert "Close" not in _btn_texts, _btn_texts
+        # names live ON their cards (no separate spec row anywhere)
+        assert _hd._cpu["name"].cget("text"), "cpu name on cpu card"
+        _cpu_sub = _hd._cpu["sub"].cget("text")
+        assert "threads" in _cpu_sub or _cpu_sub in ("", "warming up"), \
+            "threads/warmup on cpu card: %r" % _cpu_sub
+        # no Nvidia-only placeholder text on non-Nvidia rigs: temp is
+        # inline-or-absent, never an explanatory line
+        _gpu_sub = _hd._gpu["sub"].cget("text")
+        assert "Nvidia" not in _gpu_sub and "not available" not in _gpu_sub, \
+            _gpu_sub.encode("ascii", "replace")
+        assert not hasattr(_hd, "_temp_lbl"), "separate temp row removed"
+        # GPU ▾ arrow menu iff more than one adapter (no combobox chrome)
+        assert not hasattr(_hd, "_gpu_combo"), "combobox replaced by arrow menu"
+        if len(_hd._gpu_list) > 1:
+            assert _hd._gpu["pick"] is not None
+            assert _hd._gpu["pick"].winfo_exists()
+            assert len(_hd._gpu_menu_labels()) == len(_hd._gpu_list)
+            assert _hd._gpu["pick"].cget("text") == "▾"
+        else:
+            assert _hd._gpu["pick"] is None
+        # network ▾ arrow always: Auto + every NIC (Ethernet and WiFi)
+        assert _hd._net["pick"] is not None and _hd._net["pick"].winfo_exists()
+        _net_labels = _hd._net_menu_labels()
+        assert _net_labels and _net_labels[0] == "Auto (busiest)", _net_labels
+        # six cards fit the fixed body with headroom (no clipping)
+        _hd.body.update_idletasks()
+        assert _hd.body.winfo_reqheight() <= _hd.body.winfo_height() - 20, \
+            (_hd.body.winfo_reqheight(), _hd.body.winfo_height())
+        # GPU arrow follows selection (static lines repaint, live follow)
+        if _hd._gpu["pick"] is not None:
+            _hd._set_gpu(len(_hd._gpu_list) - 1)
+            assert _hd._gpu_sel == len(_hd._gpu_list) - 1
+            _hd._set_gpu(0)
+            assert _hd._gpu_sel == 0
+            _hd._set_gpu(9999)
+            assert _hd._gpu_sel == len(_hd._gpu_list) - 1, "clamped"
+            _hd._set_gpu(0)
+        # network arrow pins / releases (sampler honors the pin)
+        _hd._set_net(None)
+        assert _hd._net_sel is None
+        _names = _hd._net_iface_names()
+        assert isinstance(_names, list)
+        if _names:
+            _hd._set_net(_names[0])
+            assert _hd._net_sel == _names[0]
+            assert _hd._net_sampler._pinned == _names[0]
+            _hd._set_net("no-such-nic")
+            assert _hd._net_sel is None, "unknown falls back to auto"
+        try:
+            _hd._tick()
+            root.update()
+        except Exception as _e:
+            raise AssertionError(f"hw tick raised: {_e}")
+    finally:
+        try:
+            _hd._close()
+        except Exception:
+            pass
+        root.update()
+    print("  hardware monitor: 2x3 centered cards + arrow pickers + honesty OK")
 
     # --- Game Session Auto-Pilot (user-approved feature 6, 2026-09) ----
     import app.session_pilot as _sp
@@ -2367,7 +2559,7 @@ def main():
         if not _save_config_verified({"session_pilot_preset": "Game Session"}):
             raise RuntimeError("could not force Game Session preset for the assertion")
         _ptasks = app._pilot_preset_tasks()
-        assert len(_ptasks) == 9, f"Game Session must resolve 9 tasks, got {len(_ptasks)}"
+        assert len(_ptasks) == 12, f"Game Session must resolve 12 tasks, got {len(_ptasks)}"
         assert all(t.revert is not None for t in _ptasks), "unrevertible session member!"
     finally:
         # verified restore (see helper) — must not raise out of finally
@@ -2794,150 +2986,9 @@ def main():
         ("s", "Skip", _skipper), ("e", "Err", _boomer)])
     assert _out3["s"]["grade"] == "?" and _out3["e"]["grade"] == "?"
     print("  health loop: order + cancel + skip/exception OK")
-    # dialog builds + paints + fixes route (scan worker stubbed out —
-    # its delivery is proven by the async harness instead)
-    _orig_rhs = _hs.run_health_scan
-    _hs.run_health_scan = lambda ctx, on_card=None, sensors=None: {}
-    try:
-        _hd = gui.HealthReportDialog(root, app)
-        try:
-            _hd._stop_token[0] = True
-            root.update()
-            assert len(_hd._card_widgets) == 6, "2x3 card grid missing"
-            # (user redesign 2026-09: the toolbar Check PC button is gone;
-            # the Tools tab hosts this feature — asserted in its section)
-            _demo = {
-                "smart": {"key": "smart", "title": "SSD & Drives", "grade": "A",
-                          "headline": "Drives healthy", "detail": "", "note": ""},
-                "gpu": {"key": "gpu", "title": "GPU Driver", "grade": "C",
-                        "headline": "Driver update suggested", "detail": "d", "note": ""},
-                "disk": {"key": "disk", "title": "Disk Space", "grade": "A",
-                         "headline": "plenty", "detail": "", "note": ""},
-                "windows": {"key": "windows", "title": "Windows Files", "grade": "A",
-                            "headline": "healthy", "detail": "", "note": ""},
-                "junk": {"key": "junk", "title": "Reclaimable Junk", "grade": "B",
-                         "headline": "~2 GB", "detail": "", "note": ""},
-            }
-            for _k, _c in _demo.items():
-                _hd._paint_card(_k, _c)
-            root.update()
-            assert _hd._card_widgets["gpu"]["letter"].cget("text") == "C"
-            assert _hd._card_widgets["smart"]["letter"].cget("fg") == \
-                gui.COLORS["accent_green"]
-            # GPU per-card action appears only when actionable...
-            assert _hd._card_widgets["gpu"]["action"].winfo_manager() != "", \
-                "GPU action missing"
-            assert _hd._card_widgets["smart"]["action"].winfo_manager() == "", \
-                "healthy card must hide its action"
-            # overall: B average (4+2+4+4+3)/5=3.4 -> B, 2 fixes, clean? no:
-            # gpu C beats junk B in fix priority -> install
-            _hd._cards = dict(_demo)
-            _hd._paint_overall()
-            root.update()
-            assert _hd._card_widgets["overall"]["letter"].cget("text") == "B"
-            assert "2 things to fix" in \
-                _hd._card_widgets["overall"]["headline"].cget("text")
-            assert _hd._card_widgets["overall"]["action"].winfo_manager() != ""
-            # all-good overall hides its button
-            _hd._cards = {k: dict(v, grade="A") for k, v in _demo.items()}
-            _hd._paint_overall()
-            root.update()
-            assert _hd._card_widgets["overall"]["action"].winfo_manager() == ""
-            # ...and fires the Install navigation LAST (it closes the dialog)
-            _switched = []
-            _o_switch = app._switch_to
-            app._switch_to = lambda name: _switched.append(name)
-            try:
-                _hd._fire_card_action("gpu")
-                assert _switched == ["Install"], _switched
-            finally:
-                app._switch_to = _o_switch
-            assert not _hd._dlg.winfo_exists(), "action must close report first"
-        finally:
-            try:
-                _hd._close()
-            except Exception:
-                pass
-            root.update()
-        # fix routing per action (fresh dialog each — _do_fix closes it)
-        def _fresh_report():
-            _d = gui.HealthReportDialog(root, app)
-            _d._stop_token[0] = True
-            root.update()
-            return _d
-        # repair: pre-checks the two keys on the Repair custom grid
-        _rd = _fresh_report()
-        try:
-            _rd._cards = {"windows": {"key": "windows", "grade": "C"}}
-            _rd._do_fix("repair", ["dism_restorehealth", "sfc_scan", "bogus_key"])
-            root.update()
-            assert app.active_tab == "Repair", app.active_tab
-            _rp = app.tabs["Repair"]
-            assert _rp.vars["dism_restorehealth"].get() is True
-            assert _rp.vars["sfc_scan"].get() is True
-            assert not _rd._dlg.winfo_exists(), "report must close first"
-        finally:
-            try:
-                _rd._close()
-            except Exception:
-                pass
-            root.update()
-        # clean: selects the preset on the Clean tab
-        _cd = _fresh_report()
-        try:
-            _cd._cards = {"junk": {"key": "junk", "grade": "D"}}
-            _cd._do_fix("clean", "Quick Clean")
-            root.update()
-            assert app.active_tab == "Clean"
-            assert app.tabs["Clean"]._selected_preset == "Quick Clean"
-        finally:
-            try:
-                _cd._close()
-            except Exception:
-                pass
-            root.update()
-        # storage: delegates without running a scan here
-        _sd = _fresh_report()
-        try:
-            _sd._cards = {"disk": {"key": "disk", "grade": "F"}}
-            _opened = []
-            _o_open = app._open_storage_insight
-            app._open_storage_insight = lambda: _opened.append(True)
-            try:
-                _sd._do_fix("storage", None)
-                root.update()
-            finally:
-                app._open_storage_insight = _o_open
-            assert _opened == [True], "storage fix must open insight"
-            assert not _sd._dlg.winfo_exists()
-        finally:
-            try:
-                _sd._close()
-            except Exception:
-                pass
-            root.update()
-        # install + none
-        _id = _fresh_report()
-        try:
-            _id._cards = {"gpu": {"key": "gpu", "grade": "C"}}
-            _sw2 = []
-            _o_sw2 = app._switch_to
-            app._switch_to = lambda name: _sw2.append(name)
-            try:
-                _id._do_fix("install", None)
-                root.update()
-            finally:
-                app._switch_to = _o_sw2
-            assert _sw2 == ["Install"], _sw2
-        finally:
-            try:
-                _id._close()
-            except Exception:
-                pass
-            root.update()
-    finally:
-        _hs.run_health_scan = _orig_rhs
-    print("  health dialog: cards + overall + fix routing OK")
+    # HealthReportDialog removed — Process Manager replaced PC Health.
+    # Pure health_scan grading unit tests above are kept (module still ships).
+    print("  health dialog: skipped (feature removed, Process Manager replaces it)")
 
     # --- Tools tab (9 cards 3x3, Tweak geometry; Quick Tools popup) ---
     # The 9 feature cards open the X-button popups (800x600 modals).
@@ -2957,13 +3008,15 @@ def main():
     assert len(_declared) == len(set(_declared)), "duplicate Tools card key"
     # Audit fix: Game Night card removed (merged into Auto-Pilot's "manual
     # session" section — see the PilotDialog assertions above), and Quick
-    # Tools + Startup Manager relocated from the grid to the bottom corner
-    # row alongside Auto Maintenance / Export Logs. None of the three are
-    # cards anymore.
+    # Tools relocated from the grid to the corner toolbox icon. Startup
+    # Manager is a full card again by design (own dialog + route), so
+    # only Game Night / Quick Tools must stay out of the grid.
     assert "gamenight" not in tools_page._card_frames, \
         "Game Night card should be gone (merged into Auto-Pilot)"
-    assert "quick" not in tools_page._card_frames and "startup" not in tools_page._card_frames, \
-        "Quick Tools / Startup Manager should be relocated out of the card grid"
+    assert "quick" not in tools_page._card_frames, \
+        "Quick Tools should stay out of the card grid (corner toolbox icon)"
+    assert "startup" in tools_page._card_frames, \
+        "Startup Manager is a first-class card (own dialog + route)"
     # 3-wide grid, same pads/uniform as the Tweak preset cards. A single
     # left-over card sits in the middle column so the last row is centred.
     _pos = {k: (v[0].grid_info()["row"], v[0].grid_info()["column"])
@@ -2980,14 +3033,14 @@ def main():
     root.update()
     _opened = []
     _o_storage, _o_dns = app._open_storage_insight, app._open_dns_tester
-    _o_health, _o_pilot = app._open_health_report, app._open_pilot_dialog
+    _o_procman, _o_pilot = app._open_process_manager, app._open_pilot_dialog
     _o_speed = app._open_speed_test
     _o_gamepad, _o_mic = app._open_gamepad_tester, app._open_mic_check
     _o_gameping = app._open_game_server_ping
     _o_quick, _o_startup = app._open_quick_tools, app._open_startup_manager
     app._open_storage_insight = lambda: _opened.append("storage")
     app._open_dns_tester = lambda: _opened.append("dns")
-    app._open_health_report = lambda: _opened.append("health")
+    app._open_process_manager = lambda: _opened.append("procman")
     app._open_pilot_dialog = lambda: _opened.append("pilot")
     app._open_speed_test = lambda: _opened.append("speed")
     app._open_gamepad_tester = lambda: _opened.append("gamepad")
@@ -2996,34 +3049,32 @@ def main():
     app._open_quick_tools = lambda: _opened.append("quick")
     app._open_startup_manager = lambda: _opened.append("startup")
     try:
-        for key in ("storage", "health", "dns", "pilot", "speed",
+        for key in ("storage", "procman", "dns", "pilot", "speed",
                     "gamepad", "miccheck", "gameping"):
             tools_page._mount(key)
             root.update()
             assert _opened and _opened[-1] == key, \
                 f"Tools card {key} routed to {_opened}"
-        # Audit fix: Quick Tools / Startup Manager are now the two bottom
-        # corner icons (added between Auto Maintenance and Export Logs),
-        # not grid cards — exercise their actual click bindings directly.
-        # Headless-safe: event_generate("<Button-1>") is NOT delivered to
-        # unmapped widgets (withdrawn root => corner labels report
-        # winfo_ismapped()==0, proven by repro), so a synth click silently
-        # no-ops here while canvas-hosted Install arrows (mapped via
-        # create_window) do fire. Assert the click binding EXISTS, then
-        # invoke the exact callable the binding would call (_corner_cmd).
+        # Audit fix: Quick Tools is the bottom corner icon (between Auto
+        # Maintenance and Export Logs), not a grid card — exercise its
+        # actual click binding directly. Startup Manager is a grid card
+        # again (covered by the _mount loop above), so it has no corner
+        # icon. Headless-safe: event_generate("<Button-1>") is NOT
+        # delivered to unmapped widgets (withdrawn root => corner labels
+        # report winfo_ismapped()==0, proven by repro), so a synth click
+        # silently no-ops here while canvas-hosted Install arrows (mapped
+        # via create_window) do fire. Assert the click binding EXISTS,
+        # then invoke the exact callable the binding would call.
         assert app._corner_quick.bind("<Button-1>"), "Quick Tools corner missing click binding"
-        assert app._corner_startup.bind("<Button-1>"), "Startup corner missing click binding"
+        assert not hasattr(app, "_corner_startup"), \
+            "Startup must not have a corner icon (it is a grid card)"
         app._corner_quick._corner_cmd()
         root.update()
         assert _opened and _opened[-1] == "quick", \
             f"Quick Tools corner icon routed to {_opened}"
-        app._corner_startup._corner_cmd()
-        root.update()
-        assert _opened and _opened[-1] == "startup", \
-            f"Startup Manager corner icon routed to {_opened}"
     finally:
         app._open_storage_insight, app._open_dns_tester = _o_storage, _o_dns
-        app._open_health_report, app._open_pilot_dialog = _o_health, _o_pilot
+        app._open_process_manager, app._open_pilot_dialog = _o_procman, _o_pilot
         app._open_speed_test, app._open_quick_tools = _o_speed, _o_quick
         app._open_gamepad_tester, app._open_mic_check = _o_gamepad, _o_mic
         app._open_game_server_ping = _o_gameping

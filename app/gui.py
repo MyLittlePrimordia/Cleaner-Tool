@@ -3143,486 +3143,8 @@ class PilotDialog(ThemedModal):
             pass
 
 
-class HealthReportDialog(ThemedModal):
-    """PC Health Report Card (user-approved feature 7, 2026-09): one
-    click grades the PC's vitals — SSD, GPU driver, disk space, Windows
-    files, reclaimable junk — with plain-language findings and one-click
-    fixes. Six uniform cards (2x3, like the preset cards): five sensors
-    plus the overall score. Sensors stream in live as each finishes;
-    anything unmeasurable grades '?' (unknown), never a fake F."""
-
-    _GRADE_COLORS = {
-        "A": COLORS["accent_green"],
-        "B": COLORS["accent_sky"],
-        "C": COLORS["accent_yellow"],
-        "D": COLORS["accent_yellow"],
-        "F": COLORS["accent_red"],
-        "?": COLORS["subtext"],
-    }
-    # sensor key -> (card title, grid position)
-    _CARDS = (
-        ("smart", "SSD & Drives"),
-        ("gpu", "GPU Driver"),
-        ("disk", "Disk Space"),
-        ("windows", "Windows Files"),
-        ("junk", "Reclaimable Junk"),
-        ("overall", "Overall"),
-    )
-
-    def __init__(self, parent, app):
-        self.app = app
-        self._stop_token = [False]
-        self._cards = {}            # key -> card dict (landed)
-        self._card_widgets = {}     # key -> {"letter","headline","detail","action"}
-        self._card_actions = {}     # key -> callable (wired at paint time)
-        self._scan_done = False
-
-        super().__init__(parent, title="PC Health Report",
-                         accent=COLORS["accent_green"])
-        dlg = self._dlg
-        body = self.body
-
-        tk.Label(body, text="Simple grades for a complicated machine — green is good.",
-                 font=(F, 9), bg=COLORS["bg"],
-                 fg=COLORS["subtext"], wraplength=680,
-                 justify="left").pack(anchor="w")
-
-        # 2x3 uniform grid (same trick as the preset cards: uniform
-        # columns + rows stay symmetric at any content height).
-        # FROZEN LAYOUT (user bug report: live sensor paints resized the
-        # rows — action buttons popping in, Stop vanishing, headlines
-        # growing — shoving the footer out of the fixed 600px dialog and
-        # making the whole card wall visibly churn mid-scan). Rows carry
-        # a minsize floor so pending->painted transitions never shrink or
-        # grow them for typical content, and every card reserves its
-        # action slot (see _build_card) so buttons appearing/vanishing
-        # move nothing.
-        grid = tk.Frame(body, bg=COLORS["bg"])
-        grid.pack(fill="x", pady=(10, 0))
-        for c in (0, 1):
-            grid.grid_columnconfigure(c, weight=1, uniform="healthcards")
-        for r in (0, 1, 2):
-            grid.grid_rowconfigure(r, weight=1, uniform="healthrows",
-                                   minsize=144)
-        for i, (key, title) in enumerate(self._CARDS):
-            rr, cc = divmod(i, 2)
-            self._build_card(grid, rr, cc, key, title)
-
-        # footer: status left, actions right
-        foot = tk.Frame(body, bg=COLORS["bg"])
-        foot.pack(fill="x", pady=(10, 6))
-        self._status_lbl = tk.Label(foot, text="Starting check…", font=(F, 9),
-                                    bg=COLORS["bg"], fg=COLORS["subtext"],
-                                    anchor="w")
-        self._status_lbl.pack(side="left")
-        self._close_btn = AnimatedButton(
-            foot, text="Close", command=self.close,
-            bg=COLORS["accent_green"], fg=COLORS["black"],
-            font=(F, 9, "bold"), padx=18, pady=7)
-        self._close_btn.pack(side="right")
-        self._rescan_btn = AnimatedButton(
-            foot, text="Rescan", command=self._start_scan,
-            bg=COLORS["surface"], fg=COLORS["text"],
-            font=(F, 9, "bold"), padx=18, pady=7)
-        self._rescan_btn.pack(side="right", padx=(0, 8))
-        self._stop_btn = AnimatedButton(
-            foot, text="Stop", command=self._stop_scan,
-            bg=COLORS["surface"], fg=COLORS["accent_red"],
-            font=(F, 9, "bold"), padx=18, pady=7)
-        self._stop_btn.pack(side="right", padx=(0, 8))
-
-        # closing cancels the sensor sweep (base close hook)
-        self.on_close(self._cancel_scan)
-        self._start_scan()
-
-    def _cancel_scan(self):
-        try:
-            self._stop_token[0] = True
-        except Exception:
-            pass
-
-    # ---- cards ----------------------------------------------------------- #
-
-    def _build_card(self, grid, rr, cc, key, title):
-        # Fixed-height card (see grid minsize above): the inner frame
-        # never propagates its size, and the action slot below is ALWAYS
-        # packed (empty until actionable) — painting grades, headlines,
-        # details, or showing/hiding the action button cannot move a
-        # single pixel of the surrounding layout.
-        outer = tk.Frame(grid, bg=COLORS["hairline"], bd=0)
-        outer.grid(row=rr, column=cc, sticky="nsew", padx=5, pady=4)
-        # rigid inner (the freeze guarantee): fixed 134px, propagate off,
-        # AND no vertical expand — fill+expand would let a grown grid row
-        # stretch the card (defeating the fixed height the probe caught).
-        # Budget inside 134: title 28 + mid 40 + detail ≤32 (2 lines) +
-        # slot 30 = 130. Realistic content (≤2-line details) fits with
-        # zero movement; pathological 3+-line sensor verbosity clips its
-        # tail inside the card while buttons/footer never move.
-        inner = tk.Frame(outer, bg=COLORS["bg_alt"], height=134)
-        inner.pack(fill="x", padx=1, pady=1)
-        inner.pack_propagate(False)
-        tk.Label(inner, text=title, font=(F, 9, "bold"),
-                 bg=COLORS["bg_alt"], fg=COLORS["text"],
-                 anchor="w").pack(fill="x", padx=10, pady=(8, 0))
-        mid = tk.Frame(inner, bg=COLORS["bg_alt"])
-        mid.pack(fill="x", padx=10, pady=(2, 0))
-        # fixed 2-char width: grade glyphs (…/A/?/C/F) differ in width at
-        # 24pt — without this the headline jumps horizontally on every
-        # paint (caught by the layout-freeze probe)
-        letter = tk.Label(mid, text="…", font=(F, 24, "bold"), width=2,
-                          bg=COLORS["bg_alt"], fg=COLORS["subtext"])
-        letter.pack(side="left", anchor="n")
-        headline = tk.Label(mid, text="Checking…", font=(F, 9),
-                            bg=COLORS["bg_alt"], fg=COLORS["subtext"],
-                            anchor="w", justify="left", wraplength=190)
-        headline.pack(side="left", anchor="center", padx=(8, 0))
-        detail = tk.Label(inner, text="", font=(F, 8),
-                          bg=COLORS["bg_alt"], fg=COLORS["subtext"],
-                          anchor="w", justify="left", wraplength=250)
-        detail.pack(fill="x", padx=10)
-        # reserved action slot — ONLY on cards that can ever show one
-        # (gpu + overall). A slot on every card would steal 34px from
-        # cards whose details legitimately run 2-3 lines; conditional
-        # reservation keeps every realistic content combo inside the
-        # fixed 134px. Constant 30px when present: appearing/vanishing
-        # actions move nothing. Anchored to the card BOTTOM so a
-        # pathological detail can only clip its own (tooltip-backed)
-        # tail, never the button (the actionable UI the user must
-        # always reach). The button is parented TO the slot so it fills
-        # exactly the reserved space; other cards get an unpacked,
-        # invisible button (zero geometry impact, uniform handles).
-        slot = None
-        if key in ("gpu", "overall"):
-            slot = tk.Frame(inner, bg=COLORS["bg_alt"], height=30)
-            slot.pack(side="bottom", fill="x", padx=10, pady=(2, 2))
-            slot.pack_propagate(False)
-        action = AnimatedButton(slot if slot is not None else inner,
-                                text="",
-                                command=lambda k=key: self._fire_card_action(k),
-                                bg=COLORS["surface"], fg=COLORS["text"],
-                                font=(F, 8, "bold"), padx=10, pady=4)
-        # packed on demand (GPU/overall cards only, when actionable)
-        self._card_widgets[key] = {"outer": outer, "letter": letter,
-                                   "headline": headline, "detail": detail,
-                                   "action": action, "slot": slot}
-
-    def _grade_color(self, grade):
-        return self._GRADE_COLORS.get(grade, COLORS["subtext"])
-
-    def _paint_card(self, key, card):
-        handles = (self._card_widgets or {}).get(key)
-        if handles is None:
-            return
-        try:
-            grade = card.get("grade", "?")
-            if handles["letter"].winfo_exists():
-                handles["letter"].config(text=grade,
-                                         fg=self._grade_color(grade))
-            if handles["headline"].winfo_exists():
-                handles["headline"].config(text=card.get("headline", ""),
-                                           fg=COLORS["text"])
-            if handles["detail"].winfo_exists():
-                # display cap (layout-freeze guarantee): the fixed 134px
-                # card fits title + mid + N detail lines + (on gpu) the
-                # 30px action slot. Unbounded sensor verbosity (100+
-                # char failure messages = 3-4 lines) would overflow the
-                # card and bury the action button — so displayed detail
-                # is capped (gpu shares its card with a button: 1 line;
-                # button-less cards: 2 lines) with "…" + the FULL text
-                # one hover away in a tooltip. Sensors and logs keep the
-                # complete message; only the card face is bounded. This
-                # makes the worst case deterministic: nothing painted
-                # here can ever move the layout or leave the dialog.
-                try:
-                    full = card.get("detail", "") or ""
-                    cap = 41 if key == "gpu" else 82
-                    if len(full) > cap:
-                        handles["detail"].config(text=full[:cap - 1] + "…")
-                        try:
-                            Tooltip(handles["detail"], full)
-                        except Exception:
-                            pass
-                    else:
-                        handles["detail"].config(text=full)
-                except Exception:
-                    handles["detail"].config(text=card.get("detail", ""))
-            # per-card action: GPU card only, when the driver needs love.
-            # The button lives in the reserved slot (constant height) —
-            # showing/hiding it never resizes the card.
-            try:
-                btn = handles["action"]
-                show = (key == "gpu" and grade in ("B", "C", "D", "F"))
-                if show and btn.winfo_exists():
-                    btn.config_text("Update driver →")
-                    # Check if we have a manufacturer download URL
-                    download_url = card.get("note", "")
-                    if download_url:
-                        # Direct download URL available
-                        self._card_actions[key] = lambda u=download_url: self._open_gpu_download_url(u)
-                    else:
-                        # Fall back to Install tab
-                        self._card_actions[key] = self._goto_install
-                    btn.pack(fill="both", expand=True)
-                elif btn.winfo_exists() and btn.winfo_manager() != "":
-                    btn.pack_forget()
-                    try:
-                        self._card_actions.pop(key, None)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-        except Exception:
-            pass
-
-    def _fire_card_action(self, key):
-        """Run a card's wired action (no-op when none)."""
-        try:
-            fn = (self._card_actions or {}).get(key)
-        except Exception:
-            fn = None
-        if fn is None:
-            return
-        try:
-            fn()
-        except Exception:
-            pass
-
-    def _paint_overall(self):
-        try:
-            from app.health_scan import (count_fixes, fix_plan,
-                                         overall_grade)
-            grades = {k: (c.get("grade", "?") if isinstance(c, dict) else "?")
-                      for k, c in (self._cards or {}).items()}
-            overall = overall_grade(grades)
-            n = count_fixes(self._cards)
-            action, _payload = fix_plan(self._cards)
-            handles = (self._card_widgets or {}).get("overall")
-            if handles is None:
-                return
-            if handles["letter"].winfo_exists():
-                handles["letter"].config(text=overall,
-                                         fg=self._grade_color(overall))
-            if handles["headline"].winfo_exists():
-                handles["headline"].config(
-                    text=("All good ✓" if n == 0 else
-                          f"{n} thing{'s' if n != 1 else ''} to fix"),
-                    fg=COLORS["text"])
-            if handles["detail"].winfo_exists():
-                handles["detail"].config(text="")
-            try:
-                btn = handles["action"]
-                if btn.winfo_exists():
-                    if action == "none":
-                        btn.pack_forget()
-                        try:
-                            self._card_actions.pop("overall", None)
-                        except Exception:
-                            pass
-                    else:
-                        btn.config_text("Fix what's found")
-                        btn.pack(fill="both", expand=True)
-                        try:
-                            self._card_actions["overall"] = (
-                                lambda: self._do_fix(action, _payload))
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-        except Exception:
-            pass
-
-    # ---- scan worker ------------------------------------------------------ #
-
-    def _ui(self, fn, *args):
-        """Marshal a paint hop to the Tk thread (worker-safe).
-
-        F10: never touch Tk from the worker (even winfo_exists burns
-        ~1s off-thread) — schedule unconditionally; a destroyed dialog
-        raises inside after() and is swallowed below."""
-        try:
-            self._dlg.after(0, lambda: fn(*args))
-        except Exception:
-            pass
-
-    def _set_scan_status(self, text):
-        try:
-            if self._status_lbl.winfo_exists():
-                self._status_lbl.config(text=text)
-        except Exception:
-            pass
-
-    def _start_scan(self):
-        try:
-            self._stop_token[0] = True
-        except Exception:
-            pass
-        token = self._stop_token = [False]
-        self._scan_done = False
-        self._cards = {}
-        try:
-            self._card_actions = {}
-        except Exception:
-            pass
-        # reset cards to pending (and unpublish any previous round's
-        # action buttons — a rescan must not offer a stale fix)
-        for key, title in self._CARDS:
-            if key == "overall":
-                continue
-            self._paint_card(key, {"grade": "?", "headline": "Checking…",
-                                   "detail": "", "note": ""})
-        try:
-            self._stop_btn.pack(side="right", padx=(0, 8))
-        except Exception:
-            pass
-        self._paint_overall_pending()
-        self._set_scan_status("Starting check…")
-        try:
-            import threading as _th
-            _th.Thread(target=self._scan_worker, args=(token,),
-                       daemon=True).start()
-        except Exception:
-            pass
-
-    def _paint_overall_pending(self):
-        try:
-            handles = (self._card_widgets or {}).get("overall")
-            if handles is None:
-                return
-            if handles["letter"].winfo_exists():
-                handles["letter"].config(text="…", fg=COLORS["subtext"])
-            if handles["headline"].winfo_exists():
-                handles["headline"].config(text="Scanning…",
-                                           fg=COLORS["subtext"])
-        except Exception:
-            pass
-
-    def _scan_worker(self, token):
-        def dead():
-            # F10: token-only — close handlers already set token on the Tk
-            # thread; winfo_exists here burned ~1s off-thread per call.
-            try:
-                return bool(token[0])
-            except Exception:
-                return True
-
-        try:
-            from app.health_scan import _collecting_ctx, run_health_scan
-        except Exception:
-            self._ui(self._set_scan_status, "Health check unavailable.")
-            self._ui(self._scan_finished, True)
-            return
-        ctx = _collecting_ctx(
-            [],
-            set_status=lambda m: self._ui(self._set_scan_status, m),
-            cancelled=dead)
-        try:
-            cards = run_health_scan(
-                ctx,
-                on_card=lambda k, c: self._ui(self._paint_card_and_store, k, c))
-        except Exception:
-            cards = {}
-        if dead():
-            return
-        self._ui(self._scan_finished, bool(token[0]))
-
-    def _paint_card_and_store(self, key, card):
-        try:
-            self._cards[key] = card
-        except Exception:
-            pass
-        self._paint_card(key, card)
-
-    def _scan_finished(self, cancelled):
-        self._scan_done = True
-        try:
-            self._stop_btn.pack_forget()
-        except Exception:
-            pass
-        self._paint_overall()
-        try:
-            if cancelled:
-                self._set_scan_status("Stopped — partial results shown.")
-            else:
-                self._set_scan_status("Check complete — pick a fix or close.")
-        except Exception:
-            pass
-
-    def _stop_scan(self):
-        try:
-            self._stop_token[0] = True
-        except Exception:
-            pass
-
-    # ---- fix actions -------------------------------------------------------- #
-
-    def _goto_install(self):
-        self.close()
-        try:
-            self.app._switch_to("Install")
-        except Exception:
-            pass
-    
-    def _open_gpu_download_url(self, url: str):
-        """Open the GPU manufacturer's download page in browser."""
-        import webbrowser
-        try:
-            webbrowser.open(url)
-        except Exception:
-            pass
-
-    def _do_fix(self, action, payload):
-        """Execute the overall Fix plan, then close. Navigation targets
-        are tolerant (unknown keys/presets are skipped, never crash)."""
-        try:
-            if action == "storage":
-                self.close()
-                try:
-                    self.app._open_storage_insight()
-                except Exception:
-                    pass
-                return
-            if action == "repair":
-                self.close()
-                try:
-                    page = self.app.tabs.get("Repair")
-                    if page is not None:
-                        page._enter_custom()
-                        for k in payload or []:
-                            try:
-                                v = page.vars.get(k)
-                                if v is not None:
-                                    v.set(True)
-                            except Exception:
-                                pass
-                        self.app._switch_to("Repair")
-                except Exception:
-                    pass
-                return
-            if action == "clean":
-                self.close()
-                try:
-                    page = self.app.tabs.get("Clean")
-                    if page is not None:
-                        try:
-                            page._select_preset(payload or "Quick Clean")
-                        except Exception:
-                            pass
-                        self.app._switch_to("Clean")
-                except Exception:
-                    pass
-                return
-            if action == "install":
-                self.close()
-                try:
-                    self.app._switch_to("Install")
-                except Exception:
-                    pass
-                return
-        except Exception:
-            pass
-
-    # ---- actions ------------------------------------------------------------ #
-
+# HealthReportDialog and the PC Health feature were removed.
+# Replaced by Process Manager (see ProcessManagerDialog + app/process_manager.py).
 
 def _enable_dark_titlebar(window):
     """Ask Windows to draw this window's title bar dark (DWM immersive mode).
@@ -5064,7 +4586,7 @@ class TaskTab(tk.Frame):
         self._rr_check = None
         self._rr_undo = None
         self._rr_session = None
-        self.body_area.pack(side="top", fill="both", expand=True, padx=26, pady=4)
+        self.body_area.pack(side="top", fill="both", expand=True, padx=26, pady=(4, 4))
 
         self._build_preset_cards()
         self._build_body()
@@ -5392,19 +4914,8 @@ class TaskTab(tk.Frame):
                      font=(F, 11), bg=COLORS["bg"], fg=COLORS["subtext"]).pack(expand=True)
             return
         keys = self.presets[self._selected_preset]
-        # UI fix: the title ("Minimal — 13 tasks") and blurb ("Safe speed
-        # basics, no risk.") used to stack on two rows, eating vertical
-        # space the scroll box below badly needed. One row, same info.
-        head = tk.Frame(wrap, bg=COLORS["bg"])
-        head.pack(fill="x", pady=(2, 6))
-        accent = TAB_ACCENTS[self.tab_name]
-        tk.Label(head, text=f"{self._selected_preset} — {len(keys)} tasks",
-                 font=(F, 12, "bold"), bg=COLORS["bg"], fg=accent).pack(side="left")
-        blurb = self.PRESET_BLURBS.get(self._selected_preset, "")
-        if blurb:
-            tk.Label(head, text="  ·  " + blurb, font=(F, 9),
-                     bg=COLORS["bg"], fg=COLORS["subtext"]).pack(side="left")
-
+        # User request: drop the "Preset — N tasks · blurb" header row so
+        # the scroll panel gains vertical space (card above already names it).
         panel = ScrollableRoundedPanel(wrap)
         panel.pack(fill="both", expand=True)
 
@@ -5513,40 +5024,8 @@ class TaskTab(tk.Frame):
                      font=(F, 10, "bold"), bg="#3A2226", fg=COLORS["accent_red"]).pack(anchor="w", padx=10, pady=8)
             banner.pack(fill="x", pady=(0, 6))
 
-        topbar = tk.Frame(wrap, bg=COLORS["bg"])
-        topbar.pack(fill="x", pady=(0, 6))
-        AnimatedButton(topbar, "All On", command=lambda: self._set_all(True),
-                       bg=COLORS["surface"], fg=COLORS["text"], font=(F, 9), padx=16, pady=6).pack(side="left", padx=3)
-        AnimatedButton(topbar, "All Off", command=lambda: self._set_all(False),
-                       bg=COLORS["surface"], fg=COLORS["text"], font=(F, 9), padx=16, pady=6).pack(side="left", padx=3)
-        if mode == "run":
-            hint = "Turn on what you want to run — click a row anywhere"
-        else:
-            hint = "Turn on what you want to undo"
-        tk.Label(topbar, text=hint, font=(F, 9), bg=COLORS["bg"],
-                 fg=COLORS["subtext"]).pack(side="left", padx=10)
-        # search filter (user request: find one option among dozens fast) —
-        # rounded corners, centered in the leftover space (user request)
-        #
-        # F8 (user bug: the filter 'did nothing'): the trace used to call
-        # _apply_toggle_filter which read self._cell_blocks LIVE — shared
-        # mutable state pointing at whatever grid was built last. This box's
-        # grid is `blocks` (built below in THIS method), so the trace now
-        # passes THIS grid's blocks explicitly; the filter can never again
-        # operate on a stale/hidden grid while the visible one ignores it.
-        _ph = f"Filter {len(self.tasks)} options…"
-        _sv = tk.StringVar(value=_ph)
-        _mid = tk.Frame(topbar, bg=COLORS["bg"])
-        _mid.pack(side="left", expand=True, fill="x")
-        _re = RoundedEntry(_mid, textvariable=_sv, width=20, accent=accent)
-        _re.pack(anchor="center")
-        _se = _re.entry
-        _se.bind("<FocusIn>", lambda e: _sv.set("") if _sv.get() == _ph else None)
-        # audit fix (UI polish): InstallTab's search restores its placeholder
-        # on blur; this one never did — after clicking away, the box stayed
-        # permanently empty with no hint of what it was for.
-        _se.bind("<FocusOut>", lambda e: _sv.set(_ph) if not _sv.get().strip() else None)
-
+        # User request: remove All On / All Off / hint / Filter row so the
+        # scroll panel gains vertical space on Clean/Repair/Tweak Custom.
         state = self.app.tweak_state if mode == "undo" else {}
 
         panel = ScrollableRoundedPanel(wrap)
@@ -5663,13 +5142,6 @@ class TaskTab(tk.Frame):
         _fit_toggle_labels()
         panel.resize_decide_cb = None
         panel.refresh_scroll()
-
-        # F8: wire the search trace LAST, once `blocks` fully describes
-        # THIS grid — the closure captures this grid's own rows, so the
-        # filter always operates on exactly the grid the user sees,
-        # never a stale shared _cell_blocks (the original dead-filter bug).
-        _sv.trace_add("write", lambda *_: self._apply_toggle_filter(
-            _sv.get().strip(), _ph, mode, blocks=blocks, panel=panel))
 
     def _build_toggle_row(self, parent, t, mode, state, accent, col_w=380):
         """One compact settings-row cell (2-column grid, Install-tab density):
@@ -5866,12 +5338,13 @@ class TaskTab(tk.Frame):
                 )
                 self.run_btn.pack(anchor="center")
         if self.tab_name == "Tweak" and self.mode in ("preset", "custom"):
-            # improvement-report 2.4: Reboot Planner badge — count is
-            # refreshed in _refresh_run_count() below on every toggle.
+            # Reboot badge: created but NOT packed until _refresh_run_count
+            # finds reboot-required tasks. An empty packed label + pady was
+            # permanently shrinking the Tweak scroll area vs Clean/Repair.
             self._reboot_badge = tk.Label(
                 self.run_row, text="", font=(F, 9), bg=COLORS["bg"],
                 fg=COLORS["accent_yellow"])
-            self._reboot_badge.pack(pady=(6, 0))
+            # deliberately not packed here
         self._refresh_run_count()
 
     def _preview_clicked(self):
@@ -5996,8 +5469,12 @@ class TaskTab(tk.Frame):
                     if n_reboot:
                         plural = "s" if n_reboot != 1 else ""
                         badge.config(text=f"🔁 {n_reboot} tweak{plural} need a reboot — one reboot covers all")
+                        if not badge.winfo_ismapped():
+                            badge.pack(pady=(4, 0))
                     else:
                         badge.config(text="")
+                        if badge.winfo_ismapped():
+                            badge.pack_forget()
             except Exception:
                 pass
 
@@ -6917,49 +6394,13 @@ class InstallTab(tk.Frame):
 
         from app.app_catalog import APP_CATALOG, CATEGORY_ORDER, MANUAL_ONLY_APPS
 
-        # top bar: hint + centered search. The action buttons live in a
-        # bottom-middle run row (user request: match Clean/Repair/Tweak).
-        #
-        # SYMMETRY FIX (user bug report 2026-09): this row used to be
-        # label-height (~27 px), so Install's content column started
-        # ~27 px higher than Clean/Repair/Tweak's preset-card row —
-        # switching to/from Install read as the whole page "jumping".
-        # The row is now pinned to the same height as a one-row preset
-        # card area (56 px, measured from the Clean tab) with the hint
-        # + search vertically centered inside, so every tab's first
-        # visual row starts and ends at the same Y.
-        topbar = tk.Frame(self, bg=COLORS["bg"])
-        topbar.pack(fill="x", padx=26, pady=(14, 4))
-        topbar.pack_propagate(False)
-        topbar.config(height=56)
-        hint_wrap = tk.Frame(topbar, bg=COLORS["bg"])
-        hint_wrap.pack(side="left", fill="y")
-        hint_wrap.rowconfigure(0, weight=1)
-        tk.Label(hint_wrap, text="Pick apps to install — latest versions, silent install.",
-                 font=(F, 10), bg=COLORS["bg"],
-                 fg=COLORS["subtext"]).grid(row=0, sticky="w")
-        # search box (user request: big catalog, no way to find one).
-        # Placeholder count stays true automatically (was hardcoded '147',
-        # drifting every time the catalog changed).
-        from app.app_catalog import APP_CATALOG as _AC, MANUAL_ONLY_APPS as _MO
-        _search_ph = f"Search {len(_AC) + len(_MO)} apps…"
-        # rounded + centered between the hint and the buttons (user request)
-        search_frame = tk.Frame(topbar, bg=COLORS["bg"])
-        search_frame.pack(side="left", expand=True, fill="both")
-        search_frame.rowconfigure(0, weight=1)
-        search_center = tk.Frame(search_frame, bg=COLORS["bg"])
-        search_center.grid(row=0, sticky="ew")
+        # User request: remove hint + search topbar so the catalog scroll
+        # panel gains vertical space. Search still available via code path
+        # if re-enabled later; for now catalog is browse-only.
         self._search_var = tk.StringVar(value="")
-        self._search_var.trace_add("write", lambda *_: self._apply_search())
-        _sre = RoundedEntry(search_center, textvariable=self._search_var, width=18,
-                            accent=accent)
-        _sre.pack(anchor="center")
-        self._search_entry = _sre.entry
-        self._search_entry.insert(0, _search_ph)
-        self._search_placeholder = _search_ph
+        self._search_placeholder = ""
         self._search_focused = False
-        self._search_entry.bind("<FocusIn>", self._search_focus_in)
-        self._search_entry.bind("<FocusOut>", self._search_focus_out)
+        self._search_entry = None  # no UI; _apply_search / focus helpers guard
 
         # bottom-middle run row (user request: match the Clean/Repair/Tweak
         # Run buttons). Packed before the panel so the panel fills the
@@ -6992,7 +6433,7 @@ class InstallTab(tk.Frame):
         # set_run_enabled() already handles that via getattr(..., None).
 
         panel = ScrollableRoundedPanel(self)
-        panel.pack(fill="both", expand=True, padx=26, pady=6)
+        panel.pack(fill="both", expand=True, padx=26, pady=(4, 4))
         self._panel = panel
 
         # --- Essentials: one-click tasks, split in two groups (user request):
@@ -8658,12 +8099,13 @@ class BorderlessChrome:
 
 
 class QuickToolsDialog(ThemedModal):
-    """Quick Tools popup (6th Tools card): the exact shortcut box that
-    used to sit inline below the 4 cards — same 2 columns (Windows
-    tools / Windows Settings), same bullet rows. Same
-    popup dimensions as every other feature dialog (ThemedModal
-    800x600 default — no custom size). Read-only launcher, no busy
-    guard (mirrors card clicks, never touches the run engine)."""
+    """Quick Tools popup (corner toolbox icon, not a Tools card): the
+    exact shortcut box that used to sit inline below the 4 cards —
+    same 2 columns (Windows tools / Windows Settings), same bullet
+    rows. Same popup dimensions as every other feature dialog
+    (ThemedModal 800x600 default — no custom size). Read-only
+    launcher, no busy guard (mirrors card clicks, never touches the
+    run engine)."""
 
     def __init__(self, parent, app, open_target):
         self.app = app
@@ -8934,19 +8376,35 @@ class GaugeDial(tk.Canvas):
 
 
 class SpeedTestDialog(ThemedModal):
-    """Speed Test popup (5th Tools card): animated gauge dial + live
-    Download / Upload / Ping rows, like speed-test websites.
+    """Speed Test popup (5th Tools card): Ookla-style staged flow.
+
+    The popup NEVER auto-starts (user call) — it opens on a big GO
+    button sitting where the gauge will be. One click runs ping, then
+    the FULL download leg (needle climbs, headline tracks it), then
+    the gauge RESETS and climbs again through the FULL upload leg
+    (Ookla behavior), with a horizontal phase bar under the headline
+    throughout. When the run ends the dial hides and GO returns to
+    the stage, so re-running replays the whole animation. The four
+    stat cells + usage stars below keep every landed number; the
+    centered server line names the server only.
 
     Same popup dimensions as every other feature dialog (ThemedModal
     800x600 default — no custom size) and the same worker/hop/
     watchdog/cancel skeleton as DnsTesterDialog. Read-only: no
-    Apply, no snapshot — Re-test only. Legs run sequentially (ping,
-    then download, then upload — parallel legs would fight over the
-    same pipe). Unreachable legs show '—', never a fake 0. No API
-    keys on any path (app/speed_test.py)."""
+    Apply, no snapshot. Legs run sequentially (ping, then download,
+    then upload — parallel legs would fight over the same pipe).
+    Unreachable legs show '—', never a fake 0. No API keys on any
+    path (app/speed_test.py). No description label (user call): the
+    title + GO button are self-explanatory."""
 
     LEGS = (("ping", "Ping"), ("download", "Download"), ("upload", "Upload"),
             ("stability", "Stability"))
+
+    # overall-progress spans per measured leg (phase bar under the
+    # headline): ping/stability/warmup run indeterminate; the two
+    # measured legs split the determinate range.
+    _SPAN_DOWN = (0.12, 0.60)
+    _SPAN_UP = (0.60, 1.0)
 
     def __init__(self, parent, app):
         self.app = app
@@ -8957,38 +8415,42 @@ class SpeedTestDialog(ThemedModal):
         self._watchdog_after = None
         self._row_values = {}
         self._server_name = None
+        self._server_ms = None
+        self._stage_mode = "go"     # "go" (idle/done) | "gauge" (running)
+        self._active_leg = None     # leg the headline currently tracks
+        self._phase_span = None     # (base, end) for the phase bar
         # NOTE: no size= passed — exact same dimensions as DNS/Health/etc.
         super().__init__(parent, title="Speed Test",
                          accent=TAB_ACCENTS["Tools"])
         body = self.body
 
-        # F08: data-cost transparency — fast links run the full
-        # multi-stream rounds (≈160MB worst case, see ESTIMATED_MAX_MB).
-        # No logic change.
-        tk.Label(body, text="Tests your connection speed — download, "
-                            "upload and ping. Uses up to ~160MB on fast "
-                            "connections (avoid on metered/mobile data).",
-                 font=(F, 9), bg=COLORS["bg"],
-                 fg=COLORS["subtext"], wraplength=680,
-                 justify="left").pack(anchor="w")
-
-        # gauge + headline readout (centered, like the websites).
-        # Compact by design: the 800x600 card is fixed and system fonts
-        # vary, so every pad here is tight — the Re-test row must stay
-        # visible without scrolling (user bug: Upload clipped, no
-        # Re-test in reach). The gauge IS the progress signal, so no
-        # separate progress bar (DNS keeps its own).
-        gwrap = tk.Frame(body, bg=COLORS["bg"])
-        gwrap.pack(fill="x", pady=(1, 0))
-        self._gauge = GaugeDial(gwrap, accent=TAB_ACCENTS["Tools"],
-                                width=360, height=225)
-        self._gauge.pack(anchor="center")
-        # No unit sub-line (user call): the headline already reads
-        # "141 Mbps" via format_mbps — the freed row funds a bigger
-        # gauge instead.
-        self._big_lbl = tk.Label(gwrap, text="—", font=(F, 18, "bold"),
+        # Stage (fixed height so GO <-> gauge swaps never move the rows
+        # below): the dial + headline + phase bar while running, the big
+        # GO button + headline when idle/done. No description label —
+        # the title says what this is and GO says what to do.
+        stage = self._stage = tk.Frame(body, bg=COLORS["bg"], height=270)
+        stage.pack(fill="x", pady=(6, 0))
+        try:
+            stage.pack_propagate(False)
+        except Exception:
+            pass
+        self._gauge = GaugeDial(stage, accent=TAB_ACCENTS["Tools"],
+                                width=340, height=200)
+        self._go_btn = AnimatedButton(
+            stage, text="GO", command=self._start_test,
+            bg=TAB_ACCENTS["Tools"], fg=COLORS["black"],
+            font=(F, 14, "bold"), padx=44, pady=14)
+        # harness alias: the smoke suite drives hover/press + existence
+        # through _retest_btn (kept, now pointing at the stage button).
+        self._retest_btn = self._go_btn
+        # NOTE (user call): no Tooltip on the GO button on purpose —
+        # Tooltip binds <Enter>/<Leave> without add="+", which wipes
+        # AnimatedButton's own hover/press animation binds.
+        self._big_lbl = tk.Label(stage, text="—", font=(F, 18, "bold"),
                                  bg=COLORS["bg"], fg=COLORS["text"])
-        self._big_lbl.pack(anchor="center")
+        self._phase_bar = AnimatedProgressBar(stage,
+                                              accent=TAB_ACCENTS["Tools"])
+        self._show_go()
 
         # usage suitability (Ookla-style): 4 icons with 5 stars under
         # each — Browsing / Gaming / Streaming / Video call. PNGs from
@@ -9038,9 +8500,13 @@ class SpeedTestDialog(ThemedModal):
             self._usage[use] = {"dots": dots, "tips": tips, "title": _title}
         self._reset_usage()
 
+        # server line — CENTERED (user call: it sat left while the
+        # gauge/headline above it are centered, which read as a layout
+        # bug). Names the server only; the four stat cells below already
+        # carry the numbers, so repeating them here was redundant.
         self._status_lbl = tk.Label(body, text="Starting…", font=(F, 9),
                                     bg=COLORS["bg"], fg=COLORS["subtext"],
-                                    anchor="w")
+                                    anchor="center", justify="center")
         self._status_lbl.pack(fill="x", pady=(2, 0))
 
         # single stats bar, no divider lines (user call): plain cells
@@ -9049,26 +8515,15 @@ class SpeedTestDialog(ThemedModal):
         self._rows_body.pack(fill="x", pady=(4, 0))
         self._build_rows()
 
-        brow = tk.Frame(body, bg=COLORS["bg"])
-        brow.pack(fill="x", pady=(4, 2))
-        self._retest_btn = AnimatedButton(
-            brow, text="Re-test", command=self._start_test,
-            bg=COLORS["surface"], fg=COLORS["text"],
-            font=(F, 9, "bold"), padx=18, pady=7)
-        self._retest_btn.pack(anchor="center")
-        # NOTE (user call): no Tooltip here on purpose — Tooltip binds
-        # <Enter>/<Leave> without add="+", which wipes AnimatedButton's
-        # own hover/press animation binds. Bare, the button highlights
-        # on hover and depresses on press like every other button.
-
         self.on_close(self._cancel_test)
-        # Return re-runs (Escape still closes via ThemedModal): guarantees
-        # a re-run path even on clipped/odd-DPI renders.
+        # Return runs / re-runs (Escape still closes via ThemedModal).
         try:
             self._dlg.bind("<Return>", lambda _e: self._start_test())
         except Exception:
             pass
-        self._start_test()
+        # No auto-start (user call): the popup waits on GO. Initial
+        # paint is the idle stage (button + dashed cells).
+        self._set_status("Press GO to start.")
 
     def _load_usage_icon(self, use):
         """~28px PhotoImage for a usage cell (512px asset subsampled;
@@ -9191,6 +8646,89 @@ class SpeedTestDialog(ThemedModal):
         except Exception:
             pass
 
+    # ---- stage (GO <-> gauge swap, Ookla-style) ------------------------- #
+
+    def _show_go(self):
+        """Idle/done stage: dial + phase bar hide, GO returns to where
+        the gauge was, headline keeps the last verdict (or '—'). The
+        fixed-height stage means rows below never move. Tk thread only."""
+        try:
+            for w in (self._gauge, self._phase_bar,
+                      self._go_btn, self._big_lbl):
+                try:
+                    w.pack_forget()
+                except Exception:
+                    pass
+            self._go_btn.pack(anchor="center", pady=(64, 0))
+            self._big_lbl.pack(anchor="center", pady=(10, 0))
+            self._stage_mode = "go"
+        except Exception:
+            pass
+
+    def _show_gauge(self):
+        """Running stage: GO hides, the dial + headline + phase bar take
+        the stage. Tk thread only."""
+        try:
+            for w in (self._gauge, self._phase_bar,
+                      self._go_btn, self._big_lbl):
+                try:
+                    w.pack_forget()
+                except Exception:
+                    pass
+            self._gauge.pack(anchor="center")
+            self._big_lbl.pack(anchor="center")
+            self._phase_bar.pack(fill="x", padx=120, pady=(8, 0))
+            self._stage_mode = "gauge"
+        except Exception:
+            pass
+
+    def _set_phase(self, phase, _gen=None):
+        """Worker-driven phase switch (Tk thread only, generation-guarded).
+
+        ping/stability/warmup/race run the phase bar indeterminate
+        (no meaningful fraction exists yet); download parks the needle
+        at zero and owns the first determinate span; upload RESETS the
+        needle to zero with a fresh headline so it climbs again from
+        nothing — the Ookla two-climb behavior the stage is built for."""
+        if _gen is not None and _gen != getattr(self, "_scan_gen", _gen):
+            return
+        try:
+            if phase == "download":
+                self._active_leg = "download"
+                self._phase_span = tuple(self._SPAN_DOWN)
+                try:
+                    self._gauge.reset()
+                except Exception:
+                    pass
+                try:
+                    self._phase_bar.set_indeterminate(False)
+                    self._phase_bar.set_fraction(self._SPAN_DOWN[0])
+                except Exception:
+                    pass
+            elif phase == "upload":
+                self._active_leg = "upload"
+                self._phase_span = tuple(self._SPAN_UP)
+                try:
+                    self._gauge.reset()
+                except Exception:
+                    pass
+                try:
+                    self._big_lbl.config(text="—")
+                except Exception:
+                    pass
+                try:
+                    self._phase_bar.set_indeterminate(False)
+                    self._phase_bar.set_fraction(self._SPAN_UP[0])
+                except Exception:
+                    pass
+            else:
+                try:
+                    self._phase_bar.set_indeterminate(True)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def _build_rows(self):
         """One single stats row (user call): Ping / Download / Upload /
         Stability evenly spaced in uniform columns — each cell stacks its
@@ -9230,15 +8768,23 @@ class SpeedTestDialog(ThemedModal):
             pass
         self._watchdog_after = None
         try:
+            self._show_gauge()
             self._gauge.reset()
             self._big_lbl.config(text="—")
+            try:
+                self._phase_bar.set_indeterminate(True)
+                self._phase_bar.set_fraction(0.0)
+            except Exception:
+                pass
+            self._active_leg = None
+            self._phase_span = None
             for leg in self._row_values:
                 try:
                     self._row_values[leg].config(text="…", fg=COLORS["subtext"])
                 except Exception:
                     pass
             self._reset_usage()
-            self._set_status("Testing…")
+            self._set_status("Finding closest server…")
         except Exception:
             pass
         try:
@@ -9248,8 +8794,12 @@ class SpeedTestDialog(ThemedModal):
         except Exception:
             pass
         try:
+            # 180s: full Ookla-style flow on a slow link (warmup + 3
+            # down rounds + 3 up rounds + 10-sample stability) can
+            # legitimately run past two minutes; the old 120s watchdog
+            # could "time out" a test that was still measuring.
             self._watchdog_after = self._dlg.after(
-                120000, lambda _g=gen: self._finish(stalled=True, _gen=_g))
+                180000, lambda _g=gen: self._finish(stalled=True, _gen=_g))
         except Exception:
             pass
 
@@ -9282,22 +8832,24 @@ class SpeedTestDialog(ThemedModal):
                 self._ui(self._paint_result, leg, None, gen)
             self._ui(self._finish, False, gen)
             return
-        # — closest server race (Cloudflare anycast is usually the
-        # nearest edge already; the race confirms it and names the
-        # winner like other speed-test apps) — #
+        # — closest server race (median latency per candidate; the
+        # winner is named in the centered server line, Ookla-style) — #
         if dead():
             return
         self._ui(self._set_status, "Finding closest server…")
+        self._ui(self._set_phase, "race", gen)
         try:
             server_name, base_url, _race_ms = _st.race_endpoints(
                 cancelled=lambda: dead())
         except Exception:
             server_name, base_url = "Cloudflare edge", _st.DOWNLOAD_URL
         self._server_name = server_name
+        self._server_ms = _race_ms
         if dead():
             return
         # — ping (quick, no progress) — #
-        self._ui(self._set_status, f"Server: {server_name} — testing ping…")
+        self._ui(self._set_status, f"Server: {server_name} · testing ping…")
+        self._ui(self._set_phase, "ping", gen)
         try:
             ms = _st.ping_ms(cancelled=lambda: dead())
         except Exception:
@@ -9309,7 +8861,8 @@ class SpeedTestDialog(ThemedModal):
         # case — same host, real samples, honest Nones) — #
         if dead():
             return
-        self._ui(self._set_status, f"Server: {server_name} — testing stability…")
+        self._ui(self._set_status, f"Server: {server_name} · testing stability…")
+        self._ui(self._set_phase, "stability", gen)
         try:
             stab = _st.ping_stability(cancelled=lambda: dead())
         except Exception:
@@ -9317,16 +8870,29 @@ class SpeedTestDialog(ThemedModal):
         if dead():
             return
         self._ui(self._paint_result, "stability", stab, gen)
-        # — download (parallel streams, adaptive rounds) — #
+        # — warmup (one throwaway GET: TLS + congestion window warm so
+        # the measured rounds don't pay slow-start) — #
         if dead():
             return
-        self._ui(self._set_status, f"Server: {server_name} — testing download…")
+        self._ui(self._set_status, f"Server: {server_name} · warming up…")
+        self._ui(self._set_phase, "warmup", gen)
+        try:
+            _st.warmup(url=base_url, cancelled=lambda: dead())
+        except Exception:
+            pass
+        # — download (FULL sustained parallel rounds, then FULL upload
+        # rounds — sequential legs, never interleaved, Ookla-style) — #
+        if dead():
+            return
+        self._ui(self._set_status, f"Server: {server_name} · testing download…")
+        self._ui(self._set_phase, "download", gen)
         down = self._run_parallel_rounds(_st, dead, gen, direction="download",
                                          base_url=base_url)
         if dead():
             return
         # — upload — #
-        self._ui(self._set_status, f"Server: {server_name} — testing upload…")
+        self._ui(self._set_status, f"Server: {server_name} · testing upload…")
+        self._ui(self._set_phase, "upload", gen)
         up = self._run_parallel_rounds(_st, dead, gen, direction="upload",
                                        base_url=base_url)
         if dead():
@@ -9339,7 +8905,10 @@ class SpeedTestDialog(ThemedModal):
 
         One TCP stream cannot fill a fast pipe and a lone small sample
         is mostly handshake — so each round runs PARALLEL_STREAMS
-        concurrent streams and aggregates wall-clock throughput. Slow
+        concurrent streams and aggregates wall-clock throughput, and the
+        verdict is the LARGEST round that landed, never the first.
+        Uploads report chunk progress through the same live gauge as
+        downloads (the engine's POST body is progress-wrapped). Slow
         links stop after the small round to save data; fast links run
         bigger rounds for accuracy. Returns last good value or None."""
         import threading as _th
@@ -9348,8 +8917,12 @@ class SpeedTestDialog(ThemedModal):
         up_url = st.UPLOAD_URL
         if is_down:
             rounds = list(st.DOWNLOAD_ROUNDS)
+            gate_min = getattr(st, "ROUND_MIN_MBPS", 25.0)
+            gate_fast = getattr(st, "ROUND_FAST_MBPS", 250.0)
         else:
             rounds = list(st.UPLOAD_ROUNDS)
+            gate_min = getattr(st, "UP_MIN_MBPS", 10.0)
+            gate_fast = getattr(st, "UP_FAST_MBPS", 100.0)
         best = None
         for n in rounds:
             if dead():
@@ -9381,14 +8954,19 @@ class SpeedTestDialog(ThemedModal):
                     v = st.download_parallel(n, streams=st.PARALLEL_STREAMS,
                                              cancelled=lambda: dead(),
                                              progress_cb=_prog, url=url)
-                    if v is None and url == st.DOWNLOAD_URL:
+                    try:
+                        is_cf = st._is_cloudflare_url(url)
+                    except Exception:
+                        is_cf = (url == st.DOWNLOAD_URL)
+                    if v is None and is_cf:
                         v = st.download_parallel(
                             n, streams=st.PARALLEL_STREAMS,
                             cancelled=lambda: dead(), progress_cb=_prog,
                             url=st.FALLBACK_DOWNLOAD_URL)
                 else:
                     v = st.upload_parallel(n, streams=st.PARALLEL_STREAMS,
-                                           cancelled=lambda: dead(), url=up_url)
+                                           cancelled=lambda: dead(),
+                                           progress_cb=_prog, url=up_url)
             except Exception:
                 v = None
             if dead():
@@ -9404,10 +8982,10 @@ class SpeedTestDialog(ThemedModal):
             if best is None:
                 continue  # blocked round — try the next size once
             if n == rounds[0]:
-                if best < st.ROUND_MIN_MBPS:
+                if best < gate_min:
                     break
             elif len(rounds) > 2 and n == rounds[1]:
-                if best < st.ROUND_FAST_MBPS:
+                if best < gate_fast:
                     break
         return best
 
@@ -9420,10 +8998,25 @@ class SpeedTestDialog(ThemedModal):
             self._gauge.set_value(max(0.0, float(live_mbps or 0.0)))
         except Exception:
             pass
-        if leg == "download":
+        # the headline tracks whichever measured leg is climbing (fresh
+        # climb per leg — the upload phase resets it first, so the
+        # number on screen always belongs to the needle in motion).
+        if leg in ("download", "upload"):
             try:
                 from app.speed_test import format_mbps as _fmt
                 self._big_lbl.config(text=_fmt(live_mbps))
+            except Exception:
+                pass
+            # overall progress: the round frac mapped into this leg's
+            # span of the phase bar (ping/stability/warmup have no span
+            # and stay indeterminate — this hop only ever fires for the
+            # two measured legs).
+            try:
+                span = self._phase_span
+                if span and self._phase_bar.winfo_exists():
+                    base, end = float(span[0]), float(span[1])
+                    f = max(0.0, min(1.0, float(frac or 0.0)))
+                    self._phase_bar.set_fraction(base + f * (end - base))
             except Exception:
                 pass
 
@@ -9478,9 +9071,21 @@ class SpeedTestDialog(ThemedModal):
                 self._gauge.set_value(value or 0.0)
             except Exception:
                 pass
+            # snap the phase bar to the end of the download span — the
+            # upload phase re-parks it at its own span start.
+            try:
+                self._phase_bar.set_fraction(self._SPAN_DOWN[1])
+            except Exception:
+                pass
         elif leg == "upload" and value is not None:
             try:
+                from app.speed_test import format_mbps as _fmb
+                self._big_lbl.config(text=_fmb(value))
                 self._gauge.set_value(value)
+            except Exception:
+                pass
+            try:
+                self._phase_bar.set_fraction(self._SPAN_UP[1])
             except Exception:
                 pass
 
@@ -9497,7 +9102,7 @@ class SpeedTestDialog(ThemedModal):
             pass
         self._watchdog_after = None
         try:
-            from app.speed_test import format_mbps as _fmb, format_ping as _fp
+            from app.speed_test import format_mbps as _fmb
             down, up, ms = (self._results.get("download"),
                             self._results.get("upload"),
                             self._results.get("ping"))
@@ -9505,15 +9110,25 @@ class SpeedTestDialog(ThemedModal):
                 self._paint_usage(finished=True)
             except Exception:
                 pass
+            try:
+                server = getattr(self, "_server_name", None) or "speed server"
+            except Exception:
+                server = "speed server"
             if down is None and up is None and ms is None:
                 self._set_status("Couldn't reach the speed test servers — "
-                                 "check your connection, then Re-test."
+                                 "check your connection, then press GO."
                                  if not stalled else
-                                 "Timed out — check your connection, then Re-test.")
+                                 "Timed out — check your connection, then press GO.")
                 try:
                     self._big_lbl.config(text="—")
                 except Exception:
                     pass
+                try:
+                    self._phase_bar.set_indeterminate(False)
+                    self._phase_bar.set_fraction(0.0)
+                except Exception:
+                    pass
+                self._show_go()
                 return
             try:
                 self._gauge.set_value(down if down is not None
@@ -9521,25 +9136,26 @@ class SpeedTestDialog(ThemedModal):
                 self._big_lbl.config(text=_fmb(down))
             except Exception:
                 pass
-            parts = []
-            try:
-                if getattr(self, "_server_name", None):
-                    parts.append(f"{self._server_name}")
-            except Exception:
-                pass
-            if down is not None:
-                parts.append(f"↓ {_fmb(down)}")
-            if up is not None:
-                parts.append(f"↑ {_fmb(up)}")
-            if ms is not None:
-                parts.append(f"ping {_fp(ms)}")
+            # Server line names the server ONLY (user call): the four
+            # stat cells already carry the numbers — repeating them
+            # here was redundant. Stays centered like the gauge above.
             missing = [n for n, v in (("download", down), ("upload", up),
                                       ("ping", ms)) if v is None]
             if missing:
-                self._set_status("Partial result (" + ", ".join(missing) +
-                                 " unavailable) — " + " · ".join(parts) + ".")
+                self._set_status(f"Server: {server} · "
+                                 + ", ".join(missing) + " unavailable.")
+            elif stalled:
+                self._set_status(f"Server: {server} · timed out.")
             else:
-                self._set_status(" · ".join(parts) + ".")
+                self._set_status(f"Server: {server} · complete.")
+            # run over: park the shimmer, hide the dial, return GO to
+            # the stage — the next click replays the whole animation.
+            try:
+                self._phase_bar.set_indeterminate(False)
+                self._phase_bar.set_fraction(1.0)
+            except Exception:
+                pass
+            self._show_go()
         except Exception:
             pass
 
@@ -13878,6 +13494,625 @@ class SpecsDialog(ThemedModal):
         pass
 
 
+class HardwareMonitorDialog(ThemedModal):
+    """Hardware Monitor (Tools tab card): Task-Manager-style live stats —
+    CPU/RAM, GPU/VRAM, Disk/Network in a 2-column x 3-row grid —
+    read-only, ~1s refresh. Same on-tick-directly pattern MicCheckDialog
+    uses for its level meter (the underlying Win32/PDH calls are fast
+    synchronous reads, not I/O, so no worker thread is needed).
+
+    Cards match the Health report's card language exactly (hairline
+    outer + bg_alt inner, fixed heights, AnimatedProgressBar) — not a
+    one-off style — with everything CENTERED (title, big value, detail
+    lines) for symmetry. No Close button: the popup X already closes
+    it, and the freed row funds taller cards. Device names live ON
+    their cards; there is no separate spec row. Multi-GPU / multi-NIC
+    rigs get a small ▾ arrow in the card title that pops a dark menu
+    (no bulky combobox duplicating the name). GPU temperature is an
+    Nvidia-only bonus via nvml.dll and is rendered inline on the GPU
+    card ONLY when an Nvidia driver actually answers — on AMD/Intel
+    there is no temp UI at all, not even a placeholder line. Disk
+    (active-time + throughput + C: free/total) and Network (busiest
+    interface by default, link-scaled bar) come from the same OS
+    counters Task Manager graphs use."""
+
+    _TICK_MS = 1000
+    _GPU_REFRESH_EVERY = 15  # ticks between GPU counter instance re-enum
+    _CARD_H = 144            # fixed inner height (frozen layout, Health-style)
+
+    def __init__(self, parent, app):
+        self.app = app
+        self._tick_after = None
+        self._tick_count = 0
+        self._cpu_sampler = None
+        self._gpu_sampler = None
+        self._nvml = None
+        self._disk_sampler = None
+        self._net_sampler = None
+        self._gpu_list = []
+        self._gpu_sel = 0
+        self._cpu_info = {"name": "Unknown CPU", "logical_cores": 0}
+        super().__init__(parent, title="Hardware Monitor",
+                         accent=TAB_ACCENTS.get("Tweak", COLORS["accent_blue"]))
+        body = self.body
+
+        try:
+            from app.hw_monitor import cpu_static_info, gpu_list
+            self._cpu_info = cpu_static_info()
+            self._gpu_list = gpu_list() or []
+        except Exception:
+            pass
+        if not self._gpu_list:
+            self._gpu_list = [{"name": "Unknown GPU",
+                               "total_vram_bytes": None,
+                               "total_vram_approx": False}]
+
+        # 2x3 uniform grid (Health-card geometry: uniform columns AND
+        # rows with a minsize floor so live paints never move layout).
+        # Two wide columns (~370px each) so device names fit on one
+        # line; GPU sits above VRAM so the pair reads top-to-bottom.
+        grid = self._grid = tk.Frame(body, bg=COLORS["bg"])
+        grid.pack(fill="x", pady=(2, 0))
+        for c in (0, 1):
+            grid.columnconfigure(c, weight=1, uniform="hwcol")
+        for r in (0, 1, 2):
+            grid.rowconfigure(r, weight=1, uniform="hwrow",
+                              minsize=self._CARD_H + 10)
+
+        # Single-GPU rigs get no GPU arrow (a one-entry menu is
+        # chrome); the network arrow always exists (Auto + NICs).
+        _gpu_picker = "gpu" if len(self._gpu_list) > 1 else None
+        self._cpu = self._make_card(grid, 0, 0, "CPU")
+        self._ram = self._make_card(grid, 0, 1, "RAM")
+        self._gpu = self._make_card(grid, 1, 0, "GPU", picker=_gpu_picker)
+        self._vram = self._make_card(grid, 1, 1, "VRAM")
+        self._disk = self._make_card(grid, 2, 0, "Disk")
+        self._net = self._make_card(grid, 2, 1, "Network", picker="net")
+
+        # Picker state: GPU index into gpu_list; network None = auto
+        # (busiest interface each tick) or a pinned interface name.
+        self._net_sel = None
+        self._open_menu = None
+
+        # Honesty note only (empty = zero-height): GPU counters missing
+        # entirely. No Close button — the popup X already closes this.
+        self._note_lbl = tk.Label(
+            body, text="", font=(F, 8), bg=COLORS["bg"], fg=COLORS["subtext"],
+            anchor="center", justify="center")
+        self._note_lbl.pack(fill="x")
+
+        try:
+            from app.hw_monitor import (CpuSampler, DiskSampler, GpuSampler,
+                                        NetworkSampler, NvmlTemp)
+            self._cpu_sampler = CpuSampler()
+            self._gpu_sampler = GpuSampler()
+            self._disk_sampler = DiskSampler()
+            self._net_sampler = NetworkSampler()
+            self._nvml = NvmlTemp()
+        except Exception:
+            pass
+
+        notes = []
+        try:
+            gpu_ok = (self._gpu_sampler is not None
+                      and getattr(self._gpu_sampler, "_ok", False))
+        except Exception:
+            gpu_ok = False
+        if not gpu_ok:
+            notes.append(
+                "GPU counters unavailable on this PC — GPU/VRAM will show \"N/A\".")
+        if notes:
+            self._note_lbl.config(text=" ".join(notes))
+
+        self.on_close(self._stop_tick)
+        self._tick()
+
+    def _make_card(self, parent, row, col, title, picker=None):
+        """One stat card in the Health report's card language: hairline
+        outer + bg_alt inner at a FIXED height (pack_propagate off, so
+        live paints can never resize the grid) — everything CENTERED
+        (title, big value, detail lines) for symmetry. Title on its own
+        line and the value below it, so long values (e.g. "0.01 Mbps")
+        can never collide with the title. An optional picker ("gpu" /
+        "net") adds a small ▾ arrow beside the title that pops a dark
+        menu; the card face itself only ever shows the SELECTED name.
+        Returns a dict of handles ("pick" = arrow label or None)."""
+        outer = tk.Frame(parent, bg=COLORS["hairline"], bd=0)
+        outer.grid(row=row, column=col, sticky="nsew", padx=5, pady=5)
+        inner = tk.Frame(outer, bg=COLORS["bg_alt"], height=self._CARD_H)
+        inner.pack(fill="x", padx=1, pady=1)
+        try:
+            inner.pack_propagate(False)
+        except Exception:
+            pass
+        trow = tk.Frame(inner, bg=COLORS["bg_alt"])
+        trow.pack(anchor="center", pady=(10, 0))
+        title_lbl = tk.Label(trow, text=title, font=(F, 9, "bold"),
+                             bg=COLORS["bg_alt"], fg=COLORS["text"])
+        title_lbl.pack(side="left")
+        pick_lbl = None
+        if picker in ("gpu", "net"):
+            # (F, 11): the 8pt glyph was easy to miss next to the 9pt
+            # bold title — one step up so the picker reads as clickable.
+            pick_lbl = tk.Label(trow, text="▾", font=(F, 11),
+                                bg=COLORS["bg_alt"], fg=COLORS["subtext"],
+                                cursor="hand2")
+            pick_lbl.pack(side="left", padx=(6, 0))
+            try:
+                # Tooltip FIRST: it binds <Enter>/<Leave> without add="+"
+                # (replacing), so the hover brightening below must come
+                # after with add="+" — same trap as AnimatedButton.
+                if picker == "gpu":
+                    Tooltip(pick_lbl, "Choose which GPU these numbers describe.")
+                    pick_lbl.bind("<Button-1>", self._open_gpu_menu, add="+")
+                else:
+                    Tooltip(pick_lbl, "Choose which network interface to watch.")
+                    pick_lbl.bind("<Button-1>", self._open_net_menu, add="+")
+                pick_lbl.bind("<Enter>", lambda _e, w=pick_lbl:
+                              w.config(fg=COLORS["text"]), add="+")
+                pick_lbl.bind("<Leave>", lambda _e, w=pick_lbl:
+                              w.config(fg=COLORS["subtext"]), add="+")
+            except Exception:
+                pass
+        val_lbl = tk.Label(inner, text="—", font=(F, 16, "bold"),
+                           bg=COLORS["bg_alt"], fg=COLORS["text"],
+                           anchor="center", justify="center")
+        val_lbl.pack(anchor="center", pady=(2, 0))
+        bar = AnimatedProgressBar(inner, accent=COLORS["accent_green"])
+        bar.pack(fill="x", padx=14, pady=(8, 6))
+        name_lbl = tk.Label(inner, text="", font=(F, 8),
+                            bg=COLORS["bg_alt"], fg=COLORS["subtext"],
+                            anchor="center", justify="center")
+        name_lbl.pack(fill="x", padx=12)
+        sub_lbl = tk.Label(inner, text="", font=(F, 8),
+                           bg=COLORS["bg_alt"], fg=COLORS["subtext"],
+                           anchor="center", justify="center")
+        sub_lbl.pack(fill="x", padx=12)
+        return {"outer": outer, "inner": inner, "title": title_lbl,
+                "val": val_lbl, "bar": bar, "name": name_lbl,
+                "sub": sub_lbl, "pick": pick_lbl}
+
+    def _paint_card(self, card, percent, value_text, name_text,
+                    sub_text, name_tip=None):
+        """Paint one card. percent None = gap (muted bar, no fake fill);
+        0..100 colors green→amber→red like every other meter here."""
+        try:
+            card["val"].config(text=value_text)
+            bar = card["bar"]
+            if percent is None:
+                bar._accent = COLORS["subtext"]
+                bar.set_fraction(0.0)
+            else:
+                bar._accent = (COLORS["accent_green"] if percent < 70 else
+                               COLORS["accent_yellow"] if percent < 90 else
+                               COLORS["accent_red"])
+                bar.set_fraction(max(0.0, min(1.0, percent / 100.0)))
+            card["name"].config(text=name_text or "")
+            card["sub"].config(text=sub_text or "")
+            # Tooltip once per distinct text (this paints every second —
+            # re-binding each tick would churn hover hooks forever).
+            if name_tip and card.get("_tip_for") != name_tip:
+                try:
+                    Tooltip(card["name"], name_tip)
+                    card["_tip_for"] = name_tip
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # ---- pickers (▾ arrow menus, no combobox chrome) --------------------- #
+
+    @staticmethod
+    def _short(text, limit=44):
+        try:
+            t = str(text or "")
+            return t if len(t) <= limit else t[:limit - 1] + "…"
+        except Exception:
+            return ""
+
+    def _gpu_label(self, i):
+        try:
+            entry = self._gpu_list[i]
+            name = entry.get("name") or "Unknown GPU"
+            if entry.get("total_vram_bytes"):
+                gb = entry["total_vram_bytes"] / 1024 ** 3
+                return "%s — %.0f GB" % (name, gb)
+            return str(name)
+        except Exception:
+            return "GPU %d" % (i + 1)
+
+    def _gpu_menu_labels(self):
+        """Menu rows for the GPU arrow (also the smoke hook)."""
+        try:
+            return [self._gpu_label(i) for i in range(len(self._gpu_list))]
+        except Exception:
+            return []
+
+    def _set_gpu(self, i):
+        """Pin the GPU selection (clamped — never raises). Live numbers
+        follow on the next tick."""
+        try:
+            self._gpu_sel = max(
+                0, min(int(i), len(self._gpu_list) - 1))
+        except Exception:
+            self._gpu_sel = 0
+
+    def _net_iface_names(self):
+        """Usable NIC names for the network arrow (also the smoke hook)."""
+        try:
+            if self._net_sampler is not None:
+                return list(self._net_sampler.interfaces() or [])
+        except Exception:
+            pass
+        return []
+
+    def _net_menu_labels(self):
+        """Menu rows: Auto first, then every NIC."""
+        try:
+            return ["Auto (busiest)"] + self._net_iface_names()
+        except Exception:
+            return ["Auto (busiest)"]
+
+    def _set_net(self, name_or_none):
+        """Pin a NIC (None/"" = auto-busiest). Unknown names fall back
+        to auto — never raises, never sticks on a dead interface."""
+        try:
+            if not name_or_none:
+                self._net_sel = None
+            elif name_or_none in self._net_iface_names():
+                self._net_sel = name_or_none
+            else:
+                self._net_sel = None
+            if self._net_sampler is not None:
+                self._net_sampler.select(self._net_sel)
+        except Exception:
+            pass
+
+    def _dark_menu(self):
+        """One dark popup menu in dialog colors (never raises)."""
+        try:
+            return tk.Menu(self._dlg, tearoff=0, bg=COLORS["surface"],
+                           fg=COLORS["text"],
+                           activebackground=COLORS["surface_hover"],
+                           activeforeground=COLORS["text"],
+                           selectcolor=COLORS["text"], font=(F, 9))
+        except Exception:
+            return None
+
+    def _post_menu(self, menu, widget):
+        """Pop a menu under a ▾ arrow (best-effort, never raises)."""
+        if menu is None or widget is None:
+            return
+        try:
+            self._open_menu = menu  # anti-GC while posted
+            x = widget.winfo_rootx()
+            y = widget.winfo_rooty() + widget.winfo_height() + 2
+            menu.tk_popup(x, y)
+        except Exception:
+            pass
+
+    def _open_gpu_menu(self, _event=None):
+        """GPU ▾ arrow: radio menu with a check on the live selection."""
+        if len(self._gpu_list) < 2:
+            return
+        try:
+            menu = self._dark_menu()
+            if menu is None:
+                return
+            var = tk.IntVar(value=int(self._gpu_sel or 0))
+            for i, label in enumerate(self._gpu_menu_labels()):
+                menu.add_radiobutton(label=label, variable=var, value=i,
+                                     command=lambda i=i: self._set_gpu(i))
+            self._post_menu(menu, self._gpu.get("pick"))
+        except Exception:
+            pass
+
+    def _open_net_menu(self, _event=None):
+        """Network ▾ arrow: Auto (busiest) + every NIC, check on live."""
+        try:
+            menu = self._dark_menu()
+            if menu is None:
+                return
+            cur = self._net_sel or ""
+            var = tk.StringVar(value=cur)
+            menu.add_radiobutton(label="Auto (busiest)", variable=var,
+                                 value="", command=lambda: self._set_net(None))
+            for name in self._net_iface_names():
+                menu.add_radiobutton(label=name, variable=var, value=name,
+                                     command=lambda n=name: self._set_net(n))
+            self._post_menu(menu, self._net.get("pick"))
+        except Exception:
+            pass
+
+    def _selected_gpu(self):
+        """(registry entry, phys_index|None): positional pairing of the
+        picked registry GPU to the PDH phys bucket (best-effort — the
+        two enumerations have no shared key; counts that disagree fall
+        back to totals rather than a wrong mapping)."""
+        try:
+            entry = self._gpu_list[self._gpu_sel]
+        except Exception:
+            entry = {"name": "Unknown GPU", "total_vram_bytes": None,
+                     "total_vram_approx": False}
+        phys = None
+        try:
+            idx = sorted(getattr(self._gpu_sampler, "phys_indices", []) or [])
+            if self._gpu_sel < len(idx):
+                phys = idx[self._gpu_sel]
+            elif len(idx) == 1 and len(self._gpu_list) == 1:
+                phys = idx[0]
+        except Exception:
+            phys = None
+        return entry, phys
+
+    def _selected_temp(self):
+        """Nvidia temp for the picked GPU, or None (AMD/Intel/unreadable
+        all read None — the caller renders NOTHING in that case, not
+        even a placeholder)."""
+        try:
+            if self._nvml is None or not getattr(
+                    self._nvml, "available", False):
+                return None
+            t = self._nvml.sample_at(self._gpu_sel)
+            if t is None and int(getattr(self._nvml, "device_count", 0)) == 1:
+                t = self._nvml.sample_at(0)
+            return t
+        except Exception:
+            return None
+
+    def _tick(self):
+        self._tick_after = None
+        self._tick_count += 1
+        try:
+            from app.hw_monitor import sample_ram
+        except Exception:
+            sample_ram = None
+
+        # ---- RAM ---- #
+        ram = sample_ram() if sample_ram else None
+        if ram:
+            used_gb = ram["used_bytes"] / 1024 ** 3
+            total_gb = ram["total_bytes"] / 1024 ** 3
+            self._paint_card(
+                self._ram, ram["percent"], f"{ram['percent']:.0f}%",
+                f"{used_gb:.1f} / {total_gb:.1f} GB", "physical memory")
+        else:
+            self._paint_card(self._ram, None, "N/A", "", "")
+
+        # ---- CPU (name lives on the card) ---- #
+        cpu_pct = self._cpu_sampler.sample() if self._cpu_sampler else None
+        try:
+            cores = int(self._cpu_info.get("logical_cores") or 0)
+        except Exception:
+            cores = 0
+        cpu_name = self._cpu_info.get("name") or "Unknown CPU"
+        threads_txt = (f"{cores} threads" if cores else "")
+        if cpu_pct is not None:
+            self._paint_card(self._cpu, cpu_pct, f"{cpu_pct:.0f}%",
+                             self._short(cpu_name), threads_txt, cpu_name)
+        else:
+            self._paint_card(self._cpu, None, "…",
+                             self._short(cpu_name),
+                             "warming up" if threads_txt else "", cpu_name)
+
+        # ---- GPU (+ picker, + inline Nvidia temp) ---- #
+        # NOTE: exactly ONE CollectQueryData per tick (inside
+        # sample_per_adapter). A second collect in the same tick would
+        # read ~0 out of the rate counters (they need wall-clock
+        # between collections), so totals are summed from the same
+        # per-adapter pass, never re-collected.
+        per = {}
+        totals = {"gpu_percent": None, "vram_used_bytes": None}
+        if self._gpu_sampler is not None:
+            if self._tick_count % self._GPU_REFRESH_EVERY == 0:
+                try:
+                    self._gpu_sampler.refresh_instances()
+                except Exception:
+                    pass
+            try:
+                per = self._gpu_sampler.sample_per_adapter() or {}
+            except Exception:
+                per = {}
+            try:
+                pcts = [v.get("gpu_percent") for v in per.values()]
+                pcts = [p for p in pcts if p is not None]
+                if pcts:
+                    totals["gpu_percent"] = max(0.0, min(100.0, sum(pcts)))
+                vrams = [v.get("vram_used_bytes") for v in per.values()]
+                vrams = [b for b in vrams if b is not None]
+                if vrams:
+                    totals["vram_used_bytes"] = int(sum(vrams))
+            except Exception:
+                pass
+        entry, phys = self._selected_gpu()
+        gpu_name = entry.get("name") or "Unknown GPU"
+        # Name always on the card (the ▾ menu is transient — nothing is
+        # duplicated); detail carries VRAM size + Nvidia temp when known.
+        gpu_name_line = self._short(gpu_name)
+        try:
+            _tb = entry.get("total_vram_bytes")
+            vram_size_txt = ("%.0f GB" % (_tb / 1024 ** 3) if _tb else "")
+        except Exception:
+            vram_size_txt = ""
+        temp = self._selected_temp()
+        if temp is not None:
+            gpu_detail = ((vram_size_txt + " · ") if vram_size_txt
+                          else "") + f"{temp}°C"
+        else:
+            gpu_detail = vram_size_txt
+        gpu_ok = bool(getattr(self._gpu_sampler, "_ok", False))
+        if phys is not None and phys in per:
+            gp = (per[phys] or {}).get("gpu_percent")
+            if gp is not None:
+                self._paint_card(
+                    self._gpu, gp, f"{gp:.0f}%", gpu_name_line,
+                    gpu_detail, gpu_name)
+            else:
+                detail = (gpu_detail if not gpu_ok or gpu_detail
+                          else "warming up")
+                if gpu_ok and not gpu_detail:
+                    detail = "warming up"
+                self._paint_card(
+                    self._gpu, None, "…" if gpu_ok else "N/A",
+                    gpu_name_line, detail, gpu_name)
+        elif len(self._gpu_list) > 1:
+            # picked GPU has no engine counters this pass (idle card) —
+            # Task Manager reads 0% here, not a gap.
+            _core = ((vram_size_txt + " · ") if vram_size_txt else "")
+            if temp is not None:
+                idle_detail = _core + f"{temp}°C · idle"
+            else:
+                idle_detail = _core + "idle"
+            self._paint_card(self._gpu, 0.0, "0%", gpu_name_line,
+                             idle_detail, gpu_name)
+        else:
+            gp = totals.get("gpu_percent")
+            if gp is not None:
+                self._paint_card(self._gpu, gp, f"{gp:.0f}%",
+                                 gpu_name_line, gpu_detail, gpu_name)
+            else:
+                detail = (gpu_detail if not gpu_ok or gpu_detail
+                          else "warming up")
+                if gpu_ok and not gpu_detail:
+                    detail = "warming up"
+                self._paint_card(
+                    self._gpu, None, "…" if gpu_ok else "N/A",
+                    gpu_name_line, detail, gpu_name)
+
+        # ---- VRAM (follows the GPU picker) ---- #
+        total_b = entry.get("total_vram_bytes")
+        vram_used = None
+        vram_idle = False
+        if phys is not None and phys in per:
+            vram_used = (per[phys] or {}).get("vram_used_bytes")
+        elif not (len(self._gpu_list) > 1):
+            vram_used = totals.get("vram_used_bytes")
+        elif self._tick_count > 1:
+            # picked GPU exposes no adapter counters (idle card on a
+            # multi-GPU rig) — "idle", not a gap and not a fake number.
+            vram_idle = True
+        if vram_used is not None and total_b:
+            used_gb = vram_used / 1024 ** 3
+            total_gb = total_b / 1024 ** 3
+            pct = max(0.0, min(100.0, vram_used / total_b * 100.0))
+            self._paint_card(self._vram, pct, f"{used_gb:.1f} GB",
+                             f"of {total_gb:.1f} GB",
+                             self._short(gpu_name), gpu_name)
+        elif vram_used is not None:
+            self._paint_card(self._vram, None,
+                             f"{vram_used / 1024 ** 3:.1f} GB", "used",
+                             self._short(gpu_name), gpu_name)
+        elif vram_idle:
+            self._paint_card(self._vram, None, "—",
+                             self._short(gpu_name), "idle", gpu_name)
+        else:
+            self._paint_card(self._vram, None,
+                             "N/A" if not gpu_ok else "…",
+                             self._short(gpu_name), "", gpu_name)
+
+        # ---- Disk ---- #
+        ds = None
+        try:
+            ds = self._disk_sampler.sample() if self._disk_sampler else None
+        except Exception:
+            ds = None
+        disk_free_txt, disk_sub2 = "", ""
+        try:
+            from app.hw_monitor import drive_free_total
+            pair = drive_free_total(
+                (os.environ.get("SystemDrive", "C:") or "C:") + "\\")
+            if pair:
+                free_gb, total_gb = pair[0] / 1024 ** 3, pair[1] / 1024 ** 3
+                disk_free_txt = f"C: {free_gb:.0f} / {total_gb:.0f} GB free"
+        except Exception:
+            pass
+        if ds:
+            try:
+                r = (ds.get("read_bps") or 0.0) / 1024 ** 2
+                w = (ds.get("write_bps") or 0.0) / 1024 ** 2
+                disk_sub2 = f"R {r:.1f} · W {w:.1f} MB/s"
+            except Exception:
+                pass
+            ap = ds.get("active_percent")
+            if ap is not None:
+                self._paint_card(self._disk, ap, f"{ap:.0f}%",
+                                 disk_free_txt, disk_sub2)
+            else:
+                disk_ok = bool(getattr(self._disk_sampler, "_ok", False))
+                self._paint_card(self._disk, None,
+                                 "…" if disk_ok else "N/A",
+                                 disk_free_txt,
+                                 disk_sub2 or ("warming up" if disk_ok else ""))
+        else:
+            self._paint_card(self._disk, None, "N/A", disk_free_txt, "")
+
+        # ---- Network ---- #
+        ns = None
+        try:
+            ns = self._net_sampler.sample() if self._net_sampler else None
+        except Exception:
+            ns = None
+        if ns and ns.get("total_mbps") is not None:
+            try:
+                total = float(ns["total_mbps"])
+            except Exception:
+                total = 0.0
+            link = ns.get("link_mbps")
+            if link and link > 0:
+                pct = max(0.0, min(100.0, total / link * 100.0))
+                scale_txt = f"of {link:.0f} Mbps link"
+            else:
+                try:
+                    peak = float(self._net_sampler.max_seen_mbps or 0.0)
+                except Exception:
+                    peak = 0.0
+                denom = max(peak, total, 1.0)
+                pct = max(0.0, min(100.0, total / denom * 100.0))
+                scale_txt = "auto-scaled"
+            try:
+                up = float(ns.get("up_bps") or 0.0) * 8.0 / 1_000_000.0
+                down = float(ns.get("down_bps") or 0.0) * 8.0 / 1_000_000.0
+                io_txt = f"↓ {down:.1f} · ↑ {up:.1f} Mbps"
+            except Exception:
+                io_txt = scale_txt
+                scale_txt = ""
+            iface = self._short(ns.get("iface") or "")
+            self._paint_card(
+                self._net, pct,
+                f"{total:.1f} Mbps" if total >= 10 else f"{total:.2f} Mbps",
+                iface, io_txt,
+                ns.get("iface") or None)
+        else:
+            net_ok = bool(getattr(self._net_sampler, "_ok", False))
+            self._paint_card(self._net, None, "…" if net_ok else "N/A",
+                             "", "warming up" if net_ok else "")
+
+        try:
+            self._tick_after = self._dlg.after(self._TICK_MS, self._tick)
+        except Exception:
+            self._tick_after = None
+
+    def _stop_tick(self):
+        try:
+            if self._tick_after is not None:
+                self._dlg.after_cancel(self._tick_after)
+        except Exception:
+            pass
+        self._tick_after = None
+        for sampler in (self._gpu_sampler, self._disk_sampler,
+                        self._net_sampler):
+            try:
+                if sampler is not None:
+                    sampler.close()
+            except Exception:
+                pass
+        try:
+            if self._nvml is not None:
+                self._nvml.close()
+        except Exception:
+            pass
+
+
 
 class DriveToolkitDialog(ThemedModal):
     """Drive Toolkit (Tools tab card): 3-in-1 — Health, Speed, Capacity.
@@ -14306,6 +14541,869 @@ class DriveToolkitDialog(ThemedModal):
                 fg=COLORS["accent_red"])
 
 
+
+class UninstallProgramsDialog(ThemedModal):
+    """Uninstall Programs (Tools tab card): list installed apps,
+    run each program's official uninstaller, then optionally scan for
+    leftover folders for the chosen name only.
+
+    Safety model matches the rest of the app:
+      * Official UninstallString / QuietUninstallString only — never a
+        blind force-delete of Program Files trees.
+      * Leftover scan is name-scoped and high-confidence (same residual
+        heuristics as the Clean-tab orphan task).
+      * User reviews leftover candidates with checkboxes before delete.
+      * Elevation is requested only when the selected uninstall needs it.
+    """
+
+    def __init__(self, parent, app):
+        self.app = app
+        self._programs = []       # full list from list_installed_programs
+        self._shown = []          # filtered view
+        self._checked = {}        # program id -> BooleanVar (multi-select)
+        self._leftover_vars = {}  # path (or REGKEY::/STARTUP::/SHORTCUT:: pseudo-path) -> BooleanVar
+        self._icon_cache = {}     # DisplayIcon spec -> tk.PhotoImage (survives rebuilds)
+        self._icon_waiters = {}   # DisplayIcon spec -> [Label, ...] awaiting extraction
+        self._icon_default_img = None  # lazily built placeholder PhotoImage
+        super().__init__(parent, title="Uninstall Programs",
+                         accent=TAB_ACCENTS.get("Clean", COLORS["accent_green"]))
+        body = self.body
+
+        tk.Label(body, text="Uninstall a program the official way, then "
+                            "optionally clean leftovers it left behind.",
+                 font=(F, 10, "bold"), bg=COLORS["bg"], fg=COLORS["text"],
+                 anchor="w").pack(fill="x", pady=(0, 2))
+        tk.Label(body, text="Only the program's own uninstaller runs. "
+                            "Leftover folders are shown for review — nothing "
+                            "is force-deleted without your say-so.",
+                 font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
+                 anchor="w", wraplength=720).pack(fill="x", pady=(0, 8))
+
+        # Search
+        self._search_var = tk.StringVar()
+        self._search_var.trace_add("write", lambda *_: self._apply_filter())
+        entry = RoundedEntry(body, textvariable=self._search_var)
+        entry.pack(fill="x", pady=(0, 6))
+        self._search_entry = entry.entry
+        self._search_placeholder = "Type to filter…"
+        self._search_entry.insert(0, self._search_placeholder)
+        self._search_focused = False
+        self._search_entry.bind("<FocusIn>", self._filter_focus_in)
+        self._search_entry.bind("<FocusOut>", self._filter_focus_out)
+
+        # Program list
+        self._list_panel = ScrollableRoundedPanel(body)
+        self._list_panel.config(height=280)
+        self._list_panel.pack(fill="both", expand=True, pady=(0, 6))
+        self._list_body = self._list_panel.inner
+
+        # Status + actions
+        brow = tk.Frame(body, bg=COLORS["bg"])
+        brow.pack(fill="x", pady=(4, 0))
+        self._status = tk.Label(brow, text="Scanning…", font=(F, 9),
+                                bg=COLORS["bg"], fg=COLORS["subtext"],
+                                wraplength=420, justify="left", anchor="w")
+        self._status.pack(side="left", fill="x", expand=True)
+        self._uninstall_btn = AnimatedButton(
+            brow, text="Uninstall Selected", command=self._do_uninstall,
+            bg=TAB_ACCENTS.get("Clean", COLORS["accent_green"]),
+            fg=COLORS["black"], font=(F, 9, "bold"), padx=14, pady=6)
+        self._uninstall_btn.pack(side="right", padx=(6, 0))
+        self._uninstall_btn.set_enabled(False)
+        self._select_all_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            brow, text="Select all", variable=self._select_all_var,
+            command=self._on_select_all, font=(F, 9), bg=COLORS["bg"],
+            fg=COLORS["text"], selectcolor=COLORS["surface"],
+            activebackground=COLORS["bg"], activeforeground=COLORS["text"]
+        ).pack(side="right", padx=(6, 0))
+        AnimatedButton(brow, text="Refresh", command=self._refresh,
+                       bg=COLORS["surface"], fg=COLORS["text"],
+                       font=(F, 9, "bold"), padx=12, pady=6).pack(
+                           side="right", padx=(6, 0))
+        AnimatedButton(brow, text="Close", command=self.close,
+                       bg=COLORS["surface"], fg=COLORS["text"],
+                       font=(F, 9, "bold"), padx=12, pady=6).pack(
+                           side="right")
+
+        # Leftover review panel (hidden until after uninstall)
+        self._leftover_frame = tk.Frame(body, bg=COLORS["bg"])
+        # packed on demand
+
+        # Async enumerate so the dialog never freezes on open
+        self._scan_token = [False]
+        self._start_scan()
+
+    # ---- search placeholder helpers (same pattern as CatalogPicker) ---- #
+
+    def _filter_focus_in(self, _e=None):
+        self._search_focused = True
+        if self._search_entry.get() == self._search_placeholder:
+            self._search_entry.delete(0, "end")
+            self._search_entry.config(fg=COLORS["text"])
+
+    def _filter_focus_out(self, _e=None):
+        self._search_focused = False
+        if not self._search_entry.get().strip():
+            self._search_entry.delete(0, "end")
+            self._search_entry.insert(0, self._search_placeholder)
+            self._search_entry.config(fg=COLORS["subtext"])
+
+    def _query(self):
+        q = self._search_var.get().strip()
+        if q == self._search_placeholder:
+            return ""
+        return q.lower()
+
+    def _apply_filter(self):
+        if not hasattr(self, "_list_body"):
+            return   # trace can fire while RoundedEntry wires up the
+                     # variable, before the list panel exists yet
+        q = self._query()
+        if not q:
+            self._shown = list(self._programs)
+        else:
+            self._shown = [
+                p for p in self._programs
+                if q in p["name"].lower()
+                or q in (p.get("publisher") or "").lower()
+            ]
+        self._rebuild_list()
+
+    def _start_scan(self):
+        self._status.config(text="Scanning installed programs…")
+        token = self._scan_token
+        token[0] = False
+
+        def work():
+            try:
+                from app.game_catalog import list_installed_programs
+                programs = list_installed_programs()
+            except Exception:
+                programs = []
+            if token[0]:
+                return
+            try:
+                self._dlg.after(0, lambda: self._on_scan_done(programs))
+            except Exception:
+                pass
+
+        import threading
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_scan_done(self, programs):
+        if self._scan_token[0]:
+            return
+        self._programs = programs or []
+        self._shown = list(self._programs)
+        self._status.config(
+            text=f"{len(self._programs)} program(s) found. Select one to uninstall.")
+        self._rebuild_list()
+
+    def _refresh(self):
+        self._checked = {}
+        self._select_all_var.set(False)
+        self._uninstall_btn.set_enabled(False)
+        self._clear_leftover_panel()
+        self._start_scan()
+
+    # ---- multi-select helpers ------------------------------------------ #
+
+    @staticmethod
+    def _program_id(prog):
+        """Stable id for a program dict — key_path+hive when we have a
+        registry location (the common case), else fall back to the name
+        (still unique: list_installed_programs() dedups by DisplayName)."""
+        hive = prog.get("hive") or ""
+        key_path = prog.get("key_path") or ""
+        if hive and key_path:
+            return f"{hive}|{key_path}"
+        return f"name|{(prog.get('name') or '').lower()}"
+
+    def _is_checked(self, prog):
+        var = self._checked.get(self._program_id(prog))
+        return bool(var and var.get())
+
+    def _checked_count(self):
+        return sum(1 for v in self._checked.values() if v.get())
+
+    def _update_uninstall_btn(self):
+        n = self._checked_count()
+        self._uninstall_btn.config_text(
+            f"Uninstall Selected ({n})" if n else "Uninstall Selected")
+        self._uninstall_btn.set_enabled(n > 0)
+
+    def _on_select_all(self):
+        want = self._select_all_var.get()
+        for prog in self._shown:
+            pid = self._program_id(prog)
+            var = self._checked.get(pid)
+            if var is None:
+                var = tk.BooleanVar(value=False)
+                self._checked[pid] = var
+            var.set(want)
+        self._rebuild_list()
+        self._update_uninstall_btn()
+
+    def _toggle_row(self, prog):
+        pid = self._program_id(prog)
+        var = self._checked.get(pid)
+        if var is None:
+            var = tk.BooleanVar(value=False)
+            self._checked[pid] = var
+        var.set(not var.get())
+        self._update_uninstall_btn()
+
+    def _rebuild_list(self):
+        for child in self._list_body.winfo_children():
+            try:
+                child.destroy()
+            except Exception:
+                pass
+        if not self._shown:
+            tk.Label(self._list_body,
+                     text="No matching programs.",
+                     font=(F, 10), bg=COLORS["bg"], fg=COLORS["subtext"],
+                     anchor="w").pack(fill="x", padx=8, pady=12)
+            try:
+                self._list_panel.refresh_scroll()
+            except Exception:
+                pass
+            return
+        for prog in self._shown:
+            self._add_row(prog)
+        try:
+            self._list_panel.refresh_scroll()
+        except Exception:
+            pass
+
+    def _add_row(self, prog):
+        pid = self._program_id(prog)
+        var = self._checked.get(pid)
+        if var is None:
+            var = tk.BooleanVar(value=False)
+            self._checked[pid] = var
+
+        row = tk.Frame(self._list_body, bg=COLORS["bg"], cursor="hand2")
+        row.pack(fill="x", padx=4, pady=1)
+
+        cb = tk.Checkbutton(
+            row, variable=var, command=lambda p=prog: self._update_uninstall_btn(),
+            bg=COLORS["bg"], activebackground=COLORS["bg"],
+            selectcolor=COLORS["surface"])
+        cb.pack(side="left", padx=(2, 2), pady=2)
+
+        icon_lbl = tk.Label(row, bg=COLORS["bg"])
+        icon_lbl.pack(side="left", padx=(0, 6), pady=2)
+        self._set_row_icon(icon_lbl, prog)
+
+        name = prog.get("name") or "(unknown)"
+        publisher = prog.get("publisher") or ""
+        size_kb = prog.get("size_kb") or 0
+        size_txt = ""
+        if size_kb >= 1024:
+            size_txt = f"  ·  {size_kb / 1024:.1f} MB"
+        elif size_kb > 0:
+            size_txt = f"  ·  {size_kb} KB"
+        left = f"{name}"
+        if publisher:
+            left += f"  —  {publisher}"
+        left += size_txt
+        lbl = tk.Label(row, text=left, font=(F, 9), bg=COLORS["bg"],
+                       fg=COLORS["text"], anchor="w", justify="left")
+        lbl.pack(side="left", fill="x", expand=True, padx=6, pady=4)
+
+        # clicking anywhere on the row (not just the checkbox hitbox)
+        # toggles selection, same reachable-target size the rest of the
+        # app uses for clickable rows
+        def _pick(_e=None, p=prog):
+            self._toggle_row(p)
+        row.bind("<Button-1>", _pick)
+        icon_lbl.bind("<Button-1>", _pick)
+        lbl.bind("<Button-1>", _pick)
+        row._prog = prog
+
+    def _icon_default_photo(self):
+        if self._icon_default_img is None:
+            try:
+                from app.icon_extract import default_icon_ppm
+                self._icon_default_img = tk.PhotoImage(
+                    data=default_icon_ppm(18, (90, 96, 104)))
+            except Exception:
+                self._icon_default_img = None
+        return self._icon_default_img
+
+    def _set_row_icon(self, label, prog):
+        """Show a placeholder immediately; if this program has a
+        DisplayIcon, extract the real one on a background thread (GDI
+        calls are pure computation, no Tk involved) and swap it in once
+        ready. Cached by icon spec so re-filtering never re-extracts the
+        same icon twice, and an in-flight guard stops duplicate threads
+        firing on every keystroke while a search filters the list."""
+        placeholder = self._icon_default_photo()
+        if placeholder is not None:
+            label.config(image=placeholder)
+            label.image = placeholder
+
+        icon_spec = prog.get("icon") or ""
+        if not icon_spec:
+            return
+        cached = self._icon_cache.get(icon_spec)
+        if cached is not None:
+            label.config(image=cached)
+            label.image = cached
+            return
+        # Register this label as waiting for icon_spec. If a rebuild (e.g.
+        # a search keystroke) destroys this row before extraction lands,
+        # the widget-existence check in apply() below skips just that
+        # stale entry — the new row for the same program registers its
+        # own label here too, so it still gets the icon once ready.
+        waiters = self._icon_waiters.setdefault(icon_spec, [])
+        waiters.append(label)
+        if len(waiters) > 1:
+            return   # extraction already in flight for this icon
+
+        def work():
+            ppm = None
+            try:
+                from app.icon_extract import icon_ppm_bytes
+                ppm = icon_ppm_bytes(
+                    icon_spec, size=18, bg_rgb=(30, 32, 36))
+            except Exception:
+                ppm = None
+
+            def apply():
+                pending = self._icon_waiters.pop(icon_spec, [])
+                photo = None
+                if ppm:
+                    try:
+                        photo = tk.PhotoImage(data=ppm)
+                        self._icon_cache[icon_spec] = photo
+                    except Exception:
+                        photo = None
+                if photo is None:
+                    return
+                for lbl in pending:
+                    try:
+                        if lbl.winfo_exists():
+                            lbl.config(image=photo)
+                            lbl.image = photo
+                    except Exception:
+                        pass
+            try:
+                self._dlg.after(0, apply)
+            except Exception:
+                self._icon_waiters.pop(icon_spec, None)
+
+        import threading
+        threading.Thread(target=work, daemon=True).start()
+
+    def _do_uninstall(self):
+        checked = [p for p in self._programs if self._is_checked(p)]
+        if not checked:
+            return
+        names = ", ".join((p.get("name") or "?") for p in checked[:5])
+        more = f", and {len(checked) - 5} more" if len(checked) > 5 else ""
+        plural = "1 program" if len(checked) == 1 else f"{len(checked)} programs"
+        if not _themed_askyesno(
+                self._dlg, "Confirm Uninstall",
+                f"Uninstall {plural}?\n\n{names}{more}\n\n"
+                "A System Restore point is attempted first as a safety "
+                "net, then each program's own uninstaller runs in turn. "
+                "After they finish you can review any leftovers.",
+                yes_text="Uninstall", no_text="Cancel"):
+            return
+        self._uninstall_btn.set_enabled(False)
+        self._queue = list(checked)
+        self._queue_total = len(checked)
+        self._queue_results = []   # [(prog, rc_or_None, err_str), ...]
+        self._create_pre_uninstall_restore_point()
+
+    def _create_pre_uninstall_restore_point(self):
+        """Best-effort safety net before a batch that can uninstall
+        multiple programs and delete registry/startup/shortcut leftovers.
+        Reuses the same create_restore_point() the Repair tab's own
+        'Safety Checkpoint' task uses — it never raises, just logs and
+        returns False on failure (System Protection off, Windows'
+        built-in once-per-~24h throttling, etc.), so this can't block or
+        fail the uninstall itself; it only delays starting it by however
+        long the checkpoint takes."""
+        self._status.config(text="Creating a System Restore point (safety net)…")
+        token = self._scan_token
+
+        def work():
+            ok = False
+            try:
+                from app.utils import TaskContext, create_restore_point
+                ctx = TaskContext(
+                    log=lambda m: None,
+                    set_status=lambda m: None,
+                    cancelled=lambda: False,
+                )
+                ok = create_restore_point(
+                    ctx, description="Cleaner Tool - before uninstall")
+            except Exception:
+                ok = False
+            if token[0]:
+                return
+            try:
+                self._dlg.after(
+                    0, lambda: self._after_restore_point(ok))
+            except Exception:
+                pass
+
+        import threading
+        threading.Thread(target=work, daemon=True).start()
+
+    def _after_restore_point(self, ok):
+        self._status.config(
+            text="Restore point created." if ok
+            else "Restore point skipped (System Protection may be off) — continuing.")
+        self._run_next_in_queue()
+
+    def _run_next_in_queue(self):
+        if not self._queue:
+            self._on_queue_done()
+            return
+        prog = self._queue.pop(0)
+        name = prog.get("name") or "this program"
+        step = self._queue_total - len(self._queue)
+        self._status.config(
+            text=f"Uninstalling {name}… ({step}/{self._queue_total})")
+        cmd = prog.get("quiet") or prog.get("uninstall") or ""
+        if not cmd:
+            self._queue_results.append((prog, None, "No uninstall command found"))
+            self._run_next_in_queue()
+            return
+        token = self._scan_token
+
+        def work():
+            rc = -1
+            err = ""
+            try:
+                import subprocess
+                import shlex
+                # Prefer QuietUninstallString when present; otherwise run
+                # the normal UninstallString. Parse to argv and run
+                # shell=False so registry metacharacters cannot inject
+                # extra commands (SEC-001). Fall closed on malformed strings.
+                try:
+                    argv = shlex.split(cmd, posix=False)
+                except ValueError as ve:
+                    err = f"Refusing to run malformed uninstall command: {ve}"
+                    argv = None
+                if argv:
+                    completed = subprocess.run(
+                        argv, shell=False, timeout=600,
+                        capture_output=True, text=True,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                    rc = completed.returncode
+            except Exception as exc:
+                err = str(exc)
+            if token[0]:
+                return
+            try:
+                self._dlg.after(
+                    0, lambda: self._on_item_done(prog, rc, err))
+            except Exception:
+                pass
+
+        import threading
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_item_done(self, prog, rc, err):
+        self._queue_results.append((prog, rc, err))
+        self._run_next_in_queue()
+
+    def _on_queue_done(self):
+        results = self._queue_results
+        n = len(results)
+        # Only programs whose uninstaller actually started get a leftover
+        # scan — one that failed to launch left nothing new behind.
+        started_ok = [p for p, rc, err in results if not err]
+        failed = n - len(started_ok)
+        self._status.config(text=f"Finished {n} uninstall(s). Scanning leftovers…")
+
+        token = self._scan_token
+
+        # Registry enumeration + filesystem walks per item add up for a
+        # multi-item batch — run the whole scan off the Tk thread so the
+        # dialog never freezes mid-batch, same async-then-hop-back pattern
+        # _start_scan() already uses for the initial program list.
+        def work():
+            try:
+                from app.tasks.clean_tasks import _normalize_product_token
+            except Exception:
+                def _normalize_product_token(s):
+                    return (s or "").lower().strip()
+
+            items = []
+            seen_paths = set()
+
+            def _add(it, owner_name):
+                if it["path"] in seen_paths:
+                    return
+                seen_paths.add(it["path"])
+                it["label"] = f"{it['label']}  —  {owner_name}"
+                items.append(it)
+
+            for prog in started_ok:
+                if token[0]:
+                    return
+                name = prog.get("name") or "program"
+                pt = _normalize_product_token(name)
+                for folder in self._scan_leftovers_for(
+                        name, prog.get("location") or ""):
+                    _add({"path": folder, "label": folder, "kind": "folder"}, name)
+                ghost = self._check_ghost_registry_key(prog)
+                if ghost:
+                    _add(ghost, name)
+                for it in self._scan_startup_leftovers_for(pt):
+                    _add(it, name)
+                for it in self._scan_shortcut_leftovers_for(pt):
+                    _add(it, name)
+
+            if token[0]:
+                return
+            try:
+                self._dlg.after(
+                    0, lambda: self._on_leftover_scan_done(items, n, failed))
+            except Exception:
+                pass
+
+        import threading
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_leftover_scan_done(self, items, n, failed):
+        if not items:
+            msg = f"Finished {n} uninstall(s). No high-confidence leftovers found."
+            if failed:
+                msg += f" ({failed} failed to start.)"
+            self._status.config(text=msg)
+            self._refresh()
+            return
+        summary = f"{n} uninstalled program(s)" if n != 1 else "1 program"
+        self._show_leftover_review(summary, items)
+
+    def _check_ghost_registry_key(self, prog):
+        """If prog's own Uninstall registry key is still present after its
+        uninstaller ran, AND list_installed_programs() no longer sees it
+        (proof the uninstall actually took, not just that the key opens),
+        return a reviewable REGKEY:: item. Never offered for a program
+        that a fresh scan still considers installed."""
+        key_path = prog.get("key_path") or ""
+        hive_label = prog.get("hive") or ""
+        if not key_path or hive_label not in ("HKLM", "HKCU"):
+            return None
+        try:
+            import winreg
+            root = (winreg.HKEY_LOCAL_MACHINE if hive_label == "HKLM"
+                    else winreg.HKEY_CURRENT_USER)
+            try:
+                k = winreg.OpenKey(root, key_path)
+                winreg.CloseKey(k)
+            except FileNotFoundError:
+                return None   # uninstaller already cleaned its own key
+            except OSError:
+                return None
+        except Exception:
+            return None
+        try:
+            from app.game_catalog import list_installed_programs
+            fresh = list_installed_programs()
+        except Exception:
+            return None
+        still_there = any(
+            p.get("hive") == hive_label and p.get("key_path") == key_path
+            for p in fresh)
+        if still_there:
+            return None
+        leaf = key_path.rsplit("\\", 1)[-1]
+        return {
+            "path": f"REGKEY::{hive_label}::{key_path}",
+            "label": f"Leftover registry entry: {hive_label}\\…\\{leaf}",
+            "kind": "regkey",
+        }
+
+    @staticmethod
+    def _startup_target_missing(cmd):
+        """True only when we can confidently say the target no longer
+        exists. Any ambiguity (empty command, env var we can't resolve,
+        can't stat) returns False — never flag a startup entry we're not
+        sure about, since removing one changes what runs at sign-in."""
+        cmd = (cmd or "").strip()
+        if not cmd:
+            return False
+        if cmd.startswith('"'):
+            end = cmd.find('"', 1)
+            path = cmd[1:end] if end != -1 else cmd[1:]
+        else:
+            path = cmd.split(" ", 1)[0]
+        path = os.path.expandvars(path).strip()
+        if not path:
+            return False
+        try:
+            return not os.path.exists(path)
+        except Exception:
+            return False
+
+    def _scan_startup_leftovers_for(self, token):
+        """Startup Run-key / Startup-folder entries whose target no longer
+        exists and whose name matches the just-uninstalled product. Fully
+        reuses app.startup_manager (already-tested enumerate/toggle code,
+        same undo-capable removal the Startup Manager dialog uses)."""
+        if not token or len(token) < 3:
+            return []
+        try:
+            from app.startup_manager import list_startup_items
+            from app.tasks.clean_tasks import _normalize_product_token
+        except Exception:
+            return []
+        hits = []
+        for it in list_startup_items():
+            if not it.get("enabled"):
+                continue   # already disabled/held — nothing to clean
+            if not self._startup_target_missing(it.get("command") or ""):
+                continue
+            nname = _normalize_product_token(it.get("name") or "")
+            related = (
+                nname == token or token in nname or nname in token
+                or (len(set(nname.split()) & set(token.split())) >= 2))
+            if not related:
+                continue
+            hits.append({
+                "path": f"STARTUP::{it['id']}",
+                "label": f"Startup entry (target missing): {it.get('name')} "
+                         f"({it.get('source_label', '')})",
+                "kind": "startup",
+            })
+        return hits
+
+    def _scan_shortcut_leftovers_for(self, token):
+        """Desktop / Start Menu .lnk/.url files whose filename matches the
+        just-uninstalled product. Name-matched only (no shell-link target
+        resolution, same conservative heuristic the folder scan uses) —
+        review-only, never auto-deleted."""
+        if not token or len(token) < 3:
+            return []
+        try:
+            from app.tasks.clean_tasks import _normalize_product_token
+        except Exception:
+            return []
+        roots = []
+        userprofile = os.environ.get("USERPROFILE", "")
+        if userprofile:
+            roots.append(os.path.join(userprofile, "Desktop"))
+        public = os.environ.get("PUBLIC", "")
+        if public:
+            roots.append(os.path.join(public, "Desktop"))
+        appdata = os.environ.get("APPDATA", "")
+        if appdata:
+            roots.append(os.path.join(
+                appdata, "Microsoft", "Windows", "Start Menu", "Programs"))
+        programdata = os.environ.get("PROGRAMDATA", "")
+        if programdata:
+            roots.append(os.path.join(
+                programdata, "Microsoft", "Windows", "Start Menu", "Programs"))
+
+        hits = []
+        seen = set()
+        for root in roots:
+            if not root or not os.path.isdir(root):
+                continue
+            try:
+                entries = os.listdir(root)
+            except OSError:
+                continue
+            for entry in entries:
+                low = entry.lower()
+                if not (low.endswith(".lnk") or low.endswith(".url")):
+                    continue
+                stem = os.path.splitext(entry)[0]
+                nname = _normalize_product_token(stem)
+                related = (
+                    nname == token or token in nname or nname in token
+                    or (len(set(nname.split()) & set(token.split())) >= 2))
+                if not related:
+                    continue
+                full = os.path.join(root, entry)
+                if full in seen:
+                    continue
+                seen.add(full)
+                hits.append({
+                    "path": f"SHORTCUT::{full}",
+                    "label": f"Shortcut: {full}",
+                    "kind": "shortcut",
+                })
+        return hits
+
+    def _scan_leftovers_for(self, display_name, install_location):
+        """Name-scoped leftover scan. Reuses orphan residual heuristics."""
+        try:
+            from app.tasks.clean_tasks import (
+                _orphan_scan_roots, _looks_like_residual_folder,
+                _normalize_product_token, _ORPHAN_DENY_NAMES,
+            )
+        except Exception:
+            return []
+        token = _normalize_product_token(display_name)
+        if not token or len(token) < 3:
+            return []
+        hits = []
+        # Always include InstallLocation if it still exists and looks residual
+        if install_location and os.path.isdir(install_location):
+            base = os.path.basename(install_location.rstrip("\\/"))
+            if (base.lower() not in _ORPHAN_DENY_NAMES
+                    and _looks_like_residual_folder(install_location)):
+                hits.append(install_location)
+        roots = _orphan_scan_roots()
+        for root in roots:
+            try:
+                children = os.listdir(root)
+            except OSError:
+                continue
+            for name in children:
+                folder = os.path.join(root, name)
+                if not os.path.isdir(folder):
+                    continue
+                if folder in hits:
+                    continue
+                lname = name.lower().strip()
+                if lname in _ORPHAN_DENY_NAMES:
+                    continue
+                nname = _normalize_product_token(name)
+                # must relate to the uninstalled product name
+                related = (
+                    nname == token
+                    or token in nname
+                    or nname in token
+                    or (len(set(nname.split()) & set(token.split())) >= 2)
+                )
+                if not related:
+                    continue
+                if not _looks_like_residual_folder(folder):
+                    continue
+                hits.append(folder)
+        return hits
+
+    def _clear_leftover_panel(self):
+        try:
+            self._leftover_frame.pack_forget()
+            for child in self._leftover_frame.winfo_children():
+                child.destroy()
+        except Exception:
+            pass
+        self._leftover_vars = {}
+
+    def _show_leftover_review(self, summary_name, items):
+        self._clear_leftover_panel()
+        self._leftover_frame.pack(fill="x", pady=(10, 0))
+        tk.Label(self._leftover_frame,
+                 text=f"Possible leftovers for {summary_name} — check what to remove:",
+                 font=(F, 9, "bold"), bg=COLORS["bg"], fg=COLORS["text"],
+                 anchor="w").pack(fill="x", pady=(0, 4))
+        for item in items:
+            var = tk.BooleanVar(value=True)
+            self._leftover_vars[item["path"]] = var
+            cb = tk.Checkbutton(
+                self._leftover_frame, text=item["label"], variable=var,
+                font=(F, 8), bg=COLORS["bg"], fg=COLORS["text"],
+                selectcolor=COLORS["surface"], activebackground=COLORS["bg"],
+                activeforeground=COLORS["text"], anchor="w",
+                wraplength=700, justify="left")
+            cb.pack(fill="x", padx=4, pady=1)
+        brow = tk.Frame(self._leftover_frame, bg=COLORS["bg"])
+        brow.pack(fill="x", pady=(6, 0))
+        AnimatedButton(
+            brow, text="Delete Selected Leftovers",
+            command=lambda: self._delete_leftovers(summary_name),
+            bg=COLORS.get("accent_red", "#c44"),
+            fg=COLORS["black"], font=(F, 9, "bold"),
+            padx=12, pady=6).pack(side="right")
+        AnimatedButton(
+            brow, text="Skip",
+            command=self._skip_leftovers,
+            bg=COLORS["surface"], fg=COLORS["text"],
+            font=(F, 9, "bold"), padx=12, pady=6).pack(side="right", padx=(0, 6))
+
+    def _skip_leftovers(self):
+        self._clear_leftover_panel()
+        self._refresh()
+
+    def _delete_leftovers(self, summary_name):
+        paths = [p for p, v in self._leftover_vars.items() if v.get()]
+        if not paths:
+            self._status.config(text="Nothing selected to delete.")
+            return
+        if not _themed_askyesno(
+                self._dlg, "Confirm Delete",
+                f"Delete {len(paths)} selected leftover item(s) for {summary_name}?\n\n"
+                "This cannot be undone. (A removed startup entry can still "
+                "be restored later from Startup Manager.)",
+                yes_text="Delete", no_text="Cancel"):
+            return
+
+        def work():
+            freed = 0
+            ok_count = 0
+            try:
+                from app.utils import (
+                    TaskContext, clean_folder_contents, reg_delete_key)
+                ctx = TaskContext(
+                    log=lambda m: None,
+                    set_status=lambda m: None,
+                    cancelled=lambda: False,
+                )
+                for p in paths:
+                    try:
+                        if p.startswith("REGKEY::"):
+                            _tag, hive, key_path = p.split("::", 2)
+                            if reg_delete_key(ctx, hive, key_path):
+                                ok_count += 1
+                        elif p.startswith("STARTUP::"):
+                            item_id = p[len("STARTUP::"):]
+                            from app.startup_manager import set_item_enabled
+                            okd, _msg = set_item_enabled(item_id, False)
+                            if okd:
+                                ok_count += 1
+                        elif p.startswith("SHORTCUT::"):
+                            target = p[len("SHORTCUT::"):]
+                            try:
+                                os.remove(target)
+                                ok_count += 1
+                            except OSError:
+                                pass
+                        else:
+                            freed += clean_folder_contents(
+                                ctx, p, remove_root=True)
+                            ok_count += 1
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                self._dlg.after(
+                    0, lambda: self._after_leftover_delete(ok_count, freed))
+            except Exception:
+                pass
+
+        import threading
+        threading.Thread(target=work, daemon=True).start()
+        self._status.config(text="Deleting selected leftovers…")
+
+    def _after_leftover_delete(self, ok_count, freed):
+        mb = freed / (1024 * 1024) if freed else 0
+        self._status.config(
+            text=f"Removed {ok_count} leftover item(s)"
+                 + (f" (~{mb:.1f} MB freed)." if mb > 0 else "."))
+        self._clear_leftover_panel()
+        self._refresh()
+
+    def close(self):
+        self._scan_token[0] = True
+        super().close()
+
+
 class StartupManagerDialog(ThemedModal):
     """Startup Manager (Tools tab card): everything that launches at
     sign-in, with one toggle each.
@@ -14449,6 +15547,192 @@ class StartupManagerDialog(ThemedModal):
         self._say(msg)
 
 
+class ProcessManagerDialog(ThemedModal):
+    """Process Manager (Tools tab card): what's using CPU/RAM right now,
+    plain names, one-click Close. Minimal text, auto-refreshes every 2s,
+    fixed 800×600 popup like every other Tools dialog.
+
+    Filters core Windows processes so nothing offered can brick the PC.
+    Close uses taskkill /PID /F (same path Game Night already trusts).
+    """
+
+    _TICK_MS = 2000
+    _TOP_N = 10
+
+    def __init__(self, parent, app):
+        self.app = app
+        self._tick_after = None
+        self._sampler = None
+        self._rows = {}  # pid -> row frame widgets
+        super().__init__(parent, title="Process Manager",
+                         accent=TAB_ACCENTS["Tools"])
+        body = self.body
+
+        tk.Label(body, text="What's using your PC — close anything you don't need.",
+                 font=(F, 10, "bold"), bg=COLORS["bg"], fg=COLORS["text"],
+                 anchor="w").pack(fill="x", pady=(0, 8))
+
+        self._panel = ScrollableRoundedPanel(body)
+        self._panel.config(height=380)
+        self._panel.pack(fill="both", expand=True)
+
+        brow = tk.Frame(body, bg=COLORS["bg"])
+        brow.pack(fill="x", pady=(10, 0))
+        self._status = tk.Label(brow, text="Scanning…", font=(F, 9),
+                                bg=COLORS["bg"], fg=COLORS["subtext"],
+                                wraplength=560, justify="left")
+        self._status.pack(side="left", fill="x", expand=True)
+        AnimatedButton(brow, text="Refresh", command=self._force_refresh,
+                       bg=COLORS["surface"], fg=COLORS["text"],
+                       font=(F, 9, "bold"), padx=16, pady=6).pack(
+            side="right", padx=(8, 0))
+        AnimatedButton(brow, text="Close", command=self.close,
+                       bg=TAB_ACCENTS["Tools"], fg=COLORS["black"],
+                       font=(F, 9, "bold"), padx=20, pady=6).pack(side="right")
+
+        try:
+            from app.process_manager import ProcessSampler
+            self._sampler = ProcessSampler(top_n=self._TOP_N)
+        except Exception:
+            self._sampler = None
+
+        # Prime + first paint, then tick
+        self._force_refresh()
+        self._schedule_tick()
+
+    def _say(self, text):
+        try:
+            self._status.config(text=text)
+        except Exception:
+            pass
+
+    def _schedule_tick(self):
+        try:
+            if self._tick_after is not None:
+                self.after_cancel(self._tick_after)
+        except Exception:
+            pass
+        try:
+            self._tick_after = self.after(self._TICK_MS, self._on_tick)
+        except Exception:
+            self._tick_after = None
+
+    def _on_tick(self):
+        self._tick_after = None
+        if not self.winfo_exists():
+            return
+        self._refresh_list(quiet=True)
+        self._schedule_tick()
+
+    def _force_refresh(self):
+        self._say("Scanning…")
+        self._refresh_list(quiet=False)
+
+    def _refresh_list(self, quiet=False):
+        holder = self._panel.inner
+        try:
+            for w in list(holder.winfo_children()):
+                w.destroy()
+        except Exception:
+            return
+        self._rows = {}
+        items = []
+        try:
+            if self._sampler is not None:
+                items = self._sampler.sample()
+        except Exception:
+            items = []
+        if not items:
+            tk.Label(holder, text="Nothing heavy found right now.",
+                     font=(F, 9), bg=COLORS["bg_alt"],
+                     fg=COLORS["subtext"]).pack(pady=20)
+            try:
+                self._panel.refresh_scroll()
+            except Exception:
+                pass
+            if not quiet:
+                self._say("Ready.")
+            return
+        for it in items:
+            self._build_row(holder, it)
+        try:
+            self._panel.refresh_scroll()
+        except Exception:
+            pass
+        n = len(items)
+        top = items[0]
+        if not quiet:
+            self._say(f"Top {n} · heaviest: {top['display']}")
+
+    def _build_row(self, parent, item):
+        row = tk.Frame(parent, bg=COLORS["bg_alt"])
+        row.pack(fill="x", padx=4, pady=3)
+
+        left = tk.Frame(row, bg=COLORS["bg_alt"])
+        left.pack(side="left", fill="x", expand=True, padx=(10, 6), pady=8)
+
+        name = tk.Label(left, text=item.get("display") or item.get("name") or "?",
+                        font=(F, 11, "bold"), bg=COLORS["bg_alt"],
+                        fg=COLORS["text"], anchor="w")
+        name.pack(fill="x")
+
+        cpu = item.get("cpu_percent", 0) or 0
+        ram = item.get("ram_mb", 0) or 0
+        detail = f"{cpu:.0f}% CPU  ·  {ram:.0f} MB RAM"
+        tk.Label(left, text=detail, font=(F, 9), bg=COLORS["bg_alt"],
+                 fg=COLORS["subtext"], anchor="w").pack(fill="x")
+
+        pid = item.get("pid")
+        btn = AnimatedButton(
+            row, text="Close",
+            command=lambda p=pid, d=item.get("display"): self._confirm_close(p, d),
+            bg=COLORS["surface"], fg=COLORS["text"],
+            font=(F, 9, "bold"), padx=14, pady=5)
+        btn.pack(side="right", padx=(0, 10), pady=8)
+        self._rows[pid] = row
+
+    def _confirm_close(self, pid, display):
+        if not pid:
+            return
+        # Tiny one-line confirm — same fixed-size dialog language
+        try:
+            from tkinter import messagebox
+            ok = messagebox.askyesno(
+                "Close process?",
+                f"Close {display or 'this process'}?",
+                parent=self,
+            )
+        except Exception:
+            ok = True
+        if not ok:
+            return
+        try:
+            from app.process_manager import close_process
+            ok = close_process(int(pid), force=True)
+        except Exception:
+            ok = False
+        if ok:
+            self._say(f"Closed {display}.")
+            self.after(300, self._force_refresh)
+        else:
+            self._say(f"Couldn't close {display}.")
+
+    def close(self):
+        try:
+            if self._tick_after is not None:
+                self.after_cancel(self._tick_after)
+                self._tick_after = None
+        except Exception:
+            pass
+        try:
+            super().close()
+        except Exception:
+            try:
+                self.destroy()
+            except Exception:
+                pass
+
+
 class ToolsTab(tk.Frame):
     """Tools tab (user redesign 2026-09): the 5th tab — pink accent.
 
@@ -14458,37 +15742,54 @@ class ToolsTab(tk.Frame):
     the 6th card's Quick Tools popup, so the tab itself is cards
     only, like Tweak's top."""
 
+    # Logical groups (left→right, top→bottom):
+    #   1) Storage / disk
+    #   2) System performance & control
+    #   3) PC info + network
+    #   4) Gaming automation
+    #   5) Peripheral testers (input → display → audio/video)
     _CARDS = (
+        # Storage / disk
         ("storage", "💾", "Storage",
          "Free up disk space", TAB_ACCENTS["Clean"]),
-        ("health", "🩺", "PC Health",
-         "Grade your PC health", COLORS["accent_green"]),
-        ("dns", "⚡", "DNS Test",
-         "Find your fastest DNS", TAB_ACCENTS["Tweak"]),
-        ("pilot", "🎮", "Auto-Pilot",
-         "Auto-tweaks for games", TAB_ACCENTS["Tweak"]),
         ("drivetoolkit", "💽", "Drive Toolkit",
          "Health, speed & real capacity checks", TAB_ACCENTS["Clean"]),
-        ("speed", "🚀", "Speed Test",
-         "Check download, upload + ping", TAB_ACCENTS["Clean"]),
-        ("gamepad", "🕹️", "Gamepad Tester",
-         "Test buttons, sticks + triggers", TAB_ACCENTS["Clean"]),
-        ("miccheck", "🎙️", "Mic Check",
-         "Mics, permission + live level", TAB_ACCENTS["Tweak"]),
-        ("gameping", "📶", "Server Ping",
-         "Ping game servers before you queue", TAB_ACCENTS["Clean"]),
-        ("keyboard", "⌨️", "Keyboard Tester",
-         "See which keys register — spot ghosting", TAB_ACCENTS["Clean"]),
-        ("monitor", "🖥️", "Monitor Test",
-         "Dead pixels + display info", TAB_ACCENTS["Clean"]),
-        ("speaker", "🔊", "Speaker Test",
-         "Surround check on any output", TAB_ACCENTS["Clean"]),
-        ("webcam", "📷", "Webcam Test",
-         "Check your camera works", TAB_ACCENTS["Clean"]),
-        ("mouse", "🖱️", "Mouse Tester",
-         "Buttons, polling + aim test", TAB_ACCENTS["Clean"]),
+        ("uninstall", "🗑️", "Uninstall Programs",
+         "Remove apps + their leftovers", TAB_ACCENTS["Clean"]),
+        # System performance & control
+        ("procman", "📋", "Process Manager",
+         "See what's using CPU & RAM — close it", TAB_ACCENTS["Tweak"]),
+        ("hwmonitor", "📊", "Hardware Monitor",
+         "Live CPU, RAM, GPU, disk + network", TAB_ACCENTS["Tweak"]),
+        ("startup", "🚀", "Startup Manager",
+         "See what launches at sign-in", TAB_ACCENTS["Tweak"]),
+        # PC info + network
         ("specs", "💻", "PC Specs",
          "Your PC at a glance", TAB_ACCENTS["Clean"]),
+        ("dns", "⚡", "DNS Test",
+         "Find your fastest DNS", TAB_ACCENTS["Tweak"]),
+        ("speed", "📡", "Speed Test",
+         "Check download, upload + ping", TAB_ACCENTS["Clean"]),
+        ("gameping", "📶", "Server Ping",
+         "Ping game servers before you queue", TAB_ACCENTS["Clean"]),
+        # Gaming automation
+        ("pilot", "🎮", "Auto-Pilot",
+         "Auto-tweaks for games", TAB_ACCENTS["Tweak"]),
+        # Peripheral testers
+        ("gamepad", "🕹️", "Gamepad Tester",
+         "Test buttons, sticks + triggers", TAB_ACCENTS["Clean"]),
+        ("keyboard", "⌨️", "Keyboard Tester",
+         "See which keys register — spot ghosting", TAB_ACCENTS["Clean"]),
+        ("mouse", "🖱️", "Mouse Tester",
+         "Buttons, polling + aim test", TAB_ACCENTS["Clean"]),
+        ("monitor", "🖥️", "Monitor Test",
+         "Dead pixels + display info", TAB_ACCENTS["Clean"]),
+        ("webcam", "📷", "Webcam Test",
+         "Check your camera works", TAB_ACCENTS["Clean"]),
+        ("miccheck", "🎙️", "Mic Check",
+         "Mics, permission + live level", TAB_ACCENTS["Tweak"]),
+        ("speaker", "🔊", "Speaker Test",
+         "Surround check on any output", TAB_ACCENTS["Clean"]),
     )
 
     _SHORTCUTS = (
@@ -14594,21 +15895,42 @@ class ToolsTab(tk.Frame):
 
     def _build_card(self, parent, rr, cc, key, icon, title, blurb,
                       card_accent):
-        """One feature card — mirrors TaskTab._make_card exactly: accent-
-        colored emoji icon + bold title on the face, description in a
-        hover tooltip (user call 2026-09: no blurb text on cards, like
-        the Clean/Repair/Tweak preset cards). Grid pads + uniform
-        columns match TaskTab._build_preset_cards exactly (padx=5,
-        pady=4, uniform="cards") so Tools cards sit at the same size
-        + position as Tweak's 6."""
+        """One feature card: full-color PNG icon (Twemoji) when present under
+        assets/tools_icons/{key}.png, else accent-colored emoji glyph. Bold
+        title; description lives in a hover tooltip. Grid pads match Tweak."""
         outer = tk.Frame(parent, bg=COLORS["hairline"], bd=0)
         outer.grid(row=rr, column=cc, sticky="nsew", padx=5, pady=4)
         inner = tk.Frame(outer, bg=COLORS["bg_alt"])
         inner.pack(fill="both", expand=True, padx=1, pady=1)
         head = tk.Frame(inner, bg=COLORS["bg_alt"])
         head.pack(fill="x", padx=12, pady=(6, 6))
-        icon_lbl = tk.Label(head, text=icon, font=("Segoe UI Emoji", 16),
-                            bg=COLORS["bg_alt"], fg=card_accent)
+
+        photo = None
+        try:
+            from pathlib import Path as _P
+            icon_path = _P(__file__).resolve().parent / "assets" / "tools_icons" / f"{key}.png"
+            if icon_path.is_file():
+                photo = tk.PhotoImage(file=str(icon_path))
+                try:
+                    w, h = photo.width(), photo.height()
+                    if w > 28 or h > 28:
+                        factor = max(1, max(w, h) // 24)
+                        if factor > 1:
+                            photo = photo.subsample(factor, factor)
+                except Exception:
+                    pass
+                if not hasattr(self, "_card_photos"):
+                    self._card_photos = {}
+                self._card_photos[key] = photo
+        except Exception:
+            photo = None
+
+        if photo is not None:
+            icon_lbl = tk.Label(head, image=photo, bg=COLORS["bg_alt"],
+                                bd=0, highlightthickness=0)
+        else:
+            icon_lbl = tk.Label(head, text=icon, font=("Segoe UI Emoji", 16),
+                                bg=COLORS["bg_alt"], fg=card_accent)
         icon_lbl.pack(side="left")
         title_lbl = tk.Label(head, text=title, font=(F, 12, "bold"),
                              bg=COLORS["bg_alt"], fg=COLORS["text"])
@@ -14616,10 +15938,6 @@ class ToolsTab(tk.Frame):
         self._card_frames[key] = (outer, inner)
 
         if blurb:
-            # one Tooltip per card part, same text: hovering anywhere on
-            # the card shows the description (child crossings fire
-            # <Leave>, so a single container-bound tip would die at the
-            # first label edge) — same pattern as _make_card
             for _w in (outer, inner, head, icon_lbl, title_lbl):
                 Tooltip(_w, blurb)
 
@@ -14635,9 +15953,6 @@ class ToolsTab(tk.Frame):
             except Exception:
                 pass
 
-        # click + hover on the container frames AND every descendant
-        # (add="+": parts carry Tooltip <Enter>/<Leave> hooks by now —
-        # plain bind() would wipe them, see _build_toggle_row)
         for w in (outer, inner, head):
             w.bind("<Button-1>", lambda e, k=key: self._mount(k))
             w.bind("<Enter>", hover_on, add="+")
@@ -14670,8 +15985,8 @@ class ToolsTab(tk.Frame):
         try:
             if key == "storage":
                 self.app._open_storage_insight()
-            elif key == "health":
-                self.app._open_health_report()
+            elif key == "procman":
+                self.app._open_process_manager()
             elif key == "dns":
                 self.app._open_dns_tester()
             elif key == "pilot":
@@ -14698,6 +16013,12 @@ class ToolsTab(tk.Frame):
                 self.app._open_mouse_tester()
             elif key == "specs":
                 self.app._open_pc_specs()
+            elif key == "hwmonitor":
+                self.app._open_hw_monitor()
+            elif key == "startup":
+                self.app._open_startup_manager()
+            elif key == "uninstall":
+                self.app._open_uninstall_programs()
         except Exception:
             pass
 
@@ -15288,25 +16609,6 @@ class Application:
         self._update_banner_frame.pack(side="left", padx=(0, 8))
         self._update_banner_frame.pack_forget()  # Hidden by default
         
-        # Health score badge (shows overall PC health grade)
-        self._health_badge_frame = tk.Frame(toolbar, bg=COLORS["bg"])
-        self._health_badge = tk.Label(
-            self._health_badge_frame,
-            text="?",
-            font=(F, 12, "bold"),
-            bg=COLORS["surface"],
-            fg=COLORS["subtext"],
-            width=3,
-            relief="solid",
-            bd=1,
-            cursor="hand2"
-        )
-        self._health_badge.pack(padx=6, pady=2)
-        self._health_badge.bind("<Button-1>", lambda e: self._show_health_report())
-        Tooltip(self._health_badge, "Click to check PC health")
-        self._health_badge_frame.pack(side="left", padx=(0, 8))
-        self._health_grade = "?"  # Current health grade
-        
         # Audit fix (Limited-mode clarity): this used to be a plain, inert
         # label — the user had no way to get to Administrator rights again
         # short of quitting and relaunching by hand. Clicking it in Limited
@@ -15415,15 +16717,16 @@ class Application:
         )
         self.cancel_btn.set_enabled(False)
 
-        # Bottom-corner shortcuts (user request): Auto Maintenance and
-        # Export Logs live here as icon buttons instead of inside the
-        # Quick Tools popup. Click opens the dialog; hover names it.
+        # Bottom-corner shortcuts: Auto Maintenance, Quick Tools, Export
+        # Logs. Startup Manager and Uninstall Programs moved to Tools tab
+        # cards (user request, 2026-09) — the Tools grid had exactly two
+        # empty slots on its last row, and both dialogs already existed
+        # as ThemedModal popups launched the same way every other Tools
+        # card is, so this is a straight relocation, not new plumbing.
+        # Three equal-width columns, each icon centered — gaps stay identical.
         corners = tk.Frame(host, bg=COLORS["bg"])
         corners.pack(fill="x", padx=26, pady=(0, 8))
-        # Four equal-width columns, each icon centered in its own column:
-        # the gaps between the icons are identical (the old layout pinned
-        # two icons to the edges and floated the other two in the middle).
-        for _ci in range(4):
+        for _ci in range(3):
             corners.columnconfigure(_ci, weight=1, uniform="corner")
 
         def _corner_icon(col, icon, tip, command):
@@ -15448,10 +16751,8 @@ class Application:
             0, "🛠️", "Auto Maintenance", lambda: self._show_schedule_dialog())
         self._corner_quick = _corner_icon(
             1, "🧰", "Quick Tools", lambda: self._open_quick_tools())
-        self._corner_startup = _corner_icon(
-            2, "🚀", "Startup Manager", lambda: self._open_startup_manager())
         self._corner_logs = _corner_icon(
-            3, "📋", "Export Logs", lambda: self.export_logs())
+            2, "📋", "Export Logs", lambda: self.export_logs())
 
         self._build_log(bottom)
         self._start_disk_monitor()
@@ -15485,9 +16786,6 @@ class Application:
 
         # Check for updates in the background (non-blocking)
         self._schedule_update_check()
-        
-        # Schedule periodic health check for the badge
-        self._schedule_health_check()
 
         # F6: the window is up — pre-warm the first-entry Custom/Undo
         # bodies and the Install catalog in idle time instead of on the
@@ -15526,8 +16824,12 @@ class Application:
                 # Replace with your actual GitHub repo when ready
                 result = check_for_updates("MyLittlePrimordia/Cleaner-Tool", timeout=10)
                 if result.get('update_available'):
-                    # Show update banner on main thread
-                    self.root.after(0, lambda: self._show_update_banner(result))
+                    # Show update banner on main thread (guard destroyed root)
+                    try:
+                        if self.root.winfo_exists():
+                            self.root.after(0, lambda: self._show_update_banner(result))
+                    except Exception:
+                        pass
             except Exception:
                 # Silently fail - update check is optional
                 pass
@@ -15576,87 +16878,6 @@ class Application:
                     webbrowser.open(download_url)
         except Exception:
             pass
-    
-    def _show_health_report(self):
-        """Show the PC Health Report dialog."""
-        try:
-            HealthReportDialog(self.root, self).wait()
-        except Exception:
-            pass
-    
-    def _update_health_badge(self, grade: str):
-        """Update the health badge with the given grade."""
-        try:
-            if not hasattr(self, '_health_badge') or not self._health_badge.winfo_exists():
-                return
-            
-            self._health_grade = grade
-            self._health_badge.config(text=grade)
-            
-            # Update color based on grade
-            grade_colors = {
-                "A": COLORS["accent_green"],
-                "B": COLORS["accent_sky"],
-                "C": COLORS["accent_yellow"],
-                "D": COLORS["accent_yellow"],
-                "F": COLORS["accent_red"],
-                "?": COLORS["subtext"]
-            }
-            color = grade_colors.get(grade, COLORS["subtext"])
-            self._health_badge.config(fg=color)
-        except Exception:
-            pass
-    
-    def _schedule_health_check(self):
-        """Schedule a periodic health check to update the badge."""
-        # Check health every 5 minutes
-        self._health_check_worker()
-    
-    def _health_check_worker(self):
-        """Background health check to update the badge."""
-        def _worker():
-            try:
-                from app.health_scan import run_health_scan, SENSORS
-                import logging
-                
-                # Create a simple context for the health scan
-                log_list = []
-                cancelled_flag = [False]
-                
-                def set_status(msg):
-                    pass  # We don't need status updates for badge
-                
-                def cancelled():
-                    return cancelled_flag[0]
-                
-                ctx = type('TaskContext', (), {
-                    'log': log_list.append,
-                    'set_status': set_status,
-                    'cancelled': cancelled
-                })()
-                
-                # Run a quick health scan (disk + GPU only for speed)
-                quick_sensors = [s for s in SENSORS if s[0] in ('disk', 'gpu')]
-                cards = run_health_scan(ctx, sensors=quick_sensors)
-                
-                # Calculate overall grade
-                from app.health_scan import overall_grade
-                grades = {k: v.get('grade', '?') for k, v in cards.items()}
-                overall = overall_grade(grades)
-                
-                # Update badge on main thread
-                self.root.after(0, lambda: self._update_health_badge(overall))
-            except Exception:
-                # If health check fails, show unknown
-                self.root.after(0, lambda: self._update_health_badge("?"))
-        
-        # Run in background thread
-        import threading
-        thread = threading.Thread(target=_worker, daemon=True)
-        thread.start()
-        
-        # Schedule next check in 5 minutes
-        self.root.after(300000, self._health_check_worker)
 
     # ---------------- F6: idle pre-warm chain ---------------- #
 
@@ -16071,24 +17292,12 @@ class Application:
         except Exception:
             pass
 
-    def _open_health_report(self):
-        """Check PC entry (Tools tab card). Opens the Health popup.
-        Busy-guarded like Storage: a sensor sweep competes for disk/CPU
-        with a live run, and its fix actions navigate tabs the run engine
-        is using."""
+    def _open_process_manager(self):
+        """Process Manager (Tools tab card). Live top processes by CPU/RAM
+        with one-click Close. No busy-guard needed — sampling is lightweight
+        and closing is an explicit user action."""
         try:
-            with self._busy_lock:
-                busy = self._busy
-        except Exception:
-            busy = False
-        if busy:
-            try:
-                self.set_status("Busy — wait for the current task to finish (or press ✕ Stop).")
-            except Exception:
-                pass
-            return
-        try:
-            HealthReportDialog(self.root, self).wait()
+            ProcessManagerDialog(self.root, self).wait()
         except Exception:
             pass
 
@@ -16115,6 +17324,14 @@ class Application:
         as the DNS tester)."""
         try:
             SpeedTestDialog(self.root, self).wait()
+        except Exception:
+            pass
+
+    def _open_hw_monitor(self):
+        """Hardware Monitor entry (Tools tab card). Read-only live
+        stats, no busy-guard needed — same rationale as Speed Test/DNS."""
+        try:
+            HardwareMonitorDialog(self.root, self).wait()
         except Exception:
             pass
 
@@ -16435,6 +17652,14 @@ class Application:
         """Startup Manager entry (Tools tab card)."""
         try:
             StartupManagerDialog(self.root, self).wait()
+        except Exception:
+            pass
+
+    def _open_uninstall_programs(self):
+        """Uninstall Programs entry (Tools tab card — moved off the
+        bottom-corner icon row, 2026-09)."""
+        try:
+            UninstallProgramsDialog(self.root, self).wait()
         except Exception:
             pass
 

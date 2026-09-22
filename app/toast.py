@@ -189,8 +189,9 @@ def show_toast(title: str, message: str, duration: str = "short",
             # weighted strings in AV/EDR PowerShell-abuse heuristics
             # (Behavior:Win32/Execution.A!ml and similar), so dropping it
             # removes a false-positive trigger with no behavior change.
+            from app.utils import resolve_exe
             subprocess.Popen(
-                ["powershell", "-NoProfile", "-Command", ps_script],
+                [resolve_exe("powershell"), "-NoProfile", "-Command", ps_script],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)

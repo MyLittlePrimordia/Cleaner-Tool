@@ -542,6 +542,15 @@ def save_config(config: dict) -> None:
                 os.fsync(f.fileno())
             except Exception:
                 pass
+        # UX-001: keep a single last-good backup so a later quarantine
+        # can restore applied_tweaks / snapshots instead of wiping undo history.
+        try:
+            if CONFIG_FILE.exists():
+                bak = CONFIG_FILE.with_suffix(CONFIG_FILE.suffix + ".bak")
+                import shutil
+                shutil.copy2(CONFIG_FILE, bak)
+        except Exception:
+            pass
         # Atomic replace
         try:
             os.replace(tmp, CONFIG_FILE)

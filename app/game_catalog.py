@@ -381,3 +381,211 @@ def installed_apps():
             continue
     out.sort(key=lambda g: g["name"].lower())
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Full uninstall-capable program list (Uninstall Programs dialog + orphan
+# leftover scanner). Includes entries that have no runnable DisplayIcon —
+# those are still uninstallable via UninstallString.
+# --------------------------------------------------------------------------- #
+
+def list_installed_programs():
+    """[{name, publisher, uninstall, quiet, location, size_kb, key_path,
+    hive, icon}] for every uninstall registry entry that has a DisplayName
+    and an UninstallString (or QuietUninstallString). SystemComponent=1 and
+    common redist/noise names are filtered. Read-only, failure-tolerant.
+
+    key_path is the full relative path under the hive (for leftover
+    ghost-entry cleanup after a successful uninstall). hive is 'HKLM' or
+    'HKCU'. size_kb is EstimatedSize when present (KB), else 0. icon is the
+    raw DisplayIcon value ('path' or 'path,index') when it points at a file
+    that exists on disk, else ''.
+    """
+    out = []
+    seen_names = set()
+    try:
+        import winreg
+    except Exception:
+        return out
+
+    hives = (
+        (winreg.HKEY_LOCAL_MACHINE,
+         r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", "HKLM"),
+        (winreg.HKEY_LOCAL_MACHINE,
+         r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+         "HKLM"),
+        (winreg.HKEY_CURRENT_USER,
+         r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", "HKCU"),
+    )
+
+    for hive, subkey_path, hive_label in hives:
+        try:
+            with winreg.OpenKey(hive, subkey_path) as hive_key:
+                i = 0
+                while True:
+                    try:
+                        sub = winreg.EnumKey(hive_key, i)
+                        i += 1
+                    except OSError:
+                        break
+                    try:
+                        with winreg.OpenKey(hive_key, sub) as k:
+                            def _val(name):
+                                try:
+                                    v, _t = winreg.QueryValueEx(k, name)
+                                    return str(v or "").strip()
+                                except OSError:
+                                    return ""
+
+                            name = _val("DisplayName")
+                            if not name:
+                                continue
+                            try:
+                                syscomp, _t = winreg.QueryValueEx(
+                                    k, "SystemComponent")
+                                if int(syscomp) == 1:
+                                    continue
+                            except OSError:
+                                pass
+                            # ParentKeyName marks nested MSI components
+                            try:
+                                parent = _val("ParentKeyName")
+                                if parent:
+                                    continue
+                            except Exception:
+                                pass
+                            lname = name.lower()
+                            if any(p in lname for p in _NOISE_PATTERNS):
+                                continue
+                            uninstall = _val("UninstallString")
+                            quiet = _val("QuietUninstallString")
+                            if not uninstall and not quiet:
+                                continue
+                            publisher = _val("Publisher")
+                            location = _val("InstallLocation")
+                            if location and not os.path.isdir(location):
+                                location = ""
+                            size_kb = 0
+                            try:
+                                raw, _t = winreg.QueryValueEx(k, "EstimatedSize")
+                                size_kb = int(raw or 0)
+                            except (OSError, ValueError, TypeError):
+                                pass
+                            # DisplayIcon (path[,index]) so icon_extract can
+                            # hand it straight to ExtractIconExW — this is
+                            # exactly what Control Panel itself shows, so
+                            # unlike installed_apps() we do NOT filter out
+                            # uninstaller exes here (Inno/NSIS uninstallers
+                            # commonly reuse the app's real icon resource).
+                            # DisplayIcon very often carries an unexpanded
+                            # env var (%SystemRoot%\..., %ProgramFiles%\...
+                            # — common for Windows Installer / system-
+                            # component entries); ExtractIconExW needs a
+                            # literal path, so expand + re-attach the index
+                            # once here rather than at every call site.
+                            icon = ""
+                            raw_icon = _val("DisplayIcon")
+                            if raw_icon:
+                                # rpartition (not partition): when there IS
+                                # an index, it's always the last comma-
+                                # separated token, and a folder name can
+                                # itself contain a comma (e.g. "C:\...\Foo,
+                                # Inc\app.exe,0"). But that same ambiguity
+                                # means a comma-in-folder-name path with NO
+                                # index (e.g. "C:\...\Foo, Inc\app.exe")
+                                # would wrongly look like "...\Foo" + index
+                                # "Inc\app.exe" — only trust the split when
+                                # the tail is actually a bare integer;
+                                # otherwise there's no index and the comma
+                                # was always part of the path.
+                                head, _comma, tail = raw_icon.rpartition(",")
+                                tail = tail.strip()
+                                if _comma and tail.lstrip("-").isdigit():
+                                    path_part, index_part = head, tail
+                                else:
+                                    path_part, index_part = raw_icon, ""
+                                icon_path = os.path.expandvars(
+                                    path_part.strip().strip('"'))
+                                if icon_path and os.path.isfile(icon_path):
+                                    icon = icon_path
+                                    if index_part:
+                                        icon += "," + index_part
+                            # Dedup by DisplayName (prefer entry that has
+                            # InstallLocation / larger size)
+                            key = lname
+                            if key in seen_names:
+                                # keep the richer entry
+                                for existing in out:
+                                    if existing["name"].lower() == key:
+                                        if (not existing["location"]
+                                                and location):
+                                            existing["location"] = location
+                                        if size_kb > existing["size_kb"]:
+                                            existing["size_kb"] = size_kb
+                                        if not existing["quiet"] and quiet:
+                                            existing["quiet"] = quiet
+                                        if not existing.get("icon") and icon:
+                                            existing["icon"] = icon
+                                        break
+                                continue
+                            seen_names.add(key)
+                            out.append({
+                                "name": name,
+                                "publisher": publisher,
+                                "uninstall": uninstall,
+                                "quiet": quiet,
+                                "location": location,
+                                "size_kb": size_kb,
+                                "key_path": f"{subkey_path}\\{sub}",
+                                "hive": hive_label,
+                                "icon": icon,
+                            })
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    out.sort(key=lambda p: p["name"].lower())
+    return out
+
+
+def installed_display_names():
+    """Lowercased DisplayName set for every uninstall entry (including
+    SystemComponent / noise). Used by the orphan-leftover cleaner so we
+    never treat a still-registered program folder as orphaned."""
+    names = set()
+    try:
+        import winreg
+    except Exception:
+        return names
+    hives = (
+        (winreg.HKEY_LOCAL_MACHINE,
+         r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_LOCAL_MACHINE,
+         r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_CURRENT_USER,
+         r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+    )
+    for hive, subkey_path in hives:
+        try:
+            with winreg.OpenKey(hive, subkey_path) as hive_key:
+                i = 0
+                while True:
+                    try:
+                        sub = winreg.EnumKey(hive_key, i)
+                        i += 1
+                    except OSError:
+                        break
+                    try:
+                        with winreg.OpenKey(hive_key, sub) as k:
+                            try:
+                                v, _t = winreg.QueryValueEx(k, "DisplayName")
+                                name = str(v or "").strip()
+                                if name:
+                                    names.add(name.lower())
+                            except OSError:
+                                pass
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return names

@@ -1129,16 +1129,6 @@ def revert_delivery_optimization_disable(ctx: TaskContext):
     reg_delete_value(ctx, "HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\DeliveryOptimization", "DODownloadMode")
     ctx.log("DeliveryOptimization reverted.")
 
-# Enables end task on taskbar #
-def apply_end_task_on_taskbar(ctx: TaskContext):
-    ctx.log("[Tweak] End Task With Right Click - Enable")
-    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced\\TaskbarDeveloperSettings", "TaskbarEndTask", 1)
-    ctx.log("TaskbarEndTask enabled.")
-
-def revert_end_task_on_taskbar(ctx: TaskContext):
-    reg_delete_value(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced\\TaskbarDeveloperSettings", "TaskbarEndTask")
-    ctx.log("TaskbarEndTask reverted.")
-
 # Disables explorer auto discovery #
 def apply_explorer_auto_discovery_disable(ctx: TaskContext):
     ctx.log("[Tweak] File Explorer Automatic Folder Discovery - Disable")
@@ -3906,11 +3896,6 @@ def verify_visual_effects() -> "bool | None":
                          "EnableTransparency", 0)
 
 
-def verify_end_task_taskbar() -> "bool | None":
-    return _verify_value("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced\\TaskbarDeveloperSettings",
-                         "TaskbarEndTask", 1)
-
-
 def verify_startup_delay() -> "bool | None":
     return _verify_value("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Serialize",
                          "StartupDelayInMSec", 0)
@@ -3990,7 +3975,6 @@ TASKS = [
     Task("activity_history", "Disable Activity History", "Stops Windows saving your recent files and history", apply_activity_history_disable, default=False, admin_required=True, revert=revert_activity_history_disable),
     Task("consumer_features", "Disable Consumer Features", "Stops Windows installing suggested apps", apply_consumer_features_disable, default=False, admin_required=True, revert=revert_consumer_features_disable),
     Task("tweak_delivery_optimization", "Disable Delivery Optimization", "Stops sharing updates with other PCs", apply_delivery_optimization_disable, default=False, admin_required=True, revert=revert_delivery_optimization_disable),
-    Task("end_task_taskbar", "Enable End Task on Taskbar", "Lets you right-click taskbar to close frozen apps", apply_end_task_on_taskbar, default=False, admin_required=False, revert=revert_end_task_on_taskbar, verify=verify_end_task_taskbar),
     Task("explorer_auto_discovery", "No Explorer Auto Discovery", "Stops Explorer guessing folder types — IRREVERSIBLY clears all saved folder views/sorts (Undo cannot restore them)", apply_explorer_auto_discovery_disable, default=False, admin_required=False, revert=revert_explorer_auto_discovery_disable, risk="ADVANCED"),
     Task("background_apps", "Disable Background Apps", "Stops apps running in background so games get more power", apply_background_apps_disable, default=False, admin_required=False, revert=revert_background_apps_disable, verify=verify_background_apps),
     Task("shader_cache_10gb", "Shader Cache 10GB", "Sets shader cache to 10GB to stop stutter", apply_shader_cache_10gb, default=False, admin_required=False, revert=revert_shader_cache_10gb, verify=verify_shader_cache_10gb),

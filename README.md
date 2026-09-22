@@ -50,6 +50,7 @@ A free Windows 10/11 utility for gamers: cleans junk, fixes common Windows probl
 - Game files: logs, crash dumps, and shader caches for 25+ verified top titles (Fortnite, PUBG, BG3, Cyberpunk…) plus an automatic Unity log sweep for indie games — saves are never touched
 - Windows junk: temp files, update leftovers, Recycle Bin, thumbnails, browser caches, DNS flush
 - Optional debloat: removes preinstalled junk like TikTok and Clipchamp
+- Orphan program leftovers: high-confidence residual folders from already-uninstalled programs (Custom only)
 
 **Repair**
 - Quick Repair or Deep Repair presets
@@ -79,7 +80,7 @@ restored. Every other tweak's Undo is a full, verified revert.</sub>
 - Internet Speed Test with folk-friendly ratings (browsing, gaming, streaming, calls)
 - Gamepad Tester (buttons, sticks, triggers) and Mic Check (devices, permission, live level)
 - Quick Tools shortcuts: system utilities and settings pages
-- Auto Maintenance (🛠️) and Export Logs (📋) live as corner icons on the main window
+- Corner icons: Auto Maintenance (🛠️), Quick Tools (🧰), Startup Manager (🚀), Uninstall Programs (🗑️), Export Logs (📋)
 
 **Also included**
 - Safety checkpoint (restore point) before changes

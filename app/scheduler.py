@@ -257,9 +257,14 @@ def _validate_time_str(time_str) -> str:
     return t
 
 
-def _build_schtasks_cmd_str(frequency, time_str, extra_args=None) -> str:
-    """Legacy string form for display / debugging (properly quoted)."""
-    return subprocess.list2cmdline(_build_schtasks_cmd(frequency, time_str, extra_args))
+def _build_schtasks_cmd_str(frequency, time_str, extra_args=None, today=None) -> str:
+    """Legacy string form for display / debugging (properly quoted).
+
+    today pass-through (matches _build_schtasks_cmd's M4 audit param):
+    lets callers pin the /D weekday deterministically instead of
+    depending on whatever day the test happens to run."""
+    return subprocess.list2cmdline(
+        _build_schtasks_cmd(frequency, time_str, extra_args, today=today))
 
 
 def enable_schedule(frequency="weekly", time_str="03:00", extra_args=None):

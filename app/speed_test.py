@@ -1,22 +1,36 @@
 """
 Internet Speed Test engine (Tools tab, Speed Test card).
 
-Measures ping + download + upload FOR THIS machine with stdlib only
-(socket + urllib, no API keys, no third-party deps):
+Ookla-style flow with stdlib only (socket + urllib, no API keys, no
+third-party deps): closest-server race, a throwaway warmup, then FULL
+sustained download rounds followed by FULL upload rounds — never an
+interleaved or single-sample shortcut:
 
-  * ping     — median TCP-connect latency to speed.cloudflare.com:443
-  * download — timed GET from https://speed.cloudflare.com/__down?bytes=N
-               (Cloudflare edge, same engine that powers speed.cloudflare.com)
-  * upload   — timed POST to https://speed.cloudflare.com/__up
+  * race     — median TCP-connect latency across the candidate edges;
+               lowest wins and is named in the UI (Cloudflare is anycast
+               so its edge is usually already the nearest PoP; the race
+               confirms it instead of assuming it)
+  * warmup   — one unpainted single-stream GET (TLS + congestion-control
+               warmup so the measured rounds don't pay slow-start)
+  * download — timed parallel GETs from
+               https://speed.cloudflare.com/__down?bytes=N (Cloudflare
+               edge, same engine that powers speed.cloudflare.com)
+  * upload   — timed parallel POSTs to https://speed.cloudflare.com/__up
+               with chunk-reported progress, same live-gauge contract as
+               downloads
 
 Fallback: https://cachefly.cachefly.net/10mb.test when the Cloudflare
-endpoint is unreachable. No keys on any path; the Cloudflare
-`authorizationToken` stays null (only needed to attribute tests to your
-own account — never requested here).
+endpoint is unreachable (fixed 10 MB file, so fallback rounds are
+honestly file-size-capped — the verdict is bytes actually moved over
+wall-clock, never the planned size). No keys on any path; the
+Cloudflare `authorizationToken` stays null (only needed to attribute
+tests to your own account — never requested here).
 
 Honesty contract (mirrors dns_test / health_scan):
   * unreachable legs report None, never a fake 0
   * cancelled() aborts between attempts and mid-stream
+  * verdict = the LARGEST sustained round that landed (a lone small
+    sample is handshake-heavy and never the verdict)
   * dialog (gui.py) runs these in worker threads and paints live
 
 The dialog lives in gui.py; this module stays Tk-free and unit-tested.
@@ -32,11 +46,28 @@ PING_HOST = "speed.cloudflare.com"
 PING_PORT = 443
 PING_TIMEOUT_S = 1.5
 PING_ATTEMPTS = 3
+# Closest-server race uses a slightly roomier budget than a plain ping:
+# the winner names the server in the UI, so it should be a real median,
+# not one lucky handshake.
+RACE_TIMEOUT_S = 2.0
+RACE_ATTEMPTS = 3
 
 DOWNLOAD_URL = "https://speed.cloudflare.com/__down"
 UPLOAD_URL = "https://speed.cloudflare.com/__up"
 # Keyless fallback when the edge endpoint is down (well-known test file).
 FALLBACK_DOWNLOAD_URL = "https://cachefly.cachefly.net/10mb.test"
+
+
+def _is_cloudflare_url(url: str) -> bool:
+    """True for the variable-size Cloudflare down endpoint (supports
+    ?bytes=N). Substring match, not equality — the race hands back the
+    same constant today, but a redirected/regional edge URL must still
+    take the ?bytes path instead of being misread as a fixed file."""
+    try:
+        return "speed.cloudflare.com" in (url or "")
+    except Exception:
+        return False
+
 
 DOWNLOAD_BYTES = (100_000, 1_000_000, 10_000_000)
 UPLOAD_BYTES = (100_000, 1_000_000)
@@ -46,13 +77,23 @@ LEG_TIMEOUT_S = 10.0
 # handshake — that combo once reported 2.9 Mbps on a fast link).
 PARALLEL_STREAMS = 4
 DOWNLOAD_ROUNDS = (2_000_000, 10_000_000, 25_000_000)  # per stream
-UPLOAD_ROUNDS = (512_000, 2_000_000)                   # per stream
+# Upload rounds are deliberately bigger than the old (0.5, 2)MB pair: a
+# 2 MB-per-stream POST finishes inside TCP slow-start on a fast uplink
+# and mostly measures the handshake, which made uploads read low and
+# jumpy. (1, 4, 10)MB per stream x4 gives a sustained verdict on fast
+# links while slow links still stop after the small round (gates below).
+UPLOAD_ROUNDS = (1_000_000, 4_000_000, 10_000_000)     # per stream
+# Throwaway single-stream warmup before the measured download rounds
+# (TLS session + congestion window warm — unpainted, never the verdict).
+WARMUP_BYTES = 512_000
 # F08: worst-case data budget surfaced in the Tools dialog copy
-# ((2+10+25)MB x4 down + (0.5+2)MB x4 up ≈ 160MB on a fast link).
+# ((2+10+25)MB x4 down + (1+4+10)MB x4 up ≈ 210MB on a fast link).
 ESTIMATED_MAX_MB = (sum(DOWNLOAD_ROUNDS) * PARALLEL_STREAMS
                     + sum(UPLOAD_ROUNDS) * PARALLEL_STREAMS) / 1_000_000
 ROUND_MIN_MBPS = 25.0    # run the next download round above this…
 ROUND_FAST_MBPS = 250.0  # …and the jumbo round above this (else save data)
+UP_MIN_MBPS = 10.0       # …same pair for uploads (uplinks run slower)…
+UP_FAST_MBPS = 100.0     # …so the gates are scaled down, not copied.
 STREAM_TIMEOUT_S = 20.0
 CHUNK = 1 << 16
 _UA = "CleanerTool/2.0 (speed test)"
@@ -66,12 +107,17 @@ CANDIDATE_HOSTS = (
 )
 
 
-def race_endpoints(timeout: float = PING_TIMEOUT_S, attempts: int = 2,
+def race_endpoints(timeout: float = RACE_TIMEOUT_S,
+                   attempts: int = RACE_ATTEMPTS,
                    cancelled=None) -> tuple:
     """(name, base_url, ms-or-None) of the lowest-latency candidate.
 
-    Never raises; offline returns ("Cloudflare edge", DOWNLOAD_URL, None)
-    so the caller still attempts the primary and fails honestly."""
+    Median TCP-connect latency per candidate over `attempts` samples
+    (a single sample is one lucky handshake — the race needs a median
+    to be worth naming in the UI). Ties keep the incumbent, so the
+    primary wins draws by design. Never raises; offline returns
+    ("Cloudflare edge", DOWNLOAD_URL, None) so the caller still
+    attempts the primary and fails honestly."""
     is_cancelled = cancelled or (lambda: False)
     best = ("Cloudflare edge", DOWNLOAD_URL, None)
     for name, host, base in CANDIDATE_HOSTS:
@@ -173,6 +219,26 @@ def _mbps(num_bytes: int, seconds: float) -> "float | None":
         return None
 
 
+def warmup(url: str = DOWNLOAD_URL,
+           num_bytes: int = WARMUP_BYTES,
+           timeout: float = LEG_TIMEOUT_S,
+           cancelled=None) -> "float | None":
+    """One throwaway single-stream GET (TLS + congestion-window warmup).
+
+    Unpainted and never the verdict — the GUI fires this right before
+    the measured download rounds so slow-start doesn't tax the real
+    samples. Best-effort: None on any failure/cancel, never raises."""
+    is_cancelled = cancelled or (lambda: False)
+    if is_cancelled():
+        return None
+    try:
+        return download_mbps(int(num_bytes), timeout=timeout,
+                             cancelled=cancelled, progress_cb=None,
+                             url=url)
+    except Exception:
+        return None
+
+
 def download_mbps(num_bytes: int = 1_000_000,
                   timeout: float = LEG_TIMEOUT_S,
                   cancelled=None, progress_cb=None,
@@ -183,7 +249,8 @@ def download_mbps(num_bytes: int = 1_000_000,
     same contract the parallel streams use (the GUI sums deltas)."""
     is_cancelled = cancelled or (lambda: False)
     try:
-        req_url = f"{url}?bytes={int(num_bytes)}" if url == DOWNLOAD_URL else url
+        req_url = (f"{url}?bytes={int(num_bytes)}"
+                   if _is_cloudflare_url(url) else url)
         req = urllib.request.Request(req_url, headers={"User-Agent": _UA})
         t0 = time.perf_counter()
         got = 0
@@ -211,6 +278,100 @@ def download_mbps(num_bytes: int = 1_000_000,
         return None
 
 
+class _ProgressReader:
+    """File-like POST body that reports chunks as urllib streams it.
+
+    Lets parallel uploads drive the live gauge with the same
+    incremental contract downloads use. urllib sets the wire length
+    from the explicit Content-Length header the call site sends, so
+    this only needs read() (+ seek/tell for the length probe some
+    Python versions do — backed by BytesIO, always consistent).
+    Never raises out of read(); a broken wrapper just ends the
+    stream early and the round measures what actually moved."""
+
+    def __init__(self, payload: bytes, on_read=None, chunk: int = 65536):
+        import io as _io
+        self._buf = _io.BytesIO(bytes(payload))
+        self._on_read = on_read
+        try:
+            self._chunk = max(4096, int(chunk))
+        except Exception:
+            self._chunk = 65536
+
+    def read(self, size=-1):
+        try:
+            if size is None or size < 0:
+                n = self._chunk
+            else:
+                n = min(int(size), self._chunk)
+            data = self._buf.read(n)
+        except Exception:
+            data = b""
+        if data and self._on_read is not None:
+            try:
+                self._on_read(len(data))
+            except Exception:
+                pass
+        return data
+
+    def seekable(self):
+        return True
+
+    def seek(self, *args):
+        try:
+            return self._buf.seek(*args)
+        except Exception:
+            return 0
+
+    def tell(self):
+        try:
+            return self._buf.tell()
+        except Exception:
+            return 0
+
+
+def _post_bytes(url: str, payload: bytes, timeout: float,
+                on_read=None) -> bool:
+    """POST `payload` (progress-wrapped when on_read is set), drain the
+    reply, True on a complete wire exchange. Falls back to a plain
+    bytes POST if the wrapped body is ever rejected — the measurement
+    matters more than the progress signal."""
+    try:
+        body = (_ProgressReader(payload, on_read=on_read)
+                if on_read is not None else bytes(payload))
+        req = urllib.request.Request(
+            url, data=body, method="POST",
+            headers={"User-Agent": _UA,
+                     "Content-Type": "application/octet-stream",
+                     "Content-Length": str(len(payload))})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            try:
+                resp.read(1024)
+            except Exception:
+                pass
+        return True
+    except Exception:
+        if on_read is not None:
+            # one retry as plain bytes before giving up — WITHOUT a
+            # lump progress report (partials may already have fired;
+            # double-counting would bend the live gauge; the verdict
+            # uses wall-clock bytes, never the progress sums).
+            try:
+                req = urllib.request.Request(
+                    url, data=bytes(payload), method="POST",
+                    headers={"User-Agent": _UA,
+                             "Content-Type": "application/octet-stream"})
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    try:
+                        resp.read(1024)
+                    except Exception:
+                        pass
+                return True
+            except Exception:
+                return False
+        return False
+
+
 def upload_mbps(num_bytes: int = 1_000_000,
                 timeout: float = LEG_TIMEOUT_S,
                 cancelled=None,
@@ -225,15 +386,9 @@ def upload_mbps(num_bytes: int = 1_000_000,
     if is_cancelled():
         return None
     try:
-        req = urllib.request.Request(url, data=payload, method="POST",
-                                     headers={"User-Agent": _UA,
-                                              "Content-Type": "application/octet-stream"})
         t0 = time.perf_counter()
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            try:
-                resp.read(1024)
-            except Exception:
-                pass
+        if not _post_bytes(url, payload, timeout):
+            return None
         dt = time.perf_counter() - t0
         return _mbps(len(payload), dt)
     except Exception:
@@ -245,7 +400,8 @@ def _one_download_stream(url: str, num_bytes: int, timeout: float,
     """Single GET stream -> (bytes, start, end) or None. Thread worker."""
     is_cancelled = cancelled or (lambda: False)
     try:
-        req_url = f"{url}?bytes={int(num_bytes)}" if url == DOWNLOAD_URL else url
+        req_url = (f"{url}?bytes={int(num_bytes)}"
+                   if _is_cloudflare_url(url) else url)
         req = urllib.request.Request(req_url, headers={"User-Agent": _UA})
         got = 0
         t0 = time.perf_counter()
@@ -273,21 +429,29 @@ def _one_download_stream(url: str, num_bytes: int, timeout: float,
 
 
 def _one_upload_stream(url: str, payload: bytes, timeout: float,
-                       cancelled) -> "tuple | None":
-    """Single POST stream -> (bytes, start, end) or None. Thread worker."""
+                       cancelled, progress_cb=None,
+                       planned_total: int = 0) -> "tuple | None":
+    """Single POST stream -> (bytes, start, end) or None. Thread worker.
+
+    Progress uses the same INCREMENTAL (delta, total) contract as the
+    download streams (the GUI sums deltas into its live gauge) — the
+    chunk wrapper reports as the bytes leave, not one lump at the end,
+    so the needle climbs DURING the upload like Ookla's."""
     is_cancelled = cancelled or (lambda: False)
     if is_cancelled():
         return None
     try:
-        req = urllib.request.Request(url, data=payload, method="POST",
-                                     headers={"User-Agent": _UA,
-                                              "Content-Type": "application/octet-stream"})
+        def _cb(n):
+            if progress_cb is not None:
+                try:
+                    progress_cb(n, planned_total)
+                except Exception:
+                    pass
+
         t0 = time.perf_counter()
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            try:
-                resp.read(1024)
-            except Exception:
-                pass
+        if not _post_bytes(url, payload, timeout,
+                           on_read=_cb if progress_cb is not None else None):
+            return None
         end = time.perf_counter()
         return (len(payload), t0, end)
     except Exception:
@@ -341,11 +505,13 @@ def download_parallel(num_bytes_per_stream: int, streams: int = PARALLEL_STREAMS
 
 
 def upload_parallel(num_bytes_per_stream: int, streams: int = PARALLEL_STREAMS,
-                    timeout: float = STREAM_TIMEOUT_S,
-                    cancelled=None,
-                    url: str = UPLOAD_URL) -> "float | None":
+                      timeout: float = STREAM_TIMEOUT_S,
+                      cancelled=None, progress_cb=None,
+                      url: str = UPLOAD_URL) -> "float | None":
     """Aggregate Mbps over N parallel POST streams. None when nothing
-    landed. Payloads are fresh random bytes per stream."""
+    landed. Payloads are fresh random bytes per stream. progress_cb
+    takes the same INCREMENTAL (delta_bytes, planned_total) contract
+    as download_parallel (the GUI sums deltas into one live gauge)."""
     import os as _os
     import threading as _th
     is_cancelled = cancelled or (lambda: False)
@@ -354,11 +520,20 @@ def upload_parallel(num_bytes_per_stream: int, streams: int = PARALLEL_STREAMS,
                     for _ in range(max(1, int(streams)))]
     except Exception:
         return None
+    planned = int(num_bytes_per_stream) * max(1, int(streams))
     results = []
     lock = _th.Lock()
 
+    def _report(n, _total):
+        if progress_cb is not None:
+            try:
+                progress_cb(n, _total)
+            except Exception:
+                pass
+
     def _work(p):
-        r = _one_upload_stream(url, p, timeout, cancelled)
+        r = _one_upload_stream(url, p, timeout, cancelled,
+                               progress_cb=_report, planned_total=planned)
         if r is not None:
             with lock:
                 results.append(r)

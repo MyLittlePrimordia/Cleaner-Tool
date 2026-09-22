@@ -56,32 +56,22 @@ def _get_elevation_token_path() -> str:
 
 
 def _exclusive_write(path: str, data: str) -> None:
-    """F05: predictable %TEMP% names + plain open() let a same-user attacker
-    pre-create a symlink/file to force false-success/DoS. Unlink any
-    pre-existing entry (removes a planted symlink) then create exclusively
-    (O_CREAT|O_EXCL) with a restrictive mode — the create fails instead of
-    following a raced-in link. Best-effort: falls back to a plain write
-    only if exclusive create is unavailable on this platform."""
+    """F05 / SEC-002: predictable %TEMP% names + plain open() let a
+    same-user attacker pre-create a symlink/file to force false-success
+    or DoS. Unlink any pre-existing entry (removes a planted symlink)
+    then create exclusively (O_CREAT|O_EXCL). On failure we raise so the
+    caller aborts the handshake and falls through to a normal (unelevated)
+    launch — never follow a raced-in link via open(path, "w")."""
     try:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        try:
-            fd = os.open(path, flags, 0o600)
-        except AttributeError:
-            raise
-        try:
-            os.write(fd, data.encode("utf-8"))
-        finally:
-            os.close(fd)
-    except Exception:
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(data)
-        except Exception:
-            pass
+        os.unlink(path)
+    except OSError:
+        pass
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    fd = os.open(path, flags, 0o600)
+    try:
+        os.write(fd, data.encode("utf-8"))
+    finally:
+        os.close(fd)
 
 
 def _write_elevation_cookie(pid: int, token: str = "") -> None:

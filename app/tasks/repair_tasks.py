@@ -213,8 +213,12 @@ def repair_search_index(ctx: TaskContext):
             ctx.log(f"  ! WSearch stop failed (code {rc_stop}) — skipping delete to avoid partial lock")
         else:
             try:
-                shutil.rmtree(index_db, ignore_errors=False)
-                ctx.log(f"Cleared search index database at {index_db}")
+                from app.utils import _is_reparse_point
+                if _is_reparse_point(index_db):
+                    ctx.log(f"  ! skipping junction/symlink search index path: {index_db}")
+                else:
+                    shutil.rmtree(index_db, ignore_errors=False)
+                    ctx.log(f"Cleared search index database at {index_db}")
             except Exception as exc:
                 ctx.log(f"  ! could not clear search index: {exc}")
     else:

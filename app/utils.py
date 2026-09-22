@@ -30,17 +30,22 @@ _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 
 
 def _is_reparse_point(path: str) -> bool:
-    """True if path is a junction / directory symlink / other reparse point."""
+    """True if path is a junction / directory symlink / other reparse point.
+
+    Fail-closed: any error (INVALID_FILE_ATTRIBUTES, access denied, race)
+    is treated as a reparse point so cleaners refuse to walk/delete rather
+    than risk following a planted junction. Callers already log and skip.
+    """
     if not IS_WINDOWS or ctypes is None:
         # POSIX: os.walk(followlinks=False) already skips symlinks for us
         return os.path.islink(path)
     try:
         attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path))
-        if attrs == 0xFFFFFFFF:  # INVALID_FILE_ATTRIBUTES
-            return False
+        if attrs == 0xFFFFFFFF:  # INVALID_FILE_ATTRIBUTES — fail closed
+            return True
         return bool(attrs & _FILE_ATTRIBUTE_REPARSE_POINT)
     except Exception:
-        return False
+        return True  # fail closed on any API/race error
 
 
 def known_folder(name: str, fallback: str = "", *, strict: bool = False) -> str:

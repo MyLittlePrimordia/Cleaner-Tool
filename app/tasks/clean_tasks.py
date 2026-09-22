@@ -5,6 +5,7 @@ Laymen short labels + hover tooltips; compact symmetrical grid.
 
 import glob as globmod
 import os
+import re
 import time
 # audit fix (hygiene): module-level `subprocess` was unused — every caller
 # that needs it already does its own local `import subprocess`.
@@ -1203,6 +1204,214 @@ def clean_edge_update_downloads(ctx: TaskContext):
     return _clean_many(ctx, folders, "Edge update downloads")
 
 
+# --------------------------------------------------------------------------- #
+# Orphan program leftovers (post-uninstall residue)
+# --------------------------------------------------------------------------- #
+
+# Folder basenames that must NEVER be treated as orphan leftovers.
+_ORPHAN_DENY_NAMES = {
+    "microsoft", "windows", "common files", "commonfiles", "modifiablewindowsapps",
+    "windowsapps", "packages", "package cache", "temp", "tmp",
+    "programdata", "program files", "program files (x86)", "system32", "syswow64",
+    "winsxs", "installer", "assembly", "microsoft shared", "internet explorer",
+    "windows defender", "windows mail", "windows media player", "windows nt",
+    "windows photo viewer", "windows sidebar", "windowspowershell",
+    "reference assemblies", "msbuild", "dotnet", ".net", "nuget", "python",
+    "steam", "steamapps", "epic games", "origin", "uplay", "ubisoft",
+    "battle.net", "riot games", "gog galaxy", "discord", "nvidia corporation",
+    "amd", "intel", "realtek", "logitech", "razer", "corsair",
+    "microsoft visual studio", "microsoft office", "microsoft games",
+    "windows kits", "windows portable devices", "rempl", "sxs",
+    "application data", "local settings", "cookies", "history", "recent",
+    "sendto", "start menu", "templates", "netflix", "xbox", "xboxgames",
+    "microsoftedge", "edge", "google", "mozilla", "firefox", "chromium",
+}
+
+
+def _orphan_scan_roots():
+    """Top-level roots we scan for orphan folders (only direct children)."""
+    roots = []
+    for env_key, sub in (
+        ("ProgramFiles", ""),
+        ("ProgramFiles(x86)", ""),
+        ("ProgramData", ""),
+        ("LOCALAPPDATA", ""),
+        ("APPDATA", ""),
+        ("LOCALAPPDATA", "Programs"),
+    ):
+        base = os.environ.get(env_key, "")
+        if not base:
+            continue
+        path = os.path.join(base, sub) if sub else base
+        if path and os.path.isdir(path):
+            roots.append(path)
+    for p in (
+        os.path.join(_SYSTEMDRIVE_ROOT, "Program Files"),
+        os.path.join(_SYSTEMDRIVE_ROOT, "Program Files (x86)"),
+        _PROGRAMDATA,
+    ):
+        if p and os.path.isdir(p) and p not in roots:
+            roots.append(p)
+    return roots
+
+
+def _normalize_product_token(name: str) -> str:
+    """Lowercase, strip version / architecture noise so related names match."""
+    s = (name or "").lower().strip()
+    s = re.sub(r"\([^)]*\)", " ", s)
+    s = re.sub(r"\bv?\d+(\.\d+){1,3}\b", " ", s)
+    s = re.sub(r"\bbuild\s+\d+\b", " ", s)
+    s = re.sub(r"\bx64\b|\bx86\b|\bwin64\b|\bwin32\b|\b64-bit\b|\b32-bit\b",
+               " ", s)
+    s = re.sub(r"[_\-]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _name_matches_installed(folder_name: str, installed_names: set) -> bool:
+    """True if this folder name clearly belongs to a still-installed program."""
+    fn = folder_name.lower().strip()
+    if not fn:
+        return True
+    for inst in installed_names:
+        if fn == inst or fn in inst or inst in fn:
+            return True
+    nfn = _normalize_product_token(folder_name)
+    if not nfn or len(nfn) < 3:
+        return True
+    for inst in installed_names:
+        ninst = _normalize_product_token(inst)
+        if not ninst:
+            continue
+        if nfn == ninst or nfn in ninst or ninst in nfn:
+            return True
+        t1 = set(nfn.split())
+        t2 = set(ninst.split())
+        shared = t1 & t2
+        if len(shared) >= 2:
+            return True
+        if any(len(t) >= 6 and t in t2 for t in t1):
+            return True
+    return False
+
+
+def _looks_like_residual_folder(folder_path: str) -> bool:
+    """High-confidence residual: empty, logs/cache only, or tiny with no binaries."""
+    if not os.path.isdir(folder_path):
+        return False
+    try:
+        entries = list(os.listdir(folder_path))
+    except OSError:
+        return False
+    if not entries:
+        return True
+
+    residual_markers = {
+        "logs", "log", "cache", "caches", "temp", "tmp", "crash", "crashes",
+        "dumps", "dump", "diagnostics", "diagnostic", "telemetry", "crashdumps",
+        "crashpad", "sentry", "error", "errors", "debug", "leftover", "old",
+        "backup", "backups", "uninst", "uninstall",
+    }
+    has_exe_or_dll = False
+    only_residual = True
+    total_files = 0
+    try:
+        for root, dirs, files in os.walk(folder_path, topdown=True,
+                                         followlinks=False):
+            if total_files > 2000:
+                only_residual = False
+                break
+            dirs[:] = [d for d in dirs
+                       if not os.path.islink(os.path.join(root, d))]
+            for f in files:
+                total_files += 1
+                low = f.lower()
+                ext = os.path.splitext(low)[1]
+                if ext in (".exe", ".dll", ".sys", ".msi"):
+                    has_exe_or_dll = True
+                    only_residual = False
+                elif ext not in (".log", ".tmp", ".old", ".bak", ".dmp",
+                                 ".txt", ".json", ".xml", ".etl", ".cab",
+                                 ".cache", ".dat", ".db", ".sqlite"):
+                    rel = os.path.relpath(root, folder_path)
+                    parts = {p.lower() for p in rel.split(os.sep) if p != "."}
+                    if not (parts & residual_markers):
+                        only_residual = False
+    except OSError:
+        return False
+
+    if total_files == 0:
+        return True
+    if only_residual and not has_exe_or_dll:
+        return True
+    if not has_exe_or_dll and total_files <= 8:
+        return True
+    return False
+
+
+def clean_orphan_program_leftovers(ctx: TaskContext):
+    """Scan common install roots for folders left behind after programs were
+    uninstalled. Only high-confidence residuals are removed: the folder name
+    must not match any currently registered DisplayName, must not be on the
+    deny-list, and must look residual (empty / logs-only / no binaries).
+
+    Default OFF (Custom only). Shared runtimes and Microsoft/Windows trees
+    are never touched. Junctions are refused by clean_folder_contents.
+    """
+    try:
+        from app.game_catalog import installed_display_names
+        installed = installed_display_names()
+    except Exception as exc:
+        ctx.log(f"  ! could not read installed programs list: {exc}")
+        return 0
+
+    ctx.log(f"Orphan scan: {len(installed)} registered program names on this PC")
+
+    candidates = []
+    roots = _orphan_scan_roots()
+    for root in roots:
+        if ctx.cancelled():
+            break
+        try:
+            children = os.listdir(root)
+        except OSError:
+            continue
+        for name in children:
+            if ctx.cancelled():
+                break
+            folder = os.path.join(root, name)
+            if not os.path.isdir(folder):
+                continue
+            try:
+                from app.utils import _is_reparse_point
+                if _is_reparse_point(folder):
+                    continue
+            except Exception:
+                if os.path.islink(folder):
+                    continue
+            lname = name.lower().strip()
+            if lname in _ORPHAN_DENY_NAMES:
+                continue
+            if any(lname.startswith(d) for d in (
+                "microsoft", "windows", "nvidia", "amd ", "intel", "realtek",
+            )):
+                continue
+            if _name_matches_installed(name, installed):
+                continue
+            if not _looks_like_residual_folder(folder):
+                continue
+            candidates.append(folder)
+
+    if not candidates:
+        ctx.log("No high-confidence orphan program leftovers found.")
+        return 0
+
+    ctx.log(f"Found {len(candidates)} high-confidence leftover folder(s):")
+    for c in candidates:
+        ctx.log(f"  - {c}")
+    return _clean_many(ctx, candidates, "orphan program leftover")
+
+
 from app.tasks import Task  # noqa: E402
 
 TASKS = [
@@ -1247,4 +1456,7 @@ TASKS = [
     Task("squirrel_staging", "Clear Update Staging", "Removes GBs of leftover Discord/Spotify updater packages; apps untouched", clean_squirrel_staging, default=False, admin_required=False),
     Task("setup_logs", "Clear Setup Logs", "Removes old Windows upgrade diagnostic logs; rollback files untouched", clean_setup_logs, default=False, admin_required=True),
     Task("edge_update_cache", "Clear Edge Update Downloads", "Removes staged Edge updater payloads; profile and passwords kept", clean_edge_update_downloads, default=False, admin_required=True),
+    Task("orphan_leftovers", "Clean Orphan Program Leftovers",
+         "Removes high-confidence leftover folders from programs already uninstalled; Microsoft/Windows/runtimes never touched",
+         clean_orphan_program_leftovers, default=False, admin_required=True),
 ]

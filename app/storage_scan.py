@@ -104,11 +104,19 @@ def _clean_task_by_key() -> dict:
 
 
 def make_measure_ctx(set_status=None, cancelled=None) -> TaskContext:
-    """A TaskContext for scanning: silent log, live status, dry_run on.
-    set_status/cancelled are wired to the dialog (both optional)."""
+    """A TaskContext for scanning: dry_run on, with the status line wired to
+    the dialog (both optional).
+
+    MED-002: `log` used to be `lambda _m: None`, which silently discarded
+    every message. That is fine while nothing logs - but it meant the failure
+    logging added to measure_clean_tasks would have been thrown away on exactly
+    the path that needed it. Messages now go to the status line, so a category
+    that could not be measured actually tells the user instead of vanishing.
+    """
+    _status = (set_status or (lambda _m: None))
     return TaskContext(
-        log=lambda _m: None,
-        set_status=(set_status or (lambda _m: None)),
+        log=lambda m: _status(m),
+        set_status=_status,
         cancelled=(cancelled or (lambda: False)),
         dry_run=True,
     )
@@ -116,9 +124,20 @@ def make_measure_ctx(set_status=None, cancelled=None) -> TaskContext:
 
 def measure_clean_tasks(ctx: TaskContext, keys) -> dict:
     """Run the given allowlisted task functions with the dry-run ctx and
-    return {key: estimated bytes}. Unknown keys and raising tasks yield
-    0 (logged via ctx.set_status, never raised) — a scan must degrade,
-    not die. Honors ctx.cancelled() between tasks."""
+    return {key: estimated bytes}.
+
+    A key whose task was never measured is ``None``, NOT 0. MED-002: the old
+    version recorded 0 for every failure, so a category that blew up mid-scan
+    was painted as "0 bytes" and graded "A - already empty" by
+    health_scan.grade_junk. The app asserted a clean bill of health for
+    something it never looked at, inverting its own honesty contract. 0 is a
+    real measurement; None is the absence of one, and grade_junk already
+    grades None as "?" - this function was simply never handing it one.
+
+    The exception is now logged through ctx.log (and the status line), which
+    the old docstring CLAIMED but never did.
+
+    Honors ctx.cancelled() between tasks."""
     by_key = _clean_task_by_key()
     out = {}
     for key in keys:
@@ -130,9 +149,37 @@ def measure_clean_tasks(ctx: TaskContext, keys) -> dict:
             continue
         try:
             out[key] = task.run(ctx) or 0
-        except Exception:
-            out[key] = 0
+        except Exception as exc:
+            out[key] = None          # unmeasured, NOT zero
+            msg = f"  ! could not measure {key}: {exc}"
+            try:
+                ctx.log(msg)
+            except Exception:
+                pass
+            try:
+                ctx.set_status(f"Could not measure {key} — its size is unknown.")
+            except Exception:
+                pass
     return out
+
+
+def sum_measured(sizes: dict):
+    """Total a {key: bytes|None} mapping, or None if anything is unknown.
+
+    Callers used to write `sum(sizes.values())`, which both invented a total
+    and would now raise TypeError on a None. This keeps the 0-vs-None
+    distinction all the way to the UI: one unmeasured category makes the whole
+    total unknown rather than quietly too small.
+    """
+    if not sizes:
+        return 0
+    if any(v is None for v in sizes.values()):
+        return None
+    return sum(sizes.values())
+
+
+def count_unmeasured(sizes: dict) -> int:
+    return sum(1 for v in sizes.values() if v is None)
 
 
 def validate_allowlist() -> "tuple[bool, list[str]]":
@@ -230,10 +277,13 @@ def measure_all_cached(set_status=None, cancelled=None):
     try:
         if cancelled is not None and cancelled():
             return None
-        ctx = make_measure_ctx(set_status=set_status, cancelled=cancelled)
-        total = sum(measure_clean_tasks(ctx, sorted(SCAN_ALLOWLIST)).values())
-        store_estimate(total)
-        return total
+            ctx = make_measure_ctx(set_status=set_status, cancelled=cancelled)
+            # MED-002: sum the measured values, but let a single unmeasured
+            # category make the TOTAL unknown rather than silently too small.
+            total = sum_measured(measure_clean_tasks(ctx, sorted(SCAN_ALLOWLIST)))
+            if total is not None:
+                store_estimate(total)
+            return total
     finally:
         release_scan()
 
@@ -243,21 +293,29 @@ def measure_all_cached(set_status=None, cancelled=None):
 # --------------------------------------------------------------------------- #
 
 def _is_link(path: str) -> bool:
-    """Reparse-point/junction guard for the size walk (mirrors the
-    cleaner's _is_reparse_point without importing a private helper)."""
-    try:
-        if os.path.islink(path):
-            return True
-    except Exception:
-        return True
-    try:
-        import ctypes
-        attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path))
-        if attrs == 0xFFFFFFFF:
-            return False
-        return bool(attrs & 0x400)  # FILE_ATTRIBUTE_REPARSE_POINT
-    except Exception:
-        return False
+    """Reparse-point/junction guard for the size walk.
+
+    LOW-014: this was a hand-rolled duplicate of the cleaner's
+    _is_reparse_point, and it got all three things wrong that the real one is
+    careful about:
+
+      1. It FAILED OPEN. `except Exception: return False` means "not a link",
+         so any error told the walk to descend. The real helper fails CLOSED -
+         utils.py:47-48 returns True and documents why: refuse to walk rather
+         than risk following a planted junction.
+      2. Its INVALID_FILE_ATTRIBUTES check was DEAD CODE. With no `restype`
+         set, ctypes returns a c_int, so 0xFFFFFFFF arrives as -1 and the
+         comparison never matched - meaning that path fell through to the
+         "return bool(attrs & 0x400)" line with attrs == -1.
+      3. `os.path.islink` alone is wrong on Windows: it is False for a real
+         junction, which is exactly what this guard exists to catch.
+
+    It now delegates to the single correct implementation rather than keeping a
+    third copy of the rule. app.utils is already imported here (TaskContext),
+    so this adds no dependency - it removes a divergent one.
+    """
+    from app.utils import _is_reparse_point
+    return _is_reparse_point(path)
 
 
 def measure_folder_tree(path: str, cancelled=None) -> int:

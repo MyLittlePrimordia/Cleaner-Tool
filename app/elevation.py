@@ -418,6 +418,211 @@ def _current_exe_path() -> str:
             return ""
 
 
+# SEC-004: the record of exclusions THIS application added, so that turning
+# the setting off can undo exactly those and nothing else.
+_EXCLUSION_KEY = "defender_exclusions_applied"
+
+
+def _ps_quote(s: str) -> str:
+    """Quote a path for embedding in a PowerShell command string.
+
+    Single-quote it and double any embedded single quotes, so spaces and
+    apostrophes in a user path cannot break out of the string literal.
+    """
+    return "'" + (s or "").replace("'", "''") + "'"
+
+
+def _run_mp_script(script: str) -> tuple[bool, str]:
+    """Run a Defender preference script. Returns (ok, combined output)."""
+    # Prefer the full path to powershell so PATH tricks can't redirect us.
+    ps_exe = os.path.join(
+        os.environ.get("SystemRoot", r"C:\Windows"),
+        "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+    if not os.path.isfile(ps_exe):
+        ps_exe = "powershell.exe"
+    result = subprocess.run(
+        [
+            ps_exe,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy", "Bypass",
+            "-Command", script,
+        ],
+        shell=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    out = ((result.stdout or "") + (result.stderr or "")).strip()
+    return result.returncode == 0, out
+
+
+def _applied_exclusions() -> list[str]:
+    """The exclusions this app believes it added. Never raises."""
+    try:
+        from app.config_persist import load_config
+        raw = load_config().get(_EXCLUSION_KEY)
+        if not isinstance(raw, list):
+            return []
+        return [p for p in raw if isinstance(p, str) and p]
+    except Exception:
+        return []
+
+
+def _record_applied_exclusions(paths=(), remove=()) -> None:
+    """Remember what we added so the removal path can undo exactly it.
+
+    `remove` names entries to forget. The record is only pruned after
+    Remove-MpPreference actually succeeded, so a failed removal stays
+    recorded and is retried on the next elevated launch. Never raises.
+    """
+    try:
+        from app.config_persist import update_config
+        entries = set()
+        for p in paths or ():
+            if isinstance(p, str) and p:
+                entries.add(p)
+        for p in remove or ():
+            if isinstance(p, str):
+                entries.discard(p)
+
+        def _mut(cfg):
+            cfg[_EXCLUSION_KEY] = sorted(entries)
+
+        # NOTE: update_config takes the MUTATOR, so this must be `_mut`, not
+        # `_mut()`. It shipped as `_mut()` - which calls _mut() with no `cfg`
+        # argument, raises TypeError, and was then swallowed by the bare
+        # except below, so the record was never written and the whole removal
+        # path silently had nothing to remove. The bare except is kept (this is
+        # best-effort bookkeeping and must never break a launch), but a failure
+        # here means removal cannot work, which is worth knowing.
+        update_config(_mut)
+    except Exception:
+        pass
+
+
+def remove_defender_exclusions(paths=None) -> tuple[bool, str]:
+    """SEC-004: remove the exclusions THIS APPLICATION added.
+
+    Only recorded paths are removed, and it never clears Defender's whole
+    exclusion list - doing that would silently drop exclusions the user or
+    another tool set deliberately, which is a far worse surprise than a
+    leftover entry. Returns (ok, human-readable message). Never raises.
+    """
+    try:
+        if not is_admin():
+            return False, "not running as administrator"
+    except Exception:
+        return False, "could not check elevation"
+
+    recorded = _applied_exclusions()
+    if paths is None:
+        targets = list(recorded)
+    else:
+        allow = set(recorded)
+        targets = []
+        for p in paths:
+            if not isinstance(p, str) or not p:
+                continue
+            try:
+                ap = os.path.abspath(p)
+            except Exception:
+                continue
+            # An explicit path must still be one we recorded. The `not allow`
+            # case is for installs predating the record, where the only
+            # exclusion this app ever added was its own binary.
+            if (ap in allow or not allow) and ap not in targets:
+                targets.append(ap)
+
+    if not targets:
+        return True, "no exclusions recorded by this app"
+
+    ps_script = "; ".join(
+        f"Remove-MpPreference -ExclusionPath {_ps_quote(p)} -ErrorAction SilentlyContinue"
+        for p in targets)
+    try:
+        ok, out = _run_mp_script(ps_script)
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    if ok:
+        _record_applied_exclusions((), remove=targets)
+        return True, f"removed {len(targets)} exclusion(s)"
+    return False, out or "Remove-MpPreference failed"
+
+
+def list_defender_exclusions() -> list[str]:
+    """Current Defender ExclusionPath entries. [] if unavailable. Never raises.
+
+    Read-only: used by the migration notice to spot an exclusion an OLDER
+    build applied, which is not in our record because the record did not exist
+    then.
+    """
+    try:
+        script = ("(Get-MpPreference).ExclusionPath | "
+                  "ForEach-Object { $_.ToString() }")
+        ok, out = _run_mp_script(script)
+    except Exception:
+        return []
+    if not ok:
+        return []
+    return [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+
+
+def find_stale_folder_exclusion() -> str:
+    """The parent FOLDER excluded by an older build, or "" if there is none.
+
+    SEC-004 migration. Older versions defaulted this ON and excluded the
+    executable's entire parent directory, not just the binary. That exclusion is
+    NOT in `defender_exclusions_applied` - the record did not exist when it was
+    added - so `remove_defender_exclusions()` deliberately ignores it. Leaving
+    it would mean a portable copy keeps its whole folder un scanned forever.
+
+    It is only ever REPORTED, never removed automatically: the app cannot tell
+    an exclusion it added from one the user added on purpose, and silently
+    deleting a security setting is worse than asking. The caller shows a
+    one-time notice and the user decides.
+    """
+    try:
+        exe = _current_exe_path()
+        if not exe:
+            return ""
+        parent = os.path.dirname(os.path.abspath(exe))
+        if not parent or parent == os.path.dirname(parent):
+            return ""            # never a drive root
+        have = {os.path.normcase(os.path.normpath(p)) for p in list_defender_exclusions()}
+        if os.path.normcase(os.path.normpath(parent)) in have:
+            return parent
+    except Exception:
+        pass
+    return ""
+
+
+def remove_path_exclusion(path: str) -> tuple[bool, str]:
+    """Remove ONE explicitly-confirmed exclusion path. Never raises.
+
+    Separate from remove_defender_exclusions() on purpose: that one only ever
+    touches paths it recorded, and this one exists so the migration notice
+    requires the user to name the exact path they are agreeing to remove.
+    """
+    try:
+        if not is_admin():
+            return False, "not running as administrator"
+    except Exception:
+        return False, "could not check elevation"
+    if not path or not isinstance(path, str):
+        return False, "no path given"
+    try:
+        ok, out = _run_mp_script(
+            "Remove-MpPreference -ExclusionPath %s -ErrorAction SilentlyContinue"
+            % _ps_quote(path))
+    except Exception as exc:
+        return False, "%s: %s" % (type(exc).__name__, exc)
+    if ok:
+        return True, "Removed the exclusion for %s" % path
+    return False, out or "Remove-MpPreference failed"
+
+
 def ensure_defender_exclusion(paths: list[str] | None = None) -> tuple[bool, str]:
     """
     Add Windows Defender exclusion(s) for this app.
@@ -448,71 +653,53 @@ def ensure_defender_exclusion(paths: list[str] | None = None) -> tuple[bool, str
         exe = _current_exe_path()
         if exe:
             targets.append(exe)
-            try:
-                parent = os.path.dirname(exe)
-                if parent and parent not in targets:
-                    targets.append(parent)
-            except Exception:
-                pass
+            # SEC-004: the parent directory is deliberately NOT excluded.
+            # It used to be, and for a portable app that means running from
+            # Desktop, Downloads or any shared folder excluded everything ELSE
+            # in that folder from Defender scanning - files the user did not
+            # agree to trust, on a directory they share with other things. The
+            # exclusion the app actually needs is for ITS OWN binary, so that
+            # is all it takes.
 
     if not targets:
         return False, "no path to exclude"
 
-    # Build a single PowerShell command that adds every path. Quote each
-    # path with single quotes and double any embedded single quotes so
-    # spaces / apostrophes cannot break the command.
-    def _ps_quote(s: str) -> str:
-        return "'" + (s or "").replace("'", "''") + "'"
-
-    parts = [
+    ps_script = "; ".join(
         f"Add-MpPreference -ExclusionPath {_ps_quote(p)} -ErrorAction SilentlyContinue"
-        for p in targets
-    ]
-    ps_script = "; ".join(parts)
+        for p in targets)
 
     try:
-        # Prefer the full path to powershell so PATH tricks can't redirect us.
-        ps_exe = os.path.join(
-            os.environ.get("SystemRoot", r"C:\Windows"),
-            "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
-        if not os.path.isfile(ps_exe):
-            ps_exe = "powershell.exe"
-
-        result = subprocess.run(
-            [
-                ps_exe,
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy", "Bypass",
-                "-Command", ps_script,
-            ],
-            shell=False,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        out = ((result.stdout or "") + (result.stderr or "")).strip()
-        if result.returncode == 0:
-            return True, f"exclusion added for {len(targets)} path(s)"
-        # Non-zero can still mean partial success (Defender not installed,
-        # policy blocked, etc.). Surface the message for diagnostics.
-        return False, out or f"Add-MpPreference exit {result.returncode}"
+        ok, out = _run_mp_script(ps_script)
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"
+    if ok:
+        # SEC-004: remember exactly what we added. Without this there was no
+        # removal path at all, so an exclusion could outlive the user's
+        # decision to stop having it.
+        _record_applied_exclusions(targets)
+        return True, f"exclusion added for {len(targets)} path(s)"
+    # Non-zero can still mean partial success (Defender not installed,
+    # policy blocked, etc.). Surface the message for diagnostics.
+    return False, out or "Add-MpPreference failed"
 
 
 def apply_defender_exclusion_if_wanted() -> None:
-    """
-    Best-effort: if the user opted in (config add_defender_exclusion) and
-    we are elevated, add the exclusion. Called once early on elevated
-    startup. Never raises, never blocks the UI for long.
+    """SEC-004: this used to apply a default-ON, parent-directory-wide
+    Defender exclusion on every elevated launch, with no way to undo it.
+
+    The preference is now opt-in. If the user has turned it OFF but we still
+    have exclusions on record - from an earlier opt-in, or from a version
+    that predates the record - those are removed, so flipping the checkbox
+    back off genuinely reverses it and an older install repairs itself on its
+    next elevated launch. Best-effort; never raises, never blocks for long.
     """
     try:
         if not is_admin():
             return
         from app.config_persist import load_config
-        if not bool(load_config().get("add_defender_exclusion", True)):
+        if not bool(load_config().get("add_defender_exclusion", False)):
+            if _applied_exclusions():
+                remove_defender_exclusions()
             return
         ensure_defender_exclusion()
     except Exception:

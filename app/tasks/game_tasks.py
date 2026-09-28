@@ -266,10 +266,17 @@ def clean_game_captures(ctx: TaskContext):
     return _clean_many(ctx, GAME_CAPTURES_PATHS, "game captures")
 
 
-def _process_running(image: str) -> bool:
-    """True if a process with this image name is currently running
-    (active game/launcher files may be mid-write — callers skip instead of
-    touching live data; same shape as the Steam guard below)."""
+def _process_running(image: str):
+    """True if a process with this image name is running, False if definitely
+    not, None if the probe itself failed (callers skip instead of touching
+    live data; same shape as the Steam guard below).
+
+    MED-005: this returned False on ANY error, which is indistinguishable
+    from "not running". A tasklist timeout therefore read as "safe to
+    proceed" and the caller cleared the game's download caches during a live
+    session - the exact damage the guard exists to prevent. An unanswerable
+    question must not be answered "safe to proceed", so callers skip on
+    None."""
     try:
         import subprocess as _sp
         out = _sp.check_output(
@@ -279,7 +286,7 @@ def _process_running(image: str) -> bool:
         )
         return image.lower() in (out or "").lower()
     except Exception:
-        return False
+        return None
 
 
 def clean_vrchat_cache(ctx: TaskContext):
@@ -291,8 +298,10 @@ def clean_vrchat_cache(ctx: TaskContext):
     is the asset download cache; `config.json`, `LocalAvatarData`,
     `LocalPlayerModerations` (saves/moderation data), `Avatars` (local test
     avatars) and `OSC` are settings/user data and are NEVER touched — only
-    the cache folder goes. A relocated cache (`cache_directory` in the
-    game's own config.json, read-only parse) is honored too.
+    the cache folder goes.
+
+    A RELOCATED cache (the `cache_directory` key in the game's own
+    config.json) is deliberately NOT cleaned — see the BUG-013 note below.
     Redownloads on demand; safe to run any time."""
     import json as _json
     local_low = _lp.LOCALLOW if hasattr(_lp, "LOCALLOW") else ""
@@ -304,28 +313,39 @@ def clean_vrchat_cache(ctx: TaskContext):
         ctx.log("VRChat data folder not found — nothing to do.")
         return 0
     targets = [os.path.join(base, "Cache-WindowsPlayer")]
-    # Relocated cache (the game's own config may point anywhere, even another
-    # drive): read-only parse, absolute dirs only, junctions still skipped by
-    # the walker (a symlinked custom dir is left alone, never followed).
+    # BUG-013 (audit 2026-09-27). This block used to read the game's own
+    # config.json and APPEND `cache_directory` to the list of directories
+    # recursively emptied. That made a user-writable file the delete root:
+    #   * reachable from the Clean tab's DEEP CLEAN preset (tab_presets.py),
+    #     not Custom-only, so no opt-in was required;
+    #   * executed with whatever elevation the app was launched with, which
+    #     is the documented normal mode;
+    #   * validated only by a three-entry denylist (drive root / %WINDIR% /
+    #     %USERPROFILE%), so C:\Users\<you>\Documents, C:\Windows.old or any
+    #     Program Files tree passed straight through.
+    # It contradicted both the README's first safety guarantee and this
+    # function's own docstring.
+    #
+    # Relocation support is REMOVED rather than re-validated. The default
+    # cache is already handled above, and there is no allowlist of "plausible
+    # VRChat cache roots" that is both correct and maintainable — a path the
+    # game merely NAMES is not a path we can vouch for. Cleaning only what we
+    # know, and saying plainly what was skipped, is the honest behaviour.
+    #
+    # The parse is kept (read-only) purely to TELL the user their cache is
+    # somewhere we will not touch, instead of silently under-delivering.
     try:
-        with open(os.path.join(base, "config.json"), "r", encoding="utf-8") as f:
-            custom = (_json.load(f) or {}).get("cache_directory", "")
-        if isinstance(custom, str) and custom.strip() and os.path.isabs(custom):
-            norm = os.path.normpath(custom.strip())
-            # F16: cache_directory is game-writable — refuse system roots
-            # (drive root / Windows / profile root); entry-junction guard
-            # in clean_folder_contents covers the symlink case.
-            try:
-                croot = os.path.splitdrive(norm)[0] + os.sep
-                cwindir = os.environ.get("WINDIR", "")
-                cprofile = os.environ.get("USERPROFILE", "")
-                if norm.lower() in (croot.lower(), cwindir.lower() if cwindir else "", cprofile.lower() if cprofile else ""):
-                    ctx.log(f"VRChat custom cache looks unsafe — skipping: {norm}")
-                elif norm not in targets:
-                    targets.append(norm)
-                    ctx.log(f"VRChat uses a relocated cache: {norm}")
-            except Exception:
-                pass
+        cfg_path = os.path.join(base, "config.json")
+        if os.path.isfile(cfg_path):
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                custom = (_json.load(f) or {}).get("cache_directory", "")
+            if isinstance(custom, str) and custom.strip():
+                norm = os.path.normpath(custom.strip())
+                if os.path.normcase(norm) != os.path.normcase(targets[0]):
+                    ctx.log(f"  ! VRChat's cache is relocated to {norm} — not cleaned.")
+                    ctx.log("    That path comes from the game's own config file, so "
+                            "it is not deleted automatically. Point VRChat back at "
+                            "its default cache, or clear that folder yourself.")
     except (OSError, ValueError):
         pass
     total = _clean_many(ctx, [t for t in targets if os.path.isdir(t)],
@@ -351,7 +371,13 @@ def clean_fivem_cache(ctx: TaskContext):
     active session). Default FiveM location only — a portable install
     elsewhere is left alone with an honest log line."""
     ctx.set_status("Cleaning FiveM download caches...")
-    if _process_running("FiveM.exe"):
+    _fivem = _process_running("FiveM.exe")
+    if _fivem is None:
+        # MED-005: fail CLOSED — we could not prove the session is over.
+        ctx.log("  ! could not determine whether FiveM is running - skipping "
+                "to avoid touching the live session.")
+        return 0
+    if _fivem:
         ctx.log("FiveM is running — skipping to avoid touching the live session.")
         return 0
     localappdata = os.environ.get("LOCALAPPDATA", "")
@@ -643,7 +669,12 @@ def clean_steam_stuck_downloads(ctx: TaskContext):
             ctx.log("Steam is running — skipping to avoid touching active downloads.")
             return 0
     except Exception:
-        pass
+        # MED-005: fail CLOSED. The old `pass` fell straight through to the
+        # delete, so a tasklist failure emptied steamapps\downloading and
+        # steamapps\temp while Steam was live.
+        ctx.log("  ! could not determine whether Steam is running - skipping "
+                "to avoid touching active downloads.")
+        return 0
     steam_path = None
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Software\\Valve\\Steam") as k:

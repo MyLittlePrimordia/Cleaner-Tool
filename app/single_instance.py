@@ -37,12 +37,58 @@ _ERROR_ALREADY_EXISTS = 183
 _ERROR_ACCESS_DENIED = 5
 _WAIT_OBJECT_0 = 0
 
-_state = {
-    "namespace": None,      # "Global" or "Local" once probed
-    "mutex": None,          # owned handle (winner only)
-    "event": None,          # show-event handle (winner only)
-    "bg_claim": None,       # background-claim thread (elevation child only)
-}
+class _InstanceState:
+    """Process-wide single-instance handles, guarded by a lock.
+
+    This replaced a bare module-level dict, which was shared mutable state
+    touched by two different threads. claim_in_background() starts a daemon
+    thread that calls acquire() -> _probe_namespace() while the main thread is
+    still calling set_owner() and ensure_show_event(). The worst case is
+    release()'s check-then-act:
+
+        if _state.get("mutex") is handle:
+            _state["mutex"] = None
+
+    Two racing callers can both pass the check and both clear, or clear a
+    handle that a concurrent set_owner() has just installed. Under CPython the
+    individual dict ops cannot tear, but the sequence can still interleave
+    wrongly. The lock makes each read-modify-write atomic.
+    """
+
+    __slots__ = ("_lock", "namespace", "mutex", "event", "bg_claim")
+
+    _KEYS = ("namespace", "mutex", "event", "bg_claim")
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self.namespace = None
+        self.mutex = None
+        self.event = None
+        self.bg_claim = None
+
+    def get(self, key: str):
+        with self._lock:
+            return getattr(self, key)
+
+    def set(self, key: str, value) -> None:
+        with self._lock:
+            setattr(self, key, value)
+
+    def clear_if(self, key: str, expected) -> bool:
+        """Atomically clear `key` only if it still holds `expected`.
+
+        Returns True if the clear happened. This is the operation that needed
+        the lock; the old code read the slot, compared outside any lock, and
+        then wrote to it.
+        """
+        with self._lock:
+            if getattr(self, key) is expected:
+                setattr(self, key, None)
+                return True
+            return False
+
+
+_state = _InstanceState()
 
 
 def _is_windows() -> bool:
@@ -174,7 +220,7 @@ def _probe_namespace() -> str:
                     ns = "Global"
         except Exception:
             pass
-    _state["namespace"] = ns
+    _state.set("namespace", ns)
     return ns
 
 
@@ -219,8 +265,7 @@ def release(handle) -> None:
     except Exception:
         pass
     try:
-        if _state.get("mutex") is handle:
-            _state["mutex"] = None
+        _state.clear_if("mutex", handle)
     except Exception:
         pass
 
@@ -228,7 +273,7 @@ def release(handle) -> None:
 def set_owner(handle) -> None:
     """Record the owned mutex so the winner holds it for process life."""
     try:
-        _state["mutex"] = handle
+        _state.set("mutex", handle)
     except Exception:
         pass
 
@@ -282,7 +327,7 @@ def ensure_show_event(name: str | None = None):
         except Exception:
             pass
         if name is None:
-            _state["event"] = h
+            _state.set("event", h)
         return h
     except Exception:
         return None
@@ -408,7 +453,7 @@ def claim_in_background(timeout_s: float = 70.0, name: str | None = None) -> Non
                 return
     try:
         th = threading.Thread(target=_run, daemon=True, name="SingleInstanceClaim")
-        _state["bg_claim"] = th
+        _state.set("bg_claim", th)
         th.start()
     except Exception:
         pass

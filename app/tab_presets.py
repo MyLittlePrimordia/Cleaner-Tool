@@ -17,26 +17,27 @@ The GUI imports TABS / PRESETS from here and never builds task lists itself.
 """
 
 from app.tasks import clean_tasks, repair_tasks, tweak_tasks, game_tasks, advanced_tasks, install_tasks
+# H2: these two live in a leaf module so `app.config_persist`'s migrator can
+# use them without importing this one (which imports the task tables, which
+# import app.utils, which used to import config_persist — the repository's
+# only cycle). Re-exported here, so `from app.tab_presets import
+# CUT_TASK_KEYS` still works for app.scheduler and the F3-4 "import the
+# public constant, never a private copy" rule is preserved. Still exactly
+# one definition, so drift remains impossible.
+from app.task_keys import CUT_TASK_KEYS, GAMES_TO_CLEAN_DEDUPE  # noqa: F401
 
 # --------------------------------------------------------------------------- #
 # Cuts (punch-list #13: "Remove from app")
-# --------------------------------------------------------------------------- #
-
-CUT_TASK_KEYS = {"adv_memory_integrity", "adv_vmp", "wpbt_disable"}
-
-# --------------------------------------------------------------------------- #
 # Merge: Games -> Clean (dedupe)
 # --------------------------------------------------------------------------- #
-# Games tab tasks and their Clean-tab twins:
-#   gamer_launchers  == launcher_cache   (identical path list since M5 fix)
+# CUT_TASK_KEYS and GAMES_TO_CLEAN_DEDUPE now live in app.task_keys (imported
+# above). The Games->Clean dedupe rule, for the record:
+#   gamer_launchers    == launcher_cache   (identical path list since M5 fix)
 #   gpu_shader_caches == shader_cache     (identical path list since M2 fix)
-#   game_files       (unique — 100+ per-game junk table)  -> kept
-#   game_captures    (unique — Xbox Game Bar clips)       -> kept
-#
-# The dedup rule: keep the CLEAN-tab twin (it's already referenced by saved
+#   game_files         (unique - 100+ per-game junk table)  -> kept
+#   game_captures      (unique - Xbox Game Bar clips)       -> kept
+# The dedupe rule: keep the CLEAN-tab twin (it's already referenced by saved
 # configs and the scheduler), absorb the unique Games tasks into Clean.
-
-GAMES_TO_CLEAN_DEDUPE = {"gamer_launchers": "launcher_cache", "gpu_shader_caches": "shader_cache"}
 
 def _merge_clean():
     merged = list(clean_tasks.TASKS)  # Phase-1 list, M2/M5 dedupe already applied
@@ -76,10 +77,17 @@ TABS = {
     "Tweak": _merge_tweak(),
     "Install": list(install_tasks.TASKS),
     # Tools embeds the power features in-tab (user redesign 2026-09):
-    # Storage Insight, DNS tester, Health Report, Session Pilot panels +
-    # Windows shortcut link-rows. No runnable tasks live here, but an
-    # empty task list keeps the tab machinery (run_tasks guards, sched-
-    # tolerant resolvers) happy without special-casing.
+    # Storage Insight, DNS tester, Session Pilot panels + Windows shortcut
+    # link-rows. No runnable tasks live here, but an empty task list keeps the
+    # tab machinery (run_tasks guards, sched-tolerant resolvers) happy without
+    # special-casing.
+    #
+    # LOW-002: this comment used to claim a "Health Report" panel here too.
+    # There is no such panel - the Tools tab has never had one since the
+    # H-series split - and the grading engine it referred to
+    # (app/health_scan.py) is a library with no UI consumer, not a second
+    # implementation shadowing this tab. Saying otherwise in the source is how
+    # the next person ends up "fixing" a duplicate that does not exist.
     "Tools": [],
 }
 

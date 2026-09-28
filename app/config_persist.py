@@ -9,58 +9,37 @@ import sys
 import threading
 from pathlib import Path
 
-def _get_config_dir() -> Path:
-    base = os.environ.get("LOCALAPPDATA", "")
-    if not base or not os.path.isdir(base):
-        # Fallback to home or temp if LOCALAPPDATA missing (service / test context)
-        base = os.path.expanduser("~") or os.environ.get("TEMP", "") or "."
-    return Path(base) / "CleanerTool"
+# H2/H3: path resolution and the event log now live in leaf modules, and are
+# re-exported here so every existing importer
+# (`from app.config_persist import CONFIG_DIR, log_security_event`) keeps
+# working untouched. config_persist is now a consumer of these rather than
+# their owner, which is what breaks the utils -> config_persist -> ... edge
+# of the repository's only import cycle.
+from app.config_paths import (  # noqa: F401  (re-exported on purpose)
+    CONFIG_DIR,
+    CONFIG_FILE,
+    EVENTS_LOG_FILE,
+    get_config_dir,
+)
+from app.config_events import log_security_event  # noqa: F401  (re-exported)
 
-CONFIG_DIR = _get_config_dir()
-CONFIG_FILE = CONFIG_DIR / "config.json"
+#: LOW-007: refuse to json.load() a config larger than this. A real config is a
+#: few KB; 32 MB is ~1000x headroom and still bounds what a truncated write, a
+#: runaway append, or a stray large file can cost us in RAM. update_checker
+#: already caps its input the same way.
+_MAX_CONFIG_BYTES = 32 * 1024 * 1024
 
-# ARCH-001: one small append-only local event log for security-relevant
-# events (config quarantines, elevation outcomes, backup rotations) that
-# previously left no persistent record anywhere. Additive only — nothing
-# reads this back into app behavior, it exists purely so a future
-# debugging session (yours or a support thread) has more than "it just
-# reset" to go on. Capped to the last ~2000 lines, same idea as the GUI's
-# own in-memory log cap, so it can never grow unbounded over months.
-EVENTS_LOG_FILE = CONFIG_DIR / "events.log"
-_EVENTS_LOCK = threading.Lock()
-
-
-def log_security_event(category: str, message: str) -> None:
-    """Append one timestamped line to the local event log. Best-effort and
-    never raises — this is observability, not a control path, so a
-    failure here must never affect the caller's actual operation."""
-    try:
-        from datetime import datetime
-        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        line = f"[{stamp}] [{category}] {message}\n"
-        with _EVENTS_LOCK:
-            try:
-                os.makedirs(CONFIG_DIR, exist_ok=True)
-            except Exception:
-                pass
-            with open(EVENTS_LOG_FILE, "a", encoding="utf-8") as f:
-                f.write(line)
-            # cheap cap check — only actually trims once in a long while,
-            # so no need to count lines on every single append
-            try:
-                if os.path.getsize(EVENTS_LOG_FILE) > 512_000:
-                    with open(EVENTS_LOG_FILE, "r", encoding="utf-8", errors="ignore") as f:
-                        lines = f.readlines()
-                    if len(lines) > 2000:
-                        with open(EVENTS_LOG_FILE, "w", encoding="utf-8") as f:
-                            f.writelines(lines[-2000:])
-            except Exception:
-                pass
-    except Exception:
-        pass
+# Legacy alias: the old private name is still referenced by name in the
+# quarantine path's history; keep it importable so nothing external breaks.
+_get_config_dir = get_config_dir
 
 DEFAULT_CONFIG = {
     "schedule_enabled": False,
+    # H7: this key was written by app/scheduler.py and read by the Auto
+    # Maintenance dialog, but was never declared here — so it was never
+    # defaulted and never validated, and a hand-edited "yes" rendered the
+    # dialog's update checkbox as ON. Two features, one scheduled task each.
+    "schedule_update_enabled": False,
     "schedule_frequency": "weekly",  # daily, weekly, monthly
     "schedule_time": "03:00",
     # Phase 2 (#12): 5 tabs merged to 3 — Games folded into Clean, Advanced
@@ -135,27 +114,43 @@ DEFAULT_CONFIG = {
     # merge onto old configs like every other additive key below.
     "auto_elevate": False,
     "remember_limited": False,
-    # When True (default), an elevated launch will add a Windows Defender
-    # exclusion for this executable (and its folder). Offered as a
-    # default-checked checkbox on the Admin Gate so users aren't forced
-    # to manually exclude a clean app that Defender sometimes flags.
-    "add_defender_exclusion": True,
+    # SEC-004: this used to default to True and to exclude the executable's
+    # PARENT DIRECTORY. Two problems, both real:
+    #   * a security-weakening preference should not be opt-OUT, especially
+    #     when the app is portable - running it from Desktop, Downloads or any
+    #     shared folder silently excluded everything else in that folder from
+    #     Defender scanning, and it was reapplied on every elevated launch;
+    #   * there was NO removal path anywhere in the codebase, so a user who
+    #     wanted it gone had to open an elevated PowerShell themselves.
+    # It is now opt-in (default False), excludes only the exact verified
+    # executable, records what it added, and removes exactly those when the
+    # user turns the setting back off. See app.elevation.
+    "add_defender_exclusion": False,
+    "defender_exclusions_applied": [],
+    "defender_migration_notice_shown": False,
     # Startup tray (Phase 5): boot hidden with --tray at logon. Same
     # additive-merge + junk-coercion contract as its neighbors.
     "startup_tray_enabled": False,
     # Close to tray: window X hides to the tray instead of quitting.
     # Default True preserves the existing behavior for upgrades.
     "close_to_tray_enabled": True,
+    # H7: also undeclared. has_seen_tip/mark_tip_seen read and write it with
+    # a local default, so a non-dict value here made every tip reappear
+    # forever instead of being ignored.
+    "seen_tips": {},
 }
 
-_STARTUP_MAX = 200
-
-# Feature 10: keep the history short — this is a friendly summary, not an
-# audit trail, and the config file should stay small.
-_RUN_HISTORY_MAX = 120
-# Feature 7: bounds so a hand-edited config can never balloon the file.
-_PROFILE_MAX = 20
-_PROFILE_ITEMS_MAX = 400
+# H7: the caps are schema constraints, so they live in app/config_schema.py
+# with the rules that apply them. Re-exported here because the writers below
+# still enforce them on the way OUT, and both ends must agree on the number.
+from app.config_schema import (  # noqa: E402
+    PROFILE_ITEMS_MAX as _PROFILE_ITEMS_MAX,
+    PROFILE_MAX as _PROFILE_MAX,
+    RUN_HISTORY_MAX as _RUN_HISTORY_MAX,
+    STARTUP_MAX as _STARTUP_MAX,
+    apply_schema,
+    validate_schema,
+)
 
 # Phase 2 (#12): mapping used to migrate configs saved by the old 5-tab UI.
 # Games-tab twins -> the Clean-tab task that cleans the identical paths
@@ -192,9 +187,11 @@ def _migrate_selected_tasks(data: dict) -> dict:
         return data
     # F3-4: the migration rules are the SAME public constants tab_presets
     # uses to build the live tabs — one source of truth, no private copies.
-    # Lazy import: config_persist must stay import-light (it is imported by
-    # tweak_tasks, and tab_presets imports tweak_tasks).
-    from app.tab_presets import CUT_TASK_KEYS as _cut_keys, GAMES_TO_CLEAN_DEDUPE as _dedupe_map
+    # H2: they now come from the leaf module `app.task_keys`, which
+    # `app.tab_presets` itself imports, so this edge no longer closes the
+    # utils -> config_persist -> tab_presets -> tasks -> utils cycle. The
+    # import stays function-local to keep config_persist import-light.
+    from app.task_keys import CUT_TASK_KEYS as _cut_keys, GAMES_TO_CLEAN_DEDUPE as _dedupe_map
     clean = st.setdefault("Clean", [])
     tweak = st.setdefault("Tweak", [])
     # audit fix (probe-confirmed): a hand-edited config could store a task
@@ -260,6 +257,29 @@ def _disk_mtime():
     try:
         return os.path.getmtime(CONFIG_FILE)
     except OSError:
+        return None
+
+
+def _restore_from_bak() -> "dict | None":
+    """MED-013: the UX-001 comment promised "a later quarantine can restore
+    applied_tweaks / snapshots instead of wiping undo history" - but nothing
+    ever read the .bak. This does.
+
+    Only used when the primary is genuinely CORRUPT (not merely unreadable),
+    and the backup must itself parse. Returns the recovered dict, or None.
+    """
+    bak = CONFIG_FILE.with_suffix(CONFIG_FILE.suffix + ".bak")
+    try:
+        if not bak.exists():
+            return None
+        with open(bak, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return None
+        apply_schema(data, DEFAULT_CONFIG)
+        _migrate_selected_tasks(data)
+        return data
+    except Exception:
         return None
 
 
@@ -336,160 +356,88 @@ def _load_config_from_disk() -> dict:
     """Load config from disk (internal use). No side-effect dir creation for read-only queries."""
     if CONFIG_FILE.exists():
         try:
+            # LOW-007: json.load() parses the WHOLE file into memory, so a
+            # multi-GB config.json (truncated write, runaway append, someone
+            # copying a huge file into place) is fully materialised before a
+            # single key is validated. update_checker already caps its input
+            # this way; the config reader should too. Refusing an oversized
+            # file is also the correct response rather than trying to parse it.
+            try:
+                size = CONFIG_FILE.stat().st_size
+            except OSError:
+                size = None
+            if size is not None and size > _MAX_CONFIG_BYTES:
+                raise ValueError(
+                    f"config.json is {size} bytes, over the "
+                    f"{_MAX_CONFIG_BYTES}-byte limit - refusing to parse it")
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if not isinstance(data, dict):
                 raise ValueError("config.json root is not a JSON object")
-            # Merge with defaults for any missing keys (deep merge for selected_tasks)
-            for k, v in DEFAULT_CONFIG.items():
-                if k not in data:
-                    data[k] = copy.deepcopy(v)
-                elif isinstance(v, dict) and isinstance(data[k], dict):
-                    for sub_k, sub_v in v.items():
-                        data[k].setdefault(sub_k, copy.deepcopy(sub_v))
-            # Ensure selected_tasks has all tabs
-            if "selected_tasks" in data and isinstance(data["selected_tasks"], dict):
-                for tab in DEFAULT_CONFIG["selected_tasks"]:
-                    data["selected_tasks"].setdefault(tab, [])
-                _migrate_selected_tasks(data)
-            # H8/H9: validate the tweak-state containers — a hand-edited
-            # string here would scatter per-character badge keys in
-            # get_tweak_state(). Coerce junk back to empty defaults.
-            if not isinstance(data.get("applied_tweaks"), list):
-                data["applied_tweaks"] = []
-            else:
-                data["applied_tweaks"] = [t for t in data["applied_tweaks"] if isinstance(t, str)]
-            # Session Pilot (feature 6): same hand-edited-config hazards —
-            # a string here would scatter per-character exe names into the
-            # watchlist; coerce junk back to defaults.
-            if not isinstance(data.get("session_pilot_games"), list):
-                data["session_pilot_games"] = []
-            else:
-                data["session_pilot_games"] = [
-                    g for g in data["session_pilot_games"]
-                    if isinstance(g, str) and g.strip()]
-            if not isinstance(data.get("session_pilot_preset"), str):
-                data["session_pilot_preset"] = copy.deepcopy(
-                    DEFAULT_CONFIG["session_pilot_preset"])
-            if not isinstance(data.get("session_pilot_enabled"), bool):
-                data["session_pilot_enabled"] = False
-            # Auto-elevate / remember-limited / Defender exclusion (Admin Gate
-            # prefs): same junk-degrades-to-default contract, never raises.
-            if not isinstance(data.get("auto_elevate"), bool):
-                data["auto_elevate"] = False
-            if not isinstance(data.get("remember_limited"), bool):
-                data["remember_limited"] = False
-            if not isinstance(data.get("add_defender_exclusion"), bool):
-                # Default True so existing users get the convenience unless
-                # they explicitly turn the checkbox off.
-                data["add_defender_exclusion"] = True
-            if not isinstance(data.get("startup_tray_enabled"), bool):
-                data["startup_tray_enabled"] = False
-            if not isinstance(data.get("close_to_tray_enabled"), bool):
-                data["close_to_tray_enabled"] = True
-            # Phase-5 keys: same coercion contract (strings scatter;
-            # junk degrades to defaults, never raises)
-            if not isinstance(data.get("session_pilot_paths"), list):
-                data["session_pilot_paths"] = []
-            else:
-                data["session_pilot_paths"] = [
-                    p for p in data["session_pilot_paths"]
-                    if isinstance(p, str) and p.strip()]
-            if "session_pilot_watch_all" in data:
-                # explicit user choice (or legacy default) — validate only
-                if not isinstance(data["session_pilot_watch_all"], bool):
-                    data["session_pilot_watch_all"] = bool(
-                        DEFAULT_CONFIG["session_pilot_watch_all"])
-            else:
-                # key absent = brand-new install (or never touched pilot):
-                # the new-config default applies (True — see DEFAULT_CONFIG)
-                data["session_pilot_watch_all"] = copy.deepcopy(
-                    DEFAULT_CONFIG["session_pilot_watch_all"])
-            if not isinstance(data.get("session_pilot_names"), dict):
-                data["session_pilot_names"] = {}
-            if not isinstance(data.get("gameping_hosts"), list):
-                data["gameping_hosts"] = []
-            else:
-                data["gameping_hosts"] = [
-                    h for h in data["gameping_hosts"]
-                    if isinstance(h, str) and h.strip()][:64]
-            if not isinstance(data.get("tweak_snapshots"), dict):
-                data["tweak_snapshots"] = {}
-            # Feature 10: same hand-edited-config contract as the lists
-            # above — anything that is not a well-formed {t, b} entry is
-            # dropped rather than crashing the summary line later.
-            if not isinstance(data.get("run_history"), list):
-                data["run_history"] = []
-            else:
-                clean_hist = []
-                for entry in data["run_history"]:
-                    if not isinstance(entry, dict):
-                        continue
-                    try:
-                        t = float(entry.get("t", 0))
-                        b = int(entry.get("b", 0))
-                    except (TypeError, ValueError):
-                        continue
-                    if t > 0 and b >= 0:
-                        clean_hist.append({"t": t, "b": b})
-                data["run_history"] = clean_hist[-_RUN_HISTORY_MAX:]
-            # Feature 7: profiles are {name: [str ids]} — coerce junk away.
-            if not isinstance(data.get("install_profiles"), dict):
-                data["install_profiles"] = {}
-            else:
-                clean_prof = {}
-                for name, ids in list(data["install_profiles"].items())[:_PROFILE_MAX]:
-                    if not isinstance(name, str) or not name.strip():
-                        continue
-                    if not isinstance(ids, list):
-                        continue
-                    clean_prof[name.strip()[:60]] = [
-                        i for i in ids
-                        if isinstance(i, str) and i.strip()][:_PROFILE_ITEMS_MAX]
-                data["install_profiles"] = clean_prof
-            # Feature 9: same coercion contract as every list above.
-            if not isinstance(data.get("game_night_active"), bool):
-                data["game_night_active"] = False
-            for _gn_key in ("game_night_keys", "game_night_close_apps"):
-                if not isinstance(data.get(_gn_key), list):
-                    data[_gn_key] = []
-                else:
-                    data[_gn_key] = [
-                        k for k in data[_gn_key]
-                        if isinstance(k, str) and k.strip()][:200]
-            # Startup Manager: same coercion contract — a hand-edited or
-            # corrupted entry is dropped rather than crashing the toggle
-            # list or, worse, being trusted as a restore record.
-            if not isinstance(data.get("startup_disabled"), list):
-                data["startup_disabled"] = []
-            else:
-                clean_su = []
-                for rec in data["startup_disabled"]:
-                    if not isinstance(rec, dict):
-                        continue
-                    src = rec.get("source")
-                    nm = rec.get("name")
-                    cmd = rec.get("command")
-                    if not (isinstance(src, str) and src.strip()
-                            and isinstance(nm, str) and nm.strip()
-                            and isinstance(cmd, str)):
-                        continue
-                    vtype = rec.get("value_type", "")
-                    clean_su.append({
-                        "source": src.strip(), "name": nm.strip()[:200],
-                        "command": cmd[:4096],
-                        "value_type": vtype if isinstance(vtype, str) else "",
-                    })
-                data["startup_disabled"] = clean_su[:_STARTUP_MAX]
+            # H7: validation is declared, not hand-written. Every key gets
+            # either its stored value or its DEFAULT_CONFIG default, and
+            # anything not in the schema is left untouched so a config written
+            # by a NEWER build does not lose data. This replaces ~130 lines of
+            # per-key isinstance checks whose rules, caps and defaults had
+            # drifted into three places; see app/config_schema.py.
+            apply_schema(data, DEFAULT_CONFIG)
+            # The legacy 5-tab -> 3-tab fold needs app.tab_presets, which
+            # imports app.tweak_tasks, which imports this module. So it runs
+            # here, immediately after selected_tasks has been coerced to have
+            # all three tabs, rather than inside the schema.
+            _migrate_selected_tasks(data)
             return data
         except FileNotFoundError:
             pass  # file vanished between exists() and open() — treat as missing
+        except (json.JSONDecodeError, ValueError) as exc:
+            # GENUINELY CORRUPT: the bytes are there but the body is not a
+            # config. This is the only case that should quarantine.
+            #
+            # MED-013: before quarantining, try the last-good .bak that
+            # save_config has been maintaining all along. Wiping a user's
+            # tweak_snapshots - the entire undo history - to recover from one
+            # truncated write is a terrible trade when a known-good copy is
+            # sitting right next to it.
+            recovered = _restore_from_bak()
+            if recovered is not None:
+                log_security_event(
+                    "config_recovered",
+                    f"config.json was unreadable ({type(exc).__name__}); "
+                    "restored the last known-good backup instead of resetting "
+                    "to defaults.")
+                return recovered
+            _quarantine_corrupt_config(exc)
+        except OSError as exc:
+            # MED-013: NOT corrupt - merely UNREADABLE RIGHT NOW. A
+            # PermissionError, an AV sharing violation, a file locked by
+            # another process, a transient I/O error: none of these mean the
+            # bytes are bad. The old code funnelled all of them into
+            # _quarantine_corrupt_config, which meant a momentary lock
+            # produced a false "config_quarantine" entry in the app's own
+            # SECURITY EVENT LOG, wiped every tweak badge in the UI, and then
+            # had the next update_config OVERWRITE the real config.json with
+            # defaults - destroying the tweak_snapshots undo registry.
+            #
+            # Serve the cached copy if we have one and leave the file alone.
+            cached = _config_cache
+            if isinstance(cached, dict) and cached:
+                return copy.deepcopy(cached)
+            log_security_event(
+                "config_unreadable",
+                f"config.json could not be read ({type(exc).__name__}: {exc}); "
+                "it was left in place and defaults are in use for this "
+                "session. It is NOT corrupt and was not reset.")
+            return copy.deepcopy(DEFAULT_CONFIG)
         except Exception as exc:
-            # M5 audit fix: this swallowed EVERY exception (incl. a corrupt
-            # JSON body) and silently returned defaults, wiping the user's
-            # applied-tweak registry / snapshots / selections in memory.
-            # Only a genuinely missing file returns defaults silently; a
-            # corrupt file is quarantined (rename aside) with a warning.
+            # Anything else (a schema bug, a migration failure) is treated as
+            # corrupt, but we still prefer the backup.
+            recovered = _restore_from_bak()
+            if recovered is not None:
+                log_security_event(
+                    "config_recovered",
+                    f"config.json failed to load ({type(exc).__name__}: {exc}); "
+                    "restored the last known-good backup.")
+                return recovered
             _quarantine_corrupt_config(exc)
     return copy.deepcopy(DEFAULT_CONFIG)
 
@@ -517,6 +465,36 @@ def load_config() -> dict:
         return copy.deepcopy(_config_cache)
 
 
+def _prune_stale_config_temps(max_age_s: int = 3600) -> int:
+    """LOW-008: remove leftover config.json.<pid>.<token>.tmp files.
+
+    save_config writes to a unique temp name and then os.replace()s it, so a
+    healthy run leaves nothing behind. A crash or a kill between the write and
+    the replace leaves one, and nothing ever cleaned them up - they accumulate
+    in the config directory forever. Only files older than `max_age_s` are
+    removed, so a temp belonging to a write happening right now (from the GUI
+    or a concurrent --auto-clean) is never touched.
+    """
+    import time
+    removed = 0
+    try:
+        now = time.time()
+        prefix = CONFIG_FILE.name + "."
+        for entry in CONFIG_FILE.parent.iterdir():
+            if not entry.name.startswith(prefix) or not entry.name.endswith(".tmp"):
+                continue
+            try:
+                if now - entry.stat().st_mtime < max_age_s:
+                    continue
+                entry.unlink()
+                removed += 1
+            except OSError:
+                pass
+    except Exception:
+        pass
+    return removed
+
+
 def save_config(config: dict) -> None:
     """Save config to disk atomically (write to temp then replace). Thread-safe. Raises on failure."""
     global _config_cache, _config_mtime
@@ -533,8 +511,15 @@ def save_config(config: dict) -> None:
         # same file; only the final os.replace (atomic on the same volume)
         # decides what lands in config.json.
         import secrets
-        tmp = CONFIG_FILE.with_name(f"{CONFIG_FILE.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
-        # Write to temp
+    tmp = CONFIG_FILE.with_name(f"{CONFIG_FILE.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+    # LOW-008: json.dump() raising (a TypeError from a non-serializable value
+    # reaches here, because it escapes the `with` BEFORE the os.replace
+    # try/except below) used to leave the temp file on disk forever, and
+    # nothing ever pruned config.json.*.tmp. The dump is wrapped so a failure
+    # removes its own temp file, and a cheap sweep clears any left by a
+    # previous crash.
+    _prune_stale_config_temps()
+    try:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2)
             try:
@@ -542,26 +527,33 @@ def save_config(config: dict) -> None:
                 os.fsync(f.fileno())
             except Exception:
                 pass
-        # UX-001: keep a single last-good backup so a later quarantine
-        # can restore applied_tweaks / snapshots instead of wiping undo history.
+    except Exception:
         try:
-            if CONFIG_FILE.exists():
-                bak = CONFIG_FILE.with_suffix(CONFIG_FILE.suffix + ".bak")
-                import shutil
-                shutil.copy2(CONFIG_FILE, bak)
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    # UX-001: keep a single last-good backup so a later quarantine
+    # can restore applied_tweaks / snapshots instead of wiping undo history.
+    try:
+        if CONFIG_FILE.exists():
+            bak = CONFIG_FILE.with_suffix(CONFIG_FILE.suffix + ".bak")
+            import shutil
+            shutil.copy2(CONFIG_FILE, bak)
+    except Exception:
+        pass
+    # Atomic replace
+    try:
+        os.replace(tmp, CONFIG_FILE)
+    except Exception as e:
+        # Cleanup temp on failure and propagate
+        try:
+            if tmp.exists():
+                tmp.unlink()
         except Exception:
             pass
-        # Atomic replace
-        try:
-            os.replace(tmp, CONFIG_FILE)
-        except Exception as e:
-            # Cleanup temp on failure and propagate
-            try:
-                if tmp.exists():
-                    tmp.unlink()
-            except Exception:
-                pass
-            raise
+        raise
         # Directory fsync for durability (Windows: ensure directory entry flushed)
         try:
             # On Windows, opening directory for fsync is not supported; ignore

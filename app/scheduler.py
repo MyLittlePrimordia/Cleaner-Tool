@@ -9,6 +9,7 @@ import subprocess
 from app.config_persist import load_config, save_config, update_config
 from app.elevation import is_admin
 from app.utils import resolve_exe
+from app.runner.task_runner import run_batch
 
 TASK_NAME = "CleanerTool_AutoMaintenance"
 TASK_DESC = "Cleaner Tool automatic maintenance run"
@@ -267,6 +268,91 @@ def _build_schtasks_cmd_str(frequency, time_str, extra_args=None, today=None) ->
         _build_schtasks_cmd(frequency, time_str, extra_args, today=today))
 
 
+def _live_schedule_xml(extra_args=None) -> "str | None":
+    """The live task's definition XML, or None if it cannot be read.
+
+    Deliberately `/XML` rather than `/FO LIST`. The LIST form's field labels
+    ("Task To Run:", "Start Time:", "Schedule Type:") are TRANSLATED on a
+    localized Windows, so parsing them silently returns nothing there - the
+    same trap B6 documented for `sc qc`'s "START_TYPE" label, which is why that
+    one reads the registry instead. The XML element names are schema-defined
+    and are the same in every locale.
+    """
+    task_name = TASK_NAME if not extra_args else TASK_NAME + "_" + extra_args[0].lstrip("-").replace("-", "_")
+    cmd = [resolve_exe("schtasks"), "/Query", "/TN", task_name, "/XML"]
+    try:
+        result = subprocess.run(cmd, shell=False, capture_output=True, text=True,
+                                timeout=30, errors="replace")
+        if result.returncode != 0:
+            return None
+        return result.stdout or None
+    except Exception:
+        return None
+
+
+def _xml_schedule_matches(xml: str, frequency: str, time_str: str) -> "bool | None":
+    """True/False if the live schedule matches what we would write; None if the
+    XML cannot be read or understood.
+
+    prior BUG-010: the drift check compared ONLY the `/TR` (Task To Run) string,
+    so a task whose time or frequency had been changed - in Task Scheduler
+    directly, or by an older build - was judged "already matches" and the
+    rewrite was SKIPPED. The dialog then said 09:00 while the machine ran the
+    job at 03:00, and Apply silently did nothing.
+
+    None is a real third answer and matters: the caller must only skip the
+    rewrite when it can POSITIVELY confirm a match. Any inability to read or
+    understand the XML has to fall through to "rewrite", because skipping on a
+    failed check is what produced the bug.
+    """
+    if not xml or "<" not in (xml or ""):
+        return None
+    try:
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(xml)
+        # Windows emits these in a namespace; match on the local tag name so
+        # this does not depend on the exact namespace URI.
+        def _find(tag):
+            for el in root.iter():
+                if el.tag.rsplit("}", 1)[-1] == tag:
+                    return el
+            return None
+
+        st = _find("StartTime")
+        if st is None or not (st.text or "").strip():
+            return None
+        live_time = st.text.strip()
+        # live is "HH:MM:SS" (24h, no AM/PM); ours is "HH:MM"
+        want = "%s:00" % time_str.strip()
+        if live_time.upper() != want.upper():
+            return False
+
+        sched = _find("Schedule")
+        if sched is None:
+            return None
+        cal = None
+        for el in sched.iter():
+            if el.tag.rsplit("}", 1)[-1] == "Calendar":
+                cal = el
+                break
+        if cal is None:
+            return None
+        cal_type = None
+        for el in cal.iter():
+            if el.tag.rsplit("}", 1)[-1] in ("Weekly", "Daily", "Monthly"):
+                cal_type = el.tag.rsplit("}", 1)[-1]
+                break
+        want_type = {"daily": "Daily", "weekly": "Weekly",
+                     "monthly": "Monthly"}.get(frequency)
+        if want_type is None:
+            return None
+        if cal_type != want_type:
+            return False
+        return True
+    except Exception:
+        return None
+
+
 def enable_schedule(frequency="weekly", time_str="03:00", extra_args=None):
     """Create or update the scheduled task. `extra_args=["--auto-update"]`
     schedules the Update Everything run instead of the clean/repair run
@@ -290,18 +376,27 @@ def enable_schedule(frequency="weekly", time_str="03:00", extra_args=None):
                 if line.strip().lower().startswith("task to run"):
                     m = line.split(":", 1)[1].strip() if ":" in line else ""
                     break
-            if m is not None and m.strip().strip('"') == want_tr.strip().strip('"'):
-                def _mut(extra_args=extra_args, frequency=frequency, time_str=time_str):
-                    def _m(cfg):
-                        if extra_args:
-                            cfg["schedule_update_enabled"] = True
-                        else:
-                            cfg["schedule_enabled"] = True
-                        cfg["schedule_frequency"] = frequency
-                        cfg["schedule_time"] = time_str
-                    return _m
-                update_config(_mut())
-                return True, "Schedule already up to date."
+                if m is not None and m.strip().strip('"') == want_tr.strip().strip('"'):
+                    # prior BUG-010: matching /TR is NOT enough. Also require
+                    # the live TIME and FREQUENCY to match, read from the
+                    # locale-independent XML. Only skip the rewrite when both
+                    # positively confirm; if the XML cannot be read we fall
+                    # through to the rewrite, because skipping on a failed
+                    # check is exactly the bug.
+                    _sched_ok = _xml_schedule_matches(
+                        _live_schedule_xml(extra_args), frequency, time_str)
+                    if _sched_ok is not False:
+                        def _mut(extra_args=extra_args, frequency=frequency, time_str=time_str):
+                            def _m(cfg):
+                                if extra_args:
+                                    cfg["schedule_update_enabled"] = True
+                                else:
+                                    cfg["schedule_enabled"] = True
+                                cfg["schedule_frequency"] = frequency
+                                cfg["schedule_time"] = time_str
+                            return _m
+                        update_config(_mut())
+                        return True, "Schedule already up to date."
     except Exception:
         pass
     cmd = _build_schtasks_cmd(frequency, time_str, extra_args)
@@ -414,7 +509,9 @@ def run_auto_clean(selected_tasks_by_tab):
     Run the auto-clean with pre-selected tasks.
     Called when the app is launched with --auto-clean.
     """
-    from app.utils import TaskContext, TaskSkipped, TaskCancelled
+    # H8: TaskSkipped/TaskCancelled are no longer imported here — the
+    # outcome mapping moved to app.runner.task_runner, which owns both.
+    from app.utils import TaskContext
     from app.tasks import clean_tasks, repair_tasks, tweak_tasks, game_tasks, advanced_tasks
     import threading
     import time
@@ -551,39 +648,28 @@ def run_auto_clean(selected_tasks_by_tab):
     except Exception:
         pass
 
-    for task in tasks_to_run:
-        if ctx.cancelled():
-            ctx.log("Cancelled — remaining tasks were skipped.")
-            break
+    # H8/ARCH-004: this loop used to re-implement the GUI runner's outcome
+    # classification inline (int-means-bytes, bool-False-is-a-failure,
+    # TaskSkipped is not a failure, TaskCancelled is not a failure) while
+    # incrementing its own counters. Its comments said "mirrors the GUI
+    # runner", which is exactly the maintenance hazard: the two copies
+    # drifted, and the six silent-success tasks from audit MED-001 were the
+    # result. Both surfaces now call app.runner.task_runner.
+    #
+    # The log wording below is unchanged, so a scheduled run's transcript
+    # reads exactly as it did.
+    def _log_outcome(line: str) -> None:
+        ctx.log(line)
+
+    def _announce(task) -> None:
         ctx.log(f"Running: {task.label}")
-        try:
-            result = task.run(ctx)
-            # H6 fix: mirror the GUI's result classification so failures are
-            # reported honestly in headless runs (previously every run was
-            # 'succeeded' and the exit code lied to Task Scheduler)
-            if isinstance(result, int) and not isinstance(result, bool):
-                total_bytes += result
-            elif isinstance(result, bool) and not result:
-                raise RuntimeError("Task returned False")
-            completed += 1
-        except TaskSkipped as exc:
-            # B5 audit fix (mirrors the GUI runner): a tweak with nothing
-            # to do on this machine is completed-with-skip — it must not
-            # count as a failure (no error exit for Task Scheduler) and is
-            # logged as skipped, not succeeded.
-            skipped_n += 1
-            ctx.log(f"Skipped {task.label}: {exc}")
-        except TaskCancelled as exc:
-            # F-2 audit fix (mirrors the GUI runner): a user/tool Stop is
-            # 'stopped', not a failure — run_cmd_checked's H6 contract.
-            # The next iteration's cancelled() check ends the loop. Without
-            # this catch the generic handler counted the interrupted task
-            # as failed, flipping the run's exit code for Task Scheduler.
-            ctx.log(f"Stopped {task.label}: {exc}")
-            break
-        except Exception as e:
-            failed += 1
-            ctx.log(f"ERROR in {task.label}: {e}")
+
+    summary_obj = run_batch(ctx, tasks_to_run, mode="run", strict_ok=True,
+                            log=_log_outcome, before=_announce)
+    completed = summary_obj.succeeded
+    skipped_n = summary_obj.skipped
+    failed = summary_obj.failed
+    total_bytes = summary_obj.bytes_freed
 
     if skipped_n:
         summary = (f"Auto-clean complete: {completed} succeeded, "
@@ -593,6 +679,6 @@ def run_auto_clean(selected_tasks_by_tab):
     if total_bytes > 0:
         from app.utils import format_bytes
         summary += f" Freed: {format_bytes(total_bytes)}"
-    
+
     ctx.log(summary)
     return failed == 0, summary

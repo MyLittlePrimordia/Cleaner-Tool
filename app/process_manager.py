@@ -228,6 +228,75 @@ def _friendly_name(exe: str) -> str:
     return base.replace("-", " ").replace("_", " ").title()
 
 
+def _process_image_path(pid: int) -> str:
+    """Full image path for a pid, or "" when it cannot be read. Never raises.
+
+    Needed for icons: the registry's DisplayIcon is the wrong source for a
+    running process (an Electron app's real icon lives in its .exe, not in the
+    launcher), so the authoritative source is the running image itself.
+
+    Deliberately NOT called for every process during a sample - it is only used
+    for the handful of rows actually on screen, since this opens a handle per
+    call and the sampler runs every few seconds.
+    """
+    if not IS_WINDOWS or pid <= 0:
+        return ""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k = ctypes.windll.kernel32
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        # Bind the signatures. ctypes defaults foreign calls through a 32-bit
+        # c_int, and a real HANDLE overflows it on 64-bit Windows - so without
+        # this, OpenProcess appears to fail and every path comes back empty.
+        # This is the same trap app/single_instance._bind() documents.
+        k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k.OpenProcess.restype = wintypes.HANDLE
+        k.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                                 wintypes.LPWSTR,
+                                                 ctypes.POINTER(wintypes.DWORD)]
+        k.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        k.CloseHandle.restype = wintypes.BOOL
+        h = k.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not h:
+            return ""
+        try:
+            size = wintypes.DWORD(1024)
+            buf = ctypes.create_unicode_buffer(1024)
+            if k.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                return buf.value or ""
+            return ""
+        finally:
+            k.CloseHandle(h)
+    except Exception:
+        return ""
+
+
+def _process_cpu_percent(delta_ticks, wall_delta, n_cores):
+    """A process's CPU use as a PERCENTAGE OF THE WHOLE MACHINE, 0-100.
+
+    Pure math, split out so it is testable without Windows and without live
+    process timing.
+
+    BUG (user-reported from the Process Manager screenshot): this used to be
+    "percent of ONE core", so a thread-hungry process on a 16-core machine read
+    162% while Windows Task Manager - which normalises across all cores - read
+    10.8%. 162/16 is 10.1%, so the two were the same number on different scales,
+    and the cap of 100*n_cores (1600%) let absurd values through. A user
+    comparing the app against Task Manager had no way to know the scales
+    differed.
+
+    Dividing by the core count puts both on the same 0-100 scale: a process
+    saturating every core now reads 100%, exactly as Task Manager shows it.
+    """
+    if wall_delta <= 0 or n_cores <= 0:
+        return 0.0
+    # 100ns ticks -> seconds of CPU consumed. 1 second = 10_000_000 units.
+    core_seconds = max(0.0, float(delta_ticks)) / 10_000_000.0
+    return max(0.0, min(100.0, (core_seconds / wall_delta) * 100.0 / float(n_cores)))
+
+
 def _tasklist_csv(timeout: int = 8) -> List[Tuple[str, int, str]]:
     """Return [(image_name, pid, mem_kb_str), ...] via tasklist CSV.
     Never raises."""
@@ -239,17 +308,23 @@ def _tasklist_csv(timeout: int = 8) -> List[Tuple[str, int, str]]:
     except Exception:
         exe = "tasklist"
     try:
+        # PERF: no /v. The verbose form makes tasklist resolve a window title
+        # and session status for EVERY process before printing anything, and
+        # measured 18.3 s on a 250-process machine versus 348 ms without it -
+        # a 52x difference that froze the whole app, because the dialog calls
+        # this on the Tk thread. The parser below reads only the image name
+        # (0), the PID (1) and the memory figure (4), and all three are in the
+        # 5-column non-verbose output, so /v bought nothing and cost 18 seconds.
         out = subprocess.check_output(
-            [exe, "/fo", "csv", "/nh", "/v"],
+            [exe, "/fo", "csv", "/nh"],
             text=True, timeout=timeout, errors="replace",
             stderr=subprocess.DEVNULL,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except Exception:
         try:
-            # Fallback without /v (still has Image Name, PID, Mem Usage)
             out = subprocess.check_output(
-                [exe, "/fo", "csv", "/nh"],
+                [exe, "/fo", "csv", "/nh", "/v"],
                 text=True, timeout=timeout, errors="replace",
                 stderr=subprocess.DEVNULL,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -446,14 +521,21 @@ class ProcessSampler:
             new_cpu[pid] = cpu_ticks
             prev = self._prev_cpu.get(pid)
             if prev is not None and wall_delta > 0:
-                # 100ns ticks → percent of one core
+                # Normalised to a share of the WHOLE machine, so this reads
+                # on the same 0-100 scale as Windows Task Manager. It used to
+                # be 'percent of one core' capped at 100*n_cores, which showed
+                # 162% where Task Manager showed 10.8% (162/16 = 10.1%).
                 delta = max(0, cpu_ticks - prev)
-                # 1 second = 10_000_000 of 100ns units
-                cpu_pct = (delta / 10_000_000.0) / wall_delta * 100.0
+                cpu_pct = _process_cpu_percent(delta, wall_delta, n_cores)
             else:
+                # First sighting of this pid: no previous reading exists, so no
+                # delta can be formed. 0.0 is the honest answer - inventing a
+                # figure here would be the MED-002 class of bug.
                 cpu_pct = 0.0
             # Cap display; multi-core processes can exceed 100
-            cpu_pct = min(cpu_pct, 100.0 * n_cores)
+            # No second cap needed: _process_cpu_percent already clamps to
+            # 0-100 on the whole-machine scale. The old
+            # `min(cpu_pct, 100.0 * n_cores)` here is what let 1600% through.
             _kind = "system" if _sys else (
                 "apps" if pid in _win_pids else "background")
             results.append({

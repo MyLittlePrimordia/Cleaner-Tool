@@ -146,6 +146,33 @@ def _likely_game_exe(folder, name_hint=""):
         return ""
 
 
+def _split_icon_index(raw_icon: str):
+    """Split a registry DisplayIcon value into (path_part, index_part).
+
+    LOW-012: `icon.split(",")[0]` was used at one call site and is wrong.
+    A DisplayIcon is `"<path>[,<index>]",` and a path may itself contain a
+    comma - `C:\\Program Files\\Foo, Inc\\app.exe` - so a naive split truncates
+    it to `C:\\Program Files\\Foo` and the app silently vanishes from the
+    picker.
+
+    When there IS an index it is always the last comma-separated token and is
+    a bare integer, so rpartition is correct. But that same ambiguity means a
+    comma-in-path with NO index would look like a path plus a garbage tail, so
+    only trust the split when the tail really is an integer; otherwise the
+    comma was part of the path all along.
+
+    Extracted so both call sites share it - the second one already had this
+    logic inline, correctly, and the first was the outlier.
+    """
+    if not raw_icon:
+        return "", ""
+    head, comma, tail = raw_icon.rpartition(",")
+    tail = tail.strip()
+    if comma and tail.lstrip("-").isdigit():
+        return head.strip().strip('"'), tail
+    return raw_icon.strip().strip('"'), ""
+
+
 def steam_games():
     """[{name, launcher:'Steam', folder, path}] for every installed Steam
     game with a resolvable manifest. Empty on any failure."""
@@ -163,6 +190,22 @@ def steam_games():
             if not name or not installdir:
                 continue
             if name.lower() in _STEAM_SKIP_NAMES:
+                continue
+            # LOW-011: `installdir` is scraped from appmanifest_*.acf, a
+            # user-writable text file, and was passed straight to os.path.join.
+            # ntpath.join discards everything before an ABSOLUTE component, so
+            # a manifest saying "installdir" "C:\Windows" yielded
+            # folder == "C:\Windows" and the entry passed the isdir() check.
+            # Read-only (the exe is still isfile-confirmed), but it put a bogus
+            # picker entry and a spurious watched path in front of the user.
+            #
+            # A real Steam installdir is a single relative folder name, so
+            # anything absolute or containing a separator/traversal is
+            # malformed and is rejected outright.
+            if (os.path.isabs(installdir)
+                    or "/" in installdir or "\\" in installdir
+                    or installdir in (".", "..")
+                    or ":" in installdir):
                 continue
             folder = os.path.join(apps, "common", installdir)
             if not os.path.isdir(folder):
@@ -354,7 +397,13 @@ def installed_apps():
                             icon = _val("DisplayIcon")
                             path = ""
                             if icon:
-                                path = icon.split(",")[0].strip().strip('"')
+                                # LOW-012: was `icon.split(",")[0]`, which
+                                # truncates any install path containing a comma
+                                # and makes the app vanish from the picker. The
+                                # correct version already existed further down
+                                # this same file; both now share
+                                # _split_icon_index.
+                                path, _icon_index = _split_icon_index(icon)
                                 base = os.path.basename(path).lower()
                                 lp = path.lower()
                                 if (not path.lower().endswith(".exe")
@@ -510,6 +559,23 @@ def list_installed_programs():
                                     icon = icon_path
                                     if index_part:
                                         icon += "," + index_part
+                            if not icon:
+                                # No usable DisplayIcon. 16 of 41 programs on
+                                # a typical machine land here: MSI installers
+                                # and Electron/Squirrel apps write none at all
+                                # (Audacity, Discord, WinGet FFmpeg), and some
+                                # point the value at a binary with no icon
+                                # resource. Hunt for the real binary instead of
+                                # leaving the row a grey square. Costs ~45ms
+                                # and only for these entries; this whole scan
+                                # runs on a worker thread.
+                                try:
+                                    from app.icon_resolve import (
+                                        resolve_program_icon)
+                                    icon = resolve_program_icon(
+                                        name, raw_icon, location, uninstall) or ""
+                                except Exception:
+                                    icon = ""
                             # Dedup by DisplayName (prefer entry that has
                             # InstallLocation / larger size)
                             key = lname

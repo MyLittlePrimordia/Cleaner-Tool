@@ -10,7 +10,10 @@ import time
 # audit fix (hygiene): module-level `subprocess` was unused — every caller
 # that needs it already does its own local `import subprocess`.
 
-from app.utils import TaskContext, clean_folder_contents, run_cmd, restart_explorer, resolve_exe
+from app.utils import (
+    TaskCancelled, TaskContext, clean_folder_contents, run_cmd,
+    restart_explorer, resolve_exe,
+)
 from app.tasks.launcher_paths import (
     ALL_LAUNCHER_CACHE_PATHS, GPU_SHADER_CACHE_ALL, refresh_dynamic_paths,
 )
@@ -68,24 +71,47 @@ def clean_engine_cache(ctx: TaskContext):
     return _clean_many(ctx, folders, "engine cache")
 
 
-def _is_driver_leftover_folder(folder_path: str) -> bool:
+#: Driver-package file extensions that mean "this folder holds something a
+#: driver may still be installed from, so do not delete it".
+_DRIVER_BINARY_EXTS = (".sys", ".dll", ".inf", ".cat", ".ocx", ".drv", ".sys")
+
+
+def _is_driver_leftover_folder(folder_path: str, max_entries: int = 20000) -> bool:
     """True if the folder is safe to delete as a leftover driver install.
 
-    Safety gate (the only thing inspected is the folder ROOT): an actively
-    referenced driver keeps its .sys/.dll/.inf/.cat binaries at the root of
-    these staging folders (C:\\NVIDIA, C:\\AMD, C:\\ATI, C:\\Intel\\Driver) —
-    if ANY driver binary appears at root level we refuse and the folder is
-    skipped. Logs, temp files, and version-numbered subfolders are all
-    disposable install debris; clean_folder_contents walks them safely."""
+    Safety gate: if ANY driver binary (.sys/.dll/.inf/.cat/...) appears
+    ANYWHERE under the folder we refuse and skip it, because an actively
+    referenced driver keeps its binaries somewhere inside it.
+
+    MED-004: this used to inspect only the folder ROOT, and its own docstring
+    said as much ("the only thing inspected is the folder ROOT"). Modern
+    NVIDIA/AMD extraction does not stage binaries at the root - it lays them
+    down in VERSIONED SUBDIRECTORIES, e.g.
+        C:\\NVIDIA\\Display.Nv.Container\\560.94\\
+        C:\\AMD\\AMDSoftware\\Driver\\bin
+    so the root held nothing but debris, the gate passed, and
+    clean_folder_contents deleted a driver package the user may have needed
+    for an offline reinstall. The docstring even listed "version-numbered
+    subfolders" as disposable, which is exactly backwards.
+
+    So this now RECURSES, which is what the gate was for. The walk is bounded
+    (max_entries) and skips reparse points, so a planted junction cannot turn
+    a safety check into an unbounded traversal or walk us out of the tree.
+    """
     if not os.path.isdir(folder_path):
         return False
+    from app.utils import _is_reparse_point as _is_rp
+    seen = 0
     try:
-        for entry in os.listdir(folder_path):
-            entry_path = os.path.join(folder_path, entry)
-            if os.path.isfile(entry_path):
-                ext = os.path.splitext(entry)[1].lower()
-                # Skip if there are driver binaries in root (might be active)
-                if ext in (".sys", ".dll", ".inf", ".cat"):
+        for root, dirs, files in os.walk(folder_path, topdown=True,
+                                         followlinks=False):
+            dirs[:] = [d for d in dirs if not _is_rp(os.path.join(root, d))]
+            for name in files:
+                seen += 1
+                if seen > max_entries:
+                    # Too big to certify: assume the worst and keep it.
+                    return False
+                if os.path.splitext(name)[1].lower() in _DRIVER_BINARY_EXTS:
                     return False
         return True
     except OSError:
@@ -853,16 +879,56 @@ def run_disk_cleanup(ctx: TaskContext):
     key_base = (r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer"
                 r"\VolumeCaches")
     state_flag = f"StateFlags{_CLEANMGR_SAGE_NUM:04d}"
+    # MED-001: these two steps were fire-and-forget, so the task reported
+    # "Disk Cleanup complete." with a green tick even when nothing had been
+    # cleaned. Both failure modes are silent and common:
+    #   * if the `reg add` calls fail (no admin, or a locked key) the
+    #     StateFlags are never written, so /sagerun has no categories
+    #     selected and cleans NOTHING while still exiting 0;
+    #   * if cleanmgr itself is absent, blocked by policy, or hits the
+    #     900 s timeout, run_cmd returns non-zero / -1 and the old code
+    #     ignored it.
+    # Count rather than fail on the first reg add: a single unavailable
+    # VolumeCaches handler on some edition is normal and the rest still
+    # clean. Zero successes, though, means /sagerun is pointless.
+    flagged, flag_failed = 0, []
     for cat in _CLEANMGR_SAGE_CATEGORIES:
-        run_cmd(
+        rc = run_cmd(
             ctx,
             f'reg add "{key_base}\\{cat}" /v {state_flag} '
             f'/t REG_DWORD /d 2 /f',
             timeout=15,
         )
-    ctx.log(f"$ cleanmgr.exe /sagerun:{_CLEANMGR_SAGE_NUM}")
-    run_cmd(ctx, f"cleanmgr.exe /sagerun:{_CLEANMGR_SAGE_NUM}", timeout=900)
-    ctx.log("Disk Cleanup complete.")
+        if rc == -1 and ctx.cancelled():
+            raise TaskCancelled("Disk Cleanup cancelled by user")
+        if rc == 0:
+            flagged += 1
+        else:
+            flag_failed.append(f"{cat} (code {rc})")
+    if flag_failed:
+        ctx.log(f"  ! {len(flag_failed)} cleanup categor"
+                f"{'y' if len(flag_failed) == 1 else 'ies'} could not be "
+                f"flagged and will be skipped: {', '.join(flag_failed[:4])}"
+                + (" ..." if len(flag_failed) > 4 else ""))
+    if not flagged:
+        raise RuntimeError(
+            "Disk Cleanup could not flag any category to clean "
+            f"(all {len(flag_failed)} `reg add` calls failed — this needs "
+            "Administrator rights). Nothing was cleaned.")
+
+    ctx.log(f"$ cleanmgr.exe /sagerun:{_CLEANMGR_SAGE_NUM} "
+            f"({flagged} categor{'y' if flagged == 1 else 'ies'})")
+    rc = run_cmd(ctx, f"cleanmgr.exe /sagerun:{_CLEANMGR_SAGE_NUM}", timeout=900)
+    if rc == -1 and ctx.cancelled():
+        raise TaskCancelled("Disk Cleanup cancelled by user")
+    if rc != 0:
+        raise RuntimeError(
+            f"cleanmgr.exe /sagerun:{_CLEANMGR_SAGE_NUM} failed (code {rc})"
+            + (" — it did not finish inside 900s"
+               if rc == -1 else "")
+            + ". Nothing was reported as cleaned.")
+    ctx.log(f"Disk Cleanup complete ({flagged} categor"
+            f"{'y' if flagged == 1 else 'ies'}).")
     return 0
 
 # Removes temp files via PowerShell #
@@ -906,26 +972,98 @@ def remove_windows_bloat(ctx: TaskContext):
         "Microsoft.Getstarted",            # Microsoft Tips
         "Microsoft.WindowsFeedbackHub",   # (only app users report issues with)
     ]
+    # MED-001: every package used to be removed with
+    # `-ErrorAction SilentlyContinue` and the pipeline's exit code discarded,
+    # so the task always ended "Bloat removal complete." — including on the
+    # stripped/LTSC images this task exists for, where
+    # `Get-AppxPackage -AllUsers` commonly fails outright and removes
+    # nothing.
+    #
+    # The script now reports three distinct outcomes, because "not installed"
+    # and "the query failed" look identical from the outside and must never
+    # be reported the same way:
+    #   CLEANER_TOOL_QFAIL=1  the package query itself failed  -> a real failure
+    #   CLEANER_TOOL_OK=<n>    n packages actually removed
+    #   CLEANER_TOOL_BAD=<n>   n packages matched but would not remove
+    # shell=False argv, so the single-quoted package name needs no escaping.
+    def _ps_remove(where: str) -> "tuple[int, int, int]":
+        script = (
+            "$q=$null;$qf=0;"
+            "try{$q=@(Get-AppxPackage " + where + " -ErrorAction Stop)}"
+            "catch{$qf=1};"
+            "$ok=0;$bad=0;"
+            "if($qf -eq 0){foreach($p in $q){"
+            "try{Remove-AppxPackage -Package $p.PackageFullName "
+            "-ErrorAction Stop;$ok++}catch{$bad++}}};"
+            "Write-Output \"CLEANER_TOOL_QFAIL=$qf\";"
+            "Write-Output \"CLEANER_TOOL_OK=$ok\";"
+            "Write-Output \"CLEANER_TOOL_BAD=$bad\""
+        )
+        out: list = []
+        rc = run_cmd(ctx, ["powershell", "-NoProfile", "-Command", script],
+                     shell=False, timeout=60, collect=out)
+        qf = ok = bad = 0
+        for line in out:
+            s = str(line).strip()
+            for key in ("QFAIL", "OK", "BAD"):
+                if s.startswith(f"CLEANER_TOOL_{key}="):
+                    try:
+                        val = int(s.split("=", 1)[1])
+                    except ValueError:
+                        val = 0
+                    if key == "QFAIL":
+                        qf = val
+                    elif key == "OK":
+                        ok = val
+                    else:
+                        bad = val
+        if rc == -1 and ctx.cancelled():
+            raise TaskCancelled("Bloat removal cancelled by user")
+        return qf, ok, bad
+
+    removed = failed = not_installed = 0
     for pkg in bloat:
         if ctx.cancelled():
-            ctx.log("  ! cancelled — stopping bloat removal.")
-            break
-        # shell=False argv + PS single quotes (package names need no
-        # expansion; backslash-escaped double quotes would ParserError).
-        run_cmd(ctx, ["powershell", "-NoProfile", "-Command",
-                      f"Get-AppxPackage -Name '{pkg}' -AllUsers | Remove-AppxPackage -ErrorAction SilentlyContinue"],
-                shell=False, timeout=60)
-        ctx.log(f"  Checked {pkg}")
+            raise TaskCancelled("Bloat removal cancelled by user")
+        qf, ok, bad = _ps_remove(f"-Name '{pkg}'")
+        if qf:
+            ctx.log(f"  ! {pkg}: the package query failed — not removed.")
+            failed += 1
+        elif bad:
+            ctx.log(f"  ! {pkg}: matched but would not remove ({bad}).")
+            failed += bad
+        elif ok:
+            ctx.log(f"  Removed {pkg}")
+            removed += ok
+        else:
+            ctx.log(f"  {pkg}: not installed — nothing to do.")
+            not_installed += 1
     # TikTok registers under different publisher names; catch-all fallback
     if not ctx.cancelled():
-        run_cmd(ctx, ["powershell", "-NoProfile", "-Command",
-                      "Get-AppxPackage -AllUsers | Where-Object {$_.Name -like '*TikTok*'} | Remove-AppxPackage -ErrorAction SilentlyContinue"],
-                shell=False, timeout=60)
+        qf, ok, bad = _ps_remove("| Where-Object {$_.Name -like '*TikTok*'}")
+        if qf:
+            ctx.log("  ! TikTok sweep: the package query failed.")
+            failed += 1
+        elif bad:
+            ctx.log(f"  ! TikTok: matched but would not remove ({bad}).")
+            failed += bad
+        elif ok:
+            ctx.log(f"  Removed TikTok ({ok})")
+            removed += ok
     # Note: blocking auto-reinstall of consumer suggestions (DisableWindowsConsumerFeatures)
     # lives in the Tweak tab's "Stop Windows Ads & Tips" task instead, since that task has
     # a working revert. This Clean-tab task only removes apps (Store-reinstallable, no
     # one-way registry writes left behind).
-    ctx.log("Bloat removal complete.")
+    summary = (f"{removed} removed, {not_installed} not installed"
+               + (f", {failed} failed" if failed else ""))
+    if failed and not removed:
+        raise RuntimeError(
+            f"No bloat could be removed ({summary}). This task needs "
+            "Administrator rights to query packages for all users.")
+    if failed:
+        ctx.log(f"Bloat removal finished with errors — {summary}.")
+    else:
+        ctx.log(f"Bloat removal complete — {summary}.")
     return 0
 
 
@@ -1000,8 +1138,16 @@ def _steam_root() -> str:
     return os.path.join(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"), "Steam")
 
 
-def _steam_running() -> bool:
-    """True if steam.exe is currently running (active downloads may be writing)."""
+def _steam_running():
+    """True if steam.exe is running, False if definitely not, None if the
+    probe itself failed.
+
+    MED-005: this returned False on ANY error, which is indistinguishable
+    from "Steam is not running". A tasklist timeout (5-10s on a loaded
+    machine, or while AV holds the process table) therefore meant the caller
+    went ahead and emptied depotcache + appinfo.vdf while Steam was live -
+    the exact damage the guard exists to prevent. An unanswerable question
+    must not be answered "safe to proceed", so callers now skip on None."""
     try:
         import subprocess as _sp
         out = _sp.check_output(
@@ -1011,13 +1157,20 @@ def _steam_running() -> bool:
         )
         return "steam.exe" in (out or "").lower()
     except Exception:
-        return False
+        return None
 
 
 def clean_steam_download_cache(ctx: TaskContext):
     """Clear Steam's depot manifest cache + stale appinfo (fixes phantom
     'update required' states; Steam re-downloads them on launch)."""
-    if _steam_running():
+    _steam = _steam_running()
+    if _steam is None:
+        # MED-005: fail CLOSED. We could not prove Steam is stopped, and the
+        # folders below are written during an active download.
+        ctx.log("  ! could not determine whether Steam is running - skipping "
+                "to avoid touching active downloads.")
+        return 0
+    if _steam:
         ctx.log("Steam is running — skipping to avoid touching active downloads.")
         return 0
     root = _steam_root()
@@ -1315,14 +1468,34 @@ def _looks_like_residual_folder(folder_path: str) -> bool:
     has_exe_or_dll = False
     only_residual = True
     total_files = 0
+    reparse_pruned = 0
+    # MED-003: this used to be `os.path.islink(...)`, which is the wrong test
+    # for the thing being walked. Verified on this platform:
+    #     os.path.islink(<junction>)            -> False
+    #     os.lstat(<junction>).st_reparse_tag  -> True
+    #     os.walk(<junction>, followlinks=False) DESCENDS and yields files
+    # So the prune was a no-op for exactly the case it existed to stop: a
+    # junction into a real program folder. A folder whose ONLY subdirectory is
+    # such a junction then scanned as "high-confidence orphan leftover" (the
+    # target's game.exe is invisible, total_files is 0 or the residue-only
+    # check passes on the junction's own contents) and clean_orphan_programs
+    # would delete the real files on the far side of it.
+    # The other six walkers in this codebase already use _is_reparse_point,
+    # which is fail-closed and correct for junctions. Use it here too.
+    from app.utils import _is_reparse_point as _is_rp
     try:
         for root, dirs, files in os.walk(folder_path, topdown=True,
                                          followlinks=False):
             if total_files > 2000:
                 only_residual = False
                 break
-            dirs[:] = [d for d in dirs
-                       if not os.path.islink(os.path.join(root, d))]
+            keep = []
+            for d in dirs:
+                if _is_rp(os.path.join(root, d)):
+                    reparse_pruned += 1
+                else:
+                    keep.append(d)
+            dirs[:] = keep
             for f in files:
                 total_files += 1
                 low = f.lower()
@@ -1338,6 +1511,21 @@ def _looks_like_residual_folder(folder_path: str) -> bool:
                     if not (parts & residual_markers):
                         only_residual = False
     except OSError:
+        return False
+
+    # MED-003, second half: refusing to walk through a reparse point is NOT the
+    # same as the folder being empty, and the function must not confuse the two.
+    # With the junction correctly pruned, total_files stays 0 and the
+    # `if total_files == 0: return True` below would call the folder a
+    # high-confidence residual - i.e. deletable - precisely BECAUSE we declined
+    # to look. The real files on the far side of the junction are then removed
+    # with the folder.
+    #
+    # A folder containing a reparse point holds something real by definition: we
+    # have proof there is data, and no evidence about what it is. That is
+    # "unknown", and unknown must never be scored as "confidently deletable".
+    if reparse_pruned:
+        ctx_free_note = ""      # no ctx here; the caller logs the skip
         return False
 
     if total_files == 0:

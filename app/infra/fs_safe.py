@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 from typing import Iterator, List, Tuple
 
-from app.utils import _is_reparse_point
+from app.utils import _is_reparse_point, _is_protected_root
 
 
 def safe_walk(top: str, topdown: bool = True) -> Iterator[Tuple[str, List[str], List[str]]]:
@@ -27,9 +27,18 @@ def safe_walk(top: str, topdown: bool = True) -> Iterator[Tuple[str, List[str], 
 
 
 def is_safe_to_delete(path: str) -> bool:
-    """True only when path exists and is not a reparse point."""
+    """True only when path exists, is not a reparse point, and is not a
+    protected container root.
+
+    BUG-014: this now consults utils._is_protected_root so the rule lives in
+    exactly ONE place. Previously this function and clean_folder_contents each
+    had their own idea of what was safe, which is how they drifted. The
+    import direction stays utils <- fs_safe (fs_safe already imported
+    _is_reparse_point from utils), so no new cycle is introduced."""
     try:
         if not os.path.exists(path):
+            return False
+        if _is_protected_root(path):
             return False
         return not _is_reparse_point(path)
     except Exception:

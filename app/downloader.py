@@ -32,6 +32,13 @@ from app import capabilities as cap
 
 _UA = "CleanerTool/2.0 (component installer)"
 
+#: LOW-005/LOW-006 resource ceilings. These are deliberately GENEROUS: the
+#: real integrity guarantee is the pinned expected_size + SHA-256, and these
+#: only exist so a response that is not what we asked for cannot fill the disk
+#: (LOW-005) or exhaust memory (LOW-006).
+_MAX_UNPINNED_DOWNLOAD = 512 * 1024 * 1024   # 512 MB with no pinned size
+_MAX_SCRAPE_BYTES = 8 * 1024 * 1024          # 8 MB of HTML is plenty for a link
+
 
 def _log(ctx: TaskContext, msg: str):
     ctx.log(msg)
@@ -44,6 +51,16 @@ def _download(ctx: TaskContext, url: str, dest: str, expected_size: int,
     (dest is removed) — the caller must NOT execute on False."""
     _log(ctx, f"Downloading {label}...")
     _log(ctx, f"  from {url}")
+    # LOW-005: the ceiling has to be enforced WHILE writing, not after. The
+    # old code wrote every chunk and only then compared `got != expected_size`,
+    # so a hostile or misconfigured origin could stream unbounded data and fill
+    # the volume before the check ever ran. `expected_size` is our own pinned
+    # figure, so exceeding it means the response is not what we asked for.
+    #
+    # Content-Length is used for the progress bar only; it is server-supplied
+    # and is never trusted as a limit. When we have no pinned size, the cap
+    # below still applies so an unknown-length body cannot fill the disk.
+    ceiling = expected_size if expected_size else _MAX_UNPINNED_DOWNLOAD
     try:
         req = urllib.request.Request(url, headers={"User-Agent": _UA})
         with urllib.request.urlopen(req, timeout=timeout) as resp, open(dest, "wb") as f:
@@ -60,6 +77,15 @@ def _download(ctx: TaskContext, url: str, dest: str, expected_size: int,
                 chunk = resp.read(1 << 16)
                 if not chunk:
                     break
+                # LOW-005: stop the moment the body exceeds what we expected,
+                # BEFORE writing the offending chunk. Aborting here leaves at
+                # most ceiling bytes on disk instead of an unbounded amount.
+                if got + len(chunk) > ceiling:
+                    raise RuntimeError(
+                        f"download exceeded the expected size: already have "
+                        f"{got} bytes, ceiling is {ceiling}"
+                        + (f" (pinned {expected_size})" if expected_size
+                           else " (no pinned size; using the unpinned cap)"))
                 f.write(chunk)
                 got += len(chunk)
                 if total:
@@ -67,8 +93,8 @@ def _download(ctx: TaskContext, url: str, dest: str, expected_size: int,
                     if pct >= last_pct + 10:
                         last_pct = pct
                         ctx.set_status(f"Downloading {label}... {pct}%")
-        if expected_size and got != expected_size:
-            raise RuntimeError(f"size mismatch: got {got}, expected {expected_size}")
+            if expected_size and got != expected_size:
+                raise RuntimeError(f"size mismatch: got {got}, expected {expected_size}")
         _log(ctx, f"  downloaded {got} bytes — verifying...")
         h = hashlib.sha256()
         with open(dest, "rb") as f:
@@ -114,10 +140,26 @@ def _scrape_download_center(ctx: TaskContext, page_url: str, filename: str,
         req = urllib.request.Request(
             page_url,
             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+                                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
                      "Accept-Language": "en-US,en;q=0.9"},
         )
-        html = urllib.request.urlopen(req, timeout=30).read().decode("utf-8", "replace")
+        # LOW-006: this was
+        #     html = urllib.request.urlopen(req, timeout=30).read().decode(...)
+        # Two problems. The response was never closed (no `with`), leaking the
+        # socket for the life of the process, and `.read()` with no argument
+        # pulls the ENTIRE body into memory - a memory-exhaustion vector on a
+        # worker thread, from a page this code does not control the size of.
+        # Read a bounded prefix instead: the URL we are looking for is a link
+        # near the top of a download page, and a hard cap keeps a hostile or
+        # broken origin from costing anything but a failed regex match.
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            declared = int(resp.headers.get("Content-Length") or 0)
+            if declared > _MAX_SCRAPE_BYTES:
+                raise RuntimeError(
+                    f"download page is {declared} bytes, refusing to scrape "
+                    f"more than {_MAX_SCRAPE_BYTES}")
+            raw = resp.read(_MAX_SCRAPE_BYTES)
+        html = raw.decode("utf-8", "replace")
         import re
         m = re.search(rf"https://download\.microsoft\.com[^\"'<> ]*?{re.escape(filename)}", html)
         if m:

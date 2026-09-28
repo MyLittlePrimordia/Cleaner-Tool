@@ -188,6 +188,34 @@ class _PDH_FMT_COUNTERVALUE(ctypes.Structure):
     _fields_ = [("CStatus", ctypes.c_uint32), ("doubleValue", ctypes.c_double)]
 
 
+def _close_pdh_query(owner) -> bool:
+    """LOW-013: close a PDH query handle held by `owner`, if any.
+
+    The three counter collectors assign `self._hquery = hquery` immediately
+    after PdhOpenQueryW and then run loops that add counters. An exception in
+    one of those loops used to `return False` with the query still open and no
+    path to close it, so every failed construction leaked a handle. The field
+    is cleared as well as the handle closed, so no later code can use a closed
+    handle.
+
+    Best-effort and never raises: this runs on a failure path that is already
+    reporting a failure, and a close error must not replace that report.
+    """
+    hq = getattr(owner, "_hquery", None)
+    if hq is None:
+        return False
+    try:
+        ctypes.windll.pdh.PdhCloseQuery(hq)
+    except Exception:
+        return False
+    finally:
+        try:
+            owner._hquery = None
+        except Exception:
+            pass
+    return True
+
+
 def _pdh_expand_wildcard(path):
     """-> list[str] of concrete counter paths matching a PDH wildcard
     path, via the standard two-pass PdhExpandWildCardPathW pattern
@@ -284,8 +312,14 @@ class GpuSampler:
                     auto_idx += 1
                 used_phys.add(phys)
                 self._vram_counters.append((phys, hc))
-            return bool(self._util_counters or self._vram_counters)
+                return bool(self._util_counters or self._vram_counters)
         except Exception:
+            # LOW-013: self._hquery is assigned BEFORE the counter-add loops,
+            # so an exception in one of them returned with the PDH query still
+            # open and no path to close it - one leaked handle per failed
+            # construction. Close it, and clear the field so nothing later can
+            # touch a closed handle.
+            _close_pdh_query(self)
             return False
 
     @property
@@ -790,8 +824,9 @@ class DiskSampler:
                 hc = self._add(hquery, p)
                 if hc is not None:
                     self._write.append(hc)
-            return bool(self._active or self._read or self._write)
+                return bool(self._active or self._read or self._write)
         except Exception:
+            _close_pdh_query(self)          # LOW-013
             return False
 
     def _read_one(self, hc):
@@ -922,8 +957,9 @@ class NetworkSampler:
                     hc = self._add(hquery, p)
                     if hc is not None:
                         store[name] = hc
-            return bool(self._rx or self._tx)
+                return bool(self._rx or self._tx)
         except Exception:
+            _close_pdh_query(self)          # LOW-013
             return False
 
     def interfaces(self):

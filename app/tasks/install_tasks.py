@@ -681,6 +681,13 @@ def _verify_download_integrity(ctx: TaskContext, dest: str, label: str, part: di
         ctx.log(f"  {label}: Authenticode signature valid.")
 
 
+#: LOW-005: ceiling for an un-pinned binary download. Generous on purpose -
+#: the real gate is the MZ/OLE magic check plus the pinned size/hash in
+#: _verify_download_integrity. This only stops an origin from filling the
+#: volume between starting and finishing the transfer.
+_MAX_BINARY_DOWNLOAD = 1024 * 1024 * 1024   # 1 GB
+
+
 def _download_binary(ctx: TaskContext, url: str, dest: str, label: str, min_bytes: int,
                      part: "dict | None" = None) -> None:
     """Download url -> dest with a browser UA (SourceForge file mirrors
@@ -701,6 +708,7 @@ def _download_binary(ctx: TaskContext, url: str, dest: str, label: str, min_byte
             ctype = (resp.headers.get("Content-Type") or "").lower()
             if "text/html" in ctype:
                 raise RuntimeError(f"server returned an HTML page, not a file (blocked/challenge?)")
+            written = 0        # LOW-005: running byte count for the ceiling
             while True:
                 if ctx.cancelled():
                     # F-7: a user Stop is 'stopped', not a download failure —
@@ -711,6 +719,17 @@ def _download_binary(ctx: TaskContext, url: str, dest: str, label: str, min_byte
                 chunk = resp.read(1 << 16)
                 if not chunk:
                     break
+                # LOW-005: this downloader has a `min_bytes` FLOOR but no
+                # ceiling - the same gap the audit flagged in downloader.py.
+                # The floor is checked after the fact (below), so between
+                # starting and finishing, an origin that never stops sending
+                # can fill the volume. Enforce a cap while writing.
+                written += len(chunk)
+                if written > _MAX_BINARY_DOWNLOAD:
+                    raise RuntimeError(
+                        f"download exceeded the {_MAX_BINARY_DOWNLOAD}-byte "
+                        f"ceiling after {written} bytes - refusing to continue "
+                        "(this is not the file we asked for)")
                 f.write(chunk)
     except TaskCancelled:
         # same partial-file cleanup as failures, but keep the 'stopped'

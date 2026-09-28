@@ -117,6 +117,53 @@ def _ps_query(class_name, props, timeout=4.0):
         return []
 
 
+# ---------------------------------------------------------------------------
+# PERF: session cache for the hardware/OS probes.
+#
+# Measured on the user's machine: full_report_lines() took ~6.0 s, and
+# summary_lines() - which it calls FIRST - re-runs the same probes:
+#
+#     os_info    756 ms      cpu_info  1342 ms      board_info  597 ms
+#     net_info   427 ms      ram_info    1.2 ms    gpu_info     0.1 ms
+#
+# So every expensive probe ran TWICE per report: roughly 2.7 s of the 6 s was
+# pure duplicated work, and all of it on the Tk thread, which is why the PC
+# Specs card froze the app.
+#
+# These are static facts about the machine (OS build, CPU model, motherboard).
+# Re-reading them hundreds of times a session cannot reveal anything new, so
+# they are memoised. Results are DEEP-COPIED on the way in and out, because
+# several of these return mutable lists and a shared instance would let one
+# caller's edit corrupt another's.
+#
+# clear_cache() exists for tests and for the one case the app cannot observe
+# itself: the user adding or removing RAM while Cleaner Tool is open.
+# ---------------------------------------------------------------------------
+
+_SPEC_CACHE: dict = {}
+
+
+def clear_cache() -> None:
+    """Forget every memoised hardware/OS probe. See the note above."""
+    _SPEC_CACHE.clear()
+
+
+def _memo(fn):
+    """Memoise a zero-argument probe for the lifetime of the process."""
+    import copy
+    import functools
+
+    @functools.wraps(fn)
+    def _wrapped(*a, **kw):
+        key = (fn.__module__, fn.__qualname__)
+        if key not in _SPEC_CACHE:
+            _SPEC_CACHE[key] = copy.deepcopy(fn(*a, **kw))
+        return copy.deepcopy(_SPEC_CACHE[key])
+
+    return _wrapped
+
+
+@_memo
 def os_info():
     """(caption, build_line) e.g. ('Windows 11 Pro 64-bit', '24H2 · build 26100.1')."""
     try:
@@ -160,6 +207,7 @@ def os_info():
         return "Windows", "Unknown build"
 
 
+@_memo
 def cpu_info():
     """(name, detail) e.g. ('Intel Core i7-14700K', '3.40GHz · 8 cores / 20 threads')."""
     try:
@@ -304,6 +352,7 @@ def ram_sticks():
     return out
 
 
+@_memo
 def ram_info():
     """('16.0GB total (2 sticks @ 3200MT/s), 9.1GB free', ...). Honest fallbacks."""
     try:
@@ -323,6 +372,7 @@ def ram_info():
         return "Unknown RAM", ""
 
 
+@_memo
 def board_info():
     """('Micro-Star B650 TOMAHAWK', 'BIOS 1.20'). Falls back to CIM,
     then to the computer's own manufacturer/model (common on laptops,
@@ -378,6 +428,7 @@ def board_info():
         return "Unknown motherboard", ""
 
 
+@_memo
 def gpu_info():
     """[names] of real display adapters (filters the Basic Display stub).
     Falls back to CIM when the registry class keys come back empty —
@@ -426,6 +477,7 @@ def gpu_info():
     return names
 
 
+@_memo
 def storage_info():
     """[{drive, label, fs, total, free}] fixed local disks. Never raises."""
     out = []

@@ -74,6 +74,10 @@ KNOWN_GAME_EXES = frozenset({
 })
 
 POLL_INTERVAL_S = 15.0
+#: How long a single process poll may block. `stop()` must wait longer than
+#: this or it can return with the watcher thread still inside tasklist
+#: (BUG-023), which is what let a stale revert reach the next pilot.
+POLL_TIMEOUT_S = 10.0
 EXIT_STABLE_POLLS = 2     # game gone this many consecutive polls = exited
 # (alt-tabbing, map loads and lobby-to-match hitches keep the process
 # alive, so a single clean miss already means a real exit; 2 is grace)
@@ -114,8 +118,16 @@ def default_get_processes(timeout: int = 10, wanted=None):
     """Live [(image name, full path)] pairs, via tasklist CSV + a
     per-process QueryFullProcessImageNameW resolution (batched through
     tasklist's PID column — one subprocess, then fast ctypes calls; no
-    per-process spawning). Never raises: [] on any failure (a failed
-    poll is a missed poll, never a crash).
+    per-process spawning). THREE-valued, and that is the point (BUG-022):
+    it used to return [] on every failure, and [] is also what 'nothing is
+    running' looks like - so a tasklist timeout was indistinguishable
+    from the game exiting, and two consecutive timeouts mid-match reverted
+    the tweaks of a game that was still running.
+        []    - polled successfully, nothing matched
+        list  - polled successfully, these matched
+        None  - we do not know; the poll failed
+    tick() treats None as 'do not count this poll', so a transient failure
+    can no longer cause a revert. Never raises.
 
     F5-3: tasklist is invoked as an argv list with shell=False — no cmd.exe
     parsing of the command line at all.
@@ -132,7 +144,13 @@ def default_get_processes(timeout: int = 10, wanted=None):
             creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
         )
     except Exception:
-        return []
+        # BUG-022: the tasklist call FAILED. That is "we do not know", and it
+        # must not be reported as [] (="nothing is running") - the state
+        # machine counts misses toward revert, so two consecutive tasklist
+        # timeouts mid-match used to pull Game Mode out from under a player who
+        # was still playing, plus a "Game Mode OFF" toast. tasklist timing out
+        # at 10 s is routine on a loaded machine or during an AV scan.
+        return None
     procs = []
     try:
         for line in (out or "").splitlines():
@@ -147,9 +165,9 @@ def default_get_processes(timeout: int = 10, wanted=None):
             pid = parts[1]
             procs.append((name, int(pid) if pid.isdigit() else 0))
     except Exception:
-        return []
+        return None
     if not procs:
-        return []
+        return []   # a SUCCESSFUL poll that matched nothing
     # resolve full paths in one pass (OpenProcess+QueryFullProcessImageName
     # are cheap; 0-PID entries just keep name-only matching)
     try:
@@ -196,6 +214,13 @@ class SessionPilot:
         self._active_hit = None
         self._stop = False
         self._thread = None
+        # BUG-023 generation counter. `_gen` is the generation of the run that
+        # is CURRENTLY polling; `_generation` is the high-water mark handed out
+        # to each start(). A thread only ever speaks for its own `_gen`, so a
+        # consumer can compare and drop anything stale.
+        self._generation = 0
+        self._gen = 0
+        self._gen_lock = threading.Lock()
         # matching state: basenames always; path-verified dirs per basename
         self._watched_names = set()
         self._watched_dirs = {}   # basename -> {normparent, ...}
@@ -275,11 +300,24 @@ class SessionPilot:
     def tick(self) -> str:
         """One poll: detect launches/exits, fire at most one callback.
         Returns the (possibly new) state. Never raises — a failed poll
-        is swallowed so one bad tasklist can never kill the watcher."""
+        is swallowed so one bad tasklist can never kill the watcher.
+
+        BUG-022: a poll that came back UNKNOWN (the process source returned
+        None - e.g. tasklist timed out) is NOT counted as a miss. Counting it
+        is what made two consecutive tasklist timeouts revert the tweaks of a
+        game that was still running, and toast "Game Mode OFF". We simply do
+        not know, so we decline to conclude anything and try again next tick.
+        A genuine exit is still two REAL polls with no match.
+        """
         try:
-            procs = self._get_processes() or []
+            procs = self._get_processes()
         except Exception:
             return self._state
+        if procs is None:
+            # unknown. Deliberately not `or []`, which would fold this into
+            # "nothing is running" - the exact bug.
+            return self._state
+        procs = procs or []
         try:
             hits = set()
             for item in procs:
@@ -299,12 +337,24 @@ class SessionPilot:
         except Exception:
             return self._state
         try:
+            # BUG-023: a STOPPED pilot must never speak again. `stop()` sets
+            # _stop and then waits, but `tick()` can already be in flight - past
+            # the _stop check in _loop, inside the (slow) process poll - when
+            # stop() is called. It would then reach _on_apply/_on_revert AFTER
+            # stop() returned, and _pilot_revert restores settings and clears
+            # _pilot_applied_keys, which by then belong to whatever session the
+            # user has since started. A stale revert, silently undoing a new
+            # session. So re-check immediately before every callback, not just
+            # in the loop.
+            if self._stop:
+                return self._state
             if self._state == "idle":
                 if hits:
                     self._state = "active"
                     self._misses = 0
                     self._active_hit = hits[0]
-                    self._on_apply(list(hits))
+                    if not self._stop:
+                        self._on_apply(list(hits))
             else:  # active
                 if hits:
                     self._misses = 0
@@ -315,7 +365,8 @@ class SessionPilot:
                         self._state = "idle"
                         self._misses = 0
                         self._active_hit = None
-                        self._on_revert()
+                        if not self._stop:
+                            self._on_revert()
         except Exception:
             pass
         return self._state
@@ -327,6 +378,14 @@ class SessionPilot:
         if self._thread is not None and self._thread.is_alive():
             return False
         self._stop = False
+        # BUG-023: every start() is a new GENERATION. Anything a previous
+        # generation still produces - a late tick, an already-queued message -
+        # can be recognised as stale and dropped, instead of the code having to
+        # bet that stop() was thorough enough. Cheap, and it makes the
+        # "stop() actually stopped" property checkable rather than assumed.
+        with self._gen_lock:
+            self._generation += 1
+            self._gen = self._generation
 
         def _loop():
             while not self._stop:
@@ -345,19 +404,47 @@ class SessionPilot:
             self._thread = None
             return False
 
-    def stop(self, join_timeout: float = 2.0) -> None:
-        # L06: best-effort join under a small timeout (loop sleeps 0.1s
-        # slices, so it exits promptly); never block the Tk thread long.
-        # Lock-free: _stop is a plain bool flipped here, read by the loop
-        # (GIL-atomic); _thread is only ever started/stopped from the app
-        # thread, so no lock is needed for this handoff.
+    def stop(self, join_timeout: float = None) -> bool:
+        """Ask the watcher to finish, and WAIT for it to actually finish.
+
+        BUG-023. This used to join with a fixed 2-second timeout while `tick()`
+        can block for up to the process-poll timeout (10 s for tasklist) plus
+        the path-resolution pass. So `stop()` routinely returned with the thread
+        STILL ALIVE, and that had two consequences the caller could not see:
+
+          1. The old thread could still reach `_on_revert()` and put a stale
+             "revert" message on the queue that the NEW pilot (already
+             installed by then) drains - reverting tweaks the new pilot had
+             just applied, i.e. a spontaneous "Game Mode OFF" mid-game.
+          2. `_set_stay_awake` increments a counter non-atomically against a
+             later decrement, so two increments against one decrement left the
+             stay-awake hold engaged forever: THE PC NEVER SLEEPS and the
+             display never turns off until the app exits.
+
+        The fix is to not lie about termination. `_stop` is set, then we wait
+        for the thread to actually die, for as long as a poll can legitimately
+        take (the poll timeout, with headroom). Only if it still will not die
+        do we say so, by returning False, instead of pretending.
+
+        Returns True if the thread is confirmed dead.
+        """
         self._stop = True
         th, self._thread = self._thread, None
+        if th is None:
+            return True
         try:
-            if th is not None and th.is_alive() and th is not threading.current_thread():
+            if th.is_alive() and th is not threading.current_thread():
+                if join_timeout is None:
+                    # cover an in-flight poll: the process source's own
+                    # timeout, plus slack for the ctypes path pass
+                    join_timeout = POLL_TIMEOUT_S + 5.0
                 th.join(timeout=join_timeout)
+                if th.is_alive():
+                    # Still running. Report it rather than pretending.
+                    return False
         except Exception:
-            pass
+            return False
+        return True
 
     def running(self) -> bool:
         try:

@@ -323,7 +323,12 @@ def log_or_swallow(ctx: "TaskContext | None", msg: str, exc: BaseException | Non
             print(text, file=sys.stderr)
         # also feed the existing security event log when available
         try:
-            from app.config_persist import log_security_event
+            # H2: imported from the leaf module, not from app.config_persist.
+            # That was the last edge of the repository's only import cycle
+            # (utils -> config_persist -> tab_presets -> tasks -> utils);
+            # the event log is observability and needs nothing from the
+            # config loader, so it no longer has to drag it in.
+            from app.config_events import log_security_event
             log_security_event("ops", text.strip())
         except Exception:
             pass
@@ -355,31 +360,46 @@ class TaskCancelled(RuntimeError):
 # Subprocess helper — fixed timeout deadlock, proper wait
 # --------------------------------------------------------------------------- #
 
-def cmd_arg(value) -> str:
-    """Quote one token for use inside a run_cmd(command, shell=True) string.
-    Windows cmd.exe quoting is genuinely broken, so this uses
-    subprocess.list2cmdline — the same rules subprocess applies when given
-    a list — meaning `&`, `|`, `>`, `%`, spaces etc. inside a value travel
-    as data, never as command separators. Callers that embed user- or
-    registry-derived values into shell command strings should route them
-    through this (F5-1: shell=True stays the default everywhere for
-    backward compatibility; the helper makes it safe)."""
-    try:
-        return subprocess.list2cmdline([str(value)])
-    except Exception:
-        return str(value)
+# BUG-021: a `cmd_arg()` helper used to live here. It was documented as making
+# `&`, `|`, `>`, `%`, `^` and spaces "travel as data, never as command
+# separators" inside a shell=True string, and it did NONE of that except
+# whitespace. Its body was `subprocess.list2cmdline([str(value)])`, which quotes
+# only for whitespace, embedded quotes and empty strings — it performs no
+# metacharacter escaping at all:
+#
+#     'C:\a&b' -> 'C:\a&b'    # not quoted
+#     'a|b'    -> 'a|b'        # not quoted
+#     'C:\a b' -> '"C:\a b"'  # quoted (whitespace only)
+#
+# So a caller who trusted the docstring got a false sense of safety. It is
+# DELETED rather than fixed, because there is no correct version of it: escaping
+# metacharacters for cmd.exe inside a shell string is a losing game. Pass an
+# argv list with shell=False instead (see run_cmd), where no shell exists to
+# parse them. That is the pattern the rest of this codebase already uses.
 
 
-def run_cmd(ctx: TaskContext, command: str, shell: bool = True, timeout: Optional[int] = None,
+def run_cmd(ctx: TaskContext, command, shell: bool = True, timeout: Optional[int] = None,
             collect: "list | None" = None) -> int:
     """Run a command, streaming each output line to ctx.log.
+
+    `command` is either a command string (with `shell=True`, the default) or an
+    argv SEQUENCE, which you must pair with `shell=False`. Prefer the sequence
+    form for anything derived from the environment, the registry, or a
+    user-writable path: with `shell=False` there is no shell to parse
+    metacharacters, so `&`, `|`, `>`, `^` and `%` are just characters in an
+    argument. That is the only construction that makes those characters inert
+    (BUG-021).
 
     `collect` (optional): when given a list, every stripped non-empty output
     line is also appended to it — lets long batch runs (e.g. `winget
     upgrade --all`) build an honest per-item success/failure summary without
     a second slow invocation. Backward compatible: all existing callers
     omit it and behave exactly as before."""
-    ctx.log(f"$ {command}")
+    if isinstance(command, (list, tuple)):
+        # Render the way the user would recognise it, not as a raw repr.
+        ctx.log("$ " + subprocess.list2cmdline([str(c) for c in command]))
+    else:
+        ctx.log(f"$ {command}")
     try:
         startupinfo = None
         creationflags = 0
@@ -620,11 +640,132 @@ def format_bytes(size_bytes: float) -> str:
     return f"{n} Bytes"
 
 
+# --------------------------------------------------------------------------- #
+# BUG-014 protected-root guard
+# --------------------------------------------------------------------------- #
+# The audit finding: clean_folder_contents() is the single destructive funnel
+# for the Clean tab, the Games tab and four Repair-tab tasks, and it had NO
+# guard on WHICH directory it was pointed at. Any caller bug therefore became
+# an arbitrary recursive delete. game_tasks.clean_vrchat_cache turned that into
+# a live data-loss bug (a user-writable config.json supplying the delete root).
+#
+# This guard is the last line of defence for every caller at once.
+#
+# DESIGN — EXACT normalized match, never a prefix/containment test. That
+# distinction is the whole point: we deny the CONTAINER and allow the subtree.
+# Roughly 25 legitimate call sites clean things that live strictly INSIDE
+# these very roots — C:\Windows\Prefetch, C:\Windows\SoftwareDistribution\
+# Download, DeliveryOptimization, the print spooler, %LOCALAPPDATA%\...\
+# Cache, Program Files app shader caches. A containment check would have
+# broken core functionality; an exact check leaves all of them working.
+
+# Environment roots that must never be emptied. normcase'd env lookups, so
+# the caller does not need to trust how the value was spelled.
+#
+# TEMP/TMP are deliberately NOT here. %TEMP% is a legitimate cleaning target
+# by design -- clean_tasks.clean_user_temp_files passes it BARE (and so does
+# the disk-cleanup fallback at clean_tasks.py:886), and it is part of the
+# Quick/Deep Clean presets. It is scratch space whose entire purpose is to be
+# emptied, it holds no user data, and protecting it would silently free 0
+# bytes for a headline feature. Verified: %TEMP% bare is the ONLY protected
+# container any task passes unextended; everything else is a subfolder.
+_PROTECTED_ROOT_ENV = (
+    "SystemRoot", "windir", "ProgramData", "ProgramFiles",
+    "ProgramFiles(x86)", "ProgramW6432", "USERPROFILE", "LOCALAPPDATA",
+    "APPDATA", "PUBLIC",
+)
+
+# Well-known user data folders as (User Shell Folders value name, path
+# relative to %USERPROFILE%). BOTH are checked: the registry value honors
+# OneDrive / known-folder redirection, and the relative path is the fallback
+# for SKUs where the value is absent. That fallback is not theoretical --
+# known_folder() returns "" for MyPictures/MyVideo/MyMusic on this machine, so
+# a registry-only check would have left Pictures, Videos and Music UNPROTECTED.
+# The Downloads entry is a GUID because that is how User Shell Folders spells
+# it; Favorites is the legacy GUID.
+_PROTECTED_ROOT_SHELL = (
+    ("Desktop", "Desktop"),
+    ("Personal", "Documents"),
+    ("MyPictures", "Pictures"),
+    ("MyVideo", "Videos"),
+    ("MyMusic", "Music"),
+    ("{374DE290-123F-4565-9164-39C4925E467B}", "Downloads"),   # Downloads
+    ("{645FF040-5081-101B-9F08-00AA002F954E}", "Favorites"),   # legacy
+)
+
+
+def _norm_dir(path: str) -> str:
+    """Absolute + normalized + case-folded directory key for comparison."""
+    try:
+        return os.path.normcase(os.path.abspath(os.path.normpath(path)))
+    except Exception:
+        return ""
+
+
+def _is_protected_root(path: str) -> bool:
+    """True when `path` IS a protected container root (BUG-014).
+
+    Also refuses a bare drive root ("C:\\", "D:\\"). No caller should ever pass
+    one, and if one arrives it is certainly not a cache.
+
+    Deliberately does NOT walk up the tree. Refusing an ANCESTOR of a
+    protected root is already covered, because every dangerous ancestor is
+    itself in the list above: C:\\ , C:\\Windows, C:\\Users, C:\\Program Files,
+    C:\\ProgramData, and the user profile.
+
+    Fails CLOSED (returns True on any error), matching _is_reparse_point's
+    posture — an unanswerable question about a delete target must stop the
+    delete, not permit it."""
+    try:
+        if not path or not isinstance(path, str):
+            return False
+        norm = _norm_dir(path)
+        if not norm:
+            return False
+        drive, rest = os.path.splitdrive(norm)
+        if drive and not rest.strip("\\"):
+            return True   # bare drive root
+        for var in _PROTECTED_ROOT_ENV:
+            raw = os.environ.get(var, "")
+            if raw and norm == _norm_dir(raw):
+                return True
+        for shell, relative in _PROTECTED_ROOT_SHELL:
+            raw = known_folder(shell)
+            if raw and norm == _norm_dir(raw):
+                return True
+            prof = os.environ.get("USERPROFILE", "")
+            if prof and relative:
+                cand = os.path.join(prof, relative)
+                if norm == _norm_dir(cand):
+                    return True
+        # the whole per-user tree: C:\Users (and D:\Users, etc.) holds every
+        # local account's profile, so no single env var covers it.
+        try:
+            _d, tail = os.path.splitdrive(norm)
+            if tail.strip("\\").lower() == "users":
+                return True
+        except Exception:
+            pass
+        return False
+    except Exception:
+        return True
+
+
 def clean_folder_contents(ctx: TaskContext, folder_path: str, remove_root: bool = False,
                            extensions: Optional[List[str]] = None) -> int:
     bytes_freed = 0
     skipped = 0
     if not folder_path or not os.path.exists(folder_path):
+        return 0
+    # BUG-014: refuse protected container roots before touching anything.
+    # Placed ahead of the reparse check so the refusal is unconditional, and
+    # honored in dry_run too — a folder we would never clean has no
+    # meaningful size to estimate.
+    if _is_protected_root(folder_path):
+        try:
+            ctx.log(f"  ! refusing to clean a protected location: {folder_path}")
+        except Exception:
+            pass
         return 0
     # F03 entry guard: os.walk(top) enumerates THROUGH a junction root even
     # with followlinks=False (only subdirs are pruned). Refuse to walk when
@@ -868,10 +1009,13 @@ def reg_get_value_typed(ctx: TaskContext, hive: str, path: str, name: str):
     """Read a registry value AND its real winreg type (CT-001 audit fix).
     Returns (value, type_name) where type_name is one of _TYPE_MAP's keys
     (e.g. "REG_SZ"), or None if the type has no name in _TYPE_MAP. Value
-    is None if the key/value doesn't exist; _REG_DENIED if it exists but
-    can't be read (F13: missing vs denied must not collapse — a denied
-    prior snapshotted as absent made revert DELETE a pre-existing value).
-    In both of those cases type_name is None (nothing was queried)."""
+    is None ONLY if the key/value genuinely does not exist; _REG_DENIED if it
+    may exist but could not be read (F13: missing vs denied must not
+    collapse - a denied prior snapshotted as absent made revert DELETE a
+    pre-existing value; MED-008 widened that: ANY read failure that is not a
+    definitive not-found now counts as denied, because a sharing violation or
+    a busy hive is not evidence of absence). In both of those cases type_name
+    is None (nothing was queried)."""
     key = None
     try:
         root = _HIVES[hive]
@@ -883,12 +1027,28 @@ def reg_get_value_typed(ctx: TaskContext, hive: str, path: str, name: str):
     except PermissionError:
         return _REG_DENIED, None
     except OSError as exc:
-        # ERROR_ACCESS_DENIED == 5 (winerror); errnos vary by SKU.
-        if getattr(exc, "winerror", None) == 5 or getattr(exc, "errno", None) in (5, 13):
-            return _REG_DENIED, None
-        return None, None
+        # MED-008: only a DEFINITIVE "it is not there" may be reported as
+        # absent. Everything else is UNKNOWN, and unknown must never become
+        # "absent" here, because the caller cannot tell the difference:
+        # _snap_reg_values records `present: False` and _restore_reg_values
+        # then DELETES a value that actually existed.
+        #
+        # The old code only mapped winerror 5 / errno 5,13 to _REG_DENIED and
+        # returned "absent" for everything else - so an ordinary sharing
+        # violation (32, file open by another process), a hive-busy error
+        # (33 / 234, another process is using the hive) or a transient I/O
+        # error was enough to make Undo delete a real user setting.
+        #
+        # So: the two error codes that genuinely mean "no such key/value" are
+        # absent; everything else is denied/unknown.
+        if getattr(exc, "winerror", None) in (2, 3) or getattr(exc, "errno", None) in (2, 3):
+            return None, None
+        return _REG_DENIED, None
     except Exception:
-        return None, None
+        # Same reasoning, and this catch-all had the identical flaw: an
+        # unexpected exception was reported as "absent", so it too could make a
+        # revert delete a value the user had. Unknown is not absent.
+        return _REG_DENIED, None
     finally:
         if key is not None:
             try:
@@ -1102,8 +1262,17 @@ def _reg_delete_tree(root, path: str):
 # clean_tasks.py can reuse it too; see C3 fix below)
 # --------------------------------------------------------------------------- #
 
-def _is_explorer_running() -> bool:
-    """True if at least one explorer.exe process exists right now."""
+def _is_explorer_running():
+    """True if at least one explorer.exe exists, False if definitely none,
+    None if the probe itself failed.
+
+    MED-006: this returned False on any error, which is indistinguishable
+    from "Explorer is gone". restart_explorer waits for the old shell to
+    exit BEFORE spawning a replacement, so a tasklist timeout used to break
+    that wait instantly and launch a SECOND explorer.exe while the first was
+    still alive - the shell-handoff race the function's own docstring says it
+    exists to prevent, and the source of the reported "sometimes the taskbar
+    never comes back". Callers now only act on a definitive answer."""
     try:
         tasklist_exe = resolve_exe("tasklist")
         out = subprocess.check_output(
@@ -1113,7 +1282,7 @@ def _is_explorer_running() -> bool:
         )
         return "explorer.exe" in out.lower()
     except Exception:
-        return False
+        return None
 
 
 def restart_explorer(ctx: TaskContext) -> bool:
@@ -1151,8 +1320,12 @@ def restart_explorer(ctx: TaskContext) -> bool:
     time.sleep(0.5)
     run_cmd(ctx, "taskkill /f /im explorer.exe", timeout=5)
     # 2. Wait for the old process to be fully gone (THE race fix)
+    # MED-006: break ONLY on a definitive "gone". None means the probe failed,
+    # which is not evidence of exit - keep waiting rather than spawning a
+    # second shell alongside the first. Worst case we fall through to the
+    # timeout log below, which is the safe direction.
     for _ in range(20):  # up to 10s
-        if not _is_explorer_running():
+        if _is_explorer_running() is False:
             break
         time.sleep(0.5)
     else:
@@ -1179,9 +1352,15 @@ def restart_explorer(ctx: TaskContext) -> bool:
                 ctx.log("  ! cancelled during verification — Explorer may need a manual start.")
                 return False
             time.sleep(0.5)
-            if _is_explorer_running():
+            # MED-006: only a definitive False means "it died, retry the
+            # spawn", and only a definitive True may claim success. None
+            # (probe unavailable) keeps polling instead of guessing either way.
+            _alive = _is_explorer_running()
+            if _alive is False:
+                break
+            if _alive is True:
                 time.sleep(2.0)  # let a would-be bail-out actually bail
-                if _is_explorer_running():
+                if _is_explorer_running() is True:
                     ctx.log("Explorer restarted successfully (taskbar is back).")
                     return True
                 break  # it died again — retry spawn

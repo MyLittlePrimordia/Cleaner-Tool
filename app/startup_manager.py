@@ -420,8 +420,85 @@ def _toggle_shortcut(source, name, enabled, log):
             rec = None
         if rec is None:
             return False, "Nothing saved to restore for this item."
-        held_path = rec.get("command", "")
-        target = os.path.join(folder, os.path.basename(held_path))
+        # SEC-002: the restore source must be RECONSTRUCTED from the trusted
+        # holding directory, never read out of config. `rec["command"]` used
+        # to go straight into os.replace(), so a same-user process could edit
+        # one record in the user-writable config.json and have this ELEVATED
+        # code move an arbitrary same-volume file into a Startup folder -
+        # arbitrary file relocation, or persistence creation.
+        #
+        # So: the expected path is derived from _holding_dir() plus the
+        # recorded base name, the record's own "command" must agree with it,
+        # and the result must resolve to somewhere inside the holding dir.
+        # `holding` is resolved FIRST: the legacy-record fallback below scans
+        # it. (Deriving it afterwards made that scan raise NameError, which the
+        # bare except swallowed into "not usable" — a silent regression that
+        # broke every legacy record.)
+        try:
+            holding = os.path.abspath(_holding_dir())
+        except Exception as exc:
+            return False, ("Could not open the holding folder: %s" % exc)
+        held_name = rec.get("held_name")
+        if isinstance(held_name, str) and held_name.strip():
+            held_name = os.path.basename(held_name)
+        else:
+            # Legacy record written before held_name existed. Derive it from
+            # the TRUSTED holding dir instead of from config: the display
+            # name has no extension (Spotify.lnk lists as "Spotify"), so match
+            # on the splitext-less stem and accept only files that are really
+            # sitting in the holding folder.
+            held_name = None
+            try:
+                for fn in os.listdir(holding):
+                    if os.path.splitext(fn)[0] == name:
+                        held_name = fn
+                        break
+            except Exception:
+                held_name = None
+        if not held_name or held_name in (".", ".."):
+            return False, "The saved record for this item is not usable."
+        expected = os.path.abspath(os.path.join(holding, held_name))
+        # The record's own command must match what we derived. A mismatch is
+        # exactly the tampering signature, so refuse rather than "prefer" one.
+        recorded = rec.get("command")
+        if not isinstance(recorded, str) or not recorded.strip():
+            return False, "The saved record for this item is not usable."
+        try:
+            if os.path.abspath(recorded) != expected:
+                return False, ("The saved record for this item does not match "
+                               "the held copy — refusing to restore it.")
+        except Exception:
+            return False, "The saved record for this item is not usable."
+
+        held_path = expected
+        try:
+            from app.utils import _is_reparse_point
+        except Exception:
+            _is_reparse_point = None
+        # containment, on the RESOLVED path, so .. and symlinks cannot escape
+        try:
+            real = os.path.realpath(held_path)
+            if os.path.commonpath([real, os.path.realpath(holding)]) != \
+                    os.path.realpath(holding):
+                return False, ("The held copy is outside this app's own "
+                               "holding folder — refusing to restore it.")
+        except Exception:
+            return False, "The held copy could not be verified."
+        if not os.path.isfile(held_path):
+            # Checked BEFORE the reparse test on purpose: _is_reparse_point
+            # reports True for a path that does not exist, so testing it first
+            # made a missing held copy report "is a shortcut or link" - a
+            # false statement about the user's machine, which is the exact
+            # dishonesty MED-001 is about.
+            return False, "The held copy for this item is no longer there."
+        if _is_reparse_point is not None:
+            try:
+                if _is_reparse_point(held_path):
+                    return False, ("The held copy is a shortcut or link — "
+                                   "refusing to restore it.")
+            except Exception:
+                pass
+        target = os.path.join(folder, held_name)
         if os.path.exists(target):
             return False, ("Something with that name already exists in the "
                            "Startup folder — remove it first.")
@@ -461,8 +538,15 @@ def _toggle_shortcut(source, name, enabled, log):
             return False, "Could not move the shortcut."
         try:
             from app.config_persist import add_startup_disabled
+            # SEC-002: record the HELD FILENAME alongside the path. The
+            # display `name` has no extension (Spotify.lnk lists as
+            # "Spotify"), so without this the restore side would have to
+            # guess the extension - and guessing from config is precisely
+            # what this fix removed.
             add_startup_disabled({"source": source, "name": name,
-                                  "command": dest, "value_type": ""})
+                                  "command": dest,
+                                  "held_name": os.path.basename(dest),
+                                  "value_type": ""})
         except Exception:
             try:
                 os.replace(dest, live)  # put it back — see registry path above

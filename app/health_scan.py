@@ -1,14 +1,34 @@
 """
 PC Health Report Card scan engine (user-approved feature 7, 2026-09).
 
+LOW-002 disposition: KEEP, and note why, because the finding's own
+recommendation no longer applies.
+
+The audit called this "DEAD CODE - nothing under app/ imports it" and observed
+that the Tools tab implemented the same five sensors INLINE with a different
+design, recommending "wire it up or delete it". Two things have changed since:
+
+  * the inline duplicate is GONE. After the H-series split there is no second
+    implementation of these five sensors anywhere in app/ - the Tools tab
+    (`app/ui/tabs/toolstab.py`) has no health panel at all. So this module is
+    no longer one of two divergent copies; it is the only one.
+  * deleting it would therefore destroy the ONLY copy of the five sensors and
+    of the honesty rules below, which are the part worth keeping.
+
+So it is kept as a first-class library, and the drift risk the finding names
+is closed by making its coverage permanent rather than incidental:
+tools/verify_health_scan.py exercises the grading and the honesty contract
+directly, instead of leaving the only tests for it as a side-effect inside the
+GUI smoke suite.
+
 Grades the machine across five read-only sensors plus an overall
 score — no UI here (the dialog lives in gui.py):
 
-  disk     C: free-space ratio (instant ctypes read)
-  gpu      GPU driver age via the existing repair task (report-only)
-  smart    SMART verdict via the existing repair task (report-only)
-  windows  DISM CheckHealth via the existing repair task (admin only)
-  junk     reclaimable-bytes estimate via the Storage Insight engine
+     disk     C: free-space ratio (instant ctypes read)
+     gpu      GPU driver age via the existing repair task (report-only)
+     smart    SMART verdict via the existing repair task (report-only)
+     windows  DISM CheckHealth via the existing repair task (admin only)
+     junk     reclaimable-bytes estimate via the Storage Insight engine
 
 Honesty rules (the app's standing contract):
   * Sensors never write anything; repair tasks are invoked for their

@@ -23,12 +23,37 @@ _DIB_RGB_COLORS = 0
 _BI_RGB = 0
 
 
+def _as_rgb(value, fallback=(30, 30, 30)):
+    """Accept '#rrggbb' or an (r, g, b) tuple.
+
+    Both dialogs pass COLORS[...], which is a hex STRING. Unpacking
+    "#151B24" as bg_r, bg_g, bg_b raised ValueError, and icon_ppm_bytes's
+    blanket `except Exception` turned that into a silent None — so every icon
+    in the Startup Manager vanished with no error reported anywhere. Coercing
+    here, once, means no caller can reintroduce it.
+    """
+    if isinstance(value, str):
+        h = value.strip().lstrip("#")
+        if len(h) == 6:
+            try:
+                return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+            except ValueError:
+                return fallback
+        return fallback
+    try:
+        vals = tuple(int(c) for c in value)[:3]
+        return vals if len(vals) == 3 else fallback
+    except Exception:
+        return fallback
+
+
 def default_icon_ppm(size=20, rgb=(90, 96, 104)):
     """A flat placeholder swatch, same PPM format as a real extracted
     icon, so callers can treat 'no icon yet' and 'real icon' identically.
     Pure Python — works on any platform, used for tests too."""
     size = max(1, int(size))
-    r, g, b = (max(0, min(255, int(c))) for c in rgb)
+    r, g, b = (max(0, min(255, int(c)))
+               for c in _as_rgb(rgb, (90, 96, 104)))
     header = ("P6\n%d %d\n255\n" % (size, size)).encode("ascii")
     row = bytes((r, g, b)) * size
     return header + row * size
@@ -73,7 +98,7 @@ def _composite_rgb(bgra, width, height, bg_rgb=(30, 30, 30)):
     with _resize_rgb_nearest."""
     if not bgra or len(bgra) < width * height * 4:
         return None
-    bg_r, bg_g, bg_b = bg_rgb
+    bg_r, bg_g, bg_b = _as_rgb(bg_rgb)
     has_alpha = any(bgra[i] for i in range(3, len(bgra), 4))
     out = bytearray(width * height * 3)
     for p in range(width * height):

@@ -22,16 +22,23 @@ Run:  python -X utf8 -m tools.smoke_async
 """
 
 import os
+import copy
 import sys
 import pathlib
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import tkinter as tk
 
+from _config_guard import ConfigGuard
 from app import config_persist
 from app import gui
 from app.elevation import is_admin
+
+#: Set by main(); restored by fail() before its os._exit, and by the normal
+#: exit path. Declared at module scope so fail() can reach it.
+_CONFIG_GUARD = None
 
 WATCHDOG_MS = 150000   # generous PER-STEP budget: the nudge phase runs a
                        # REAL full allowlist estimate scan (stat-only, but
@@ -112,28 +119,38 @@ def _restore_tip_seen():
         pass
 
 
-def fail(msg):
-    if _state["failed"]:
-        return
-    _state["failed"] = True
-    print(f"ASYNC SMOKE: FAIL at step { _state['step']}: {msg}", flush=True)
-    try:
-        # best-effort restore even on failure paths: fail() exits the
-        # process directly via os._exit, bypassing restore_and_exit, so
-        # without this any stub selection persists in the user's file.
-        # Pure file I/O, no Tk — safe even when the mainloop is wedged.
-        _restore_clean_selection()
-    except Exception:
-        pass
-    try:
-        _restore_tip_seen()
-    except Exception:
-        pass
-    try:
-        root.destroy()
-    except Exception:
-        pass
-    os._exit(1)
+    def fail(msg):
+        if _state["failed"]:
+            return
+        _state["failed"] = True
+        print(f"ASYNC SMOKE: FAIL at step { _state['step']}: {msg}", flush=True)
+        try:
+            # best-effort restore even on failure paths: fail() exits the
+            # process directly via os._exit, bypassing restore_and_exit, so
+            # without this any stub selection persists in the user's file.
+            # Pure file I/O, no Tk — safe even when the mainloop is wedged.
+            _restore_clean_selection()
+        except Exception:
+            pass
+        try:
+            _restore_tip_seen()
+        except Exception:
+            pass
+        # Whole-file restore, and it must come before os._exit below: this
+        # bypasses both `finally` and atexit. The per-key restores above are
+        # not enough - step 1 drives a real run_tasks, which appends to
+        # run_history, and nothing was putting that back. The user's history
+        # was being filled with stub runs.
+        try:
+            _CONFIG_GUARD.__exit__(None, None, None)
+        except Exception:
+            pass
+        try:
+            root.destroy()
+        except Exception:
+            pass
+        os._exit(1)
+
 
 
 class _NullTask:
@@ -172,8 +189,38 @@ class _SlowStopTask:
 
 def main():
     global root
+    # Byte-exact whole-file guard, taken before anything touches the config.
+    # The per-key restores further down cover selected_tasks and seen_tips
+    # explicitly, but they enumerate the keys this script happens to write;
+    # anything else it writes (run_history, today) leaks. This does not
+    # enumerate, it just puts the file back.
+    global _CONFIG_GUARD
+    _CONFIG_GUARD = ConfigGuard("smoke_async")
+    _CONFIG_GUARD.__enter__()
     root = tk.Tk()
     root.withdraw()
+
+    # The Gate is only shown when the app's own triage decides it can change
+    # something, and one of those decisions is "the saved selection contains
+    # an admin task" (app/elevated_launch.saved_selection_needs_admin). So
+    # the assertion below depends on the USER's selected_tasks, not on this
+    # file. Pin the precondition to a known admin task, exactly as
+    # tools/smoke_gui.py does, and put the user's own selection back after.
+    # Without this the suite passes or fails based on what someone last ran.
+    _gate_sel_saved = None
+    if not is_admin():
+        try:
+            from app import config_persist as _cpa
+            from app import elevated_launch as _ela
+            _gate_sel_saved = copy.deepcopy(
+                _cpa.load_config().get("selected_tasks"))
+            if not _ela.saved_selection_needs_admin():
+                _cpa.update_config(
+                    lambda c: c.setdefault("selected_tasks", {}).update(
+                        {"Clean": ["driver_junk"]}))
+                _cpa._config_cache = None
+        except Exception:
+            _gate_sel_saved = None
 
     app = gui.Application(root)
     if not is_admin():
@@ -184,6 +231,15 @@ def main():
                 break
         assert gate is not None, "Non-admin but AdminGateFrame not shown"
         gate._continue_limited()
+
+    if _gate_sel_saved is not None:
+        try:
+            from app import config_persist as _cpa
+            _cpa.update_config(
+                lambda c: c.__setitem__("selected_tasks", _gate_sel_saved))
+            _cpa._config_cache = None
+        except Exception:
+            pass
 
     # don't let one test's selection leak into the user's scheduler:
     # snapshot the Clean selection, restore it before exit
@@ -263,6 +319,15 @@ def main():
             _restore_tip_seen()
         except Exception:
             pass
+        # Whole-file restore last, after the per-key ones, so the file ends up
+        # byte-identical to how we found it no matter which keys were touched.
+        try:
+            _CONFIG_GUARD.__exit__(None, None, None)
+            if not _CONFIG_GUARD.verify():
+                print("ASYNC SMOKE: WHOLE-FILE CONFIG RESTORE FAILED", flush=True)
+                restored_ok = False
+        except Exception:
+            restored_ok = False
         try:
             root.destroy()
         except Exception:
@@ -338,6 +403,32 @@ def main():
         stop_tops.clear()
         stop_tops.update(id(w) for w in root.winfo_children()
                          if isinstance(w, tk.Toplevel))
+        # Establish a real selection first (TEXT-001, design audit
+        # 2026-09-27). TaskTab's primary button is now gated on an actual
+        # selection as well as on the run-in-progress flag, so "Run is
+        # re-enabled when the run ends" is only a true statement about a tab
+        # the user has actually chosen a preset on. Calling run_tasks with
+        # an explicit task list bypasses the selection UI entirely, which
+        # left this step asserting the old unconditional-re-enable contract
+        # against a state no user can reach. Selecting a preset here keeps
+        # the assertion meaningful AND matches the real flow: user picks a
+        # preset -> Run -> Stop -> Run is available again.
+        try:
+            _cpage = app.tabs["Clean"]
+            _names = sorted(_cpage.presets.keys())
+            assert _names, "Clean tab exposes no presets to select"
+            _cpage._select_preset(_names[0])
+            root.update()
+            assert _cpage.run_btn._enabled is True, \
+                "Run not enabled after selecting a preset"
+        except AssertionError as exc:
+            fail(f"preset selection: {exc!r}")
+            return
+        except Exception as exc:
+            fail(f"preset selection raised: {exc!r}")
+            return
+        print("  preset selection: Run enables on selection, "
+              "gated before it", flush=True)
         try:
             app.run_tasks("Clean", [_SlowStopTask()], mode="run")
         except Exception as exc:
@@ -660,7 +751,13 @@ def main():
             _spm.default_get_processes = lambda timeout=10: list(_state["procs"][0])
             # deterministic registry: pre-existing game_mode now, plus
             # ultimate_performance once the session "applies" it
-            gui.get_tweak_state = lambda: dict(_state["registry"])
+            # H13/H14: the app.gui alias is not the lookup path, so patch
+            # the module that actually calls it. H11 narrowed this to one
+            # module: TaskTab used to read get_tweak_state itself, but now
+            # goes through Application.tweak_state, which resolves the name
+            # in app/ui/app.py. Patching tasktab would now be a no-op.
+            from app.ui import app as _appmod
+            _appmod.get_tweak_state = lambda: dict(_state["registry"])
             def _cap(tab, tasks, mode="run", quiet=False):
                 _state["calls"].append(
                     (tab, mode, sorted(t.key for t in tasks)))
@@ -768,7 +865,7 @@ def main():
             try:
                 _spm = _state.pop("spm")
                 _spm.default_get_processes = _state.pop("orig_procs")
-                gui.get_tweak_state = _state.pop("orig_state")
+                _appmod.get_tweak_state = _state.pop("orig_state")
                 app.run_tasks = _state.pop("orig_run")
                 _cfg_r = config_persist.load_config()
                 _cfg_r["session_pilot_preset"] = _state.pop(

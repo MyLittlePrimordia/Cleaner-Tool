@@ -6,7 +6,11 @@ Fixed: search index path, return-code checking, added safe new tasks.
 import os
 import shutil
 
-from app.utils import TaskContext, run_cmd, run_cmd_checked, create_restore_point, clean_folder_contents, restart_explorer, reg_get_value, reg_delete_value, known_folder, atomic_write_text, cmd_arg
+from app.utils import (
+    TaskCancelled, TaskContext, run_cmd, run_cmd_checked, create_restore_point,
+    clean_folder_contents, restart_explorer, reg_get_value, reg_delete_value,
+    known_folder, atomic_write_text, resolve_exe,
+)
 
 _WINDIR = os.environ.get("WINDIR", "C:\\Windows")
 
@@ -52,10 +56,19 @@ def repair_chkdsk_scan(ctx: TaskContext):
     # contract); chkdsk now does the same with a plain-language verdict.
     # rc 0 = clean. rc 3 = errors found by the read-only scan. Anything
     # else (or -1 cancel/timeout) is surfaced honestly below.
-    # F06: _sd_root derives from %SYSTEMDRIVE% (user-writable env) — route
-    # it through cmd_arg so metacharacters travel as data, never as command
-    # separators when elevated.
-    rc = run_cmd(ctx, f"chkdsk {cmd_arg(_sd_root)} /scan", timeout=900)
+    # BUG-021: this used to be
+    #     run_cmd(ctx, f"chkdsk {cmd_arg(_sd_root)} /scan", timeout=900)
+    # cmd_arg was documented as making metacharacters "travel as data, never as
+    # command separators", but it only ever quoted whitespace — it is
+    # subprocess.list2cmdline, which does not escape & | > % ^. A SYSTEMDRIVE of
+    # `C:^&calc` therefore produced `chkdsk C:^&calc /scan` run ELEVATED, and a
+    # merely-odd-but-legitimate SYSTEMDRIVE containing `&` silently truncated
+    # the command so chkdsk scanned the wrong volume and the app reported a
+    # repair that never happened.
+    # argv + shell=False is the fix: there is no shell, so nothing to parse a
+    # metacharacter. This is the pattern the other ~29 run_cmd(shell=False)
+    # call sites already use.
+    rc = run_cmd(ctx, ["chkdsk", _sd_root, "/scan"], shell=False, timeout=900)
     if ctx.cancelled():
         from app.utils import TaskCancelled
         raise TaskCancelled(f"chkdsk scan of {_sd_root} was cancelled by user.")
@@ -100,6 +113,64 @@ def _wsus_folder_has_content(folder: str) -> bool:
         except Exception:
             return True
     return False
+
+
+def _restore_backup_safely(orig: str, bak: str, ctx: TaskContext) -> bool:
+    """Put `bak` back at `orig` without ever leaving the machine with neither.
+
+    INFO-006: the rollback used to be
+
+        if os.path.exists(orig): shutil.rmtree(orig, ignore_errors=True)
+        os.rename(bak, orig)
+
+    If that rename then failed - an AV holding a handle in SoftwareDistribution
+    is the ordinary cause - the live folder was ALREADY deleted, the backup was
+    not in place, and the user was left with neither. Recovery was still
+    possible because the `.bak` survived on disk, but only for someone who
+    read the log: the task surfaced as a bare failure with the recovery path
+    buried in it.
+
+    The order here is the fix. `os.rename` cannot overwrite a non-empty
+    directory on Windows, so the current folder has to move aside first - but
+    it is MOVED, not deleted, to a temp name beside it. At every instant there
+    is a complete copy of both. If the restore fails, the temp is moved back.
+    Only once the restore has succeeded is the temp removed.
+
+    Returns True if `orig` was successfully restored from `bak`.
+    """
+    if not os.path.exists(bak):
+        return False
+    parked = orig + ".rollback-tmp"
+    parked_ok = False
+    try:
+        if os.path.exists(orig):
+            if os.path.exists(parked):
+                shutil.rmtree(parked, ignore_errors=True)
+            os.rename(orig, parked)
+            parked_ok = True
+        os.rename(bak, orig)
+    except Exception as exc:
+        try:
+            ctx.log(f"  ! could not restore {bak} -> {orig}: {exc}")
+        except Exception:
+            pass
+        if parked_ok:
+            try:
+                if not os.path.exists(orig):
+                    os.rename(parked, orig)
+                    parked_ok = False
+                    ctx.log(f"Rolled the live folder back from {parked}.")
+            except Exception as inner:
+                ctx.log(f"  !! CRITICAL: the live folder is at {parked} and could "
+                        f"not be moved back: {inner}. Restore it by hand - do NOT "
+                        f"run Windows Update until {orig} is back in place.")
+        return False
+    if parked_ok:
+        try:
+            shutil.rmtree(parked, ignore_errors=True)
+        except Exception:
+            pass
+    return True
 
 
 def repair_windows_update_reset(ctx: TaskContext):
@@ -153,14 +224,16 @@ def repair_windows_update_reset(ctx: TaskContext):
                     ctx.log(f"  ! could not rename {folder}: {exc}")
                     # Rollback any previously renamed folders
                     for orig, bak in reversed(renamed):
-                        try:
-                            if os.path.exists(bak):
-                                if os.path.exists(orig):
-                                    shutil.rmtree(orig, ignore_errors=True)
-                                os.rename(bak, orig)
+                        # INFO-006: this used to rmtree(orig) and then
+                        # rename(bak, orig), so a failing rename left the user
+                        # with neither the live folder nor the backup in place
+                        # - recoverable only by someone who read the log. The
+                        # helper moves the live folder aside instead of
+                        # deleting it, and puts it back if the restore fails.
+                        if os.path.exists(bak):
+                            if _restore_backup_safely(orig, bak, ctx):
                                 ctx.log(f"Rolled back {bak} -> {orig}")
-                        except Exception as rollback_exc:
-                            ctx.log(f"  ! Rollback failed for {bak}: {rollback_exc}")
+                    raise
                     raise
     finally:
         for svc in reversed(stopped_services):
@@ -208,24 +281,40 @@ def repair_search_index(ctx: TaskContext):
         _sd_root = _sd if _sd.endswith("\\") else _sd + "\\"
     program_data = os.environ.get("ProgramData", os.path.join(_sd_root, "ProgramData"))
     index_db = os.path.join(program_data, "Microsoft\\Search\\Data\\Applications\\Windows")
+    # MED-001: the rmtree failure was caught, logged as a note, and the
+    # function then returned None — which the runner records as SUCCESS. The
+    # search service keeps the index locked even after a clean `net stop`, so
+    # this is the COMMON path, not an edge case: the task reliably claimed to
+    # have rebuilt an index it never touched.
+    cleared = False
     if os.path.exists(index_db):
         if rc_stop != 0:
-            ctx.log(f"  ! WSearch stop failed (code {rc_stop}) — skipping delete to avoid partial lock")
+            ctx.log(f"  ! WSearch stop failed (code {rc_stop}) — skipping "
+                    "delete to avoid a partial lock")
         else:
             try:
                 from app.utils import _is_reparse_point
                 if _is_reparse_point(index_db):
-                    ctx.log(f"  ! skipping junction/symlink search index path: {index_db}")
+                    ctx.log(f"  ! skipping junction/symlink search index "
+                            f"path: {index_db}")
                 else:
                     shutil.rmtree(index_db, ignore_errors=False)
+                    cleared = True
                     ctx.log(f"Cleared search index database at {index_db}")
             except Exception as exc:
                 ctx.log(f"  ! could not clear search index: {exc}")
     else:
-        ctx.log(f"Search index path not found: {index_db}")
+        ctx.log(f"Search index path not found: {index_db} — nothing to clear")
     rc_start = run_cmd(ctx, "net start WSearch", timeout=30)
     if rc_start != 0:
         ctx.log(f"  ! Warning: could not start WSearch (code {rc_start})")
+    if os.path.exists(index_db) and not cleared:
+        # The index file is still there, so nothing was achieved. Say so
+        # instead of letting the runner log a green tick.
+        raise RuntimeError(
+            "The search index database could not be cleared (it is usually "
+            "still locked by the Search service). Close anything indexing "
+            "files, or reboot and re-run this repair.")
     ctx.log("Search index will rebuild automatically in the background.")
 
 
@@ -244,10 +333,37 @@ def repair_print_spooler(ctx: TaskContext):
 
 def repair_wmi_repository(ctx: TaskContext):
     ctx.set_status("Verifying the WMI repository for corruption...")
+    # MED-001: `winmgmt /verifyrepository` exits 3010
+    # (ERROR_SUCCESS_REBOOT_REQUIRED) when it found inconsistency AND
+    # repaired it — the same convention run_cmd_checked documents for DISM
+    # and honours. Testing `rc != 0` therefore took the salvage branch on a
+    # SUCCESSFUL repair, and then treated a genuine verify failure the same
+    # way. Worse, the salvage's own return code was discarded, so a failed
+    # salvage returned None — which the runner records as SUCCESS.
     rc = run_cmd(ctx, "winmgmt /verifyrepository", timeout=120)
-    if rc != 0:
-        ctx.log("Repository reported inconsistent — attempting non-destructive salvage...")
-        run_cmd(ctx, "winmgmt /salvagerepository", timeout=180)
+    if rc == -1 and ctx.cancelled():
+        raise TaskCancelled("WMI repository check cancelled by user")
+    if rc in (0, 3010):
+        if rc == 3010:
+            ctx.log("  (verify repaired the repository; a reboot may be "
+                    "required to finish)")
+        else:
+            ctx.log("WMI repository is consistent — nothing to repair.")
+        return 0
+    ctx.log(f"Repository reported inconsistent (code {rc}) — attempting "
+            "non-destructive salvage...")
+    rc2 = run_cmd(ctx, "winmgmt /salvagerepository", timeout=180)
+    if rc2 == -1 and ctx.cancelled():
+        raise TaskCancelled("WMI repository salvage cancelled by user")
+    if rc2 in (0, 3010):
+        ctx.log("WMI repository salvaged"
+                + (" (reboot required)." if rc2 == 3010 else "."))
+        return 0
+    raise RuntimeError(
+        f"winmgmt /salvagerepository failed (code {rc2}) after "
+        f"/verifyrepository reported {rc}. The repository is still "
+        "inconsistent.")
+    return 0
 
 
 def repair_reregister_store_apps(ctx: TaskContext):
@@ -1124,16 +1240,6 @@ def repair_hosts_file(ctx: TaskContext):
     ctx.log("Hosts file restored to Windows defaults.")
 
 
-def _repair_desktop_dir() -> str:
-    """Real Desktop path honoring OneDrive/known-folder redirection (backups
-    below must land where the user actually sees them). F3-1: shared resolver
-    with strict=True — Desktop feeds shell strings (netsh/dism) while
-    elevated, so register values carrying cmd metachars are rejected."""
-    return known_folder("Desktop",
-                        os.path.join(os.environ.get("USERPROFILE", ""), "Desktop"),
-                        strict=True)
-
-
 def _repair_backups_dir() -> str:
     """UX-001 fix: registry/firewall/driver exports used to land straight
     on the Desktop — commonly OneDrive-synced, so multi-hundred-MB
@@ -1624,8 +1730,44 @@ def schedule_memory_test(ctx: TaskContext):
     Nothing is changed until you choose — the task just gets you there in
     one click and explains the result codes afterwards."""
     ctx.set_status("Opening the Windows Memory Diagnostic scheduler...")
-    run_cmd(ctx, "MdSched.exe", timeout=300)
-    ctx.log("Memory Diagnostic scheduler was shown.")
+    # MED-001: this used to go through run_cmd, which WAITS for the process
+    # to exit. MdSched.exe is a dialog that stays open until the user picks
+    # "Restart now" or "next restart" — so run_cmd blocked the worker for the
+    # full 300 s, then its timeout cleanup fired `taskkill /PID /T /F` and
+    # destroyed the very dialog the user was in the middle of using. This is
+    # the identical trap clean_tasks.py:353-366 documents for explorer.exe.
+    #
+    # Launch it detached and do NOT wait: the dialog is the deliverable, and
+    # the process exiting is not this task's to observe.
+    import subprocess as _sp
+    creationflags = getattr(_sp, "CREATE_NO_WINDOW", 0)
+    try:
+        creationflags |= _sp.DETACHED_PROCESS
+    except AttributeError:
+        pass
+    try:
+        exe = resolve_exe("MdSched.exe")
+    except Exception:
+        exe = "MdSched.exe"
+    try:
+        _sp.Popen([exe], creationflags=creationflags, close_fds=True)
+    except FileNotFoundError:
+        raise RuntimeError(
+            "Windows Memory Diagnostic (MdSched.exe) is not available on "
+            "this system.")
+    except OSError as exc:
+        # 740 == ERROR_ELEVATION_REQUIRED. MdSched refuses to launch from a
+        # medium-integrity process, and the old code swallowed this entirely
+        # (rc discarded) so the task reported success having shown nothing.
+        if getattr(exc, "winerror", None) == 740:
+            raise RuntimeError(
+                "Windows Memory Diagnostic can only be opened with "
+                "Administrator rights. Restart Cleaner Tool as Administrator "
+                "and run this again.")
+        raise RuntimeError(f"Could not open the Memory Diagnostic scheduler: {exc}")
+    except Exception as exc:
+        raise RuntimeError(f"Could not open the Memory Diagnostic scheduler: {exc}")
+    ctx.log("Memory Diagnostic scheduler was opened in its own window.")
     ctx.log("Pick 'Restart now and check for problems' — the PC reboots into the test.")
     ctx.log("No errors after the pass = RAM is fine; errors = reseat/replace a stick (back up saves first).")
     return None

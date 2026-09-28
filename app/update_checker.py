@@ -84,6 +84,48 @@ def fetch_latest_release_info(repo: str = "owner/repo", timeout: int = 10) -> di
         return None
 
 
+def _trusted_release_url(url: str, repo: str) -> str:
+    """Return `url` only if it is an https GitHub release-asset URL for `repo`.
+
+    MED-012: `browser_download_url` is 100% server-controlled - whoever can
+    publish a release can choose this string - and it went straight to
+    `webbrowser.open` with no scheme check and no host check. The report is
+    right that this needs repo compromise to exploit, but the app IS the
+    system-tuning tool, so "Update Available" carries very high trust, and a
+    silent downgrade to `http://` is the whole ballgame.
+
+    Two checks, both required:
+      * scheme must be exactly https (so no http:// downgrade, and no
+        file://, javascript:, data: or ms-msdt: hand-off);
+      * host must be a GitHub release host AND the path must belong to the
+        repo we asked about - so a redirector or a lookalike host cannot be
+        substituted for the release asset.
+
+    Anything else returns "" and the caller treats the release as having no
+    download. The check is deliberately at this boundary as well as at the
+    webbrowser.open call site, so neither layer alone is load-bearing.
+    """
+    if not isinstance(url, str) or not url:
+        return ""
+    try:
+        from urllib.parse import urlparse
+        parts = urlparse(url)
+    except Exception:
+        return ""
+    if parts.scheme != "https":
+        return ""
+    host = (parts.hostname or "").lower()
+    if host not in ("github.com", "www.github.com", "objects.githubusercontent.com"):
+        return ""
+    # the asset URL must name the repo we actually queried
+    owner_repo = "/".join(str(repo or "").strip("/").split("/")[:2]).lower()
+    if not owner_repo or "/" not in owner_repo:
+        return ""
+    if owner_repo not in url.lower():
+        return ""
+    return url
+
+
 def check_for_updates(repo: str = "owner/repo", timeout: int = 10) -> dict:
     """Check if a new version of the app is available.
     
@@ -131,7 +173,15 @@ def check_for_updates(repo: str = "owner/repo", timeout: int = 10) -> dict:
     download_url = ''
     for asset in assets:
         if asset.get('name', '') == 'Cleaner-Tool.exe':
-            download_url = asset.get('browser_download_url', '')
+            # MED-012: this string is entirely server-controlled. Validate it
+            # (https + GitHub host + the repo we asked about) before it becomes
+            # the "Update Available" link.
+            download_url = _trusted_release_url(
+                asset.get('browser_download_url', ''), repo)
+            if not download_url:
+                result['error'] = (
+                    "Release advertised a download link that is not an https "
+                    "GitHub asset for this project; refusing to link it.")
             break
     result['download_url'] = download_url
     

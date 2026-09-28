@@ -1,13 +1,21 @@
-# Cleaner Tool
+# 🧹 Cleaner Tool
 
-A free Windows 10/11 utility for gamers: cleans junk, fixes common Windows problems, and applies safe performance tweaks. Pick a preset, press Run, done.
+**The safe, all-in-one Windows cleaner and optimizer built for gamers.**
 
-## Safety guarantees
+Free up gigabytes of launcher cache, repair common Windows glitches, and apply safe, reversible gaming tweaks with a single click.
 
-- Cleaning never touches game saves, documents, or user profiles.
-- Every tweak ships with a one-click Undo (snapshot + restore). One documented exception: "No Explorer Auto Discovery".
-- The app starts unelevated and only requests admin when a selected task actually needs it.
-- Junctions / reparse points are refused — the cleaner will not follow them.
+[📥 **Download Latest Release (CleanerTool.exe)**](https://github.com/MyLittlePrimordia/Cleaner-Tool/releases/latest)  
+*Zero install. Just download and run.*
+
+---
+
+## 🛡️ Safe by Design
+
+- **Your saves are protected:** Never touches game saves, personal documents, or user profiles.
+- **1-Click Undo:** Every tweak includes a complete snapshot and restore button, plus an automatic Windows restore point.
+- **No unnecessary admin rights:** Runs without elevation and only asks for admin when a specific repair task requires it.
+
+---
 
 ## 📸 Screenshots
 
@@ -32,90 +40,58 @@ A free Windows 10/11 utility for gamers: cleans junk, fixes common Windows probl
       <img src="screenshots/install.png" alt="Install Tab" width="100%" />
     </td>
   </tr>
-  <tr>
-    <td align="center" colspan="2" width="100%">
-      <b>Tools Tab</b><br/><br/>
-      <img src="screenshots/tools.png" alt="Tools Tab" width="50%" />
-    </td>
-  </tr>
 </table>
 
 ---
 
-## What it does
+## ⚡ Key Features
 
-**Clean**
-- Quick Clean, Deep Clean, or Custom presets
-- Game launchers and chat apps: Steam, Epic, EA, GOG, Battle.net, Riot, Ubisoft, Xbox, Rockstar, Discord, and more
-- Game files: logs, crash dumps, and shader caches for 25+ verified top titles (Fortnite, PUBG, BG3, Cyberpunk…) plus an automatic Unity log sweep for indie games — saves are never touched
-- Windows junk: temp files, update leftovers, Recycle Bin, thumbnails, browser caches, DNS flush
-- Optional debloat: removes preinstalled junk like TikTok and Clipchamp
-- Orphan program leftovers: high-confidence residual folders from already-uninstalled programs (Custom only)
-
-**Repair**
-- Quick Repair or Deep Repair presets
-- Fixes system files (SFC + DISM), stuck Windows Updates, network stack, Xbox/Game Pass apps
-- SSD health check and retrim, search index, printer spooler, clock sync
-- Read-only disk check
-
-**Tweak (reversible, one-click Undo — one exception noted below)**
-- Minimal or Recommended presets
-- Ultimate Performance power plan, CPU boost, Game Mode, HAGS, Game DVR off
-- Classic right-click menu, no mouse acceleration, calmer animations and taskbar
-- Lower-ping network tweaks, USB dropout fix
-- One-click privacy: no ads/tips, local-only search, telemetry off, system-wide ad blocker
-
-<sub>Exception: the "No Explorer Auto Discovery" tweak (Advanced) can't be
-fully undone — Undo resets the setting it changed, but the per-folder view
-customizations it clears (Bags/BagMRU) rebuild as you browse, they're not
-restored. Every other tweak's Undo is a full, verified revert.</sub>
-
-**Install**
-- One-click runtimes every game needs: DirectX, VC++, .NET, Java
-- Essentials for stripped Windows (LTSC): Store, winget, Xbox stack, Game Bar, codecs
-- Curated app catalog and one-click "Update Everything"
-
-**Tools**
-- Storage Insight, PC Health report, fastest-DNS test, and game session Auto-Pilot
-- Internet Speed Test with folk-friendly ratings (browsing, gaming, streaming, calls)
-- Gamepad Tester (buttons, sticks, triggers) and Mic Check (devices, permission, live level)
-- Quick Tools shortcuts: system utilities and settings pages
-- Corner icons: Auto Maintenance (🛠️), Quick Tools (🧰), Startup Manager (🚀), Uninstall Programs (🗑️), Export Logs (📋)
-
-**Also included**
-- Safety checkpoint (restore point) before changes
-- Works without admin for cleanups; asks for elevation only when needed
-- Auto Maintenance scheduler (daily/weekly/monthly)
-- Dark mode UI, log export via the 📋 corner icon
-
-**Runs in the background, on your terms** (all opt-in, all in the Auto Maintenance dialog)
-- **Tray icon**: close the window and the app keeps watching from the tray instead of quitting — Storage Insight's low-space alerts and Auto-Pilot's game-session detection keep working. Right-click for Open, 🎮 Game Session now, 🧹 Quick Clean now, and Quit.
-- **Start with Windows**: boots straight to the tray at login, standard-rights, so monitoring is live from the moment you sign in.
-- **Auto-elevate ("stop asking me")**: approve elevation once and the app relaunches with admin rights with no further UAC prompts, without ever holding elevated rights while idle in the background. Off switch always available on the same screen.
-- **Windows toast notifications**: clean-complete, low-space, and game-session alerts now come from the app's own identity, so clicking one brings the window forward.
+- 🧹 **Game & Launcher Cleaner:** Clear shader caches, logs, and temp files from Steam, Epic, EA, Battle.net, Riot, Discord, and 25+ top games. Optionally remove preinstalled Windows bloatware.
+- 🩺 **1-Click Repairs:** Fix corrupted system files (SFC/DISM), unstick frozen Windows Updates, repair Xbox/Game Pass services, and reset the network stack.
+- 🚀 **Reversible Gaming Tweaks:** Enable Ultimate Performance power mode, lower network latency, disable telemetry/ad tracking, and restore classic right-click menus.
+- 📦 **Essential Runtimes:** 1-click install all dependencies games need (DirectX, Visual C++ all-in-one, .NET, Java).
+- 🧰 **Gamer Toolbox:** Built-in controller tester, live microphone test, internet speed test, and storage space visualizer.
 
 ---
 
-## Requirements
+## 🚀 Quick Start
 
-- Windows 10 or 11
-- Python 3.10+ (source only — the `.exe` needs nothing)
+1. Download [`CleanerTool.exe`](https://github.com/MyLittlePrimordia/Cleaner-Tool/releases/latest).
+2. Choose a preset (e.g. **Quick Clean** or **Recommended Tweaks**).
+3. Click **Run**. That's it!
 
-## Run it
+---
 
+## 📋 Requirements
+
+- **Windows 10 or 11**
+- Python 3.10+ *(only if running from source; the `.exe` requires nothing)*
+
+---
+
+<details>
+<summary><b>🛠️ Background Mode & Auto Maintenance</b></summary>
+
+All background features are strictly optional:
+- **System Tray:** Minimize to the tray for low-disk space warnings and automatic maintenance.
+- **Start with Windows:** Boots silently to the tray at login with standard user rights.
+- **Auto-Maintenance Scheduler:** Run automated cleanups daily, weekly, or monthly.
+- **Tweak Exception Note:** The optional advanced tweak *"No Explorer Auto Discovery"* clears per-folder view caches (`Bags/BagMRU`), which rebuild naturally as you browse rather than restoring previous view layouts. All other tweaks are 100% fully reversible.
+</details>
+
+<details>
+<summary><b>💻 Running from Source & Building</b></summary>
+
+### Run from Source
 ```powershell
 python main.py
 ```
 
-Build the `.exe`:
-
+### Build Standalone `.exe`
 ```powershell
 pip install -r requirements.txt
 pyinstaller --onefile --windowed --name "CleanerTool" --icon "app/assets/icon.ico" --add-data "app/assets;assets" --manifest "app/assets/app_manifest.xml" app/__main__.py
 ```
 
-Test it:
-
+### Run Tests
 ```powershell
-python tools/smoke_gui.py
-```

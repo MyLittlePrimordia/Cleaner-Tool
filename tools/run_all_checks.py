@@ -19,16 +19,59 @@ import subprocess
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# The repo root, so this runner works from any working directory.
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+sys.path.insert(0, ROOT)
 from _config_guard import config_path  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# PYTHONPATH for every child process.
+#
+# This is the single most important line in the file. Running
+# `python tools/verify_x.py` puts tools/ on sys.path[0], NOT the repo root,
+# so `import app` dies with ModuleNotFoundError and the check aborts before
+# a single assertion runs -- reported as FAIL, but for a reason that has
+# nothing to do with the code under test.
+#
+# Nine checks were in exactly that state and had never validated anything:
+# verify_config_schema (85 assertions), verify_run_state (67),
+# verify_session_orchestrator (61), verify_app_icons (27),
+# verify_telemetry_undo (26), verify_preflight_stop (18),
+# verify_tweak_rollback (11), verify_scorecard_layout (11) and
+# verify_run_state_e2e. Thirteen tools also hardcoded a developer's own
+# checkout path, so they could not run anywhere else at all.
+#
+# Injecting the root here means a check can no longer be silently disabled
+# by its own import bootstrap, and tools/check_architecture.py check [13]
+# now fails the build if a hardcoded path creeps back in.
+# ---------------------------------------------------------------------------
+_CHILD_ENV = dict(os.environ)
+_CHILD_ENV["PYTHONPATH"] = os.pathsep.join(
+    [ROOT] + ([os.environ["PYTHONPATH"]] if os.environ.get("PYTHONPATH") else [])
+)
 
 SUITE = [
     ("compileall", [sys.executable, "-m", "compileall", "-q", "app", "tools"]),
+    # BUG-001 guard: `after(0, ...)` from a worker is a hard RuntimeError on
+    # Python 3.14, and six dialogs shipped that. Narrow on purpose (a general
+    # reachability analysis produced 427 false positives) and negative-tested:
+    # it fails when the bug is reintroduced.
+    ("no-offthread-tk", [sys.executable, "-u",
+                         "tools/verify_no_offthread_tk.py"]),
     ("no-globals", [sys.executable, "-u", "tools/verify_no_globals.py"]),
     ("architecture", [sys.executable, "tools/check_architecture.py"]),
     ("single-instance", [sys.executable, "-u", "tools/verify_single_instance.py"]),
-    ("config-schema", [sys.executable, "-u", "tools/verify_config_schema.py"]),    ("run-state", [sys.executable, "-u", "tools/verify_run_state.py"]),
+    ("config-schema", [sys.executable, "-u", "tools/verify_config_schema.py"]),
+    # BOUNDARY-001 regression: apply_schema runs on every config load, and
+    # the _tweak_snapshots validator used to delete the nested values the
+    # telemetry / DNS / EEE / display-mode snapshots depend on -- five
+    # tweaks lost their undo record on every save.
+    ("snapshot-roundtrip", [sys.executable, "-u",
+                            "tools/verify_snapshot_roundtrip.py"]),    ("run-state", [sys.executable, "-u", "tools/verify_run_state.py"]),
     ("run-state-e2e", [sys.executable, "-u", "tools/verify_run_state_e2e.py"]),
+    ("run-claim-release", [sys.executable, "-u",
+                        "tools/verify_run_claim_release.py"]),
     ("run-generation", [sys.executable, "-u", "tools/verify_run_generation.py"]),
     ("tweak-state-view", [sys.executable, "-u", "tools/verify_tweak_state_view.py"]),
     ("session", [sys.executable, "-u", "tools/verify_session_orchestrator.py"]),
@@ -36,6 +79,11 @@ SUITE = [
     ("tweak-rollback", [sys.executable, "-u", "tools/verify_tweak_rollback.py"]),
     ("sec001-allowlist", [sys.executable, "-u",
                         "tools/verify_sec001_task_allowlist.py"]),
+    # SEC-001 regression: two Undo paths interpolated a config.json-derived
+    # scheduled-task name into a shell string, elevated. Both are argv +
+    # shell=False now, behind a task-name shape check.
+    ("sec001-injection", [sys.executable, "-u",
+                          "tools/verify_sec001_command_injection.py"]),
     ("sec004-migration", [sys.executable, "-u",
                        "tools/verify_sec004_migration.py"]),
     ("prior004-defender", [sys.executable, "-u",
@@ -79,6 +127,15 @@ SUITE = [
     ("icon-parity", [sys.executable, "-u",
                      "tools/verify_icon_parity.py"]),
     ("app-icons", [sys.executable, "-u", "tools/verify_app_icons.py"]),
+    # verify_catalog.py was written but never wired in, so it never ran.
+    # Offline mode only -- the --live winget probe is opt-in and must stay
+    # out of CI, which has no business hitting the network for a lint pass.
+    ("catalog", [sys.executable, "-u", "tools/verify_catalog.py"]),
+    ("dialog-registry", [sys.executable, "-u",
+                         "tools/verify_dialog_registry.py"]),
+    ("window-size", [sys.executable, "-u", "tools/verify_window_size.py"]),
+    ("install-tab-design", [sys.executable, "-u",
+                            "tools/verify_install_tab_design.py"]),
     ("install-row-alignment", [sys.executable, "-u",
                                "tools/verify_install_row_alignment.py"]),
     ("scorecard", [sys.executable, "-u", "tools/verify_scorecard_layout.py"]),
@@ -120,7 +177,8 @@ def main() -> int:
     for name, cmd in SUITE:
         t0 = time.time()
         proc = subprocess.run(cmd, capture_output=True, text=True,
-                              encoding="utf-8", errors="replace")
+                              encoding="utf-8", errors="replace",
+                              cwd=ROOT, env=_CHILD_ENV)
         dt = time.time() - t0
         tail = ""
         for line in reversed((proc.stdout or "").splitlines()):

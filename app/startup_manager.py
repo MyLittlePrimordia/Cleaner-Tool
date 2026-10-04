@@ -44,6 +44,29 @@ IS_WINDOWS = os.name == "nt"
 
 _RUN_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
+# BUG-009: Windows 10/11 keep a per-item enabled/disabled flag for Run entries
+# in a parallel key, and that flag -- not the presence of the Run value -- is
+# what decides whether the entry launches. Task Manager's Startup tab, Autoruns
+# and msconfig all write it; it was never read or written here (0 hits
+# repo-wide), which caused two defects:
+#
+#   * list_startup_items() hardcoded "enabled": True, so an entry the user had
+#     already disabled natively showed as ON;
+#   * re-enabling restored the Run value but left the marker saying disabled,
+#     so Windows still did not launch it -- while the UI reported
+#     "X will run at sign-in again." That is a false success with no way for
+#     the user to learn why.
+#
+# The value is a 12-byte blob: 8 bytes of flags (only the first is used) then a
+# 4-byte FILETIME. 02 = enabled, 03 = disabled, 06/07 = enabled-by-policy.
+# It lives under the Explorer key, NOT under Run.
+_STARTUP_APPROVED = (r"Software\Microsoft\Windows\CurrentVersion"
+                     r"\Explorer\StartupApproved")
+_STARTUP_APPROVED_RUN = _STARTUP_APPROVED + r"\Run"
+_STARTUP_APPROVED_RUN32 = _STARTUP_APPROVED + r"\Run32"
+#: First byte values meaning "Windows will launch this".
+_APPROVED_ENABLED_BYTES = (0x02, 0x06)
+
 # (hive, is_64bit_view, source_key) — the four places Windows itself
 # reads Run entries from at logon. WOW6432Node is where a 32-bit
 # installer's Run entry lands on 64-bit Windows; without checking it
@@ -55,6 +78,84 @@ _RUN_LOCATIONS = (
 )
 
 _ADMIN_SOURCES = {"hklm_run", "hklm_run_wow64", "startup_common"}
+
+
+def _approved_key_path(wow64: bool) -> str:
+    return _STARTUP_APPROVED_RUN32 if wow64 else _STARTUP_APPROVED_RUN
+
+
+def _approved_state(hive: str, wow64: bool, name: str):
+    """True / False / None -- enabled, disabled, or "Windows has no opinion".
+
+    None means there is no StartupApproved marker, which is the normal case on
+    Windows 7/8 and on any entry Windows has never been told about; the Run
+    value alone then governs, i.e. it is enabled.
+    """
+    if not IS_WINDOWS:
+        return None
+    try:
+        import winreg
+        root = winreg.HKEY_CURRENT_USER if hive == "HKCU" else winreg.HKEY_LOCAL_MACHINE
+        access = winreg.KEY_READ
+        if wow64:
+            access |= getattr(winreg, "KEY_WOW64_64KEY", 0)
+        key = winreg.OpenKey(root, _approved_key_path(wow64), 0, access)
+        try:
+            data, _t = winreg.QueryValueEx(key, name)
+        finally:
+            key.Close()
+        if not isinstance(data, (bytes, bytearray)) or not data:
+            return None
+        return data[0] in _APPROVED_ENABLED_BYTES
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+    except Exception:
+        return None
+
+
+def _write_approved(hive: str, wow64: bool, name: str, enabled: bool,
+                    log=None) -> bool:
+    """Write the StartupApproved marker. True when the write (or the already-
+    correct state) leaves Windows agreeing with `enabled`."""
+    if not IS_WINDOWS:
+        return False
+    try:
+        import winreg
+        root = winreg.HKEY_CURRENT_USER if hive == "HKCU" else winreg.HKEY_LOCAL_MACHINE
+        access = winreg.KEY_READ | winreg.KEY_WRITE | winreg.KEY_SET_VALUE
+        if wow64:
+            access |= getattr(winreg, "KEY_WOW64_64KEY", 0)
+        key = winreg.CreateKeyEx(root, _approved_key_path(wow64), 0, access)
+        try:
+            existing = None
+            try:
+                existing, _t = winreg.QueryValueEx(key, name)
+            except FileNotFoundError:
+                existing = None
+            want = 0x02 if enabled else 0x03
+            if isinstance(existing, (bytes, bytearray)) and existing \
+                    and existing[0] == want:
+                return True          # already what we want
+            # 8 flag bytes then a 4-byte FILETIME. Windows only reads the
+            # first byte, but the blob is expected to be 12 bytes.
+            # (Build it as one bytearray: bytearray([x]) + [0]*7 is a
+            # bytearray-plus-list TypeError, which the except below would
+            # swallow into a silent "could not write".)
+            blob = bytes(bytearray([want, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
+            winreg.SetValueEx(key, name, 0, winreg.REG_BINARY, blob)
+        finally:
+            key.Close()
+        if log:
+            log("Startup Manager: %s StartupApproved marker for %s"
+                % ("enabled" if enabled else "disabled", name))
+        return True
+    except Exception as exc:
+        if log:
+            log("  (could not write the StartupApproved marker for %s: %s)"
+                % (name, exc))
+        return False
 
 
 def _make_ctx(log=None):
@@ -125,10 +226,14 @@ def list_startup_items():
             if item_id in seen_ids:
                 continue
             seen_ids.add(item_id)
+            # BUG-009: ask Windows whether this entry will actually run,
+            # instead of assuming yes.
+            _en = _approved_state(hive, wow64, name)
             items.append({
                 "id": item_id, "name": name, "command": data,
                 "source": source, "source_label": _LABEL_SOURCE[source],
-                "admin_required": source in _ADMIN_SOURCES, "enabled": True,
+                "admin_required": source in _ADMIN_SOURCES,
+                "enabled": True if _en is None else _en,
             })
 
     folders = _startup_folders()
@@ -286,10 +391,22 @@ def _toggle_registry(source, name, enabled, log):
         ok = _reg_set_view(hive, wow64, name, rec.get("command", ""),
                           rec.get("value_type", "REG_SZ"), ctx)
         if ok:
+            # BUG-009: restoring the Run value is not enough. If a
+            # StartupApproved marker still says "disabled", Windows keeps
+            # skipping the entry -- and the old code returned
+            # "{name} will run at sign-in again." regardless, which is simply
+            # false and left the user with no way to learn why. Clear the
+            # marker too, and if we cannot, say that rather than claim success.
+            _marked = _write_approved(hive, wow64, name, True,
+                                      log=getattr(ctx, "log", None))
             try:
                 remove_startup_disabled(source, name)
             except Exception:
                 pass
+            if not _marked:
+                return (False, "%s was restored, but Windows still has it "
+                               "marked as disabled in Task Manager > Startup. "
+                               "Enable it there to finish." % name)
             return True, f"{name} will run at sign-in again."
         return False, "Could not write to the registry."
     else:
@@ -311,6 +428,12 @@ def _toggle_registry(source, name, enabled, log):
             # value right back rather than leave it half-done.
             _reg_set_view(hive, wow64, name, data, vtype, ctx)
             return False, "Could not save how to undo this — left unchanged."
+        # BUG-009: removing the Run value is enough to stop it launching, but
+        # Windows also keeps a StartupApproved marker. If the user later
+        # re-enables the entry from Windows' own Startup tab, a stale marker
+        # would win. Clear it on the way out, so our undo record is the only
+        # thing describing this entry's state.
+        _write_approved(hive, wow64, name, False, log=log)
         return True, f"{name} will no longer run at sign-in."
 
 

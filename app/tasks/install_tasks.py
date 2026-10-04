@@ -1352,36 +1352,65 @@ def install_paint_app(ctx: TaskContext):
     ctx.log("Paint installed and verified.")
 
 
-def install_everyday_apps_pack(ctx: TaskContext):
-    """Everyday Apps Pack — Calculator, Clock (alarms + focus), Sticky
-    Notes and Sound Recorder in one click. The apps non-technical users
-    expect to just be there."""
+# The Everyday Apps Pack installed all four of these from ONE checkbox, which
+# could not express "I only want the Clock": unticking was all-or-nothing, and
+# ticking it handed the user three more apps they had not asked for. Split into
+# four independent rows (user request). Same per-app guarantees as the old
+# pack: skip-if-present, install from the msstore source, then re-verify and
+# fail honestly rather than report a success that did not happen.
+_EVERYDAY_APPS = {
+    "calculator":     ("9WZDNCRFHVN5", "Windows Calculator",
+                       cap.has_calculator_app),
+    "clock":          ("9WZDNCRFJ3PR", "Windows Clock", cap.has_clock_app),
+    "sticky_notes":   ("9NBLGGH4QGHW", "Microsoft Sticky Notes",
+                       cap.has_sticky_notes),
+    "sound_recorder": ("9WZDNCRFHWKN", "Windows Sound Recorder",
+                       cap.has_sound_recorder),
+}
+
+
+def _install_everyday_app(ctx: TaskContext, store_id: str, label: str,
+                          check) -> None:
+    """One Everyday app: skip when already present, else install from the
+    Store and verify it actually arrived."""
     if not has_network():
-        raise RuntimeError("No internet connection — everyday apps need to download.")
+        raise RuntimeError(
+            "No internet connection — %s needs to download." % label)
+    if check():
+        ctx.log("%s already installed — nothing to do." % label)
+        return
     _ensure_winget(ctx)
     _store_hint(ctx)
-    parts = [
-        ("9WZDNCRFHVN5", "Windows Calculator", cap.has_calculator_app),
-        ("9WZDNCRFJ3PR", "Windows Clock", cap.has_clock_app),
-        ("9NBLGGH4QGHW", "Microsoft Sticky Notes", cap.has_sticky_notes),
-        ("9WZDNCRFHWKN", "Windows Sound Recorder", cap.has_sound_recorder),
-    ]
-    did = []
-    for pid, label, check in parts:
-        if check():
-            ctx.log(f"{label} already installed.")
-        else:
-            _winget_install(ctx, pid, label)
-            did.append(label)
+    _winget_install(ctx, store_id, label)
     cap.invalidate_caches()
-    if not did:
-        return
-    missing = [label for _, label, check in parts if not check()]
-    if missing:
+    if not check():
         raise RuntimeError(
-            f"Everyday Apps Pack did not verify — still missing: {', '.join(missing)}. "
-            "Try rebooting and running again.")
-    ctx.log(f"Installed and verified: {', '.join(did)}.")
+            "%s install did not verify — try rebooting and running again."
+            % label)
+    ctx.log("%s installed and verified." % label)
+
+
+def install_calculator_app(ctx: TaskContext):
+    """Windows Calculator — standard, scientific, programmer, date and
+    unit-conversion modes."""
+    _install_everyday_app(ctx, *_EVERYDAY_APPS["calculator"])
+
+
+def install_clock_app(ctx: TaskContext):
+    """Windows Clock — alarms and focus sessions, plus the stopwatch and
+    world-timer tabs."""
+    _install_everyday_app(ctx, *_EVERYDAY_APPS["clock"])
+
+
+def install_sticky_notes_app(ctx: TaskContext):
+    """Microsoft Sticky Notes — desktop notes that stay where you put
+    them."""
+    _install_everyday_app(ctx, *_EVERYDAY_APPS["sticky_notes"])
+
+
+def install_sound_recorder_app(ctx: TaskContext):
+    """Windows Sound Recorder — capture voice memos and system audio."""
+    _install_everyday_app(ctx, *_EVERYDAY_APPS["sound_recorder"])
 
 
 def install_phone_link(ctx: TaskContext):
@@ -1776,7 +1805,10 @@ TASKS = [
     Task("install_mediaplayer", "Media Player", "Adds Windows Media Player plus MPEG-2 so local audio and video play again", install_media_player_bundle, default=False, admin_required=False, group="LTSC Missing Components"),
     Task("install_notepad", "Notepad", "Adds the new tabbed Notepad for editing game configs and mods", install_notepad_app, default=False, admin_required=False, group="LTSC Missing Components"),
     Task("install_paint", "Paint", "Adds the new Paint with layers and background remover for quick edits", install_paint_app, default=False, admin_required=False, group="LTSC Missing Components"),
-    Task("install_everyday", "Everyday Apps Pack", "One click for Calculator, Clock, Sticky Notes and Sound Recorder", install_everyday_apps_pack, default=False, admin_required=False, group="LTSC Missing Components"),
+    Task("install_calculator", "Calculator", "Adds Windows Calculator with scientific, programmer and unit-conversion modes", install_calculator_app, default=False, admin_required=False, group="LTSC Missing Components"),
+    Task("install_clock", "Clock", "Adds Windows Clock with alarms, focus sessions, stopwatch and world timer", install_clock_app, default=False, admin_required=False, group="LTSC Missing Components"),
+    Task("install_sticky_notes", "Sticky Notes", "Adds Microsoft Sticky Notes for quick desktop reminders", install_sticky_notes_app, default=False, admin_required=False, group="LTSC Missing Components"),
+    Task("install_sound_recorder", "Sound Recorder", "Adds Windows Sound Recorder for voice memos and system audio", install_sound_recorder_app, default=False, admin_required=False, group="LTSC Missing Components"),
     Task("install_phonelink", "Phone Link", "Links your Android/iPhone for photos, texts and calls on the PC", install_phone_link, default=False, admin_required=False, group="LTSC Missing Components"),
     Task("install_quickassist", "Quick Assist", "Microsoft's 1-click remote help for fixing family PCs", install_quick_assist, default=False, admin_required=False, group="LTSC Missing Components"),
     Task("install_wsl", "WSL (Ubuntu)", "Adds Linux + Ubuntu for modders and AI tinkerers (needs a reboot)", install_wsl_ubuntu, default=False, admin_required=True, group="LTSC Missing Components"),

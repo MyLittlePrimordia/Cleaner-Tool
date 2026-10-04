@@ -277,13 +277,20 @@ def measure_all_cached(set_status=None, cancelled=None):
     try:
         if cancelled is not None and cancelled():
             return None
-            ctx = make_measure_ctx(set_status=set_status, cancelled=cancelled)
-            # MED-002: sum the measured values, but let a single unmeasured
-            # category make the TOTAL unknown rather than silently too small.
-            total = sum_measured(measure_clean_tasks(ctx, sorted(SCAN_ALLOWLIST)))
-            if total is not None:
-                store_estimate(total)
-            return total
+        # BUG-004: everything below used to sit INSIDE that if-block, after its
+        # `return None` -- an indentation slip that made the whole body
+        # unreachable, so this function could only ever return None (or a stale
+        # cache hit). Measured with the walker instrumented: it was never
+        # invoked. The Health "Reclaimable Junk" card therefore always graded
+        # "?" with "another scan is running", and the low-space chip tooltip
+        # never gained a reclaimable number.
+        ctx = make_measure_ctx(set_status=set_status, cancelled=cancelled)
+        # MED-002: sum the measured values, but let a single unmeasured
+        # category make the TOTAL unknown rather than silently too small.
+        total = sum_measured(measure_clean_tasks(ctx, sorted(SCAN_ALLOWLIST)))
+        if total is not None:
+            store_estimate(total)
+        return total
     finally:
         release_scan()
 
@@ -535,8 +542,14 @@ def write_benchmark(drive_root: str = "C:\\", size_mb: int = BENCH_MB,
         if os.path.splitdrive(os.path.abspath(tmpdir))[0].upper() != \
                 os.path.splitdrive(os.path.abspath(drive_root))[0].upper():
             tmpdir = os.path.join(os.path.abspath(drive_root), "Windows", "Temp")
+            # BUG-008: this used to fall through to tmpdir=None, which makes
+            # mkstemp use %TEMP% -- on C:. So benchmarking E: wrote 32 MB to
+            # C: and the dialog reported C: throughput as E:'s. Measured with
+            # mkstemp instrumented: asked for Z:\ and E:\, both got dir=None.
+            # If the drive has no Windows\Temp there is nowhere on THAT drive
+            # to write, so say so rather than quietly measuring another one.
             if not os.path.isdir(tmpdir):
-                tmpdir = None
+                return None, None
         fd, path = _tf.mkstemp(prefix="cleaner_bench_", suffix=".bin", dir=tmpdir)
         os.close(fd)
     except Exception:

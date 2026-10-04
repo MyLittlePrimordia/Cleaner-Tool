@@ -109,6 +109,29 @@ def main() -> int:
        "%s -> %s" % (before[:16], digest()[:16]))
 
     outer.__exit__(None, None, None)
+
+    # Hash equality only proves THIS RUN changed nothing. It cannot see a leak
+    # a previous run left behind: that is exactly how a stop_telemetry
+    # snapshot survived here for several runs, because every run faithfully
+    # preserved the already-polluted file and reported clean. This check looks
+    # for the SHAPE of a test leak -- snapshot/applied keys for tweaks nobody
+    # applied -- so the damage is reported rather than inherited.
+    print()
+    print("[3] no stray tweak state from an earlier leaking run")
+    try:
+        import json
+        with io.open(config_path(), encoding="utf-8") as handle:
+            live = json.load(handle)
+    except Exception as exc:
+        live = {}
+        ck("config.json is readable", False, repr(exc))
+    snaps = live.get("tweak_snapshots") or {}
+    applied = live.get("applied_tweaks") or []
+    ck("no tweak snapshots are recorded",
+       not snaps, "stray snapshot keys: %s" % sorted(snaps)[:6])
+    ck("no tweaks are marked applied",
+       not applied, "stray applied_tweaks: %s" % sorted(applied)[:6])
+
     print()
     if FAILS:
         print("NO-POLLUTION VERIFY: %d/%d FAILED" % (FAILS, CHECKS))

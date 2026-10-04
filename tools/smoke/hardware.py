@@ -8,6 +8,8 @@ sections share live Application state, so run_all() calls these in
 sequence.
 """
 
+from tools.smoke import assert_dialog_proportional
+
 
 def run(ctx):
     # names main() used to provide as locals
@@ -53,7 +55,7 @@ def run(ctx):
     _hd = gui.HardwareMonitorDialog(root, app)
     try:
         _settle(_hd)
-        assert (_hd._modal_w, _hd._modal_h) == (800, 600)
+        assert_dialog_proportional(_hd, root, "hardware monitor")
         # six cards, Health-chrome (hairline outer + bg_alt inner),
         # 2 columns x 3 rows (GPU above VRAM), everything centered
         assert _hd._grid.grid_size() == (2, 3), _hd._grid.grid_size()

@@ -1,7 +1,6 @@
 """Phase-5 headless verification of the new SessionPilot contract."""
 import sys, pathlib
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent
-                       if False else r"C:\Users\User\Desktop\Cleaner Tool"))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from app.session_pilot import SessionPilot, normalize_path, normalize_exe
 
 fails = []

@@ -32,12 +32,47 @@ class Tooltip:
     def __init__(self, widget, text: str):
         self.widget = widget
         self.text = text
-        widget.bind("<Enter>", self._on_enter)
-        widget.bind("<Leave>", self._hide)
-        # F8: a destroyed widget must not leave a pending timer behind —
+
+        # BUG-012: every Tooltip registered three brand-new Tcl commands and
+        # appended a <Destroy> handler with add="+", and nothing ever removed
+        # the previous Tooltip's. The Hardware Monitor's Network card rebuilds
+        # its tooltip whenever the auto-picked NIC changes, and that pick is a
+        # bare argmax with no hysteresis, so on any machine with two active
+        # adapters (Wi-Fi + Ethernet, or Wi-Fi + a VPN) it flips whenever the
+        # two totals cross -- every couple of seconds. Measured here: 200
+        # alternating paints left 600 registered Tcl commands and ~21.8 KB of
+        # bind script on ONE label, growing linearly and never reclaimed.
+        #
+        # bind() returns the Tcl funcid it registered, so remember all three
+        # and retire them before installing this instance's. <Enter>/<Leave>
+        # are bound without add="+", so their script text is already
+        # overwritten -- only the orphaned commands need deleting.
+        prev = getattr(widget, "_tooltip_funcids", None)
+        if prev is not None:
+            try:
+                widget.unbind("<Destroy>", prev["destroy"])
+            except Exception:
+                pass
+            for key in ("enter", "leave"):
+                try:
+                    widget.deletecommand(prev[key])
+                except Exception:
+                    pass
+
+        enter_id = widget.bind("<Enter>", self._on_enter)
+        leave_id = widget.bind("<Leave>", self._hide)
+        # F8: a destroyed widget must not leave a pending timer behind --
         # Tk after-ids outlive the widget that scheduled them, so the timer
-        # is cancelled here (add="+": never wipe another <Destroy> handler)
-        widget.bind("<Destroy>", self._on_destroy, add="+")
+        # is cancelled here (add="+": never wipe another <Destroy> handler).
+        destroy_id = widget.bind("<Destroy>", self._on_destroy, add="+")
+        try:
+            # Holding the strings keeps no widget alive; they are only needed
+            # long enough to unbind/deletecommand the previous instance.
+            widget._tooltip_funcids = {
+                "enter": enter_id, "leave": leave_id, "destroy": destroy_id,
+            }
+        except Exception:
+            pass
 
     @classmethod
     def _ensure_shared(cls, widget):

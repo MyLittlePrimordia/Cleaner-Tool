@@ -373,7 +373,7 @@ class MicCheckDialog(ThemedModal):
                     self._level_note.config(
                         text="Recording failed — mic in use or permission blocked.")
             try:
-                self._dlg.after(0, _land)
+                self._dispatch.post(_land)
             except Exception:
                 pass
 

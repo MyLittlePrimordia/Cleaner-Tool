@@ -312,7 +312,16 @@ class GpuSampler:
                     auto_idx += 1
                 used_phys.add(phys)
                 self._vram_counters.append((phys, hc))
-                return bool(self._util_counters or self._vram_counters)
+            # BUG-011: this `return` sat inside the VRAM loop, so only the
+            # FIRST adapter-memory counter was ever registered. On a dual-GPU
+            # rig -- the case this class documents at the lines above -- the
+            # second GPU's phys index still came from the util counters, so a
+            # bucket was created for it that never received vram_got, leaving
+            # vram_used_bytes permanently None for that adapter. Worse, if
+            # "GPU Adapter Memory" is unavailable while "GPU Engine" is
+            # present, _setup fell off the end and returned None, so sample()
+            # bailed and GPU % was lost with 100+ live engine counters.
+            return bool(self._util_counters or self._vram_counters)
         except Exception:
             # LOW-013: self._hquery is assigned BEFORE the counter-add loops,
             # so an exception in one of them returned with the PDH query still
@@ -824,7 +833,13 @@ class DiskSampler:
                 hc = self._add(hquery, p)
                 if hc is not None:
                     self._write.append(hc)
-                return bool(self._active or self._read or self._write)
+            # BUG-003: same indentation slip as the network sampler -- this
+            # `return` was inside the write-counter loop, so only the FIRST
+            # write counter was ever registered (measured: read 4 counters,
+            # write 2). sample() sums each side independently, so the Disk card
+            # reported read throughput across every drive and write throughput
+            # across a subset -- writes to D: were invisible.
+            return bool(self._active or self._read or self._write)
         except Exception:
             _close_pdh_query(self)          # LOW-013
             return False
@@ -957,7 +972,13 @@ class NetworkSampler:
                     hc = self._add(hquery, p)
                     if hc is not None:
                         store[name] = hc
-                return bool(self._rx or self._tx)
+            # BUG-002: this `return` sat at the loop body's indent level, so it
+            # fired after the FIRST counter -- "Bytes Received/sec" -- and
+            # "Bytes Sent/sec" and "Current Bandwidth" were never expanded.
+            # Measured on a live machine: _rx had 3 entries, _tx 0, _bw 0, so
+            # sample() returned up_bps 0.0 no matter how much was uploading and
+            # link_mbps None (the TaskManager-style link scale is dead code).
+            return bool(self._rx or self._tx or self._bw)
         except Exception:
             _close_pdh_query(self)          # LOW-013
             return False

@@ -45,7 +45,6 @@ class ScorecardDialog(ThemedModal):
     the nested event loop.
     """
 
-    WIDTH = 800                 # fixed shared popup footprint (ThemedModal)
     _ROWS_INLINE = 12    # beyond this the row list scrolls
     _ROW_H = 26          # per-row height budget for the panel cap
 
@@ -137,7 +136,7 @@ class ScorecardDialog(ThemedModal):
                 # is safe in both environments. A later real <Configure>
                 # just redraws at the true width.
                 self._draw_bar(self._bar_canvas, b_avail, a_avail, a_total,
-                               width=self.WIDTH - 36)
+                               width=self._modal_w - 36)
 
         # status chips
         chips = tk.Frame(body, bg=COLORS["bg"])

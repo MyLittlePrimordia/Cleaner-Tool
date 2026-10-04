@@ -138,7 +138,22 @@ def run(ctx):
                            if isinstance(w, tk.Label)), None)
             assert _intro is not None
             _intro.update_idletasks()
-            assert _intro.winfo_reqheight() <= 28, _intro.winfo_reqheight()
+            # "one row" has to be measured against the FONT, not against a
+            # magic pixel count. This used to assert reqheight() <= 28, which
+            # only held while the harness rendered DPI-unaware (tk scaling
+            # 1.33). Now that the suite opts into Per-Monitor V2 like every
+            # real launch path, the same correct layout measures 31px and the
+            # assertion failed -- the test was measuring the harness, not the
+            # app. One row == "fits in one line of its own font"; a wrap to
+            # two lines is ~2x that, so the 1.5x bound separates them at any
+            # DPI and any font size.
+            import tkinter.font as _tkfont
+            _fam = _intro.cget("font")
+            _linespace = _tkfont.Font(font=_fam).metrics("linespace") if _fam \
+                else _tkfont.nametofont("TkDefaultFont").metrics("linespace")
+            assert _intro.winfo_reqheight() <= _linespace * 1.5, (
+                "intro blurb wrapped to 2+ rows: reqheight=%d, one line=%d"
+                % (_intro.winfo_reqheight(), _linespace))
             assert _pdlg._preset_var.get() in ("Minimal", "Recommended", "Game Session")
             _pdlg._enabled_var.set(True)
             root.update()

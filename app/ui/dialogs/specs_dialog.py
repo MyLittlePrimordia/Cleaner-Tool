@@ -101,12 +101,13 @@ class SpecsDialog(ThemedModal):
             except Exception:
                 rows = [("Error", "Could not read this section.")]
             try:
-                _app = getattr(self, "app", None) or getattr(self, "_app", None)
-                _disp = getattr(_app, "_dispatch", None)
-                if _disp is not None:
-                    _disp.post(lambda: self._render(token, rows))
-                else:
-                    self.after(0, lambda: self._render(token, rows))
+                # BUG-001: the `else: self.after(0, ...)` this replaces was a
+                # Tk call from this worker -- RuntimeError on Python 3.14,
+                # swallowed by the except, so the section never rendered. The
+                # branch was also dead: Application always builds _dispatch.
+                # ThemedModal now owns one, so there is a single hop and it is
+                # the safe one.
+                self._dispatch.post(lambda: self._render(token, rows))
             except Exception:
                 pass
 

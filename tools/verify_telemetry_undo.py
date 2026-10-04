@@ -21,7 +21,8 @@ from __future__ import annotations
 import io
 import sys
 
-sys.path.insert(0, r"C:\Users\User\Desktop\Cleaner Tool")
+import pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from app.config_persist import (clear_tweak_snapshot, get_tweak_snapshot,
                                 save_tweak_snapshot)
@@ -64,6 +65,31 @@ class Ctx:
 TELEMETRY_TASKS = tuple(tt._TELEMETRY_TASKS)
 
 
+def _argv_of(cmd):
+    """Normalise a run_cmd command to a list of tokens.
+
+    Accepts the argv-list form (`["schtasks", "/change", ...]`) and the old
+    interpolated string form, so a fake does not have to care which one the
+    production code chose.
+    """
+    if isinstance(cmd, (list, tuple)):
+        return [str(x) for x in cmd]
+    import shlex
+    try:
+        return shlex.split(str(cmd))
+    except ValueError:
+        return str(cmd).split()
+
+
+def _tn_of(parts):
+    """The /TN task name from a normalised schtasks command."""
+    if "/tn" in parts:
+        i = parts.index("/tn")
+        if i + 1 < len(parts):
+            return parts[i + 1]
+    return ""
+
+
 def simulate(already_disabled):
     """Run apply+revert against a fake machine. Returns (disable_calls,
     enable_calls, snapshot_after_apply)."""
@@ -76,23 +102,28 @@ def simulate(already_disabled):
     orig_save = tt.save_tweak_snapshot
     orig_clear = tt.clear_tweak_snapshot
     orig_get = tt.get_tweak_snapshot
+    orig_merge = tt.merge_tweak_snapshot
     store = {}
 
     def fake_run(ctx, cmd, timeout=None, **kw):
-        c = str(cmd)
-        if "/disable" in c and "schtasks" in c:
-            name = c.split('/tn "', 1)[-1].split('"', 1)[0]
-            calls.append(("disable", name))
-            state[name] = True
-            return 0
-        if "/enable" in c and "schtasks" in c:
-            name = c.split('/tn "', 1)[-1].split('"', 1)[0]
-            calls.append(("enable", name))
-            state[name] = False
-            return 0
-        if "sc config" in c and "disabled" in c:
-            return 0
-        if "sc config" in c:
+        # SEC-001: the schtasks calls are now argv lists with shell=False
+        # instead of an interpolated shell string. Normalise BOTH shapes so
+        # this fake stays a test of the control flow rather than of the
+        # command's serialisation -- that is exactly the coupling that let
+        # the injection survive a test that was passing.
+        parts = _argv_of(cmd)
+        if "schtasks" in parts:
+            if "/disable" in parts:
+                name = _tn_of(parts)
+                calls.append(("disable", name))
+                state[name] = True
+                return 0
+            if "/enable" in parts:
+                name = _tn_of(parts)
+                calls.append(("enable", name))
+                state[name] = False
+                return 0
+        if "sc" in parts and "config" in parts:
             return 0
         return 0            # net stop/start and anything else: no-op
 
@@ -111,12 +142,22 @@ def simulate(already_disabled):
     def fake_get(task_id):
         return dict(store.get(task_id) or {})
 
+    def fake_merge(task_id, values):
+        # ARCH-002: _merge_tweak_snapshot used to be get + clear + save; it is
+        # now one atomic config_persist.merge_tweak_snapshot. Faked here so the
+        # two-stage telemetry apply still records start types AND task priors
+        # into the same snapshot.
+        merged = dict(store.get(task_id) or {})
+        merged.update(values or {})
+        store[task_id] = merged
+
     tt.run_cmd = fake_run
     tt._schtasks_state = fake_state
     tt.sc_query_start_type = fake_svc
     tt.save_tweak_snapshot = fake_save
     tt.clear_tweak_snapshot = fake_clear
     tt.get_tweak_snapshot = fake_get
+    tt.merge_tweak_snapshot = fake_merge
     # _merge_tweak_snapshot reads the module-level snapshot helpers (that is
     # the seam it is SUPPOSED to use). Belt and braces: also neutralise the
     # real config_persist writers, because the first version of this test let
@@ -124,10 +165,11 @@ def simulate(already_disabled):
     # actual config.json. A test must not be able to do that.
     import app.config_persist as _cp
     _real = (_cp.save_tweak_snapshot, _cp.clear_tweak_snapshot,
-             _cp.get_tweak_snapshot)
+             _cp.get_tweak_snapshot, _cp.merge_tweak_snapshot)
     _cp.save_tweak_snapshot = fake_save
     _cp.clear_tweak_snapshot = fake_clear
     _cp.get_tweak_snapshot = fake_get
+    _cp.merge_tweak_snapshot = fake_merge
     try:
         applied = None
         try:
@@ -143,13 +185,15 @@ def simulate(already_disabled):
             pass
         return calls, applied, after_apply, state, split
     finally:
-        _cp.save_tweak_snapshot, _cp.clear_tweak_snapshot, _cp.get_tweak_snapshot = _real
+        (_cp.save_tweak_snapshot, _cp.clear_tweak_snapshot,
+         _cp.get_tweak_snapshot, _cp.merge_tweak_snapshot) = _real
         tt.run_cmd = orig_run
         tt._schtasks_state = orig_state
         tt.sc_query_start_type = orig_svc
         tt.save_tweak_snapshot = orig_save
         tt.clear_tweak_snapshot = orig_clear
         tt.get_tweak_snapshot = orig_get
+        tt.merge_tweak_snapshot = orig_merge
 
 
 # --------------------------------------------------------------------------- #
@@ -214,9 +258,9 @@ orig_run = tt.run_cmd
 orig_get = tt.get_tweak_snapshot
 orig_clear = tt.clear_tweak_snapshot
 def fake_run(ctx, cmd, timeout=None, **kw):
-    c = str(cmd)
-    if "schtasks" in c and ("/enable" in c or "/disable" in c):
-        calls.append(c)
+    parts = _argv_of(cmd)                    # handles argv and string forms
+    if "schtasks" in parts and ("/enable" in parts or "/disable" in parts):
+        calls.append(parts)
     return 0
 tt.run_cmd = fake_run
 tt.get_tweak_snapshot = lambda tid: dict(store.get(tid) or {})

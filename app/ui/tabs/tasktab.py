@@ -884,20 +884,29 @@ class TaskTab(tk.Frame):
         keys = [t.key for t in selected]
 
         def _worker():
+            # BUG-001: these four hops used to be
+            # `self.app.root.after(0, ...)` called from THIS worker -- a Tk call
+            # on a foreign thread. Python 3.14 raises RuntimeError for it every
+            # time, so the Tweak-tab Preview silently never painted. They go
+            # through the app's TkDispatcher now; the lambdas bind their
+            # arguments because post() takes a zero-arg callable.
             try:
                 from app.storage_scan import (
                     acquire_scan, release_scan, make_measure_ctx,
                     measure_clean_tasks, SCAN_ALLOWLIST, SCAN_EXCLUDED_NOTE,
                     sum_measured, count_unmeasured)
             except Exception:
-                self.app.root.after(0, self._preview_done, None, None)
+                self.app._dispatch.post(
+                    lambda: self._preview_done(None, None))
                 return
             if not acquire_scan(cancelled=lambda: False):
-                self.app.root.after(0, self._preview_done, "busy", None)
+                self.app._dispatch.post(
+                    lambda: self._preview_done("busy", None))
                 return
             try:
                 ctx = make_measure_ctx(
-                    set_status=lambda m: self.app.root.after(0, self.app.set_status, m))
+                    set_status=lambda m: self.app._dispatch.post(
+                        lambda m=m: self.app.set_status(m)))
                 sizes = measure_clean_tasks(ctx, keys)
                 # MED-002: sum only what was actually measured. A category
                 # that raised is None, not 0, and one unknown category makes
@@ -907,8 +916,8 @@ class TaskTab(tk.Frame):
                 total = sum_measured(sizes)
                 unknown = count_unmeasured(sizes)
                 skipped = [k for k in keys if k not in SCAN_ALLOWLIST]
-                self.app.root.after(0, self._preview_done, total, skipped,
-                                    unknown)
+                self.app._dispatch.post(
+                    lambda: self._preview_done(total, skipped, unknown))
             finally:
                 release_scan()
 

@@ -6,3 +6,6 @@ dist/
 .venv/
 venv/
 *.egg-info/
+
+# tools/verify_catalog.py writes its offline report here on every run.
+shots/

@@ -187,7 +187,26 @@ def exclusive_create_text(dest: str, content: str, newline: str = "\n") -> bool:
     should treat "already existed" as "nothing to do", not an error.
     Raises on any other failure (permissions, disk full, etc.)."""
     dest = os.path.normpath(dest)
-    if _is_reparse_point(dest) or os.path.exists(dest):
+    # BUG-005: the guard could never succeed. `_is_reparse_point(dest) or
+    # os.path.exists(dest)` -- the reparse test is deliberately fail-closed, and
+    # GetFileAttributesW returns INVALID_FILE_ATTRIBUTES for a path that does
+    # NOT exist, which maps to True. So for every fresh path the first operand
+    # was True, `or` short-circuited, and this returned False without ever
+    # reaching os.open. Measured: a new path returned False and created no
+    # file; bypassing only that operand made the same call work.
+    #
+    # Consequence: apply_ad_blocker's one-time backup of the Windows hosts file
+    # never happened, silently, while the apply still reported success.
+    #
+    # `os.path.lexists`, not `os.path.exists`: exists() FOLLOWS symlinks, so a
+    # dangling one answers False and we would happily write through it.
+    # lexists() is the "is anything here at all" test this actually wants.
+    #
+    # The reparse check is then unnecessary rather than merely reordered:
+    # os.open with O_CREAT|O_EXCL already refuses to follow a symlink and
+    # refuses to clobber an existing file, atomically. That is a stronger
+    # guarantee than a check-then-act test, which has a TOCTOU window anyway.
+    if os.path.lexists(dest):
         return False
     flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
     try:
@@ -241,31 +260,45 @@ def _get_any_proc():
 
 
 def _kill_proc(proc: subprocess.Popen):
-    """Kill proc and its child tree (needed when shell=True on Windows)."""
+    """Kill proc AND its child tree (needed when shell=True on Windows).
+
+    BUG-006: the order was wrong. `proc.kill()` ran FIRST and synchronously,
+    and only then was the `taskkill /T` tree walk fired off in a thread. With
+    the default shell=True, `proc` is cmd.exe and the real tool (DISM.exe,
+    sfc.exe, winget.exe) is its child -- so by the time taskkill ran, the
+    parent was already gone and /T had no tree left to enumerate. Measured:
+    taskkill exited 128, "The process "N" not found.", and the child was still
+    alive two seconds later. Nothing stopped it: the `finally` in run_cmd
+    clears the cancel registry, so a later Stop could never reach it either.
+    The user was told "command cancelled" while an elevated DISM kept running.
+
+    So: walk the tree FIRST, while the parent still exists to anchor it, and
+    fall back to proc.kill() for anything taskkill missed (a non-Windows
+    platform, or a process that exited between the two calls).
+    """
+    if IS_WINDOWS:
+        pid = getattr(proc, "pid", None)
+        if pid is not None:
+            # Fire-and-forget so this does not block the cancel hot path
+            # (timeout=5 would add 5s of tail latency to every Stop).
+            def _taskkill():
+                try:
+                    subprocess.run(
+                        ["taskkill", "/PID", str(pid), "/T", "/F"],
+                        capture_output=True,
+                        timeout=5,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+                except Exception:
+                    pass
+            try:
+                threading.Thread(target=_taskkill, daemon=True).start()
+            except Exception:
+                pass
     try:
         proc.kill()
     except Exception:
         pass
-    if IS_WINDOWS:
-        pid = getattr(proc, "pid", None)
-        if pid is None:
-            return
-        # Fire-and-forget taskkill /T so it doesn't block the cancel hot path (timeout=5 would add 5s tail latency)
-        def _taskkill():
-            try:
-                subprocess.run(
-                    f"taskkill /PID {pid} /T /F",
-                    shell=True,
-                    capture_output=True,
-                    timeout=5,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                )
-            except Exception:
-                pass
-        try:
-            threading.Thread(target=_taskkill, daemon=True).start()
-        except Exception:
-            pass
 
 
 def cancel_current_command():
@@ -1378,11 +1411,24 @@ def create_restore_point(ctx: TaskContext, description: str = "GamerOpt Cleaner 
         f"Checkpoint-Computer -Description '{description.replace(chr(39), chr(39)*2)}' "
         "-RestorePointType MODIFY_SETTINGS"
     )
+    out: list = []
     rc = run_cmd(ctx, ["powershell", "-NoProfile", "-Command", ps_script],
-                 shell=False, timeout=120)
+                 shell=False, timeout=120, collect=out)
     if rc == 0:
         ctx.log("Restore point created successfully.")
         return True
+    # BUG-013: Windows allows only ONE System Restore checkpoint per 24 hours.
+    # Checkpoint-Computer exits non-zero when throttled, and this used to fall
+    # straight through to the "System Protection may be off" failure below --
+    # a wrong diagnosis, plus an instruction to go enable a setting that is
+    # very likely already on. warnings.py already promises this case is
+    # "shown as info, not failure", so raise the skip the run engine
+    # already understands instead of inventing a third state here.
+    blob = "\n".join(out).lower()
+    if "1440 minutes" in blob or "restore point cannot be created" in blob:
+        ctx.log("  i Skipped: Windows allows only one restore point per 24 hours,")
+        ctx.log("  i and one was already created today. Nothing to do.")
+        raise TaskSkipped("a restore point was already created in the last 24h")
     ctx.log("  ! Could not create a restore point (System Protection may be off for this drive).")
     ctx.log("  ! Enable it: Settings > System > About > System protection, then retry.")
     return False

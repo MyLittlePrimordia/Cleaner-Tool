@@ -523,22 +523,27 @@ class InstallTab(tk.Frame):
     # ---------------- installed badges ---------------- #
 
     def _post_to_tk(self, fn):
-        """Schedule fn on the Tk thread. InstallTab is a tk.Frame and has
-        NO .root attribute — the old self.root.after(...) here raised
-        AttributeError on every scan (swallowed by the except), so the
-        installed-badges and Update-count callbacks NEVER ran: badges never
-        appeared and the Update button sat at 'Update Apps…' forever.
-        winfo_toplevel() resolves the real root window (the same trick
-        Tooltip._ensure_shared uses), which lives for the whole session.
-        F10: the toplevel is captured on the Tk thread by
-        _start_installed_badge_scan and held here — the worker never
-        calls winfo_* itself."""
+        """Schedule fn on the Tk thread. Worker-safe.
+
+        InstallTab is a tk.Frame and has NO .root attribute — the original
+        self.root.after(...) raised AttributeError on every scan (swallowed by
+        the except), so the installed-badges and Update-count callbacks never
+        ran: badges never appeared and the Update button sat at
+        'Update Apps…' forever.
+
+        BUG-001: the replacement resolved the real toplevel and called
+        `tk_root.after(0, fn)` — but this runs ON THE WORKER (both _scan bodies
+        call it), and after() is itself a Tk call. On Python 3.14 that raises
+        RuntimeError("main thread is not in main loop") every time, so the fix
+        traded one dead path for another and the badges and Update count still
+        never appeared. The old note that "the worker never calls winfo_*" was
+        true and beside the point: after() was the call that mattered.
+
+        It now posts through the app's TkDispatcher, which is what that note
+        should have said from the start.
+        """
         try:
-            tk_root = getattr(self, "_tk_holder", None)
-            if tk_root is None:
-                tk_root = self.winfo_toplevel()
-                self._tk_holder = tk_root
-            tk_root.after(0, fn)
+            self.app._dispatch.post(fn)
         except Exception:
             pass  # shutdown race — root already destroyed; nothing to paint
 
@@ -698,14 +703,29 @@ class InstallTab(tk.Frame):
         ess_head.bind("<Leave>", lambda e: _ess_hover(False))
         self._ess_groups[title] = {"body": body, "arrow": arrow}
 
-        for task in tasks:
+        # 2-column flow, matching every catalog divider (user request).
+        # Essentials was the last divider still flowing its rows straight down
+        # one column, so the runtime groups came out about twice as tall as
+        # the categories around them and the tab read as ragged. Same
+        # construction as _build_category: per-column frames on a uniform
+        # grid, rows dealt round-robin, so the columns also line up with
+        # every other divider instead of each group picking its own widths.
+        cols = self._CAT_COLUMNS
+        col_frames = []
+        for c in range(cols):
+            cf = tk.Frame(body, bg=COLORS["bg_alt"])
+            cf.grid(row=0, column=c, sticky="nsew", padx=(6, 6))
+            body.grid_columnconfigure(c, weight=1, uniform="catcols")
+            col_frames.append(cf)
+
+        for ci, task in enumerate(tasks):
             var = tk.BooleanVar(value=False)
             self.ess_vars[task.key] = var
             # also register in the shared vars pool so 'Install Selected
             # Apps' includes Essentials naturally
             self.vars[f"task:{task.key}"] = var
             self._trace_install_var(var)
-            row = tk.Frame(body, bg=COLORS["bg_alt"])
+            row = tk.Frame(col_frames[ci % cols], bg=COLORS["bg_alt"])
             row.pack(fill="x", padx=10, pady=2)
             cb = tk.Checkbutton(row, variable=var, bg=COLORS["bg_alt"],
                                 fg=COLORS["text"], activebackground=COLORS["bg_alt"],

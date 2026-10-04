@@ -257,10 +257,7 @@ class SpeedTestDialog(ThemedModal):
 
     def _ui(self, fn, *args):
         # F10: same as the other dialogs — no winfo_exists off-thread.
-        try:
-            self._dlg.after(0, lambda: fn(*args))
-        except Exception:
-            pass
+        self._dispatch.post(lambda: fn(*args))
 
     def _cancel_test(self):
         try:

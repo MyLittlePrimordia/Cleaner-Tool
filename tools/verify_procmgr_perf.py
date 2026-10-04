@@ -190,6 +190,11 @@ from app.ui.dialogs.process_manager_dialog import ProcessManagerDialog  # noqa: 
 app = FakeApp()
 dlg = ProcessManagerDialog.__new__(ProcessManagerDialog)
 dlg.app = app
+# BUG-001: the sampling hop now uses the DIALOG's dispatcher -- ThemedModal
+# creates one per dialog and stops it in close() -- instead of reaching for the
+# application's. __new__ skips __init__, so supply it as the real constructor
+# would.
+dlg._dispatch = FakeDispatch()
 dlg._sampler = FakeSampler()
 dlg._dlg = FakeWin()
 dlg._sampling = False
@@ -223,10 +228,10 @@ ck("...returning long before the sample finished", elapsed < 45, "%.1f ms" % ela
 # through the dispatcher - and a fixed sleep after the event races that, which
 # is what made this check fail intermittently once the sampling code changed.
 _deadline = time.time() + 5.0
-while time.time() < _deadline and not app._dispatch.posted:
+while time.time() < _deadline and not dlg._dispatch.posted:
     time.sleep(0.005)
 ck("the result was marshalled through the app's dispatcher",
-   len(app._dispatch.posted) == 1, len(app._dispatch.posted))
+   len(dlg._dispatch.posted) == 1, len(dlg._dispatch.posted))
 ck("_last_items was captured for the End-task action",
    len(dlg._last_items) == 5, len(dlg._last_items))
 ck("_sampling is cleared so the next tick can sample again", dlg._sampling is False)
@@ -252,7 +257,7 @@ ck("it clears the in-flight flag first", _apply.strip().splitlines()[1].strip()
    == "self._sampling = False" or "self._sampling = False" in _apply)
 ck("PERF: the split is documented at both halves",
    "PERF" in body(dlg_src, "_refresh_list")
-   and "MED-014" in body(dlg_src, "_refresh_list"))
+   and "BUG-001" in body(dlg_src, "_refresh_list"))
 
 print()
 print("[6] the heavy lifting is still on the worker")
@@ -263,9 +268,17 @@ ck("group_processes is called on the worker too (pure data)",
    "group_processes" in _work_src)
 ck("no Tk call happens before the dispatcher post",
    _work_src.index("self._sampler.sample()")
-   < _work_src.index("_disp.post"))
-ck("...and the worker never falls back to the widget's after() first",
-   "_disp = getattr" in _work_src)
+   < _work_src.index("self._dispatch.post"))
+# BUG-001: the `getattr(app, "_dispatch")` lookup and its off-thread
+# `self._dlg.after(0, ...)` fallback are both gone -- the dialog's own
+# dispatcher is always present, so there is nothing to look up and no path
+# back to a Tk call on a worker. Matched against code with comments blanked:
+# the replacement's own comment quotes the old form verbatim. (The remaining
+# getattr is the unrelated `getattr(self, "_sampling", False)` guard.)
+_work_code = "\n".join(ln.split("#")[0] for ln in _work_src.split("\n"))
+ck("...and the worker never falls back to the widget's after()",
+   '"_dispatch", None' not in _work_code
+   and "self._dlg.after(0" not in _work_code)
 
 print()
 if FAILS:

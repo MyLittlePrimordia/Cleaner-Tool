@@ -13,6 +13,7 @@ from tkinter import ttk, messagebox
 from app.elevation import relaunch_as_admin
 from app.ui.theme import COLORS, F
 from app.ui.widgets import AnimatedButton
+from app.ui.tkdispatch import TkDispatcher
 
 
 class AdminGateFrame(tk.Frame):
@@ -161,11 +162,25 @@ class AdminGateFrame(tk.Frame):
                                          bg=COLORS["bg"], fg=COLORS["accent_blue"])
             self._wait_status.pack(pady=(10, 0))
 
+            # BUG-001: the hand-back below used to be
+            # `self.root.after(0, _on_done)` from inside this worker thread --
+            # a Tk call on a foreign thread, which Python 3.14 rejects
+            # outright. The gate has no Application to borrow a dispatcher
+            # from (it is built before one exists), so it owns a short-lived
+            # one for the duration of this wait and stops it in _on_done.
+            _disp = TkDispatcher(self.root)
+            _disp.start()
+
             def _wait_thread():
                 from app.elevation import wait_for_elevated_process
                 success = wait_for_elevated_process(timeout=60.0)
 
                 def _on_done():
+                    # the hand-back is arriving; this pump has done its job
+                    try:
+                        _disp.stop()
+                    except Exception:
+                        pass
                     if success:
                         try:
                             self.root.destroy()
@@ -191,7 +206,7 @@ class AdminGateFrame(tk.Frame):
                             pass
 
                 try:
-                    self.root.after(0, _on_done)
+                    _disp.post(_on_done)
                 except Exception:
                     pass
 

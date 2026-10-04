@@ -62,6 +62,33 @@ P = io.open(PM, encoding="utf-8", newline="").read()
 FNS = {n.name: ast.get_source_segment(S, n) for n in ast.walk(ast.parse(S))
        if isinstance(n, ast.FunctionDef)}
 
+
+def _code_only(text):
+    """`text` with comment text blanked out, positions preserved.
+
+    Several checks below assert on the ABSENCE of a call form, and these files
+    carry comments that quote the old buggy code verbatim to explain what was
+    wrong -- so a plain substring test flags the documentation of the bug as
+    the bug. Blanking rather than joining keeps ordinary substring matching
+    working, and a docstring's own quotes are left alone.
+    """
+    lines = text.split("\n")
+    try:
+        import tokenize
+        import io as _io
+        for tok in tokenize.generate_tokens(_io.StringIO(text).readline):
+            if tok.type != tokenize.COMMENT:
+                continue
+            row, col = tok.start
+            ln = lines[row - 1]
+            lines[row - 1] = ln[:col] + " " * (len(ln) - col)
+    except Exception:
+        return text
+    return "\n".join(lines)
+
+
+FNS_CODE = {k: _code_only(v) for k, v in FNS.items()}
+
 print("[1] a row has somewhere to put an icon")
 ck("the row widget dict records an icon", '"icon": icon_lbl' in S)
 ck("an icon Label is created for every row", "icon_lbl = tk.Label(" in S)
@@ -88,8 +115,16 @@ ck("the PhotoImage is built in the Tk-thread half", "_apply_icons" in S
 ck("the GDI extraction happens in the worker, not the Tk half",
    "icon_ppm_bytes(" in li and "icon_ppm_bytes(" not in FNS.get("_apply_icons", ""))
 ck("the result is posted through the dispatcher", "_dispatch" in li)
-ck("it reads self.app with an _app fallback",
-   'getattr(self, "app", None)' in li and 'getattr(self, "_app", None)' in li)
+# BUG-001: this used to require `getattr(self, "app", None)` plus an
+# `_app` fallback, because the hop reached for the APPLICATION's
+# dispatcher. ThemedModal now owns one dispatcher per dialog and stops it
+# in close(), so the hop is `self._dispatch.post(...)` -- no attribute
+# lookup to typo, and no way to fall back to an off-thread after().
+ck("it posts through the dialog's own dispatcher",
+  "self._dispatch.post" in FNS_CODE.get("_load_icons", ""))
+ck("...and never falls back to a raw after()",
+  "self.after(0" not in FNS_CODE.get("_load_icons", "")
+  and "self._dlg.after(0" not in FNS_CODE.get("_load_icons", ""))
 ck("the PhotoImage is kept referenced, or Tk garbage-collects it",
    "lbl.image = img" in S)
 

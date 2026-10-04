@@ -11,7 +11,8 @@ from app.utils import (
     resolve_asset_path, powercfg_query_indexes, sc_query_start_type, restart_explorer,
     atomic_write_text, exclusive_create_text,
 )
-from app.config_persist import save_tweak_snapshot, get_tweak_snapshot, clear_tweak_snapshot
+from app.config_persist import (save_tweak_snapshot, get_tweak_snapshot,
+                                clear_tweak_snapshot, merge_tweak_snapshot)
 
 if IS_WINDOWS:
     import winreg
@@ -142,6 +143,76 @@ def _start_types_equal(a, b) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# SEC-001: scheduled-task NAMES are config-file data.
+#
+# The per-task prior states recorded by the telemetry tweaks are keyed by
+# task name, and those names come back out of config.json — which lives in
+# the user's profile and is hand-editable. Two call sites used to hand that
+# string straight to a shell:
+#
+#   revert_stop_telemetry   ->  run_cmd(ctx, f'schtasks /change /tn "{_task}" ...')
+#   revert_nvidia_telemetry ->  _set_task_enabled() -> a hand-built PowerShell
+#                               string with nested quotes and NO escaping
+#
+# Either one turns a tampered config.json into arbitrary command execution,
+# ELEVATED, at Undo time. The sibling `sc` call two lines away was already
+# fixed to argv + shell=False (see revert_nvidia_telemetry_optout) with the
+# reasoning written down; these two were missed.
+#
+# Both are now argv + shell=False, so cmd.exe never parses the value at all.
+# _valid_scheduled_task_name is defence in depth on top of that: it is the
+# same belt-and-braces posture the module's threat model (see the comment at
+# the top of this file) takes for every other config-derived value.
+# --------------------------------------------------------------------------- #
+
+#: Every character a genuine Windows scheduled-task name is built from.
+#: Real examples this must keep accepting:
+#:   \Microsoft\Windows\Application Experience\Microsoft Compatibility Appraiser
+#:   NvTmRep_C_wxyz1234
+#: Notably absent: quotes, %, &, |, ;, $, backtick, CR/LF, and every other
+#: character cmd.exe or PowerShell would treat as syntax.
+_TASK_NAME_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyz"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "0123456789"
+    " _-.\\"
+)
+
+#: Longest real task name seen in the Microsoft\ tree, with headroom. A
+#: scheduled task path cannot be longer than MAX_PATH anyway.
+_MAX_TASK_NAME_LEN = 260
+
+
+def _valid_scheduled_task_name(name) -> bool:
+    """True if `name` is shaped like a real Windows scheduled-task name.
+
+    This is a shape check, not an allowlist of known tasks: the NVIDIA
+    telemetry tasks carry random GUID suffixes, so the exact set cannot be
+    enumerated. What can be rejected is anything containing a character that
+    a command interpreter would treat as syntax.
+    """
+    if not isinstance(name, str):
+        return False
+    if not name or len(name) > _MAX_TASK_NAME_LEN:
+        return False
+    if name.strip() != name:          # leading/trailing whitespace is a sign
+        return False                   # of a crafted value, not a real task
+    return all(ch in _TASK_NAME_CHARS for ch in name)
+
+
+def _ps_quote(value: str) -> str:
+    """Single-quote a value for embedding inside a PowerShell -Command string.
+
+    Only needed for the PowerShell cmdlets, which have no argv form for
+    -TaskName. Within single quotes PowerShell treats every character
+    literally, so doubling an embedded quote is the complete escape — and
+    because the caller passes the whole thing as ONE argv element with
+    shell=False, cmd.exe is not involved at all.
+    """
+    return "'%s'" % str(value).replace("'", "''")
+
+
+# --------------------------------------------------------------------------- #
 # BUG-016: per-task prior state for scheduled tasks.
 #
 # The telemetry tweaks disable/enable task GROUPS by wildcard, because the
@@ -189,24 +260,31 @@ def _merge_tweak_snapshot(task_id, values):
 
     `save_tweak_snapshot` deliberately refuses to overwrite a non-empty
     snapshot, which is right for the usual "keep the ORIGINAL pre-tweak
-    value" rule but wrong here: the NVIDIA apply records the service start
-    type first and the per-task states a moment later, and the second write
-    must not erase the first. Only ADDS or overwrites the keys it is given,
-    so the original service value is preserved.
+    value" rule but wrong here: the NVIDIA and telemetry applies record the
+    service start type first and the per-task states a moment later, and the
+    second write must not erase the first.
+
+    ARCH-002: this used to do that merge by hand --
+
+        existing = get_tweak_snapshot(task_id)
+        existing.update(values)
+        clear_tweak_snapshot(task_id)     # <-- snapshot now GONE
+        save_tweak_snapshot(task_id, existing)
+
+    -- which is three separate lock acquisitions. update_config holds
+    _config_lock across load-mutate-save specifically to prevent lost
+    updates, and this sequence defeated it: between the clear and the save
+    the snapshot did not exist, so a crash, a concurrent --auto-clean, or a
+    second writer in that window destroyed the task's entire undo history.
+    merge_tweak_snapshot does the same merge in one atomic call.
+
+    The module-level name is the seam every other tweak in this file uses,
+    so a test can still intercept it.
     """
     if not values:
         return
     try:
-        # Deliberately the MODULE-level names, not a fresh import from
-        # config_persist: that is the seam every other tweak in this file uses,
-        # and re-importing bypassed it — a test could not intercept the merge,
-        # so the merge silently wrote to the real user config instead.
-        existing = dict(get_tweak_snapshot(task_id) or {})
-        existing.update(values)
-        # clear first so save_tweak_snapshot's "already present" guard does
-        # not reject the merge
-        clear_tweak_snapshot(task_id)
-        save_tweak_snapshot(task_id, existing)
+        merge_tweak_snapshot(task_id, values)
     except Exception:
         # a bookkeeping failure must not abort the apply; the primary change
         # has already been made and revert still works from whatever is saved
@@ -254,12 +332,30 @@ def _collect_task_priors(ctx, patterns):
 
 
 def _set_task_enabled(ctx, name, enabled):
-    """Enable or disable one named scheduled task. True on success."""
+    """Enable or disable one named scheduled task. True on success.
+
+    SEC-001: this used to hand a config-file-derived name to a shell:
+
+        'powershell -NoProfile -Command "%s-ScheduledTask -TaskName \'%s\' ..."'
+                     % (verb, name)
+
+    with no escaping whatsoever, under an implicit shell=True. A task name of
+    x' ; calc.exe ; ' reached cmd.exe ELEVATED. Now: the name is shape-checked,
+    quoted for PowerShell, and passed as a single argv element with
+    shell=False, so no command interpreter other than PowerShell itself ever
+    sees it -- and PowerShell treats single-quoted content literally.
+    """
+    if not _valid_scheduled_task_name(name):
+        ctx.log("  ! refusing to touch scheduled task with an implausible "
+                "name (not in config.json verbatim): %r" % (name,))
+        return False
     verb = "Enable" if enabled else "Disable"
     return run_cmd(
         ctx,
-        'powershell -NoProfile -Command "%s-ScheduledTask -TaskName \'%s\' '
-        '-ErrorAction SilentlyContinue"' % (verb, name)) == 0
+        ["powershell", "-NoProfile", "-Command",
+         "%s-ScheduledTask -TaskName %s -ErrorAction SilentlyContinue"
+         % (verb, _ps_quote(name))],
+        shell=False, timeout=60) == 0
 
 
 _SCHTASKS_ENABLED = "Enabled"
@@ -383,13 +479,15 @@ def _restore_powercfg_pairs(ctx: TaskContext, task_id: str, pairs: list[tuple[st
     # ---- pass 2: write. Every value above is already known good. ----------
     failures: list = []
     for key, subgroup, setting, value, dc_value in plan:
-        rc = run_cmd(ctx, f"powercfg /setacvalueindex scheme_current {subgroup} {setting} {value}")
+        rc = run_cmd(ctx, ["powercfg", "/setacvalueindex", "scheme_current",
+                           subgroup, setting, str(value)], shell=False)
         if rc != 0:
             failures.append(f"{key} AC")
         # snapshot may also carry the DC ("key:dc") value if the machine
         # was on battery at apply time
         if dc_value is not None:
-            rc_dc = run_cmd(ctx, f"powercfg /setdcvalueindex scheme_current {subgroup} {setting} {dc_value}")
+            rc_dc = run_cmd(ctx, ["powercfg", "/setdcvalueindex", "scheme_current",
+                                 subgroup, setting, str(dc_value)], shell=False)
             if rc_dc != 0:
                 failures.append(f"{key} DC")
     rc_active = run_cmd(ctx, "powercfg /setactive scheme_current")
@@ -518,7 +616,8 @@ def apply_ultimate_performance(ctx: TaskContext):
         if guid is None:
             # No scheme yet -> duplicate the hidden template, then re-detect
             # via the registry (language- and overlay-safe).
-            rc = run_cmd(ctx, f"powercfg -duplicatescheme {ULTIMATE_PERF_GUID}")
+            rc = run_cmd(ctx, ["powercfg", "-duplicatescheme", ULTIMATE_PERF_GUID],
+                   shell=False)
             guid = _find_ultimate_scheme_guid()
             if rc != 0 or guid is None:
                 raise RuntimeError(
@@ -529,7 +628,7 @@ def apply_ultimate_performance(ctx: TaskContext):
         else:
             ctx.log("Ultimate Performance plan already present — reusing it (no duplicate created).")
 
-        rc2 = run_cmd(ctx, f"powercfg -setactive {guid}")
+        rc2 = run_cmd(ctx, ["powercfg", "-setactive", guid], shell=False)
         if rc2 != 0:
             raise RuntimeError(f"powercfg -setactive failed (code {rc2}).")
 
@@ -581,7 +680,7 @@ def revert_ultimate_performance(ctx: TaskContext):
     # restore. Clearing unconditionally would destroy the true original on
     # a failed undo, and the next apply would snapshot the tweak's own
     # output as "prior state".
-    rc = run_cmd(ctx, f"powercfg -setactive {target}")
+    rc = run_cmd(ctx, ["powercfg", "-setactive", target], shell=False)
     active = _active_scheme_guid()
     if rc != 0 or active is None or not _guids_equal(active, target):
         raise RuntimeError(
@@ -751,21 +850,53 @@ def revert_disable_mouse_accel(ctx: TaskContext):
         ctx.log("  (no snapshot found — restored to documented Windows defaults instead)")
 
 
+# Every registry value apply_visual_effects_perf writes. Kept as one list so
+# the snapshot, the writes and the SEC-001 allowlist entry cannot drift apart
+# again -- they had already drifted, which is how three of the four values
+# ended up unrestorable.
+#
+# UNDO-001: the snapshot used to cover MenuShowDelay ONLY, while the apply
+# wrote four values. The revert restored that one from the snapshot and
+# hardcoded 1 for the other three, so undoing the tweak silently destroyed
+# the user's real EnableTransparency / MinAnimate / TaskbarAnimations
+# settings. The allowlist entry mirrored the incomplete snapshot, so the
+# SEC-001 drift guard could not see it either.
+_VISUAL_EFFECTS_SPECS = [
+    ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+     "EnableTransparency"),
+    ("HKCU", "Control Panel\\Desktop\\WindowMetrics", "MinAnimate"),
+    ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+     "TaskbarAnimations"),
+    ("HKCU", "Control Panel\\Desktop", "MenuShowDelay"),
+]
+
+#: Windows' own out-of-the-box values, used only when no snapshot covers a
+#: key (tweak applied by an older build, or config.json cleared). Preferring
+#: absence is right where Windows ships no value; these two are the documented
+#: defaults for the others.
+_VISUAL_EFFECTS_DEFAULTS = {
+    ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+     "EnableTransparency"): ("1", None),
+    ("HKCU", "Control Panel\\Desktop\\WindowMetrics", "MinAnimate"):
+        ("1", "REG_SZ"),
+    ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+     "TaskbarAnimations"): ("1", None),
+    ("HKCU", "Control Panel\\Desktop", "MenuShowDelay"):
+        (None, "REG_SZ"),          # absent is the Windows default
+}
+
+
 def apply_visual_effects_perf(ctx: TaskContext):
     # M1 audit fix (double-owned MenuShowDelay): the menu_delay tweak also
-    # writes HKCU\...\Desktop\MenuShowDelay (snapshot + 100ms). This apply
-    # used to overwrite it with 0 and its revert hardcode 400 back —
-    # reverting one tweak clobbered the other's bookkeeping. Snapshot the
-    # prior value under OUR task id before writing (same helpers menu_delay
-    # uses); the revert restores exactly what this apply overwrote.
-    # Residual order-dependence (documented, not fixable without merging
-    # the tweaks): each undo restores what its own apply overwrote, so if
-    # both tweaks are applied, undoing them in apply order lands on the
-    # true original value — undoing in reverse order lands on the other
-    # tweak's output.
+    # writes HKCU\...\Desktop\MenuShowDelay (snapshot + 100ms). Each apply
+    # snapshots the prior value under ITS OWN task id, so undo restores
+    # exactly what that apply overwrote.
+    #
+    # Residual order-dependence (documented, not fixable without merging the
+    # tweaks): undoing both in apply order lands on the true original value;
+    # undoing in reverse order lands on the other tweak's output.
     had_snapshot = bool(get_tweak_snapshot("visual_effects"))
-    _snap_reg_values(ctx, "visual_effects",
-                     [("HKCU", "Control Panel\\Desktop", "MenuShowDelay")])
+    _snap_reg_values(ctx, "visual_effects", _VISUAL_EFFECTS_SPECS)
     try:
         reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
                       "EnableTransparency", 0)
@@ -780,22 +911,32 @@ def apply_visual_effects_perf(ctx: TaskContext):
 
 
 def revert_visual_effects_perf(ctx: TaskContext):
-    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
-                  "EnableTransparency", 1)
-    reg_set_value_checked(ctx, "HKCU", "Control Panel\\Desktop\\WindowMetrics", "MinAnimate", "1", value_type="REG_SZ")
-    reg_set_value_checked(ctx, "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
-                  "TaskbarAnimations", 1)
-    # M1 audit fix: restore the snapshotted prior MenuShowDelay (an absent
-    # prior value is deleted back to absence) instead of hardcoding 400 —
-    # the hardcode clobbered the menu_delay tweak's value and any custom
-    # delay the user had set.
-    if get_tweak_snapshot("visual_effects").get("specs"):
-        _restore_reg_values(ctx, "visual_effects", value_type="REG_SZ")
-    else:
-        # No snapshot (tweak applied by an older app version, or config
-        # cleared): Windows' own default is an ABSENT value — remove ours.
-        ctx.log("  (no MenuShowDelay snapshot on file — removing the value; Windows then uses its default)")
-        reg_delete_value(ctx, "HKCU", "Control Panel\\Desktop", "MenuShowDelay")
+    # Restore every value the snapshot covers, using the type _snap_reg_values
+    # recorded for each one (so the two REG_DWORD keys are not written back as
+    # REG_SZ). Any value the snapshot does NOT cover -- an older build's
+    # one-key snapshot, or a cleared config -- falls back to the documented
+    # Windows default rather than being left at this tweak's output.
+    snap = get_tweak_snapshot("visual_effects") or {}
+    covered = set()
+    for spec in (snap.get("specs") or []):
+        if isinstance(spec, (list, tuple)) and len(spec) >= 3:
+            covered.add((spec[0], spec[1], spec[2]))
+
+    if covered:
+        _restore_reg_values(ctx, "visual_effects")
+
+    missing = [s for s in _VISUAL_EFFECTS_SPECS if s not in covered]
+    if missing:
+        ctx.log("  (%d of %d values had no snapshot — restoring the documented "
+                "Windows default instead)" % (len(missing), len(_VISUAL_EFFECTS_SPECS)))
+    for hive, path, name in missing:
+        value, vtype = _VISUAL_EFFECTS_DEFAULTS[(hive, path, name)]
+        if value is None:
+            # Windows ships no value here; removing ours restores the default.
+            reg_delete_value(ctx, hive, path, name)
+        else:
+            reg_set_value_checked(ctx, hive, path, name, value,
+                                  value_type=vtype)
 
 
 _NET_THROTTLE_SPECS = [
@@ -1185,8 +1326,12 @@ def apply_usb_suspend(ctx: TaskContext):
     # index) had that value silently overwritten by Undo. Snapshot the real
     # AC and DC indexes first, like every other powercfg tweak here.
     _snapshot_powercfg_pairs(ctx, "usb_suspend", _USB_SUSPEND_PAIRS)
-    rc_ac = run_cmd(ctx, f"powercfg /setacvalueindex scheme_current {_USB_SUSPEND_SUBGROUP} {_USB_SUSPEND_SETTING} 0")
-    rc_dc = run_cmd(ctx, f"powercfg /setdcvalueindex scheme_current {_USB_SUSPEND_SUBGROUP} {_USB_SUSPEND_SETTING} 0")
+    rc_ac = run_cmd(ctx, ["powercfg", "/setacvalueindex", "scheme_current",
+                              _USB_SUSPEND_SUBGROUP, _USB_SUSPEND_SETTING, "0"],
+                   shell=False)
+    rc_dc = run_cmd(ctx, ["powercfg", "/setdcvalueindex", "scheme_current",
+                              _USB_SUSPEND_SUBGROUP, _USB_SUSPEND_SETTING, "0"],
+                   shell=False)
     if rc_ac != 0 and rc_dc != 0:
         # Nothing was written, so there is nothing to undo - drop the snapshot
         # rather than leave an Undo record for a change that did not happen.
@@ -1321,7 +1466,7 @@ def revert_ssd_superfetch(ctx: TaskContext):
         # F-1: the snapshot value flows into a shell command string — only
         # a start-type keyword this app could have snapshotted may run.
         raise _snapshot_validation_error("ssd_superfetch", "start_type", target)
-    rc = run_cmd(ctx, f"sc config SysMain start= {target}")
+    rc = run_cmd(ctx, ["sc", "config", "SysMain", "start=", target], shell=False)
     if rc != 0:
         raise RuntimeError(f"Could not restore SysMain start type (sc exited {rc}) — snapshot kept.")
     run_cmd(ctx, "net start SysMain")
@@ -2022,7 +2167,8 @@ def apply_stop_telemetry(ctx: TaskContext):
     for _svc in ("DiagTrack", "dmwappushservice"):
         if ctx.cancelled():
             raise TaskCancelled("Stop Telemetry stopped by user.")
-        if run_cmd(ctx, f"sc config {_svc} start= disabled", timeout=30) == 0:
+        if run_cmd(ctx, ["sc", "config", _svc, "start=", "disabled"],
+                   shell=False, timeout=30) == 0:
             _ok += 1
         else:
             ctx.log(f"  ! skipped (service absent or access denied): sc config {_svc} start= disabled")
@@ -2042,7 +2188,15 @@ def apply_stop_telemetry(ctx: TaskContext):
             raise TaskCancelled("Stop Telemetry stopped by user.")
         if _was_disabled:
             continue          # already off — leave it, and it stays recorded
-        if run_cmd(ctx, f'schtasks /change /tn "{_task}" /disable', timeout=30) == 0:
+        # argv + shell=False, same reason as the revert side (SEC-001): this
+        # name is echoed out of schtasks output and then written into
+        # config.json, so it must never be handed to a command interpreter.
+        if not _valid_scheduled_task_name(_task):
+            ctx.log("  ! refusing to disable a scheduled task with an "
+                    f"implausible name: {_task!r}")
+            continue
+        if run_cmd(ctx, ["schtasks", "/change", "/tn", _task, "/disable"],
+                   shell=False, timeout=30) == 0:
             _ok += 1
         else:
             ctx.log(f"  ! skipped (task absent): {_task}")
@@ -2075,7 +2229,8 @@ def revert_stop_telemetry(ctx: TaskContext):
     for _svc, _t in _targets.items():
         if ctx.cancelled():
             raise TaskCancelled("Stop Telemetry restore stopped by user — snapshot kept for Undo.")
-        if run_cmd(ctx, f"sc config {_svc} start= {_t}", timeout=30) == 0:
+        if run_cmd(ctx, ["sc", "config", _svc, "start=", _t],
+                   shell=False, timeout=30) == 0:
             _ok += 1
         else:
             ctx.log(f"  ! skipped (service absent or access denied): sc config {_svc} start= {_t}")
@@ -2088,6 +2243,16 @@ def revert_stop_telemetry(ctx: TaskContext):
         for _task, _was_disabled in _priors.items():
             if not isinstance(_task, str) or not _task.strip():
                 continue
+            # SEC-001: this name is config.json data. It used to be
+            # interpolated into f'schtasks /change /tn "{_task}" /{_want}'
+            # under an implicit shell=True, so a key of
+            #   x" & calc.exe & rem "
+            # executed calc.exe ELEVATED at Undo time. argv + shell=False means
+            # cmd.exe never parses it; the shape check is defence in depth.
+            if not _valid_scheduled_task_name(_task):
+                ctx.log("  ! refusing to touch a scheduled task with an "
+                        f"implausible name (not in config.json verbatim): {_task!r}")
+                continue
             if ctx.cancelled():
                 raise TaskCancelled("Stop Telemetry restore stopped by user "
                                    "— snapshot kept for Undo.")
@@ -2097,8 +2262,8 @@ def revert_stop_telemetry(ctx: TaskContext):
             # read `enable if _was_disabled else disable`, which re-enabled
             # precisely the tasks the user had switched off.)
             _want = "disable" if _was_disabled else "enable"
-            if run_cmd(ctx, f'schtasks /change /tn "{_task}" /{_want}',
-                       timeout=30) == 0:
+            if run_cmd(ctx, ["schtasks", "/change", "/tn", _task, "/" + _want],
+                       shell=False, timeout=30) == 0:
                 _ok += 1
             else:
                 ctx.log(f"  ! skipped (task absent): {_task}")
@@ -3190,6 +3355,17 @@ def apply_refresh_rate_fix(ctx: TaskContext):
         # too). Nothing was changed, so nothing is snapshotted; the skip
         # is raised BEFORE the snapshot so state stays untouched.
         raise TaskSkipped(f"Already running at the maximum ({max_hz} Hz) — nothing to change.")
+    # UNDO-002: the snapshot used to be written AFTER ChangeDisplaySettingsW,
+    # with none of the had_snapshot/try/clear guard the other 59 applies
+    # carry. If the mode change succeeded and the save then failed (or the
+    # process died), the display was left changed and unrecorded -- and
+    # because save_tweak_snapshot refuses to overwrite, a retry could not
+    # repair it. That is the exact BUG-015 pattern this same file fixed
+    # everywhere else; see apply_prefer_ipv4's docstring.
+    #
+    # Record first, mutate second, and drop the record if the mutation fails.
+    had_snapshot = bool(get_tweak_snapshot("refresh_rate_fix"))
+    save_tweak_snapshot("refresh_rate_fix", {"mode": current})
     import ctypes
     try:
         DEVMODE = _devmode_class()
@@ -3209,11 +3385,16 @@ def apply_refresh_rate_fix(ctx: TaskContext):
         rc = user32.ChangeDisplaySettingsW(ctypes.byref(dm), 0x00000001)
         if rc != 0:
             raise RuntimeError(f"Display mode change failed (code {rc}).")
-    except RuntimeError:
+    except BaseException:
+        # Nothing was changed, so there is nothing to undo — drop the record
+        # we just took unless a previous good one was already on file (which
+        # is what makes a failed re-apply retryable rather than destructive).
+        if not had_snapshot:
+            try:
+                clear_tweak_snapshot("refresh_rate_fix")
+            except Exception:
+                pass
         raise
-    except Exception as exc:
-        raise RuntimeError(f"Could not apply refresh rate: {exc}")
-    save_tweak_snapshot("refresh_rate_fix", {"mode": current})
     ctx.log(f"Refresh rate set to {max_hz} Hz (was {cur_hz} Hz). "
             "If the screen stays black for >10s, Windows reverts it automatically.")
 
@@ -3604,8 +3785,47 @@ _TASK_REG_ALLOWLIST = {
     "verbose_boot": (
         ("HKLM", "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System", "VerboseStatus"),
     ),
+    # UNDO-001: this listed only MenuShowDelay, faithfully mirroring an
+    # incomplete snapshot -- the other three values the apply writes were
+    # therefore unrestorable, and the revert hardcoded 1 for them, destroying
+    # whatever the user actually had. All four are listed now, which is what
+    # lets the snapshot cover the whole write set.
     "visual_effects": (
+        ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+         "EnableTransparency"),
+        ("HKCU", "Control Panel\\Desktop\\WindowMetrics", "MinAnimate"),
+        ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+         "TaskbarAnimations"),
         ("HKCU", "Control Panel\\Desktop", "MenuShowDelay"),
+    ),
+    # UNDO-003: the Advanced tab's registry-backed tasks. They shipped with
+    # no snapshot at all and reverted by hardcoding a default or deleting the
+    # value, which destroyed the user's real prior state. They now snapshot
+    # through the same helpers as everything else here, and these entries are
+    # what let the restore path accept exactly those keys.
+    "adv_memory_integrity": (
+        ("HKLM", "SYSTEM\\CurrentControlSet\\Control\\DeviceGuard",
+         "EnableVirtualizationBasedSecurity"),
+        ("HKLM", "SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios\\HypervisorEnforcedCodeIntegrity",
+         "Enabled"),
+    ),
+    "adv_copilot": (
+        ("HKCU", "Software\\Policies\\Microsoft\\Windows\\WindowsCopilot",
+         "TurnOffWindowsCopilot"),
+    ),
+    "adv_disable_ai": (
+        ("HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsAI",
+         "AllowRecallEnablement"),
+        ("HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsAI",
+         "DisableAIDataAnalysis"),
+        ("HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsAI",
+         "DisableClickToDo"),
+        ("HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsAI",
+         "RemoveMicrosoftCopilotApp"),
+    ),
+    "wpbt_disable": (
+        ("HKLM", "SYSTEM\\CurrentControlSet\\Control\\Session Manager",
+         "DisableWpbtExecution"),
     ),
     "widgets_board_off": (
         ("HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\Feeds", "ShellFeedsTaskbarViewMode"),

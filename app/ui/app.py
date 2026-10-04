@@ -20,7 +20,7 @@ import time
 from app.utils import resolve_asset_path
 import tkinter as tk
 from tkinter import ttk, messagebox
-from app.config import APP_NAME, WINDOW_MIN_SIZE, WINDOW_SIZE
+from app.config import APP_NAME, WINDOW_MIN_SIZE, WINDOW_SIZE, resolve_window_size
 from app.config_persist import get_tweak_state, mark_tweak_applied, mark_tweak_reverted
 from app.elevation import is_admin, relaunch_as_admin
 from app.runner import CancellationToken, RunState
@@ -30,26 +30,8 @@ from app.runner.task_runner import invoke_task
 from app.tab_presets import PRESETS, TABS, TAB_NAMES
 from app.toast import notify_clean_complete, notify_low_space, show_toast
 from app.ui.base import ThemedModal, Tooltip, _themed_askyesno, _themed_showinfo
-from app.ui.dialogs.dns_tester_dialog import DnsTesterDialog
-from app.ui.dialogs.drive_toolkit_dialog import DriveToolkitDialog
-from app.ui.dialogs.game_server_ping_dialog import GameServerPingDialog
-from app.ui.dialogs.gamepad_dialog import GamepadDialog
-from app.ui.dialogs.hardware_monitor_dialog import HardwareMonitorDialog
-from app.ui.dialogs.keyboard_tester_dialog import KeyboardTesterDialog
-from app.ui.dialogs.mic_check_dialog import MicCheckDialog
-from app.ui.dialogs.monitor_test_dialog import MonitorTestDialog
-from app.ui.dialogs.mouse_tester_dialog import MouseTesterDialog
-from app.ui.dialogs.pilot_dialog import PilotDialog
-from app.ui.dialogs.process_manager_dialog import ProcessManagerDialog
-from app.ui.dialogs.quick_tools_dialog import QuickToolsDialog
 from app.ui.dialogs.scorecard_dialog import ScorecardDialog
-from app.ui.dialogs.speaker_test_dialog import SpeakerTestDialog
-from app.ui.dialogs.specs_dialog import SpecsDialog
-from app.ui.dialogs.speed_test_dialog import SpeedTestDialog
-from app.ui.dialogs.startup_manager_dialog import StartupManagerDialog
-from app.ui.dialogs.storage_insight_dialog import StorageInsightDialog
-from app.ui.dialogs.uninstall_programs_dialog import UninstallProgramsDialog
-from app.ui.dialogs.webcam_dialog import WebcamDialog
+from app.ui.dialogs.registry import open_dialog
 from app.ui.hardware.drives import _snapshot_all_drives, _system_drive_root
 from app.ui.theme import COLORS, F, TAB_ACCENTS, _hex_lerp
 from app.ui.widgets import AnimatedButton, AnimatedProgressBar, ScrollableRoundedPanel
@@ -82,7 +64,10 @@ class Application:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(APP_NAME)
-        self.root.geometry(WINDOW_SIZE)
+        # Derived from the work area, not hardcoded (app/config.py explains
+        # why). Falls back to WINDOW_SIZE when the work area is unreadable.
+        self._window_size = resolve_window_size(self.root, WINDOW_SIZE)
+        self.root.geometry(self._window_size)
         self.root.minsize(*WINDOW_MIN_SIZE)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.configure(bg=COLORS["bg"])
@@ -961,10 +946,21 @@ class Application:
                 from app.update_checker import check_for_updates
                 result = check_for_updates(UPDATE_REPO, timeout=10)
                 if result.get('update_available'):
-                    # Show update banner on main thread (guard destroyed root)
+                    # Hand straight to the dispatcher. It owns the dead-root
+                    # check (see TkDispatcher._pump) and it does it on the Tk
+                    # thread.
+                    #
+                    # This used to guard with `if self.root.winfo_exists():`
+                    # right here -- a Tcl call from the worker thread, under
+                    # a comment claiming it was the main thread. It was the
+                    # last off-thread Tk call in the file, and it contradicted
+                    # three other comments in this same module plus
+                    # tkdispatch.py, all of which say worker threads must not
+                    # touch Tk at all: a foreign Tk call waits on the
+                    # interpreter and then raises, and on a destroyed root it
+                    # burns about a second first.
                     try:
-                        if self.root.winfo_exists():
-                            self._dispatch.post(lambda: self._show_update_banner(result))
+                        self._dispatch.post(lambda: self._show_update_banner(result))
                     except Exception:
                         pass
             except Exception:
@@ -1181,8 +1177,11 @@ class Application:
             TAB_NAMES[min(len(TAB_NAMES) - 1, TAB_NAMES.index(self.active_tab) + 1)]))
         self.switch.bind("<Return>", lambda e: None)  # arrows are the activation
         self.switch.bind("<space>", lambda e: None)
-        # persistent items — created once, never deleted
-        self._switch_track = self._canvas_round_rect(
+        # persistent items — created once, never deleted. The canvas item ID
+        # is deliberately not kept: nothing ever moves or deletes the track
+        # (only _switch_thumb is repositioned), so storing it was a
+        # write-only attribute.
+        self._canvas_round_rect(
             self.switch, 0, 0, self._switch_w, 44, 22,
             fill=COLORS["bg_alt"], outline="")
         thumb_w = self._seg - 8
@@ -1450,44 +1449,16 @@ class Application:
             pass
 
     def _open_storage_insight(self):
-        """Storage Insight entry (Tools tab card + drive-chip right-click +
-        low-space nudge chip + Health fix-action). Opens the X-button
-        popup (user call: in-tab panels have no room at 1040x800 — the
-        800x600 modal is the right surface). No-op while a run owns the
-        progress UI."""
-        try:
-            with self._busy_lock:
-                busy = self._busy
-        except Exception:
-            busy = False
-        if busy:
-            try:
-                self.set_status("Busy — wait for the current task to finish (or press ✕ Stop).")
-            except Exception:
-                pass
-            return
-        try:
-            StorageInsightDialog(self.root, self).wait()
-        except Exception:
-            pass
+        """Opens the storage_insight dialog. See app/ui/dialogs/registry.py."""
+        open_dialog(self, "storage_insight")
 
     def _open_dns_tester(self):
-        """gaming_dns row button entry (delegates here). Opens the DNS
-        popup. No busy-guard: opening never touches the run engine —
-        only Apply does, and run_tasks guards busy itself."""
-        try:
-            DnsTesterDialog(self.root, self).wait()
-        except Exception:
-            pass
+        """Opens the dns_tester dialog. See app/ui/dialogs/registry.py."""
+        open_dialog(self, "dns_tester")
 
     def _open_process_manager(self):
-        """Process Manager (Tools tab card). Live top processes by CPU/RAM
-        with one-click Close. No busy-guard needed — sampling is lightweight
-        and closing is an explicit user action."""
-        try:
-            ProcessManagerDialog(self.root, self).wait()
-        except Exception:
-            pass
+        """Opens the process_manager dialog. See app/ui/dialogs/registry.py."""
+        open_dialog(self, "process_manager")
 
     # ---------------- Game Session Auto-Pilot (feature 6) ---------------- #
     # The watcher thread lives only while the GUI runs (started here on
@@ -1499,29 +1470,16 @@ class Application:
     # thread only ever schedules after() hops — never touches widgets.
 
     def _open_pilot_dialog(self):
-        """Pilot entry (Tools tab card). Opens the setup popup (setup
-        only, no busy-guard needed)."""
-        try:
-            PilotDialog(self.root, self).wait()
-        except Exception:
-            pass
+        """Opens the pilot dialog. See app/ui/dialogs/registry.py."""
+        open_dialog(self, "pilot")
 
     def _open_speed_test(self):
-        """Speed Test entry (Tools tab card). Opens the speed popup
-        (read-only measurement, no busy-guard needed — same rationale
-        as the DNS tester)."""
-        try:
-            SpeedTestDialog(self.root, self).wait()
-        except Exception:
-            pass
+        """Opens the speed_test dialog. See app/ui/dialogs/registry.py."""
+        open_dialog(self, "speed_test")
 
     def _open_hw_monitor(self):
-        """Hardware Monitor entry (Tools tab card). Read-only live
-        stats, no busy-guard needed — same rationale as Speed Test/DNS."""
-        try:
-            HardwareMonitorDialog(self.root, self).wait()
-        except Exception:
-            pass
+        """Opens the hw_monitor dialog. See app/ui/dialogs/registry.py."""
+        open_dialog(self, "hw_monitor")
 
     def _refresh_mode_label(self):
         """Repaint the Administrator/Limited badge, and (re)bind the
@@ -1596,67 +1554,32 @@ class Application:
         threading.Thread(target=_wait_thread, daemon=True).start()
 
     def _open_quick_tools(self):
-        """Quick Tools entry (Tools tab card). Opens the shortcuts
-        popup (read-only launchers, no busy-guard needed)."""
-        try:
-            tools_tab = self.tabs.get("Tools")
-            open_target = getattr(tools_tab, "_open_target", None)
-            if open_target is None:
-                return
-            QuickToolsDialog(self.root, self, open_target).wait()
-        except Exception:
-            pass
+        """Opens the quick_tools dialog. See app/ui/dialogs/registry.py."""
+        open_dialog(self, "quick_tools")
 
     def _open_gamepad_tester(self):
-        """Gamepad Tester entry (Tools tab card). Opens the tester
-        popup (read-only XInput polls, no busy-guard needed — same
-        rationale as the speed popup)."""
-        try:
-            GamepadDialog(self.root, self).wait()
-        except Exception:
-            pass
+        """Opens the gamepad_tester dialog. See app/ui/dialogs/registry.py."""
+        open_dialog(self, "gamepad_tester")
 
     def _open_mic_check(self):
-        """Mic Check entry (Tools tab card). Opens the check
-        popup (read-only device/consent reads + meter, no busy-guard
-        needed — same rationale as the speed popup)."""
-        try:
-            MicCheckDialog(self.root, self).wait()
-        except Exception:
-            pass
+        """Opens the mic_check dialog. See app/ui/dialogs/registry.py."""
+        open_dialog(self, "mic_check")
 
     def _open_game_server_ping(self):
-        """Game Server Ping entry (Tools tab card). Opens the ping
-        popup (read-only measurement, no busy-guard needed — same
-        rationale as the speed popup)."""
-        try:
-            GameServerPingDialog(self.root, self).wait()
-        except Exception:
-            pass
+        """Opens the game_server_ping dialog. See app/ui/dialogs/registry.py."""
+        open_dialog(self, "game_server_ping")
 
     def _open_keyboard_tester(self):
-        """Keyboard Tester entry (Tools tab card). Opens the tester
-        popup (pure Tk key events, no busy-guard needed)."""
-        try:
-            KeyboardTesterDialog(self.root, self).wait()
-        except Exception:
-            pass
+        """Opens the keyboard_tester dialog. See app/ui/dialogs/registry.py."""
+        open_dialog(self, "keyboard_tester")
 
     def _open_monitor_test(self):
-        """Monitor Test entry (Tools tab card). Opens the Info + Dead
-        Pixels popup (read-only query + solid fills, no busy-guard)."""
-        try:
-            MonitorTestDialog(self.root, self).wait()
-        except Exception:
-            pass
+        """Opens the monitor_test dialog. See app/ui/dialogs/registry.py."""
+        open_dialog(self, "monitor_test")
 
     def _open_speaker_test(self):
-        """Speaker Test entry (Tools tab card). Plays test tones
-        (winsound only, no busy-guard needed)."""
-        try:
-            SpeakerTestDialog(self.root, self).wait()
-        except Exception:
-            pass
+        """Opens the speaker_test dialog. See app/ui/dialogs/registry.py."""
+        open_dialog(self, "speaker_test")
 
     # ---------------- Game Night (feature 9) ---------------- #
     # One press to get the PC ready to play, one press to put it back.
@@ -1831,52 +1754,28 @@ class Application:
             pass
 
     def _open_drive_toolkit(self):
-        """Drive Toolkit entry (Tools tab card)."""
-        try:
-            DriveToolkitDialog(self.root, self).wait()
-        except Exception:
-            pass
+        """Opens the drive_toolkit dialog. See app/ui/dialogs/registry.py."""
+        open_dialog(self, "drive_toolkit")
 
     def _open_startup_manager(self):
-        """Startup Manager entry (Tools tab card)."""
-        try:
-            StartupManagerDialog(self.root, self).wait()
-        except Exception:
-            pass
+        """Opens the startup_manager dialog. See app/ui/dialogs/registry.py."""
+        open_dialog(self, "startup_manager")
 
     def _open_uninstall_programs(self):
-        """Uninstall Programs entry (Tools tab card — moved off the
-        bottom-corner icon row, 2026-09)."""
-        try:
-            UninstallProgramsDialog(self.root, self).wait()
-        except Exception:
-            pass
+        """Opens the uninstall_programs dialog. See app/ui/dialogs/registry.py."""
+        open_dialog(self, "uninstall_programs")
 
     def _open_webcam_test(self):
-        """Webcam Test entry (Tools tab card). Opens the popup that
-        drives the loopback getUserMedia test page (app/webcam_web.py).
-        The camera is released when either window closes, so no
-        busy-guard is needed — same rationale as the speed popup."""
-        try:
-            WebcamDialog(self.root, self).wait()
-        except Exception:
-            pass
+        """Opens the webcam_test dialog. See app/ui/dialogs/registry.py."""
+        open_dialog(self, "webcam_test")
 
     def _open_mouse_tester(self):
-        """Mouse Tester entry (Tools tab card). Buttons + aim-test
-        popup (pure Tk events, no busy-guard needed)."""
-        try:
-            MouseTesterDialog(self.root, self).wait()
-        except Exception:
-            pass
+        """Opens the mouse_tester dialog. See app/ui/dialogs/registry.py."""
+        open_dialog(self, "mouse_tester")
 
     def _open_pc_specs(self):
-        """PC Specs entry (Tools tab card). Read-only summary popup
-        (registry + SMBIOS reads, no busy-guard needed)."""
-        try:
-            SpecsDialog(self.root, self).wait()
-        except Exception:
-            pass
+        """Opens the pc_specs dialog. See app/ui/dialogs/registry.py."""
+        open_dialog(self, "pc_specs")
 
     def _pilot_preset_tasks(self):
         """Task objects for the configured session preset (tolerant:
@@ -2192,21 +2091,6 @@ class Application:
         except Exception:
             pass
 
-    def _pilot_on_detect(self, hits):
-        """Watcher thread → queue only. Kept as a named method because
-        the pre-H15 SessionPilot was handed this; it now delegates to the
-        orchestrator's producer, which does nothing but queue.put — never
-        root.after(), which is what used to drop events silently."""
-        self._pilot_sess.post_apply(hits)
-
-    def _pilot_pump(self):
-        """Tk thread only: drain pilot events queued by the watcher thread.
-        The loop itself moved to SessionOrchestrator in H15 — including the
-        part that decides whether to keep going. Pre-H15 this rescheduled
-        itself every 50ms for the rest of the app's life, even with the
-        feature off; it now runs only while a pilot is attached."""
-        self._pilot_sess.pump()
-
     def _modal_open(self):
         """True while any themed popup is up (a dialog is open).
 
@@ -2388,10 +2272,6 @@ class Application:
             self.run_tasks("Tweak", runnable, mode="run", quiet=True)
         except Exception:
             pass
-
-    def _pilot_on_exit(self):
-        """Watcher thread → queue only (see _pilot_on_detect)."""
-        self._pilot_sess.post_revert()
 
     def _pilot_revert(self):
         """Tk thread: revert ONLY fresh session keys still marked applied
@@ -3600,6 +3480,21 @@ class Application:
         if gen is None:
             return
 
+        # Same guarantee as run_tasks: the slot is claimed but no worker
+        # exists yet, so any failure in the admin-gating dialog, the button
+        # updates or the progress setup must release it. _abort_unstarted_run
+        # explains what happened here before this guard existed.
+        try:
+            self._start_claimed_install(gen, tasks, apps)
+        except Exception as exc:                       # noqa: BLE001
+            self._abort_unstarted_run(exc)
+
+    def _start_claimed_install(self, gen, tasks, apps):
+        """The claimed-but-not-yet-started half of install_selected_mixed.
+
+        The caller must already hold the claim (PREFLIGHT) for `gen`.
+        """
+
         # Admin gating for Essentials that need it (same rule as other tabs)
         if not is_admin():
             admin_blocked = [t for t in tasks if t.admin_required]
@@ -3841,6 +3736,26 @@ class Application:
         if gen is None:
             return
 
+        # Everything from here to `thread.start()` happens with the run slot
+        # claimed but NO worker alive yet. A raise anywhere in that window
+        # used to unwind past _release_run() and strand the app in PREFLIGHT
+        # permanently (busy forever, close refused) — see
+        # _abort_unstarted_run. Nothing after thread.start() can raise, so
+        # this handler can never pull the slot out from under a live worker.
+        try:
+            self._start_claimed_run(gen, tab_name, tasks, mode, quiet,
+                                    toast_kind, toast_extra)
+        except Exception as exc:                       # noqa: BLE001
+            self._abort_unstarted_run(exc)
+
+    def _start_claimed_run(self, gen, tab_name, tasks, mode, quiet,
+                           toast_kind, toast_extra):
+        """The claimed-but-not-yet-started half of run_tasks.
+
+        Split out so the try/except that guarantees the run slot is released
+        wraps exactly the pre-worker window and nothing else. The caller must
+        already hold the claim (PREFLIGHT) for `gen`.
+        """
         # ---- Pre-flight checks (user request): fail fast with plain
         # language instead of dying mid-DISM. Long-run = 5+ tasks or any
         # task flagged long-running by the Repair tab's nature. ----
@@ -3910,21 +3825,6 @@ class Application:
         self.progress_bar.set_indeterminate(True)
         self.set_status(f"Starting {len(tasks)} task(s)...")
 
-        # Scorecard 'before' snapshot: C: free/total bytes captured on the
-        # Tk thread right before the worker starts (one instant
-        # GetDiskFreeSpaceExW call, same source as _preflight_check /
-        # _query_drives). The worker reads it via self._run_before_bytes;
-        # a failed read (None) simply renders the scorecard without the
-        # before/after bar — never invented numbers.
-        self._run_before_bytes = self._query_drive_free_total(
-            _system_drive_root())
-        run_before_bytes = self._run_before_bytes
-        # Feature 4: same instant reading for every ready drive, so the
-        # scorecard can name each drive that gained space (a clean often
-        # spans the system SSD and a games drive).
-        self._run_before_drives = _snapshot_all_drives(
-            self._query_drives, self._query_drive_free_total)
-        run_before_drives = self._run_before_drives
         # H10: the run owns its results list. `self._run_results` still points
         # at it (tools/smoke_async.py reads that attribute after a run), but
         # rebinding it on the next run no longer corrupts this run's data: the
@@ -3935,8 +3835,7 @@ class Application:
         thread = threading.Thread(target=self._run_tasks_worker,
                                   args=(tab_name, tasks, mode, quiet,
                                         toast_kind, toast_extra, gen,
-                                        run_results, run_before_bytes,
-                                        run_before_drives), daemon=True)
+                                        run_results), daemon=True)
         self._mark_running(thread)
         thread.start()
 
@@ -4047,6 +3946,45 @@ class Application:
             self._state = st if st is RunState.CANCELLING else RunState.RUNNING
         else:
             self._state = RunState.IDLE
+
+    def _abort_unstarted_run(self, exc):
+        """Release a claimed run slot whose worker never started.
+
+        run_tasks and install_selected_mixed both claim the single run slot
+        (PREFLIGHT) and then do a fair amount of work before a worker exists:
+        pre-flight notices, hazard-combo prompts, an admin-gating dialog, the
+        config write, the button/progress updates and the scorecard's
+        before-snapshot. Any of those can raise — a TclError on a root being
+        destroyed, a grab_set failure, a bad drive query.
+
+        Before this helper, such an exception unwound straight out of the Tk
+        callback, so _release_run() was never reached and the app stayed in
+        PREFLIGHT for the rest of the session: _busy stayed True forever and
+        _on_close refused to close the window. The user had to kill the
+        process. Both call sites now funnel failures here.
+
+        Safe to call only BEFORE _mark_running() + thread.start(): once a
+        worker owns the slot it releases it itself, and releasing underneath
+        it would report a bogus outcome.
+        """
+        try:
+            self._release_run(ok=False)
+        except Exception:
+            pass
+        try:
+            self.log(f"! Could not start the run: {exc}")
+            import traceback
+            self.log(traceback.format_exc().strip())
+        except Exception:
+            pass
+        try:
+            _themed_showinfo(
+                self.root, "Could Not Start",
+                "Something went wrong before the run could start.\n\n"
+                f"{exc}\n\nThe app is still usable — see the log for details.",
+                accent=COLORS["accent_red"])
+        except Exception:
+            pass
 
     def _claim_run(self):
         """Take the single run slot and return this run's generation number.
@@ -4192,10 +4130,38 @@ class Application:
 
     def _run_tasks_worker(self, tab_name, tasks, mode, quiet=False,
                           toast_kind=None, toast_extra=None, gen=None,
-                          run_results=None, run_before_bytes=None,
-                          run_before_drives=None):
+                          run_results=None):
         verb = "Undoing" if mode == "revert" else "Running"
         self.log(f"===== {verb} {len(tasks)} {tab_name} task(s) =====")
+
+        # Scorecard 'before' snapshot -- taken HERE, on the worker thread,
+        # not on the Tk thread before the thread was even started.
+        #
+        # This used to run in _start_claimed_run, which put up to 26
+        # GetDiskFreeSpaceExW calls on the Tk thread before and after every
+        # run. That is the exact hazard the disk monitor was moved off-thread
+        # to fix (see _start_disk_monitor): one unreachable mapped network
+        # drive stalls the UI for the length of its SMB timeout, so the app
+        # froze before the run appeared to start and again before the
+        # scorecard appeared. Measuring here is also more honest -- the
+        # reading now brackets the actual work rather than the UI setup.
+        #
+        # A failed read yields None/{} and the scorecard renders without the
+        # before/after bar. It never invents numbers.
+        try:
+            run_before_bytes = self._query_drive_free_total(_system_drive_root())
+        except Exception:
+            run_before_bytes = None
+        try:
+            run_before_drives = _snapshot_all_drives(
+                self._query_drives, self._query_drive_free_total)
+        except Exception:
+            run_before_drives = {}
+        # Still published for anything that wants to inspect the last run's
+        # baseline; the worker is the only writer and the scorecard reads the
+        # closure above, not this.
+        self._run_before_bytes = run_before_bytes
+        self._run_before_drives = run_before_drives
 
         ctx = TaskContext(log=self.log, set_status=self.set_status,
                           cancelled=lambda: self._cancel_requested)
@@ -4443,15 +4409,11 @@ class Application:
                 except Exception:
                     pass
                 return
-            try:
-                after = self._query_drive_free_total(_system_drive_root())
-            except Exception:
-                after = None
-            try:
-                after_drives = _snapshot_all_drives(
-                    self._query_drives, self._query_drive_free_total)
-            except Exception:
-                after_drives = {}
+            # `after` / `after_drives` are closed over from the WORKER thread,
+            # which measured them after the last task finished. They used to be
+            # read here, on the Tk thread, which put another 26 blocking
+            # GetDiskFreeSpaceExW calls in front of the scorecard -- the same
+            # UI-freeze hazard the disk monitor was moved off-thread to avoid.
             run_again = None
             if (not cancelled and tab_name == "Clean" and mode == "run"):
                 # 'Clean Again' — re-run the same selection. The task list
@@ -4499,6 +4461,23 @@ class Application:
                                          accent=COLORS["accent_green"])
                 except Exception:
                     pass
+        # Scorecard 'after' snapshot -- measured HERE, on the worker thread, right
+        # after the last task finished. It used to be taken inside _done_popup
+        # on the Tk thread, which put up to 26 blocking GetDiskFreeSpaceExW
+        # calls between the run finishing and the result card appearing. One
+        # unreachable mapped network drive stalled the UI for its whole SMB
+        # timeout. A failed read degrades to "no before/after bar"; it never
+        # invents numbers.
+        try:
+            after = self._query_drive_free_total(_system_drive_root())
+        except Exception:
+            after = None
+        try:
+            after_drives = _snapshot_all_drives(
+                self._query_drives, self._query_drive_free_total)
+        except Exception:
+            after_drives = {}
+
         # Routed through the dispatcher rather than root.after(0) called from
         # this worker thread: a cross-thread .after() can be dropped outright,
         # and this is the one hop whose loss means the user never sees the

@@ -8,6 +8,8 @@ sections share live Application state, so run_all() calls these in
 sequence.
 """
 
+from tools.smoke import assert_dialog_proportional
+
 
 def run(ctx):
     # names main() used to provide as locals
@@ -112,7 +114,7 @@ def run(ctx):
     _qd = gui.QuickToolsDialog(root, app, lambda t: None)
     try:
         root.update()
-        assert (_qd._modal_w, _qd._modal_h) == (800, 600), (_qd._modal_w, _qd._modal_h)
+        assert_dialog_proportional(_qd, root, "quick tools")
         shortcut_texts = []
         def _collect_labels(w, acc):
             for c in w.winfo_children():
@@ -138,7 +140,7 @@ def run(ctx):
     _gd = gui.GamepadDialog(root, app)
     try:
         root.update()
-        assert (_gd._modal_w, _gd._modal_h) == (800, 600), (_gd._modal_w, _gd._modal_h)
+        assert_dialog_proportional(_gd, root, "gamepad")
         assert len(_gd._pad_btns) == 14, len(_gd._pad_btns)
         _gd._paint_pad_idle()
         _shape, _text = _gd._pad_btns["A"]
@@ -237,7 +239,7 @@ def run(ctx):
     _md = gui.MicCheckDialog(root, app)
     try:
         root.update()
-        assert (_md._modal_w, _md._modal_h) == (800, 600), (_md._modal_w, _md._modal_h)
+        assert_dialog_proportional(_md, root, "mic check")
         _md._tick()
         root.update()
         _mic_texts = []
@@ -292,7 +294,7 @@ def run(ctx):
         _pd = gui.GameServerPingDialog(root, app)
         try:
             root.update()
-            assert (_pd._modal_w, _pd._modal_h) == (800, 600)
+            assert_dialog_proportional(_pd, root, "game server ping")
             for _ in range(60):
                 root.update()
                 import time as _t5

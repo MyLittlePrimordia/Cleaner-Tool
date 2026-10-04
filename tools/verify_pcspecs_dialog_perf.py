@@ -78,11 +78,18 @@ print("[3] the worker marshals through the dispatcher, reading self.app")
 ck("_show starts a worker thread", "Thread(" in _show)
 ck("...and names it, so it is identifiable in a stack dump",
    "name=" in _show and "PcSpecs" in _show)
-ck("it reads self.app with an _app fallback",
-   'getattr(self, "app", None)' in _show and 'getattr(self, "_app", None)' in _show,
-   _show[:0])
-ck("it posts through the dispatcher when one exists", "_dispatch" in _show)
-ck("...with an after() fallback if there is none", ".after(0," in _show)
+# BUG-001: these four used to require the `getattr(self, "app", None)` + `_app`
+# fallback dance AND an `.after(0, ...)` fallback, because the hop reached for
+# the application's dispatcher -- and the fallback was a Tk call on a foreign
+# thread (RuntimeError on Python 3.14, swallowed, so the section never
+# rendered). ThemedModal now owns one dispatcher per dialog, so there is one
+# hop and no fallback. Matched against code with comments blanked, because the
+# replacement's own comment quotes the old form.
+_code = "\n".join(ln.split("#")[0] for ln in _show.split("\n"))
+ck("it posts through the dialog's own dispatcher",
+   "self._dispatch.post" in _code)
+ck("...and has no after() fallback any more",
+   "self.after(0" not in _code and "self._dlg.after(0" not in _code)
 
 print()
 print("[4] a stale result cannot land on a section the user left")
@@ -127,6 +134,11 @@ from app.ui.dialogs.specs_dialog import SpecsDialog  # noqa: E402
 
 dlg = SpecsDialog.__new__(SpecsDialog)
 dlg.app = FakeApp()
+# BUG-001: the gather hop now goes through the DIALOG's own dispatcher --
+# ThemedModal creates one per dialog and stops it in close() -- rather than
+# reaching for the application's. `__new__` skips __init__, so supply it here
+# the same way the real constructor would.
+dlg._dispatch = FakeDispatch()
 dlg._rows = FakeRows()
 dlg._gather_seq = 0
 # a deliberately slow gather, so a blocking implementation is unmistakable
@@ -150,10 +162,10 @@ ck("a placeholder was shown immediately",
    any("Gathering" in str(c) for c in dlg._rows.calls), dlg._rows.calls[:1])
 
 deadline = time.time() + 5.0
-while time.time() < deadline and not dlg.app._dispatch.posted:
+while time.time() < deadline and not dlg._dispatch.posted:
     time.sleep(0.005)
-ck("the result arrived through the dispatcher", len(dlg.app._dispatch.posted) == 1,
-   len(dlg.app._dispatch.posted))
+ck("the result arrived through the dispatcher", len(dlg._dispatch.posted) == 1,
+   len(dlg._dispatch.posted))
 ck("...and the real rows were rendered",
    any("Processor" in str(c) for c in dlg._rows.calls),
    dlg._rows.calls[-1:])

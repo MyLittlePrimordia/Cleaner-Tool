@@ -21,7 +21,8 @@ import ast
 import io
 import sys
 
-sys.path.insert(0, r"C:\Users\User\Desktop\Cleaner Tool")
+import pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import tkinter as tk
 
@@ -43,9 +44,20 @@ def ck(label, cond, detail=""):
 
 
 # ------------------------------------------------------------------ static --
+# ROOT rather than a literal checkout path. This file used to open
+# r"C:\Users\User\Desktop\Cleaner Tool\app\ui\app.py" in three places, so it
+# raised FileNotFoundError on every machine except the one that path was
+# typed on -- the H11 invariant it guards had no working test at all.
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+
+def _read(rel):
+    """Read a repo-relative source file as text."""
+    return io.open(ROOT / rel, encoding="utf-8").read()
+
+
 print("\n[1] declared as a property, in the source")
-src = io.open(r"C:\Users\User\Desktop\Cleaner Tool\app\ui\app.py",
-              encoding="utf-8").read()
+src = _read("app/ui/app.py")
 tree = ast.parse(src)
 appcls = next(n for n in tree.body
               if isinstance(n, ast.ClassDef) and n.name == "Application")
@@ -65,8 +77,7 @@ if prop is not None:
 writers = []
 for p in ("app/ui/app.py", "app/ui/tabs/tasktab.py", "app/ui/tabs/installtab.py",
           "app/ui/tabs/toolstab.py"):
-    t = ast.parse(io.open(r"C:\Users\User\Desktop\Cleaner Tool" + "\\" +
-                          p.replace("/", "\\"), encoding="utf-8").read())
+    t = ast.parse(_read(p))
     for n in ast.walk(t):
         if isinstance(n, ast.Assign):
             for tg in n.targets:
@@ -158,8 +169,7 @@ try:
         appmod.get_tweak_state = orig
 
     print("\n[8] TaskTab keeps no copy of its own")
-    tsrc = io.open(r"C:\Users\User\Desktop\Cleaner Tool\app\ui\tabs\\tasktab.py",
-                   encoding="utf-8").read()
+    tsrc = _read("app/ui/tabs/tasktab.py")
     ck("tasktab does not import get_tweak_state",
        "get_tweak_state" not in tsrc)
     ck("tasktab does not assign app.tweak_state",

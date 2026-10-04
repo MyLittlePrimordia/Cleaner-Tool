@@ -129,7 +129,7 @@ class DriveToolkitDialog(ThemedModal):
             except Exception:
                 disks = []
             if not token[0]:
-                self._dlg.after(0, lambda: self._health_done(disks, token))
+                self._dispatch.post(lambda: self._health_done(disks, token))
 
         import threading
         threading.Thread(target=worker, daemon=True).start()
@@ -254,7 +254,7 @@ class DriveToolkitDialog(ThemedModal):
 
         def progress(frac):
             if not token[0]:
-                self._dlg.after(0, lambda: self._speed_bar.set_fraction(frac))
+                self._dispatch.post(lambda: self._speed_bar.set_fraction(frac))
 
         def worker():
             try:
@@ -264,7 +264,7 @@ class DriveToolkitDialog(ThemedModal):
             except Exception:
                 w, r = None, None
             if not token[0]:
-                self._dlg.after(0, lambda: self._speed_done(w, r, root, token))
+                self._dispatch.post(lambda: self._speed_done(w, r, root, token))
 
         import threading
         threading.Thread(target=worker, daemon=True).start()
@@ -396,7 +396,7 @@ class DriveToolkitDialog(ThemedModal):
 
         def progress(frac):
             if not token[0]:
-                self._dlg.after(0, lambda: self._cap_bar.set_fraction(frac))
+                self._dispatch.post(lambda: self._cap_bar.set_fraction(frac))
 
         def worker():
             try:
@@ -408,7 +408,7 @@ class DriveToolkitDialog(ThemedModal):
                 result = {"ok": False, "error": str(exc), "declared_bytes": 0,
                           "good_bytes": 0, "tested_bytes": 0}
             if not token[0]:
-                self._dlg.after(0, lambda: self._capacity_done(result, letter, token))
+                self._dispatch.post(lambda: self._capacity_done(result, letter, token))
 
         import threading
         threading.Thread(target=worker, daemon=True).start()

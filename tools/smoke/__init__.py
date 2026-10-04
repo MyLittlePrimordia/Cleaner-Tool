@@ -143,3 +143,36 @@ def settle(ctx, dlg, seconds=0.5):
         ctx.root.update()
         _t.sleep(0.01)
     dlg._results = {}
+
+
+def assert_dialog_proportional(dlg, root, label=""):
+    """A dialog must match what ThemedModal computes for its parent.
+
+    Six areas used to assert `(_modal_w, _modal_h) == (800, 600)` — the shared
+    fixed footprint. That assertion is what locked the behaviour in: every
+    dialog was 800x600 regardless of the main window, so once the main window
+    grew the popups read as small letterboxes floating inside it (user
+    report). ThemedModal now sizes dialogs as a clamped fraction of the
+    parent, so the assertion has to check THAT, not a constant.
+
+    Checks the real relationship — same formula, clamped — rather than
+    restating the numbers, so a deliberate change to the fraction or the
+    limits does not require editing six files.
+    """
+    from app.ui.base import ThemedModal
+    pw, ph = root.winfo_width(), root.winfo_height()
+    want_w, want_h = ThemedModal._proportional_size(root)
+    got = (dlg._modal_w, dlg._modal_h)
+    want = (want_w, want_h)
+    where = (" (%s)" % label) if label else ""
+    assert pw > 1 and ph > 1, \
+        "the parent window has no size (%dx%d) -- the dialog cannot be " \
+        "proportional to it%s" % (pw, ph, where)
+    assert got == want, \
+        "dialog is %dx%d, proportional size for a %dx%d parent is %dx%d%s" % (
+            got[0], got[1], pw, ph, want[0], want[1], where)
+    # And the real invariant behind the change: the dialog must never be
+    # bigger than the window it sits on.
+    assert got[0] < pw and got[1] < ph, \
+        "dialog %dx%d is not smaller than its %dx%d parent%s" % (
+            got[0], got[1], pw, ph, where)

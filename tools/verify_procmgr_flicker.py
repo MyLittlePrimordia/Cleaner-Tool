@@ -246,6 +246,13 @@ try:
         def after(self, _ms, fn):
             fn()
     _fake = _Fake()
+    # BUG-001: the icon hop now uses the DIALOG's own dispatcher (ThemedModal owns
+    # one and stops it in close()), not the application's -- so the fake carries
+    # `_dispatch` on itself. It is wired through a SEPARATE counter so the
+    # "_APPLIED == 1" assertion below still counts only the painted icon.
+    _DISPATCHED = []
+    _fake._dispatch = type("D", (), {"post": staticmethod(
+        lambda fn: (_DISPATCHED.append(1), fn())[1])})()
     _fake.app = type("A", (), {"_dispatch": type(
         "D", (), {"post": staticmethod(lambda fn: fn())})()})()
     _load = FNS["_load_icons"]
@@ -267,7 +274,8 @@ ck("the iconless exe is remembered BY PATH (so siblings still get tried)",
    _fake._icon_missed == {r"C:\app\Update.exe"},
    sorted(_fake._icon_missed))
 _ck_applied = ck("...and the icon-bearing exe reached the Tk-thread step",
-                 len(_APPLIED) == 1, "dispatch did not fire: %d" % len(_APPLIED))
+                 len(_APPLIED) == 1 and len(_DISPATCHED) == 1,
+                 "painted=%d dispatched=%d" % (len(_APPLIED), len(_DISPATCHED)))
 
 print()
 if FAILS:

@@ -53,7 +53,8 @@ INFO_NOTICES = [
     (
         REBOOT_TWEAK_KEYS,
         "ℹ️ Multiple selected tweaks require a reboot (HAGS, Priority Separation, Fast Startup, SSD tweaks, MPO). "
-        "You only need ONE reboot after all changes. The app will remind you at the end."
+        "You only need ONE reboot after all changes. The app will remind you at the end.",
+        "any",
     ),
 
     # Firewall reset wipes per-app allow rules (games re-prompt) — FYI
@@ -98,7 +99,8 @@ INFO_NOTICES = [
     (
         ["stop_telemetry", "privacy_baseline", "nvidia_telemetry"],
         "ℹ️ Several telemetry-reduction tweaks are selected (Stop Telemetry, Privacy Baseline, NVIDIA Opt-Out). "
-        "They overlap somewhat but are safe together — just know some switches do the same thing."
+        "They overlap somewhat but are safe together — just know some switches do the same thing.",
+        "any",
     ),
 
     # AllowTelemetry is owned by BOTH tweaks — limit_telemetry is the anchor
@@ -138,12 +140,34 @@ def _match_combos(selected_keys: set, combos) -> List[str]:
     ANCHOR (the act that causes the harm); the rest are the victims.
     A combo fires only when the anchor is present AND at least one
     other member is too. Single-key combos fire on that key alone.
+
+    BUG-014: that anchor rule is wrong for combos that genuinely have NO
+    anchor, and two of ours say so in their own comments. Anchor matching
+    keys off combo_keys[0], so for those two the first key listed silently
+    became the anchor:
+
+      * REBOOT_TWEAK_KEYS -- comment says "No single anchor: any pair", but
+        keys[0] is "hags", so SSD Prefetch + MPO Fix (two reboot tweaks,
+        HAGS not selected) matched NOTHING and the user got no "one reboot
+        covers all" note at all.
+      * ["stop_telemetry", "privacy_baseline", "nvidia_telemetry"] --
+        comment says "any 2 of the 3 (no anchor)", but Privacy Baseline +
+        NVIDIA Opt-Out without Stop Telemetry matched nothing.
+
+    So an entry may now carry a third element: "anchor" (default, previous
+    behaviour) or "any" (fire on any 2 members). Existing 2-tuples are
+    untouched and keep anchor semantics.
     """
     warnings = []
-    for combo_keys, message in combos:
+    for entry in combos:
+        combo_keys, message = entry[0], entry[1]
+        mode = entry[2] if len(entry) > 2 else "anchor"
         present = [k for k in combo_keys if k in selected_keys]
         if len(combo_keys) == 1:
             if present:
+                warnings.append(message)
+        elif mode == "any":
+            if len(present) >= 2:
                 warnings.append(message)
         elif present and combo_keys[0] in present and len(present) >= 2:
             warnings.append(message)

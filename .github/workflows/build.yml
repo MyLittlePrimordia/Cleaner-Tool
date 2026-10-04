@@ -45,6 +45,28 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Run architecture guard
+        # check_architecture.py pins the 13 structural invariants the H4-H16
+        # splits established: layering, the app.gui contract, asset
+        # resolution, the RunState FSM, generation gating, the read-only
+        # tweak_state view, and [13] the harness itself.
+        #
+        # This never ran in CI until now. Every defect found in the last
+        # audit reached main because nothing here could see it.
+        run: python -X utf8 -u tools/check_architecture.py
+
+      - name: Run full verification suite
+        # 50 checks: the state machine, generation gating, undo/snapshot
+        # correctness, the two injection paths, resource limits, icon
+        # parity, layout and perf budgets, and the two smoke suites.
+        #
+        # The runner injects PYTHONPATH and pins cwd for every child, so a
+        # check cannot be silently disabled by its own import bootstrap --
+        # which is how 9 of these (326 assertions) came to never run at all.
+        # It also hashes the user's config.json before and after and fails
+        # the build if the suite mutated it.
+        run: python -X utf8 -u tools/run_all_checks.py
+
       - name: Run smoke tests
         # audit fix: the build never ran any test — regressions (like the
         # ToggleSwitch duplicate-def bug) shipped silently. The harness
@@ -52,6 +74,10 @@ jobs:
         # smoke_async is the mainloop-driven twin: worker-thread after()
         # delivery (run engine -> scorecard, health check worker) only
         # works under a real mainloop, never under a manual update() pump.
+        #
+        # run_all_checks above already runs both; this step keeps them as
+        # separate, individually-legible CI steps so a smoke failure points
+        # straight at its own log line.
         run: |
           python -X utf8 -m tools.smoke_gui
           python -X utf8 -m tools.smoke_async

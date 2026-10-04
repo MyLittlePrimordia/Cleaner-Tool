@@ -8,6 +8,8 @@ sections share live Application state, so run_all() calls these in
 sequence.
 """
 
+from tools.smoke import assert_dialog_proportional
+
 
 def run(ctx):
     # names main() used to provide as locals
@@ -350,7 +352,7 @@ def run(ctx):
     try:
         _sd._stop_token[0] = True
         _settle(_sd)
-        assert (_sd._modal_w, _sd._modal_h) == (800, 600), (_sd._modal_w, _sd._modal_h)
+        assert_dialog_proportional(_sd, root, "speed test")
         assert set(_sd._row_values) == {"ping", "download", "upload", "stability"}
         # Ookla-style idle stage (user call): NO auto-start — the popup
         # waits on GO. Dial hidden, GO parked where the gauge will be,

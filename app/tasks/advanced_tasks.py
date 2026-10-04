@@ -2,8 +2,30 @@
 Advanced tab — kernel security, hypervisors, deep storage.
 All unchecked by default. Warning header displayed in GUI.
 
-Every task here is fully reversible via its revert function or an exact
-documented default value — nothing deletes system files.
+Every task here is reversible via its revert function or an exact documented
+default value — nothing deletes system files.
+
+UNDO-003: the registry-backed tasks below used to have a revert that
+hardcoded Windows' default value, or deleted the key outright, with NO
+snapshot anywhere. That silently destroyed whatever the user actually had:
+
+  adv_memory_integrity  wrote 0,0 and reverted to 1,1 — so undoing a machine
+                        that already had VBS off (or a vendor-tuned value)
+                        turned Memory Integrity ON.
+  adv_copilot           reverted with reg_delete_value, destroying any
+                        pre-existing TurnOffWindowsCopilot policy.
+  adv_disable_ai        deleted four policies, same problem.
+  wpbt_disable          deleted DisableWpbtExecution.
+
+These now use the same _snap_reg_values / _restore_reg_values pair as the
+rest of the Tweak tab, which records each value's real prior state AND its
+prior TYPE, and restores absence back to absence. The SEC-001 allowlist in
+tweak_tasks.py has entries for all four, so the restore path is allowlisted
+rather than falling through to the denylist-only default.
+
+The three non-registry tasks (bcdedit, powercfg -h, MMAgent) still cannot
+snapshot their prior state and keep their documented-default reverts; each
+one logs which value it is assuming.
 """
 
 import os
@@ -12,26 +34,105 @@ import subprocess
 from app.utils import (TaskContext, reg_set_value, reg_set_value_checked, reg_delete_value,
                        reg_delete_key, run_cmd, run_cmd_checked, IS_WINDOWS)
 
+# The snapshot primitives live with the tweaks that own them. tweak_tasks
+# does not import this module, so there is no cycle -- the same shape
+# monitor_test_dialog.py already uses for the display-mode helpers.
+from app.tasks.tweak_tasks import (  # noqa: E402
+    _snap_reg_values, _restore_reg_values,
+    get_tweak_snapshot, clear_tweak_snapshot,
+)
+
 if IS_WINDOWS:
     import winreg
 
 
+def _apply_registry(ctx: TaskContext, task_id: str, specs, writes):
+    """Snapshot `specs`, then apply `writes`, dropping the snapshot on failure.
+
+    The standard shape, factored out because four tasks here needed it and
+    they each had their own subtly-wrong version.
+
+    writes: iterable of (hive, path, name, value, value_type_or_None)
+    """
+    had_snapshot = bool(get_tweak_snapshot(task_id))
+    _snap_reg_values(ctx, task_id, specs)
+    try:
+        for hive, path, name, value, vtype in writes:
+            reg_set_value_checked(ctx, hive, path, name, value, value_type=vtype)
+    except BaseException:
+        # Nothing landed, so there is nothing to undo — drop the record we
+        # just took unless a previous good one was already on file, which is
+        # what keeps a failed re-apply retryable instead of destructive.
+        if not had_snapshot:
+            try:
+                clear_tweak_snapshot(task_id)
+            except Exception:
+                pass
+        raise
+
+
+def _revert_registry(ctx: TaskContext, task_id: str, defaults, absent=()):
+    """Restore every snapshotted value, then default anything uncovered.
+
+    defaults / absent describe the documented Windows state for keys an older
+    build (or a cleared config) left uncovered, so those keys are never left
+    sitting at this tweak's output.
+    """
+    snap = get_tweak_snapshot(task_id) or {}
+    covered = set()
+    for spec in (snap.get("specs") or []):
+        if isinstance(spec, (list, tuple)) and len(spec) >= 3:
+            covered.add((spec[0], spec[1], spec[2]))
+    if covered:
+        _restore_reg_values(ctx, task_id)
+    for key in absent:
+        if key not in covered:
+            reg_delete_value(ctx, key[0], key[1], key[2])
+    uncovered = [k for k in defaults if k not in covered]
+    for hive, path, name in uncovered:
+        value, vtype = defaults[(hive, path, name)]
+        reg_set_value_checked(ctx, hive, path, name, value, value_type=vtype)
+    if uncovered:
+        ctx.log("  (%d value(s) had no snapshot — restored the documented "
+                "Windows default instead)" % len(uncovered))
+
+
+_DG = "SYSTEM\\CurrentControlSet\\Control\\DeviceGuard"
+# Spelled out in full rather than concatenated onto _DG: the SEC-001 allowlist
+# drift guard resolves these spec lists with a static evaluator, and a BinOp
+# defeats it -- the guard then reads the path as a fragment and reports the
+# allowlist entry as invented.
+_DG_CI = ("SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios"
+          "\\HypervisorEnforcedCodeIntegrity")
+_MEMORY_INTEGRITY_SPECS = [
+    ("HKLM", _DG, "EnableVirtualizationBasedSecurity"),
+    ("HKLM", _DG_CI, "Enabled"),
+]
+
+
 def disable_memory_integrity(ctx: TaskContext):
     ctx.log("[Advanced] Disable Memory Integrity (HVCI / Core Isolation) [REBOOT REQUIRED]")
-    # F-005: both writes now raise on failure — a half-applied HVCI change
+    # F-005: both writes raise on failure — a half-applied HVCI change
     # must not be counted as 'succeeded' by the runner.
-    reg_set_value_checked(ctx, "HKLM", "SYSTEM\\CurrentControlSet\\Control\\DeviceGuard", "EnableVirtualizationBasedSecurity", 0)
-    reg_set_value_checked(ctx, "HKLM", "SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios\\HypervisorEnforcedCodeIntegrity", "Enabled", 0)
+    _apply_registry(ctx, "adv_memory_integrity", _MEMORY_INTEGRITY_SPECS, [
+        ("HKLM", _DG, "EnableVirtualizationBasedSecurity", 0, None),
+        ("HKLM", _DG_CI, "Enabled", 0, None),
+    ])
     ctx.log("Memory Integrity disabled (Enabled=0). Reboot required.")
 
 
 def revert_memory_integrity(ctx: TaskContext):
     ctx.log("Re-enabling Memory Integrity (HVCI)...")
-    # M3 fix: restore BOTH values the apply function set (previously left
-    # EnableVirtualizationBasedSecurity=0 behind, so HVCI stayed half-off)
-    reg_set_value_checked(ctx, "HKLM", "SYSTEM\\CurrentControlSet\\Control\\DeviceGuard", "EnableVirtualizationBasedSecurity", 1)
-    reg_set_value_checked(ctx, "HKLM", "SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios\\HypervisorEnforcedCodeIntegrity", "Enabled", 1)
-    ctx.log("Memory Integrity fully enabled. Reboot required.")
+    # M3 fix: restore BOTH values the apply set (it previously left
+    # EnableVirtualizationBasedSecurity=0 behind, so HVCI stayed half-off).
+    # UNDO-003: and restore what the user actually had, rather than forcing
+    # 1/1 — the old revert turned Memory Integrity ON on a machine that had
+    # legitimately turned it off.
+    _revert_registry(ctx, "adv_memory_integrity", {
+        ("HKLM", _DG, "EnableVirtualizationBasedSecurity"): ("1", None),
+        ("HKLM", _DG_CI, "Enabled"): ("1", None),
+    })
+    ctx.log("Memory Integrity restored. Reboot required.")
 
 
 def disable_vmp(ctx: TaskContext):
@@ -64,21 +165,29 @@ def revert_memory_compression(ctx: TaskContext):
     ctx.log("Memory Compression re-enabled.")
 
 
+_COPILOT_PATH = "Software\\Policies\\Microsoft\\Windows\\WindowsCopilot"
+_COPILOT_SPECS = [("HKCU", _COPILOT_PATH, "TurnOffWindowsCopilot")]
+
+
 def disable_copilot(ctx: TaskContext):
     ctx.log("[Advanced] Disable Windows Copilot & AI Telemetry")
     ctx.log("HKCU\\Software\\Policies\\Microsoft\\Windows\\WindowsCopilot -> TurnOffWindowsCopilot = 1 (DWORD)")
-    spec_path = "Software\\Policies\\Microsoft\\Windows\\WindowsCopilot"
     # F-005: raise on failure — the old log-only branch still counted as
     # success in the runner.
-    reg_set_value_checked(ctx, "HKCU", spec_path, "TurnOffWindowsCopilot", 1)
+    _apply_registry(ctx, "adv_copilot", _COPILOT_SPECS, [
+        ("HKCU", _COPILOT_PATH, "TurnOffWindowsCopilot", 1, None),
+    ])
     ctx.log("Windows Copilot disabled (TurnOffWindowsCopilot=1).")
 
 
 def revert_copilot(ctx: TaskContext):
     ctx.log("Re-enabling Windows Copilot...")
-    spec_path = "Software\\Policies\\Microsoft\\Windows\\WindowsCopilot"
-    reg_delete_value(ctx, "HKCU", spec_path, "TurnOffWindowsCopilot")
-    ctx.log("Copilot policy removed (default enabled).")
+    # UNDO-003: snapshot first. The old revert deleted the value outright,
+    # destroying any TurnOffWindowsCopilot policy the user (or an org policy)
+    # had already set — the classic "undo made it less safe" bug.
+    _revert_registry(ctx, "adv_copilot", {},
+                     absent=[("HKCU", _COPILOT_PATH, "TurnOffWindowsCopilot")])
+    ctx.log("Copilot policy restored.")
 
 
 def disable_hibernation(ctx: TaskContext):
@@ -97,33 +206,51 @@ def revert_hibernation(ctx: TaskContext):
 # bloatware (ASUS Armoury Crate, Lenovo Vantage, etc.) from auto-installing
 # itself at boot via the ACPI WPBT table. (Comment fixed per external
 # review: this has nothing to do with location tracking.)
+_WPBT_PATH = "SYSTEM\\CurrentControlSet\\Control\\Session Manager"
+_WPBT_SPECS = [("HKLM", _WPBT_PATH, "DisableWpbtExecution")]
+
+
 def disable_wpbt(ctx: TaskContext):
     ctx.log("[Advanced] WPBT - Disable")
-    reg_set_value_checked(ctx, "HKLM", "SYSTEM\\CurrentControlSet\\Control\\Session Manager", "DisableWpbtExecution", 1)
+    _apply_registry(ctx, "wpbt_disable", _WPBT_SPECS, [
+        ("HKLM", _WPBT_PATH, "DisableWpbtExecution", 1, None),
+    ])
     ctx.log("WPBT disabled.")
 
+
 def revert_wpbt(ctx: TaskContext):
-    reg_delete_value(ctx, "HKLM", "SYSTEM\\CurrentControlSet\\Control\\Session Manager", "DisableWpbtExecution")
+    # UNDO-003: snapshot first — the old revert deleted the value outright.
+    _revert_registry(ctx, "wpbt_disable", {},
+                     absent=[("HKLM", _WPBT_PATH, "DisableWpbtExecution")])
     ctx.log("WPBT reverted.")
+
+
+_AI_BASE = "SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsAI"
+_AI_NAMES = ("AllowRecallEnablement", "DisableAIDataAnalysis",
+             "DisableClickToDo", "RemoveMicrosoftCopilotApp")
+_AI_SPECS = [("HKLM", _AI_BASE, n) for n in _AI_NAMES]
 
 
 def disable_ai_features(ctx: TaskContext):
     """Disable Windows AI features: Recall snapshots, Click to Do, Copilot
     app auto-install (Win11 24H2+). Pure policy values — fully reversible."""
     ctx.log("[Advanced] Disable Recall / Copilot / AI features")
-    base = "SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsAI"
-    reg_set_value_checked(ctx, "HKLM", base, "AllowRecallEnablement", 0)
-    reg_set_value_checked(ctx, "HKLM", base, "DisableAIDataAnalysis", 1)
-    reg_set_value_checked(ctx, "HKLM", base, "DisableClickToDo", 1)
-    reg_set_value_checked(ctx, "HKLM", base, "RemoveMicrosoftCopilotApp", 1)
+    writes = [("HKLM", _AI_BASE, "AllowRecallEnablement", 0, None),
+              ("HKLM", _AI_BASE, "DisableAIDataAnalysis", 1, None),
+              ("HKLM", _AI_BASE, "DisableClickToDo", 1, None),
+              ("HKLM", _AI_BASE, "RemoveMicrosoftCopilotApp", 1, None)]
+    _apply_registry(ctx, "adv_disable_ai", _AI_SPECS, writes)
     ctx.log("AI policy values set (Recall + Click to Do off, Copilot app blocked).")
     ctx.log("Note: on Windows versions without these features the values simply have no effect.")
 
+
 def revert_ai_features(ctx: TaskContext):
-    base = "SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsAI"
-    for name in ("AllowRecallEnablement", "DisableAIDataAnalysis", "DisableClickToDo", "RemoveMicrosoftCopilotApp"):
-        reg_delete_value(ctx, "HKLM", base, name)
-    ctx.log("AI policies removed — Recall/Copilot back to Windows defaults.")
+    # UNDO-003: snapshot first. The old revert deleted all four policies,
+    # which silently removed any that were already set by the user or by an
+    # organisation before this tweak ran.
+    _revert_registry(ctx, "adv_disable_ai", {},
+                     absent=[("HKLM", _AI_BASE, n) for n in _AI_NAMES])
+    ctx.log("AI policies restored — Recall/Copilot back to their prior state.")
 
 
 # --------------------------------------------------------------------------- #

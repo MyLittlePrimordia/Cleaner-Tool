@@ -111,6 +111,94 @@ _MAX_SNAPSHOT_TASKS = 256
 _MAX_SNAPSHOT_SPECS = 64
 _MAX_SEEN_TIPS = 256
 
+# Bounds for the non-`specs` snapshot shape (see _jsonish below). Depth
+# stops a hand-edited config.json from nesting until the parser gives up;
+# the node budget stops one snapshot from ballooning the file.
+_MAX_SNAPSHOT_DEPTH = 6
+_MAX_SNAPSHOT_NODES = 512
+
+
+def _jsonish(value, depth=0, budget=None):
+    """Return a bounded, JSON-only copy of `value`, or None if unusable.
+
+    Snapshots that do NOT carry a "specs" key come from several legitimate
+    producers, and every one of them nests:
+
+        _snapshot_powercfg_pairs -> {"sub:setting": int, "...:dc": int}
+        stop/nvidia telemetry    -> {"task_priors": {task_name: bool}}
+        gaming_dns / eee_disable -> {"adapters": {nic: {...}}}
+        refresh_rate_fix         -> {"mode": [w, h, hz, bpp]}   (tuple on
+                                    disk, so a JSON *list* when reloaded)
+        max_performance_gpu      -> {"sub_processor:PROCTHROTTLEMAX": int}
+
+    The previous version of this file kept flat scalars only, so it silently
+    deleted `task_priors`, `adapters` and `mode` on the next config load.
+    That is not a cosmetic bug: revert_stop_telemetry then took its
+    "no recorded per-task states" branch and left every CEIP task disabled
+    (defeating the whole BUG-016 fix), while revert_gaming_dns and
+    revert_eee_disable RAISED "no snapshot on file" and became unundoable.
+    Five of the 82 tweaks lost their undo record on every single save.
+
+    Still rejected, deliberately:
+      * non-str dict keys -- they cannot round-trip through JSON;
+      * the REG_BINARY hex envelope must stay a str (an int here means the
+        producer wrote a malformed value, and the restore path raises
+        "corrupt snapshot value" on it);
+      * anything that is not JSON at all (sets, objects, bytes);
+      * non-finite floats, which json.dump would write as bare NaN/Infinity
+        and no JSON reader can parse back.
+
+    `budget` is a single-element list used as a shared node counter, so one
+    snapshot cannot exceed _MAX_SNAPSHOT_NODES in total no matter how it is
+    nested.
+    """
+    if budget is None:
+        budget = [_MAX_SNAPSHOT_NODES]
+    if budget[0] <= 0 or depth > _MAX_SNAPSHOT_DEPTH:
+        return None
+    budget[0] -= 1
+
+    # Scalars. bool before int is unnecessary (bool IS an int subclass and
+    # both are allowed) but float needs the finite check.
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        # NaN / Infinity are not valid JSON; json.dump emits them bare and
+        # json.load then refuses the file.
+        if value != value or value in (float("inf"), float("-inf")):
+            return None
+        return value
+
+    # The REG_BINARY envelope is meaningful data, not nesting to descend.
+    if isinstance(value, dict):
+        if "__bytes_hex__" in value:
+            # Present but not a string means the producer wrote a malformed
+            # envelope (an int length, a nested dict, ...). The restore path
+            # raises "corrupt snapshot value" on it, so reject it here rather
+            # than preserve a value that can only fail mid-Undo.
+            return ({"__bytes_hex__": value["__bytes_hex__"]}
+                    if isinstance(value["__bytes_hex__"], str) else None)
+        out = {}
+        for k, v in value.items():
+            if not isinstance(k, str) or not k:
+                continue
+            got = _jsonish(v, depth + 1, budget)
+            if got is not None:
+                out[k] = got
+        return out
+
+    # A tuple here is a value that was written as a list and reloaded, which
+    # is exactly the refresh_rate_fix "mode" case.
+    if isinstance(value, (list, tuple)):
+        out = []
+        for item in value:
+            got = _jsonish(item, depth + 1, budget)
+            if got is not None:
+                out.append(got)
+        return out
+
+    return None
+
 
 def _tweak_snapshots(value, default):
     """Validate the tweak_snapshots registry - the UNDO data.
@@ -154,17 +242,19 @@ def _tweak_snapshots(value, default):
             # on the very next config load. Caught by the BUG-015 test, which
             # asserts a pre-existing snapshot survives a failed re-apply.
             #
-            # So: keep the non-specs shape, but still bound it and keep only
-            # JSON-ish scalar values.
-            clean = {}
-            for k, v in list(snap.items())[:_MAX_SNAPSHOT_SPECS]:
-                if isinstance(v, dict):
-                    if not isinstance(v.get("__bytes_hex__"), str):
-                        continue
-                elif not isinstance(v, (str, int, float, bool, type(None))):
-                    continue
-                clean[k] = v
-            if clean:
+            # This branch was WRONG twice. First it required "specs", which
+            # made the validator DROP every powercfg / NVIDIA / GPU /
+            # telemetry snapshot on the next config load (caught by the
+            # BUG-015 test). The fix kept only flat scalars, which was wrong
+            # again and far more destructive: it silently deleted the NESTED
+            # values the telemetry, DNS and EEE snapshots depend on
+            # (task_priors, adapters) plus the list-valued display mode, so
+            # five tweaks lost their undo record on every save.
+            #
+            # _jsonish keeps the whole JSON-compatible shape, bounded by
+            # depth and a shared node budget.
+            clean = _jsonish(snap, depth=1)
+            if isinstance(clean, dict) and clean:
                 out[task_id] = clean
             continue
         if not isinstance(specs, (list, tuple)) or not specs:

@@ -28,6 +28,18 @@ from app.ui.widgets.button import AnimatedButton
 # Re-exported here because most of the app has always imported it from base.
 from app.ui.widgets.tooltip import Tooltip
 
+# BUG-001: every feature dialog needs a safe way to hand work from a worker
+# thread to the Tk thread, and the only correct way is TkDispatcher -- calling
+# `widget.after(0, fn)` from a worker is itself a Tk call from a foreign
+# thread. On Python 3.14 that raises RuntimeError("main thread is not in main
+# loop") outright; on 3.12 and earlier it is an intermittent dropped callback.
+# Six dialogs had their own `_ui()` helper doing the wrong thing, which left
+# them permanently wedged (DNS tester found 5 servers and painted zero rows).
+#
+# One dispatcher per modal, owned and stopped by the base class, so no dialog
+# can reinvent the hop and no pump can outlive its dialog.
+from app.ui.tkdispatch import TkDispatcher
+
 
 class _ModalScrim:
     """Dimmed backdrop behind a modal dialog (the 'in-app popup' look).
@@ -206,16 +218,54 @@ class ThemedModal:
     never fail to open because its decorations couldn't render).
     """
 
-    # ONE shared size for all feature dialogs (user: symmetry request).
-    # 800x600 — Storage's two columns and Health's 2x3 card grid need the
-    # room (660x520 clipped their rows); DNS/Pilot/Scorecard breathe in
-    # the same footprint. Fits inside the 1040x800 main window with
-    # margin on all sides. Content taller than the card scrolls inside
-    # ScrollableRoundedPanel — the popup footprint itself never changes.
+    # Fallback size for a feature dialog when the parent's size cannot be
+    # read (parent not mapped yet, no display, headless harness).
+    #
+    # Dialogs are otherwise sized PROPORTIONALLY to the window they open over,
+    # via _proportional_size(). These were absolute: every dialog was 800x600
+    # no matter how big the main window was, so after the main window grew the
+    # popups looked like small letterboxes floating in it -- the user read that
+    # as "not proportional". A dialog is subordinate to its parent, so it now
+    # scales with it and keeps the same ratio on every screen size.
     WIDTH = 800
     HEIGHT = 600
+
+    # Fraction of the PARENT window a dialog occupies. Deliberately under
+    # 1.0 on both axes so the parent stays visible around the dialog -- that is
+    # what makes it read as a popup rather than a second window.
+    SIZE_FRACTION = (0.78, 0.82)
+
+    # Hard limits, so a dialog is never uselessly small on a laptop and never
+    # fills a 4K screen (at which point it stops looking like a popup at all).
+    SIZE_MIN = (720, 520)
+    SIZE_MAX = (1120, 880)
+
     RADIUS = 16
     _TITLE_H = 44
+
+    @classmethod
+    def _proportional_size(cls, parent):
+        """(w, h) for a dialog over `parent`: a clamped fraction of its box.
+
+        Returns the WIDTH/HEIGHT fallback whenever the parent's real size is
+        unavailable -- an unmapped window reports 1x1, which would otherwise
+        collapse every dialog to the minimum.
+        """
+        fallback = (cls.WIDTH, cls.HEIGHT)
+        try:
+            pw = int(parent.winfo_width())
+            ph = int(parent.winfo_height())
+        except Exception:
+            return fallback
+        # 1x1 is Tk's answer for "not laid out yet".
+        if pw <= 1 or ph <= 1:
+            return fallback
+        frac_w, frac_h = cls.SIZE_FRACTION
+        min_w, min_h = cls.SIZE_MIN
+        max_w, max_h = cls.SIZE_MAX
+        w = max(min_w, min(max_w, int(pw * frac_w)))
+        h = max(min_h, min(max_h, int(ph * frac_h)))
+        return w, h
 
     # Open-instance registry (flicker fix, user bug report: opening the
     # Auto-Pilot popup and clicking its preset Combobox made the main
@@ -244,13 +294,23 @@ class ThemedModal:
         self._modal_closed = False
         self._modal_on_close = None
         self._scrim = None
-        w, h = size or (self.WIDTH, self.HEIGHT)
+        w, h = size or self._proportional_size(root)
         try:
             ThemedModal._MODAL_OPEN[id(self)] = self
         except Exception:
             pass
 
         dlg = self._dlg = tk.Toplevel(root)
+        # BUG-001: the cross-thread bridge, owned here so every dialog has one
+        # and close() below stops it. Created immediately after the Toplevel
+        # exists (the dispatcher captures it for after/after_cancel) and before
+        # any subclass body runs, so a subclass __init__ can already post.
+        # on_error routes into the dialog's own log where there is one,
+        # otherwise it is dropped -- a posted callback that raises must never
+        # break the pump or the other queued work, which TkDispatcher already
+        # guarantees.
+        self._dispatch = TkDispatcher(self._dlg, on_error=self._dispatch_error)
+        self._dispatch.start()
         try:
             dlg.title(title)          # still set: taskbar/alt-tab text
         except Exception:
@@ -455,6 +515,12 @@ class ThemedModal:
         except Exception:
             pass
 
+    def _dispatch_error(self, text):
+        """Where a posted callback's exception goes. Overridden by dialogs
+        that keep a log widget; the default is to drop it, because TkDispatcher
+        has already deduplicated and a dialog must not die in its close path."""
+        return None
+
     def on_close(self, cb):
         """Extra cleanup to run when the dialog closes (cancel tokens,
         unregisters — subclasses wire their own bookkeeping)."""
@@ -466,6 +532,14 @@ class ThemedModal:
         if self._modal_closed:
             return
         self._modal_closed = True
+        # BUG-001: stop the cross-thread pump FIRST. After this the dispatcher
+        # still accepts posts (it never raises) but nothing drains them, which
+        # is exactly right for a dialog that is going away -- and it means a
+        # worker that finishes late cannot paint into a destroyed Toplevel.
+        try:
+            self._dispatch.stop()
+        except Exception:
+            pass
         # flicker fix: deregister FIRST — the prewarm/catalog chains poll
         # the open-modal registry between idle steps, so the "no modal"
         # state must be visible the moment the close starts, not after the
@@ -486,6 +560,21 @@ class ThemedModal:
             except Exception:
                 pass
             self._scrim = None
+        # BUG-010: a nested themed confirm/notice (every _themed_askyesno and
+        # _themed_showinfo opens one) takes the grab and the keyboard focus.
+        # On its close we released the grab and let Tk hand focus back to the
+        # ROOT, not to the still-open parent dialog -- so after answering any
+        # in-dialog question, Escape stopped closing that dialog and
+        # keystrokes went to the main window behind it. Measured on the real
+        # ProcessManagerDialog: focus_get() returned the root `.` and Escape
+        # after the confirm did nothing; only the X glyph still dismissed it.
+        #
+        # Give the focus back to the window that is actually still up.
+        try:
+            if self._modal_root is not None and self._modal_root.winfo_exists():
+                self._modal_root.focus_force()
+        except Exception:
+            pass
         try:
             self._dlg.grab_release()
         except Exception:

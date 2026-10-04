@@ -13,43 +13,21 @@ Supports running as a script (app/__main__.py) or as a module (-m).
 import sys
 import pathlib
 
-
-def _enable_dpi_awareness() -> None:
-    """Opt the process into Per-Monitor V2 DPI awareness BEFORE any Tk
-    window exists (perf finding F1).
-
-    The frozen exe embeds a PerMonitorV2 manifest (write_manifest.py), but
-    running from source (`python main.py`) has no manifest, so the process
-    stays DPI-unaware and DWM bitmap-stretches every repaint at >100%
-    display scaling — smearing/ghosting while scrolling. Tk 9 does NOT opt
-    in by itself, and calling this after Tk init has no effect, so it runs
-    at import time on every entry path (this module is imported before
-    launch() by main.py / `python app/__main__.py` / `python -m app`).
-
-    Best-effort: ask for Per-Monitor V2, fall back to system-DPI aware on
-    older Windows, and swallow failures. Under the frozen exe the manifest
-    already set PMv2, so the call fails harmlessly (Windows only allows
-    setting awareness once per process)."""
-    if not sys.platform.startswith("win"):
-        return
-    try:
-        import ctypes
-        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))  # PMv2
-        return
-    except Exception:
-        pass
-    try:
-        import ctypes
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # system-DPI aware
-    except Exception:
-        pass
-
-
-_enable_dpi_awareness()
-
 # Ensure repo root is on sys.path when run as `python app/__main__.py`
+# This must come before the app.dpi import below, or a direct script
+# invocation cannot resolve the `app` package at all.
 if __package__ in (None, ""):
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
+from app.dpi import enable_dpi_awareness as _enable_dpi_awareness  # noqa: E402
+
+# Applied at import time on every entry path (this module is imported
+# before launch() by main.py / `python app/__main__.py` / `python -m app`),
+# because the call only has an effect before Tk initialises. The
+# implementation and its rationale now live in app/dpi.py so the smoke
+# harness can share them -- it used to run DPI-unaware while this path ran
+# DPI-aware, so the tests validated a layout no user ever saw.
+_enable_dpi_awareness()
 
 from app.config_persist import load_config  # noqa: E402
 from app.scheduler import run_auto_clean, run_auto_update  # noqa: E402

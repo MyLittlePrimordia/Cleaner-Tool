@@ -288,15 +288,50 @@ def _build_consts(tree):
 
 _C = _build_consts(_src_tree)
 
+# UNDO-003 moved the Advanced tab's registry-backed tasks onto the snapshot
+# helpers, so they own allowlist entries too. Scan that module as well, and
+# recognise _apply_registry -- the small local wrapper those applies use so
+# they stop each carrying their own subtly-wrong copy of the
+# had_snapshot / snapshot / try / clear sequence.
+#
+# Without this the drift guard flagged the four new entries as "declared by no
+# apply function", which would have made the guard cry wolf and get ignored.
+_adv_src = io.open(r"app\tasks\advanced_tasks.py", encoding="utf-8",
+                   newline="").read()
+_adv_tree = ast.parse(_adv_src)
+_SNAPSHOT_CALLS = ("_regn_apply", "_snap_reg_values", "_apply_registry")
 
-for _fn2 in ast.walk(_src_tree):
-    if not (isinstance(_fn2, ast.FunctionDef) and _fn2.name.startswith("apply_")):
+# The spec lists in advanced_tasks.py reference their own module constants
+# (_AI_BASE, _AI_NAMES, _COPILOT_PATH, ...), and _val resolves Names out of
+# the global _C. Without those entries the lists look dynamically built and
+# the four new entries are reported as invented.
+#
+# Resolved in ISOLATION: _build_consts seeds its fixpoint from the global _C,
+# so running it with tweak_tasks' constants already loaded lets one module's
+# names bind to the other module's values -- which produced garbage specs
+# like ('HKCU', '...\\CLSID\\None\\InprocServer32', ''). Save, reset, build,
+# restore, then merge with tweak_tasks winning any genuine collision.
+_c_main = dict(_C)
+_C = {}
+_C_adv = _build_consts(_adv_tree)
+_C = _c_main
+for _k, _v in _C_adv.items():
+    _C.setdefault(_k, _v)
+
+# advanced_tasks.py names its entry points disable_* (disable_copilot,
+# disable_wpbt, ...) where tweak_tasks.py uses apply_*. Both are the "apply"
+# side, so both must be scanned or the Advanced tab's entries look invented.
+_APPLY_PREFIXES = ("apply_", "disable_")
+
+for _fn2 in list(ast.walk(_src_tree)) + list(ast.walk(_adv_tree)):
+    if not (isinstance(_fn2, ast.FunctionDef)
+            and _fn2.name.startswith(_APPLY_PREFIXES)):
         continue
     _tid = None
     _specs = None
     for _c in ast.walk(_fn2):
         if (isinstance(_c, ast.Call) and isinstance(_c.func, ast.Name)
-                and _c.func.id in ("_regn_apply", "_snap_reg_values")):
+                and _c.func.id in _SNAPSHOT_CALLS):
             _args = list(_c.args) + [k.value for k in _c.keywords]
             for _a in _args:
                 if isinstance(_a, ast.Constant) and isinstance(_a.value, str) and _tid is None:

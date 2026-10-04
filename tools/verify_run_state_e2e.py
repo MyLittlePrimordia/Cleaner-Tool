@@ -13,7 +13,8 @@ watches the transitions:
 Needs a Tk display, like the smoke suites.
 """
 import sys, threading, time
-sys.path.insert(0, r"C:\Users\User\Desktop\Cleaner Tool")
+import pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from _config_guard import ConfigGuard  # noqa: E402
 import tkinter as tk
 from app.runner import RunState

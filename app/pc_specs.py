@@ -342,6 +342,19 @@ def ram_sticks():
                         size_mb = size_raw
                     if size_mb > 0:
                         out.append((size_mb, speed or 0, ""))
+                # 0x7FFF in the Size word means "too big for this field, read
+                # Extended Size" -- which is why a 60.8 GB machine reports no
+                # sticks at all here. Deliberately NOT changed: the Extended
+                # Size offset could not be established to the accuracy this
+                # parser holds itself to. On this firmware the structure is
+                # 0x5C bytes with Speed=5600 at 0x20 and FormFactor=13 (DIMM)
+                # at 0x0E, neither of which lines up with the documented
+                # SMBIOS 3.x Type-17 layout, so reading 0x1C or 0x24 here
+                # would be a guess. A wrong stick size would make ram_info()
+                # report a wrong TOTAL, which is a far worse defect than a
+                # missing stick count -- ram_info() already falls back to the
+                # OS-reported total, which is exact. Left as a known,
+                # documented gap rather than a plausible-looking number.
             # skip the string set (double-null terminated)
             end = pos + _ln
             while end + 1 < n and not (data[end] == 0 and data[end + 1] == 0):

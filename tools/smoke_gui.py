@@ -26,6 +26,13 @@ import pathlib
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
+# Opt into DPI awareness BEFORE Tk initialises, exactly like every real
+# entry path does. Without this the suite runs DPI-unaware while the
+# product runs Per-Monitor V2, so tk scaling differs by 1.5x and the
+# layout this harness measures is not the layout users get. See app/dpi.py.
+from app.dpi import enable_dpi_awareness as _enable_dpi_awareness
+_enable_dpi_awareness()
+
 from app import config_persist
 from app import elevated_launch as _el_gate
 from app.elevation import is_admin

@@ -190,23 +190,19 @@ class ProcessManagerDialog(ThemedModal):
             except Exception:
                 groups = []
             try:
-                # MED-014: marshal through the app's TkDispatcher, NOT
-                # self._dlg.after(0, ...) from this worker. A widget's after()
-                # is a real Tk call, and calling one from a non-main thread is
-                # the very hazard this session's cross-thread fixes were about.
-                # post() is delivery-guaranteed; after() is neither safe off
-                # the Tk thread nor guaranteed to fire.
+                # BUG-001: this used to reach for the APP's dispatcher via
+                # getattr and fall back to `self._dlg.after(0, ...)` when that
+                # came back None. Two problems: the fallback is a Tk call from
+                # this worker thread (a hard RuntimeError on Python 3.14, which
+                # the outer except then turned into a silently stuck
+                # process list), and it could never fire anyway --
+                # Application.__init__ builds _dispatch unconditionally, so the
+                # "None" branch was dead code guarding against nothing.
                 #
-                # The attribute holding the app is `self.app`; reading "_app"
-                # silently yields None, which would send every update down the
-                # off-thread after() path below - the exact hazard this branch
-                # exists to avoid.
-                _app = getattr(self, "app", None) or getattr(self, "_app", None)
-                _disp = getattr(_app, "_dispatch", None)
-                if _disp is not None:
-                    _disp.post(lambda: self._apply_groups(groups, first))
-                else:
-                    self._dlg.after(0, lambda: self._apply_groups(groups, first))
+                # ThemedModal now owns a dispatcher per dialog, so there is one
+                # hop and it is always the safe one.
+                self._dispatch.post(
+                    lambda: self._apply_groups(groups, first))
             except Exception:
                 self._sampling = False
 
@@ -535,13 +531,11 @@ class ProcessManagerDialog(ThemedModal):
             if not out:
                 return
             try:
-                _app = getattr(self, "app", None) or getattr(self, "_app", None)
-                _disp = getattr(_app, "_dispatch", None)
-                _apply = lambda: self._apply_icons(out)  # noqa: E731
-                if _disp is not None:
-                    _disp.post(_apply)
-                else:
-                    self.after(0, _apply)
+                # BUG-001: was getattr(app, "_dispatch") with a
+                # `self.after(0, ...)` fallback -- another off-thread Tk call
+                # hiding behind a branch that could never be taken. Same fix as
+                # the group hop above: one hop, and it is the safe one.
+                self._dispatch.post(lambda: self._apply_icons(out))
             except Exception:
                 pass
 

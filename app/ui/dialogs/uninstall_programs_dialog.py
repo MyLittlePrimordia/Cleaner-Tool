@@ -14,7 +14,6 @@ from tkinter import ttk, messagebox
 from app.ui.base import ThemedModal, _themed_askyesno
 from app.ui.theme import COLORS, F, TAB_ACCENTS, ICON_ROW_PX, icon_bg_rgb
 from app.ui.widgets import AnimatedButton, RoundedEntry, ScrollableRoundedPanel
-from app.ui.tkdispatch import TkDispatcher
 
 # Icons are composited onto an opaque plate, so that plate must be the
 # exact row background or the icon shows a square edge. This file's rows
@@ -50,20 +49,18 @@ class UninstallProgramsDialog(ThemedModal):
                          accent=TAB_ACCENTS.get("Clean", COLORS["accent_green"]))
         body = self.body
 
-        # One-way bridge onto the Tk thread (created after the base dialog
-        # exists, so self._dlg is available).
+        # One-way bridge onto the Tk thread.
         #
-        # The scan result AND every icon swap used to be posted with
-        # `self._dlg.after(0, ...)` FROM A WORKER THREAD. That is the
-        # documented cross-thread Tcl race: the callback is dropped outright
-        # when the main thread is not inside the event loop at that instant.
-        # Measured on this dialog headlessly — the scan callback never arrived
-        # at all and the program list stayed empty through 15s of pumping.
-        # Users usually do see the list, which is exactly why this survived:
-        # it is intermittent, so it reads as "the list takes a moment".
-        # See app/ui/tkdispatch.py.
-        self._dispatch = TkDispatcher(self._dlg)
-        self._dispatch.start()
+        # BUG-001: the scan result AND every icon swap used to be posted with
+        # `self._dlg.after(0, ...)` FROM A WORKER THREAD -- a Tk call on a
+        # foreign thread. Four hops in this file were still on it after the
+        # scan hop was fixed. On Python 3.14 that raises RuntimeError, the
+        # bare except swallowed it, and the dialog froze at "Creating a
+        # System Restore point" with no way out but Close.
+        #
+        # This dialog used to build its own TkDispatcher here. ThemedModal now
+        # owns one per dialog and stops it in close(), so the class body just
+        # uses the inherited self._dispatch. See app/ui/tkdispatch.py.
 
         tk.Label(body, text="Uninstall a program the official way, then "
                             "optionally clean leftovers it left behind.",
@@ -451,8 +448,8 @@ class UninstallProgramsDialog(ThemedModal):
             if token[0]:
                 return
             try:
-                self._dlg.after(
-                    0, lambda: self._after_restore_point(ok))
+                self._dispatch.post(
+                    lambda: self._after_restore_point(ok))
             except Exception:
                 pass
 
@@ -507,8 +504,8 @@ class UninstallProgramsDialog(ThemedModal):
             if token[0]:
                 return
             try:
-                self._dlg.after(
-                    0, lambda: self._on_item_done(prog, rc, err))
+                self._dispatch.post(
+                    lambda: self._on_item_done(prog, rc, err))
             except Exception:
                 pass
 
@@ -570,8 +567,8 @@ class UninstallProgramsDialog(ThemedModal):
             if token[0]:
                 return
             try:
-                self._dlg.after(
-                    0, lambda: self._on_leftover_scan_done(items, n, failed))
+                self._dispatch.post(
+                    lambda: self._on_leftover_scan_done(items, n, failed))
             except Exception:
                 pass
 
@@ -886,8 +883,8 @@ class UninstallProgramsDialog(ThemedModal):
             except Exception:
                 pass
             try:
-                self._dlg.after(
-                    0, lambda: self._after_leftover_delete(ok_count, freed))
+                self._dispatch.post(
+                    lambda: self._after_leftover_delete(ok_count, freed))
             except Exception:
                 pass
 

@@ -53,21 +53,46 @@ class Ctx:
         return False
 
 
+def _argv_of(cmd):
+    """Normalise a run_cmd command to a list of tokens.
+
+    Accepts the argv-list form and the old interpolated string form, so this
+    harness is a test of the restore logic rather than of how the command
+    happens to be serialised.
+    """
+    if isinstance(cmd, (list, tuple)):
+        return [str(x) for x in cmd]
+    import shlex
+    try:
+        return shlex.split(str(cmd))
+    except ValueError:
+        return str(cmd).split()
+
+
 class H:
     """Fakes run_cmd (recording every powercfg write) and the snapshot store."""
 
     def __init__(self, snap, fail_on=(), reg_count=1, reg_raises=False):
         self.snap = dict(snap or {})
-        self.writes = []          # every command string passed to run_cmd
+        # Every command, normalised to a token list.
+        #
+        # The powercfg writes are argv lists with shell=False now (SEC-001
+        # removed the interpolated command strings), so recording the raw
+        # object made `"/setacvalueindex" in c` a list-membership test and
+        # `" 12" in c` -- which relied on the old string spacing -- silently
+        # false. Normalising here keeps every assertion below an exact-token
+        # check that behaves the same for both call shapes.
+        self.writes = []
         self.fail_on = set(fail_on)
         self.reg_count = reg_count
         self.reg_raises = reg_raises
         self.cleared = []
 
     def run_cmd(self, ctx, command, shell=True, timeout=None, collect=None):
-        self.writes.append(command)
+        tokens = (_argv_of(command))
+        self.writes.append(tokens)
         for needle in self.fail_on:
-            if needle in command:
+            if needle in tokens:
                 return 1
         return 0
 
@@ -158,7 +183,7 @@ with H({"t": GOOD}) as h:
     tt._restore_powercfg_pairs(Ctx(), "t", PAIRS, FALLBACK)
     ck("all three AC values written", len(ac_writes(h)) == 3, ac_writes(h))
     ck("the DC value was written too",
-       any("/setdcvalueindex" in c and " 12" in c for c in h.writes), h.writes)
+       any("/setdcvalueindex" in c and "12" in c for c in h.writes), h.writes)
     ck("setactive was called last-ish",
        any("/setactive" in c for c in h.writes), h.writes)
     ck("the snapshot was cleared on success", "t" not in h.snap)
@@ -262,9 +287,15 @@ ck("MED-010 is documented", "MED-010" in inspect.getsource(tt.revert_nvidia_max_
 
 pf = inspect.getsource(tt._restore_powercfg_pairs)
 ck("MED-011 is documented", "MED-011" in pf)
+# The write used to be an f-string command; it is an argv list with
+# shell=False now (SEC-001), so match the structural token rather than the
+# literal text. /setacvalueindex is the flag that identifies the write.
 ck("validation happens before any run_cmd write",
    pf.index("pass 1") < pf.index("pass 2")
-   and pf.index("pass 1") < pf.index('run_cmd(ctx, f"powercfg /setacvalueindex'))
+   and pf.index("pass 1") < pf.index('"/setacvalueindex"'))
+ck("the write is an argv list, not a shell string (SEC-001)",
+   'run_cmd(ctx, ["powercfg", "/setacvalueindex"' in pf
+   and "shell=False" in pf)
 ck("the write loop iterates the pre-validated plan",
    "for key, subgroup, setting, value, dc_value in plan:" in pf)
 

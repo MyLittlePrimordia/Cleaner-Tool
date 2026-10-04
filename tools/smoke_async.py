@@ -29,6 +29,11 @@ import pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
+# Same DPI opt-in as every real entry path -- see app/dpi.py. Must happen
+# before `import tkinter` below touches Tk.
+from app.dpi import enable_dpi_awareness as _enable_dpi_awareness
+_enable_dpi_awareness()
+
 import tkinter as tk
 
 from _config_guard import ConfigGuard

@@ -46,7 +46,6 @@ class StorageInsightDialog(ThemedModal):
     The scan worker never touches widgets — every paint hops via after().
     """
 
-    WIDTH = 800                 # fixed shared popup footprint (ThemedModal)
     # Five games, not eight (user call 2026-09: no scrollbar — the columns
     # area fits 5 fixed-height rows; the '+N more' line honestly counts
     # the rest, same as before).
@@ -124,7 +123,7 @@ class StorageInsightDialog(ThemedModal):
         if _note:
             tk.Label(body, text="Note: " + _note, font=(F, 8),
                      bg=COLORS["bg"], fg=COLORS["subtext"],
-                     wraplength=self.WIDTH - 36, justify="left").pack(
+                     wraplength=self._modal_w - 36, justify="left").pack(
                          side="bottom", anchor="w", pady=(8, 0))
         self._bench_lbl = tk.Label(body, text="", font=(F, 8),
                                    bg=COLORS["bg"], fg=COLORS["subtext"],
@@ -288,13 +287,18 @@ class StorageInsightDialog(ThemedModal):
     def _ui(self, fn, *args):
         """Marshal a paint hop to the Tk thread (worker-safe).
 
-        F10: never touch Tk from the worker (even winfo_exists burns
-        ~1s off-thread) — schedule unconditionally; a destroyed dialog
-        raises inside after() and is swallowed below."""
-        try:
-            self._dlg.after(0, lambda: fn(*args))
-        except Exception:
-            pass
+        BUG-001: this used to be `self._dlg.after(0, lambda: fn(*args))`
+        under a bare `except: pass`. Calling after() from a worker IS a Tk
+        call on a foreign thread: on Python 3.14 it raises
+        RuntimeError("main thread is not in main loop") every time, and the
+        bare except swallowed it -- so the dialog silently stopped painting
+        and then blamed the network. The old docstring stated the very rule
+        this code was breaking.
+
+        self._dispatch is the TkDispatcher ThemedModal owns, so close()
+        stops it. post() also runs inline when the caller is already on the
+        Tk thread, which keeps single-update() smoke checks working."""
+        self._dispatch.post(lambda: fn(*args))
 
     def _start_scan(self):
         # stop any in-flight scan, then reset rows to pending

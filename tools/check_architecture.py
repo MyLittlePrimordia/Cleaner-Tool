@@ -42,6 +42,7 @@ import ast
 import io
 import os
 import pathlib
+import re
 import symtable
 import sys
 
@@ -583,7 +584,14 @@ def main() -> int:
         if cls is not None:
             adefs = {m.name for m in cls.body
                      if isinstance(m, ast.FunctionDef)}
-            for delegating in ("_pilot_pump", "_pilot_running", "_pilot_ensure"):
+            # _pilot_pump used to be listed here. It was never called by
+            # anything -- the H15 split wired SessionPilot's callbacks
+            # straight to SessionOrchestrator.post_apply/post_revert and the
+            # drain loop to _pilot_sink -- so all this assertion did was pin a
+            # dead method in place. A guard that keeps dead code alive is a
+            # guard that stops being read; DEAD-001 removed the method and this
+            # entry with it.
+            for delegating in ("_pilot_running", "_pilot_ensure"):
                 if delegating not in adefs:
                     bad.append("Application.%s is gone" % delegating)
             # _pilot_pump_started must not reappear anywhere in Application.
@@ -631,25 +639,38 @@ def main() -> int:
             fns = [n.name for n in t.body if isinstance(n, ast.FunctionDef)]
             if "run" not in fns:
                 bad.append("tools/smoke/%s.py has no run(ctx)" % name)
-            # each area must bind the shared names off the Ctx
-            body = io.open(p, encoding="utf-8").read()
-            if "def run(ctx):" in body and "ctx.root" not in body:
-                bad.append("tools/smoke/%s.py never reads ctx — the shared "
-                           "names are not coming from the Ctx" % name)
-        # the driver must stay a driver, not grow areas back
+# each area must bind the shared names off the Ctx
+        body = io.open(p, encoding="utf-8").read()
+        if "def run(ctx):" in body and "ctx.root" not in body:
+            bad.append("tools/smoke/%s.py never reads ctx — the shared "
+                       "names are not coming from the Ctx" % name)
+        # driver must stay a driver, not grow areas back
         if driver.is_file():
             n = len(io.open(driver, encoding="utf-8").read().splitlines())
             if n > 1400:
                 bad.append("tools/smoke_gui.py is %d lines — areas are creeping "
                            "back into the driver (budget 1400)" % n)
+        # An area may import shared helpers from the tools.smoke PACKAGE --
+        # that is what the package is for, and assert_dialog_proportional is
+        # one. symtable reports an imported binding as is_imported() rather
+        # than is_assigned(), so counting only assignments made those look
+        # like undefined globals.
+        for node in ast.walk(ast.parse(body)):
+            if isinstance(node, ast.ImportFrom) and node.module \
+                    and node.module.startswith("tools.smoke."):
+                bad.append("tools/smoke/%s.py imports from the sibling area "
+                           "%r — areas must not depend on each other; move a "
+                           "shared helper into tools/smoke/__init__.py"
+                           % (name, node.module))
         # a name referenced by one area and defined in another is the one
         # coupling H16 had to break; catch it coming back.
-        for name, _purpose in _sm.AREAS:
-            p = smoke_pkg / (name + ".py")
+        for name2, _purpose in _sm.AREAS:
+            p = smoke_pkg / (name2 + ".py")
             if not p.is_file():
                 continue
             st = symtable.symtable(io.open(p, encoding="utf-8").read(), str(p), "exec")
-            modnames = {s.get_name() for s in st.get_symbols() if s.is_assigned()}
+            modnames = {s.get_name() for s in st.get_symbols()
+                        if s.is_assigned() or s.is_imported()}
             rt = next((c for c in st.get_children() if c.get_name() == "run"), None)
             if rt is None:
                 continue
@@ -660,10 +681,62 @@ def main() -> int:
                         and not hasattr(__builtins__, nm)
                         and nm not in dir(__builtins__)):
                     bad.append("tools/smoke/%s.py references undefined global %r"
-                               % (name, nm))
+                               % (name2, nm))
     check(not bad, [], bad, failures,
-          "smoke suite is a driver + %d areas; no cross-area free variables"
-          % (len(_sm.AREAS) if _sm else 0))
+           "smoke suite is a driver + %d areas; no cross-area free variables"
+           % (len(_sm.AREAS) if _sm else 0))
+
+    # --- 13 --------------------------------------------------------------
+    print("\n[13] the harness cannot silently disable a check")
+    bad = []
+    # (a) no hardcoded developer checkout path. Thirteen tools carried
+    # r"C:\Users\User\Desktop\Cleaner Tool", which does not exist on any
+    # other machine, so `import app` failed and the check aborted before a
+    # single assertion ran. ~326 assertions had never validated anything.
+    stale = re.compile(r"[A-Za-z]:\\Users\\[^\\\r\n\"']+")
+    for p in list(py_files(ROOT / "tools")):
+        for i, line in enumerate(io.open(p, encoding="utf-8").read().splitlines(), 1):
+            m = stale.search(line)
+            if not m:
+                continue
+            # Fixture strings for the tests are fine -- they are data, not
+            # paths this process will open. Only a real open/read counts.
+            if ("open(" in line or "Path(" in line or "sys.path" in line
+                    or "io.open" in line):
+                bad.append("%s:%d hardcodes a checkout path: %s"
+                           % (rel(p), i, m.group(0)[:48]))
+    # (b) run_all_checks must inject the repo root, so a check cannot be
+    # disabled by its own import bootstrap.
+    runner = ROOT / "tools" / "run_all_checks.py"
+    if not runner.is_file():
+        bad.append("tools/run_all_checks.py is missing")
+    else:
+        rsrc = io.open(runner, encoding="utf-8").read()
+        if "PYTHONPATH" not in rsrc:
+            bad.append("tools/run_all_checks.py does not set PYTHONPATH for its "
+                       "children -- `python tools/X.py` puts tools/ on sys.path, "
+                       "not the repo root, so `import app` dies before any "
+                       "assertion runs")
+        if "cwd=ROOT" not in rsrc:
+            bad.append("tools/run_all_checks.py does not pin cwd=ROOT for its "
+                       "children, so the suite only passes from the repo root")
+    # (c) the suite must list every check file that exists, or a new check
+    # is written and never wired in.
+    listed = set()
+    if runner.is_file():
+        rtree = ast.parse(io.open(runner, encoding="utf-8").read())
+        for node in ast.walk(rtree):
+            if (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                    and node.value.endswith(".py") and "/" in node.value):
+                listed.add(node.value)
+    for p in sorted((ROOT / "tools").glob("verify_*.py")):
+        relp = rel(p)
+        if relp not in listed:
+            bad.append("%s exists but is not in the run_all_checks SUITE -- a "
+                       "check nobody runs" % relp)
+    check(not bad, [], bad, failures,
+           "no hardcoded checkout paths; runner injects the root; every "
+           "verify_*.py is in the SUITE")
 
     print()
     if failures:

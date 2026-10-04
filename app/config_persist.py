@@ -554,19 +554,26 @@ def save_config(config: dict) -> None:
         except Exception:
             pass
         raise
-        # Directory fsync for durability (Windows: ensure directory entry flushed)
-        try:
-            # On Windows, opening directory for fsync is not supported; ignore
-            dir_fd = os.open(str(CONFIG_DIR), os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-        except Exception:
-            pass
-        # Store a deepcopy to avoid aliasing with caller's mutable dict
-        _config_cache = copy.deepcopy(config)
-        _config_mtime = _disk_mtime()
+
+    # The file on disk now holds `config`, so refresh the cache HERE.
+    #
+    # This block used to sit AFTER the `raise` above, which made it
+    # unreachable: `_config_cache` and `_config_mtime` were never updated on
+    # a successful write. Two consequences, both observed in production:
+    #
+    #   1. `_config_mtime` kept pointing at the pre-write file, so
+    #      load_config() took the mismatch branch on the very next read and
+    #      re-ran `_load_config_from_disk` -- and therefore apply_schema --
+    #      after EVERY save rather than only at startup. That is what made
+    #      the _tweak_snapshots validator's data loss fire on every apply
+    #      instead of only at restart.
+    #   2. Anything that read the config back before the mtime granularity
+    #      caught up could be served the previous contents.
+    #
+    # deepcopy, not the caller's dict: callers mutate the object they passed
+    # in, and the cache must not alias it.
+    _config_cache = copy.deepcopy(config)
+    _config_mtime = _disk_mtime()
 
 
 def update_config(mutate) -> dict:
@@ -616,6 +623,41 @@ def save_tweak_snapshot(task_id: str, values: dict) -> None:
         if task_id in snapshots and snapshots[task_id]:
             return None
         snapshots[task_id] = values
+
+    update_config(_mutate)
+
+
+def merge_tweak_snapshot(task_id: str, values: dict) -> None:
+    """Merge `values` into an existing snapshot under a SINGLE lock hold.
+
+    Some applies record their snapshot in two stages: the service start type
+    first, then the per-scheduled-task priors a moment later. The second write
+    must not erase the first, which is why `save_tweak_snapshot` refuses to
+    overwrite — but a read-then-clear-then-save sequence does that by hand,
+    and it is NOT atomic:
+
+        existing = get_tweak_snapshot(task_id)   # lock acquired + released
+        clear_tweak_snapshot(task_id)            # lock acquired + released
+        save_tweak_snapshot(task_id, existing)    # lock acquired + released
+
+    Between the clear and the save the snapshot does not exist. A crash, a
+    concurrent --auto-clean process, or a second writer in that window
+    destroys the task's ENTIRE undo history — the one thing the user cannot
+    get back. update_config holds _config_lock across load-mutate-save
+    precisely to close that class of hole, so this is one call.
+
+    Fails closed: if the mutation cannot be applied the existing snapshot is
+    left exactly as it was.
+    """
+    if not values:
+        return
+
+    def _mutate(cfg):
+        snapshots = cfg.setdefault("tweak_snapshots", {})
+        existing = snapshots.get(task_id)
+        merged = dict(existing) if isinstance(existing, dict) else {}
+        merged.update(values)
+        snapshots[task_id] = merged
 
     update_config(_mutate)
 
@@ -882,8 +924,17 @@ def add_startup_disabled(record: dict) -> bool:
         value_type = value_type if isinstance(value_type, str) else ""
         if not source or not name:
             return False
+        # BUG-016: held_name was dropped here. This function rebuilds the
+        # record from an explicit whitelist and held_name was not on it, so
+        # startup_manager's careful os.path.basename(dest) never reached the
+        # config -- SEC-002 was silently defeated and EVERY restore fell
+        # through to the legacy guess-the-extension path, which can then
+        # hard-fail on the tamper check. Carry it through.
+        held_name = str(record.get("held_name", "")).strip()
         clean = {"source": source, "name": name, "command": command,
                  "value_type": value_type}
+        if held_name:
+            clean["held_name"] = os.path.basename(held_name)[:200]
 
         def _mut(cfg):
             items = cfg.get("startup_disabled")
@@ -892,7 +943,16 @@ def add_startup_disabled(record: dict) -> bool:
             items = [r for r in items
                      if not (r.get("source") == source and r.get("name") == name)]
             items.append(clean)
-            cfg["startup_disabled"] = items[:_STARTUP_MAX]
+            # BUG-015: `clean` was appended and the list then truncated from
+            # the END, so once the log was full the record just written was
+            # discarded immediately. The caller has ALREADY removed the
+            # registry value / moved the shortcut by this point, so that
+            # stranded a live change with no undo -- the exact outcome the
+            # single-lock docstring above exists to prevent. This is an undo
+            # log, so keep the newest.
+            if len(items) > _STARTUP_MAX:
+                items = items[-_STARTUP_MAX:]
+            cfg["startup_disabled"] = items
 
         update_config(_mut)
         return True

@@ -13,6 +13,8 @@ from app.ui.dialogs import AppUpdateDialog
 from app.ui.dialogs._tool_page import ToolPage
 from app.ui.dialogs.registry import DIALOGS
 
+from _tkhelpers import make_root
+
 
 class _StubApp:
     _update_info = {
@@ -32,7 +34,7 @@ def _build(monkeypatch, *, can=True, staged=""):
                         lambda exe_path="": ((True, "") if can
                                              else (False, "source checkout")))
     monkeypatch.setattr(self_update, "staged_ready", lambda: staged)
-    root = tk.Tk()
+    root = make_root()
     root.withdraw()
     return root, AppUpdateDialog(root, _StubApp())
 

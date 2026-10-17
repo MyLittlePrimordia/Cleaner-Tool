@@ -12,6 +12,8 @@ tk = pytest.importorskip("tkinter")
 
 from app.ui.dialogs.scorecard_dialog import ScorecardDialog
 
+from _tkhelpers import make_root
+
 
 def _snap(mem_avail, restart=False, total=16_000_000_000):
     return {"mem_total": total, "mem_avail": mem_avail,
@@ -19,7 +21,7 @@ def _snap(mem_avail, restart=False, total=16_000_000_000):
 
 
 def _build(measurements):
-    root = tk.Tk()
+    root = make_root()
     root.withdraw()
     card = ScorecardDialog(
         root, tab_name="Clean", mode="run", cancelled=False,
@@ -66,7 +68,7 @@ def test_unreadable_readings_stay_silent():
 
 
 def test_no_measurements_kwarg_still_builds():
-    root = tk.Tk()
+    root = make_root()
     root.withdraw()
     card = ScorecardDialog(root, tab_name="Tweak", mode="run", cancelled=False,
                            results=[], total_bytes=0)

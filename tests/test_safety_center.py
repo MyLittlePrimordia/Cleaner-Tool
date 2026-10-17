@@ -15,6 +15,8 @@ from app.ui.dialogs._tool_page import ToolPage
 from app.ui.dialogs.registry import DIALOGS
 from app.ui.dialogs.safety_center_dialog import _count_tree, _plural
 
+from _tkhelpers import make_root
+
 
 class _StubApp:
     def __getattr__(self, name):
@@ -51,7 +53,7 @@ def quiet_start(monkeypatch):
 
 
 def _build(quiet_start):
-    root = tk.Tk()
+    root = make_root()
     root.withdraw()
     dlg = SafetyCenterDialog(root, _StubApp())
     return root, dlg

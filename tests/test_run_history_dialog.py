@@ -13,6 +13,8 @@ from app.ui.dialogs import RunHistoryDialog
 from app.ui.dialogs._tool_page import ToolPage
 from app.ui.dialogs.registry import DIALOGS
 
+from _tkhelpers import make_root
+
 
 class _StubApp:
     def __getattr__(self, name):
@@ -22,7 +24,7 @@ class _StubApp:
 def _build(monkeypatch, entries):
     import app.config_persist as cp
     monkeypatch.setattr(cp, "load_config", lambda: {"run_history": entries})
-    root = tk.Tk()
+    root = make_root()
     root.withdraw()
     dlg = RunHistoryDialog(root, _StubApp())
     return root, dlg

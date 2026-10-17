@@ -27,6 +27,8 @@ tk = pytest.importorskip("tkinter")
 from app.ui import dialogs as D
 from app.ui.dialogs._tool_page import ToolPage
 
+from _tkhelpers import make_root
+
 #: Every dialog reachable from the Tools tab (27 cards). If a Tools dialog is
 #: added or removed, this list — and the assertion below — must move with it.
 TOOLS_DIALOGS = (
@@ -59,7 +61,7 @@ def test_tools_dialogs_are_all_exported():
 def test_toolpage_scroll_routes_content_through_the_shared_panel():
     from app.ui.widgets import ScrollableRoundedPanel
 
-    root = tk.Tk()
+    root = make_root()
     try:
         root.withdraw()
 
@@ -83,7 +85,7 @@ def test_toolpage_scroll_routes_content_through_the_shared_panel():
 
 
 def test_toolpage_without_scroll_is_a_plain_content_frame():
-    root = tk.Tk()
+    root = make_root()
     try:
         root.withdraw()
 

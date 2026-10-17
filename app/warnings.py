@@ -6,12 +6,45 @@ from typing import List
 
 # Reboot Planner (improvement-report 2.4): every tweak key that requires a
 # restart to take effect, in one place so the "multiple reboots" INFO_NOTICE
-# below and the Run-bar badge (gui.py TaskTab) can never drift apart.
+# below and the Run-bar badge (gui.py TaskTab) read the same list.
+#
+# BUG-017: the claim that these "can never drift apart" was false. This was a
+# hand-maintained literal and three tasks grew a risk="REBOOT REQUIRED" label
+# without being added here -- power_throttling_off, dynamic_tick_off and
+# tdr_delay. Effect: selecting e.g. Power Throttling together with HAGS
+# matched no "you only need ONE reboot" notice at all, and the Run-bar reboot
+# badge under-counted, because `hags` happened to be the accidental anchor.
+#
+# Deliberately NOT derived from the task tables at import time. `app.warnings`
+# is a leaf that the headless scheduler path imports, so importing
+# `app.tab_presets` here would drag every task module into the scheduled run.
+# Instead `reboot_required_keys()` below is the single source of truth for the
+# RULE, this list is the single source of truth for the DATA, and the two must
+# be kept in step by hand.
 REBOOT_TWEAK_KEYS = [
     "hags", "priority_separation", "disable_fast_startup",
     "ssd_trim", "ssd_superfetch", "ssd_last_access", "ssd_prefetch",
     "mpo_fix",
+    "power_throttling_off", "dynamic_tick_off", "tdr_delay",
+    # cortana_off: the AllowCortana policy only takes effect for a new
+    # session - signing out and back in is not enough. It was added to this
+    # list the day the tweak landed, on a real (not simulated) case.
+    "cortana_off",
 ]
+
+
+def reboot_required_keys(tweak_tasks) -> tuple:
+    """The reboot-required tweak keys, DERIVED from the Task objects.
+
+    Split out of this module (rather than computed at import) so the rule
+    lives in exactly one place while staying testable and cycle-free: the
+    caller passes the task list in. A Task opts in by carrying "REBOOT" in
+    its `risk` string, which is the same field the UI already renders as a
+    red "reboot required" badge -- so a tweak can no longer promise the user
+    a reboot in one place and go unlisted in another.
+    """
+    return tuple(t.key for t in tweak_tasks
+                 if "REBOOT" in (getattr(t, "risk", "") or "").upper())
 
 
 # Define dangerous combinations: (task_keys, warning_message)

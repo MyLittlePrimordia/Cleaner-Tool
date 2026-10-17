@@ -29,12 +29,16 @@ from app.ui.tkdispatch import TkDispatcher
 from app.runner.task_runner import invoke_task
 from app.tab_presets import PRESETS, TABS, TAB_NAMES
 from app.toast import notify_clean_complete, notify_low_space, show_toast
-from app.ui.base import ThemedModal, Tooltip, _themed_askyesno, _themed_showinfo
+from app.ui.base import (ThemedModal, Tooltip, _themed_askyesno,
+                         _themed_showinfo, _themed_showerror,
+                         _themed_showwarning)
 from app.ui.dialogs.scorecard_dialog import ScorecardDialog
 from app.ui.dialogs.registry import open_dialog
 from app.ui.hardware.drives import _snapshot_all_drives, _system_drive_root
-from app.ui.theme import COLORS, F, TAB_ACCENTS, _hex_lerp
+from app.ui.theme import (COLORS, F, TAB_ACCENTS, TYPE, _TAB_STATUS,
+                          _hex_lerp, _lerp, _round_rect_points)
 from app.ui.widgets import AnimatedButton, AnimatedProgressBar, ScrollableRoundedPanel
+from app.ui.widgets.dropdown import M3Dropdown
 from app.ui.widgets.chrome import BorderlessChrome, _enable_dark_titlebar, _set_window_icon
 from app.utils import IS_WINDOWS, TaskCancelled, TaskContext, format_bytes
 from app.warnings import check_dangerous_combos, check_info_notices
@@ -46,17 +50,57 @@ from app.ui.tabs.toolstab import ToolsTab
 #: The one project this app checks for updates. Used both to query the
 #: release API and to validate the download link that comes back from it
 #: (MED-012) - if those ever disagree, the link check stops matching.
-UPDATE_REPO = "MyLittlePrimordia/Cleaner-Tool"
+#: Defined in app.self_update (the module that also verifies and applies the
+#: download) so there is a single source of truth for the slug.
+from app.self_update import UPDATE_REPO
 
 
-# this file, so the table lives beside the code that consumes it.)
-_TAB_STATUS = {
-    "Clean": "Pick a preset to begin.",
-    "Repair": "Pick a preset to begin.",
-    "Tweak": "Pick a preset to begin.",
-    "Install": "Select apps to install.",
-    "Tools": "Choose a tool.",
-}
+# DESIGN AUDIT (2026-10): _TAB_STATUS now lives in app/ui/theme.py, next to
+# TAB_ACCENTS, and is re-exported here. It was defined twice -- once here and
+# once in theme.py, byte-identical and neither reading the other -- and it now
+# also has a second consumer (TaskTab's Tweak status line), which is exactly
+# the situation two copies drift in. theme.py is the bottom of the UI layering,
+# so both the shell (this file, re-exported for app/gui.py) and the tab pages
+# can read one table. Do NOT re-define it here: this import is the binding.
+
+#: Displayed size of the per-tab icon that sits inline with the pill
+#: switcher. DESIGN AUDIT (2026-10): was 72px in a band of its own, which
+#: cost ~86px of vertical chrome for a decoration that duplicated the tab
+#: name immediately below it. One constant, because the whole point is that
+#: every tab's icon displays at the SAME size - a per-tab size difference
+#: changes this row's height and shoves the switcher up or down, which was
+#: the original "few px jump" bug. Sourced in _build_main_ui.
+#:
+#: 36 is exactly 72/2, which PhotoImage.subsample can reach with an integer
+#: factor. The app is intentionally stdlib-only at runtime (no PIL - see
+#: requirements.txt), so integer subsampling is the only scaler available and
+#: the constant is chosen to be reachable by it.
+TAB_ICON_PX = 36
+
+#: Vertical gap between the inline tab icon and the pill switcher it labels.
+TAB_ICON_GAP = 10
+
+#: Horizontal breathing room between neighbours in the bottom status row
+#: (privilege label, update chip, the three corner icons). DESIGN AUDIT
+#: (2026-10): the status row went from three widgets to eight in one pass,
+#: and without a single shared inset each new widget would bring its own
+#: ad-hoc padx and the row would read as unrelated clumps.
+GAP_X = 12
+
+#: Emoji fallbacks for the status-row shortcut glyphs (redesign 2026-10).
+#: Used ONLY when the PNG is missing or will not decode, so a packaging
+#: mistake degrades to the previous look instead of a blank button.
+_CORNER_FALLBACK = {"automaint": "🛠️", "quicktools": "🧰",
+                     "exports": "📋"}
+
+#: Displayed size of a status-row glyph. The preset cards use 24; these are a
+#: little smaller because they sit in a dense strip beside the privilege
+#: label and the drive chips, and 24px there competes with the drive readout.
+STATUS_ICON_PX = 20
+
+
+def _status_icon_px():
+    return STATUS_ICON_PX
 
 
 
@@ -70,7 +114,7 @@ class Application:
         self.root.geometry(self._window_size)
         self.root.minsize(*WINDOW_MIN_SIZE)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.root.configure(bg=COLORS["bg"])
+        self.root.configure(bg=COLORS["shell"])
         _set_window_icon(self.root)
         _enable_dark_titlebar(self.root)
         # custom borderless chrome (engages lazily on first <Map> so the
@@ -148,8 +192,8 @@ class Application:
         # H15: the Auto-Pilot lifecycle (watcher object, the watcher->Tk
         # event queue and its pump, the applied/fresh key bookkeeping the
         # revert reconciles against) lives in one object now. The
-        # _pilot* names below are thin forwarders, kept because
-        # tools/smoke_async.py drives the watcher through them.
+        # _pilot* names below are thin forwarders, kept so callers that
+        # drove the watcher through them keep working.
         self._pilot_sess = SessionOrchestrator(
             root=self.root,
             on_apply=self._pilot_apply,
@@ -191,8 +235,12 @@ class Application:
                 self._build_main_ui()
                 if _elevate_pending:
                     try:
-                        self.set_status("Auto-elevate is on but needs one more approval "
-                                        "(click the 🔓 badge when ready).")
+                        # REDESIGN 2026-10: the 🔓 is gone from this string
+                        # too. It was not merely redundant on screen - it
+                        # pointed at a badge that no longer exists, so the
+                        # instruction could no longer be followed.
+                        self.set_status("Auto-elevate is on but needs one more "
+                                        "approval (click the Limited badge).")
                     except Exception:
                         pass
         # single-instance focus handoff (tray/auto-elevate foundation): a
@@ -254,6 +302,7 @@ class Application:
                        (None, None, None),
                        (104, "Quit", self.tray_quit)],
                 on_ui_thread=lambda fn: self._tray_ui_hop(fn))
+            self._tray_last = icon      # kept so a failure can say WHY
             if icon.start():
                 self._tray = icon
                 return True
@@ -292,8 +341,11 @@ class Application:
                 # and no visible window (previously: silent no-op).
                 try:
                     from app.config_persist import log_security_event
-                    log_security_event("tray", "tray icon creation failed; "
-                                       "keeping window open instead of hiding")
+                    _why = getattr(getattr(self, "_tray_last", None),
+                                   "last_error", "") or "unknown stage"
+                    log_security_event("tray", "tray icon creation failed (%s);"
+                                       " keeping window open instead of "
+                                       "hiding" % _why)
                 except Exception:
                     pass
                 try:
@@ -663,21 +715,27 @@ class Application:
         style.theme_use("default")
         style.configure(".", background=COLORS["bg"], foreground=COLORS["text"])
         style.configure("TProgressbar", thickness=10, troughcolor=COLORS["surface"],
-                        background=COLORS["accent_green"])
+                        background=COLORS["primary"])
         # dark combobox + listbox (Auto Maintenance dialog)
         style.configure("TCombobox",
                         fieldbackground=COLORS["surface"], background=COLORS["surface"],
                         foreground=COLORS["text"], arrowcolor=COLORS["text"],
                         selectbackground=COLORS["surface_hover"], selectforeground=COLORS["text"],
-                        bordercolor=COLORS["surface"], lightcolor=COLORS["surface"],
-                        darkcolor=COLORS["surface"])
+                        bordercolor=COLORS["hairline"], lightcolor=COLORS["surface"],
+                        darkcolor=COLORS["surface"], padding=6, arrowsize=16,
+                        relief="flat")
         style.map("TCombobox",
                   fieldbackground=[("readonly", COLORS["surface"]), ("disabled", COLORS["surface"])],
                   background=[("readonly", COLORS["surface"])],
+                  # M3 outlined field: the outline turns primary on focus
+                  bordercolor=[("focus", COLORS["primary"]),
+                               ("hover", COLORS["muted"])],
+                  lightcolor=[("focus", COLORS["primary"])],
+                  darkcolor=[("focus", COLORS["primary"])],
                   foreground=[("readonly", COLORS["text"]), ("disabled", COLORS["subtext"])])
         self.root.option_add("*TCombobox*Listbox.background", COLORS["surface"])
         self.root.option_add("*TCombobox*Listbox.foreground", COLORS["text"])
-        self.root.option_add("*TCombobox*Listbox.selectBackground", COLORS["surface_hover"])
+        self.root.option_add("*TCombobox*Listbox.selectBackground", COLORS["secondary_container"])
         self.root.option_add("*TCombobox*Listbox.selectForeground", COLORS["text"])
         self.root.option_add("*TCombobox*Listbox.font", (F, 9))
 
@@ -705,103 +763,114 @@ class Application:
 
         # content host: everything the app packs goes in here, leaving
         # the top TITLE_H strip for the custom title bar
-        host = self._content_host = tk.Frame(self.root, bg=COLORS["bg"])
+        host = self._content_host = tk.Frame(self.root, bg=COLORS["shell"])
         host.place(x=0, y=BorderlessChrome.TITLE_H, relwidth=1.0,
                    relheight=1.0, height=-BorderlessChrome.TITLE_H)
 
-        # Toolbar row (user redesign 2026-09): the Quick Tools dropdown and
-        # the 4 feature pills are GONE — everything they did now lives in
-        # the Tools tab (embedded panels + shortcut link-rows). What
-        # remains is the privilege mode on the right; the toolbar is a
-        # thin, quiet strip.
-        toolbar = tk.Frame(host, bg=COLORS["bg"])
-        toolbar.pack(fill="x", padx=26, pady=(8, 0))
-        
-        # Update notification banner (hidden by default, shown when update available)
-        self._update_banner_frame = tk.Frame(toolbar, bg=COLORS["accent_yellow"])
-        self._update_banner_lbl = tk.Label(
-            self._update_banner_frame, 
-            text="🔄 Update available", 
-            font=(F, 9, "bold"),
-            bg=COLORS["accent_yellow"], 
-            fg=COLORS["black"],
-            cursor="hand2"
-        )
-        self._update_banner_lbl.pack(side="left", padx=10, pady=4)
-        self._update_banner_lbl.bind("<Button-1>", lambda e: self._show_update_dialog())
-        self._update_banner_frame.pack(side="left", padx=(0, 8))
-        self._update_banner_frame.pack_forget()  # Hidden by default
-        
-        # Audit fix (Limited-mode clarity): this used to be a plain, inert
-        # label — the user had no way to get to Administrator rights again
-        # short of quitting and relaunching by hand. Clicking it in Limited
-        # mode now offers to restart elevated, same UAC flow AdminGateFrame
-        # already uses, just reachable after that first screen is gone.
-        self._mode_lbl = tk.Label(toolbar, text="", font=(F, 9),
-                                  bg=COLORS["bg"], fg=COLORS["subtext"])
-        self._mode_lbl.pack(side="right", anchor="se")
-        self._refresh_mode_label()
-
-        # Per-tab icon, centered above the pill switcher (user request).
-        # The image swaps on every tab switch; PhotoImages are kept on self
-        # so Tk never garbage-collects the currently shown one.
+        # DESIGN AUDIT (2026-10) — the toolbar band is GONE.
         #
-        # ICON SIZE CONTRACT (switcher-jump fix 2026-09): every icon must
-        # DISPLAY at the same size or the icon label changes height per
-        # tab and shoves the whole column (switcher included) up/down —
-        # the "few px jump" bug report. Assets are normalized to 72x72 on
-        # disk, and this loader subsamples any stray oversized file to
-        # <=72px with a computed factor (not a magic /4) so one odd PNG
-        # can never change the label height again.
-        self._tab_icons: dict = {}
-        for _tab, _fname in (("Clean", "clean.png"), ("Repair", "repair.png"),
-                             ("Tweak", "tweak.png"), ("Install", "install.png"),
-                             ("Tools", "tools.png")):
-            for _p in self._asset_candidates(_fname):
-                if not _p.is_file():
-                    continue
-                try:
-                    _img = tk.PhotoImage(file=str(_p))
-                    w, h = _img.width(), _img.height()
-                    if w > 72 or h > 72:
-                        _f = 2
-                        while w // _f > 72 or h // _f > 72:
-                            _f *= 2
-                        _img = _img.subsample(_f, _f)
-                    self._tab_icons[_tab] = _img
-                    break
-                except Exception:
-                    continue
-        self._tab_icon_lbl = tk.Label(host, bg=COLORS["bg"])
-        self._tab_icon_lbl.pack(pady=(6, 8))
+        # It used to be a full-width strip whose only permanent contents were
+        # a right-aligned privilege label and a hidden update banner: ~26px of
+        # chrome (plus its own 8px top pad) spent on one word, on every launch,
+        # forever. Both of its two widgets now live where they belong:
+        #
+        #   * the privilege label  -> the status row (stat_row below), beside
+        #     the other live app state. It IS status: "what can this app do
+        #     right now". It was a toolbar icon with no toolbar around it.
+        #   * the update banner   -> the status row too. A one-line notice
+        #     about a newer build is transient information, and the status
+        #     line is where transient information already lives. Packing it
+        #     at the top of the window made a non-blocking notification look
+        #     like a modal alert.
+        #
+        # Nothing is lost: _refresh_mode_label() and _show_update_banner()
+        # are unchanged in behaviour, only in which parent they pack into.
+        # Both widgets are created further down, inside the status row.
+        # ----------------------------------------------------------------
 
-        # Pill switcher (Phase 2 #12: 5 tabs -> one sliding 3-way pill).
-        # active_tab must exist before _build_tab_switch draws the thumb.
+        # Pill switcher + its inline per-tab icon (DESIGN AUDIT 2026-10).
+        #
+        # The icon was a 72px band of its own ABOVE the switcher - ~86px with
+        # padding, the single largest chrome consumer in the window, for a
+        # decoration that duplicates the tab name sitting directly beneath it.
+        # It is now a TAB_ICON_PX mark in the switcher's own centered row,
+        # which reclaims ~50px of page height and reads as one navigation unit
+        # instead of two. See _build_tab_switch and _load_tab_icons.
+        #
+        # active_tab must exist BEFORE _build_tab_switch runs: it reads
+        # TAB_NAMES.index(self.active_tab) to place the thumb on first paint.
         self.active_tab = "Clean"
-        self._update_tab_icon()
         self._build_tab_switch()
 
         # Tab pages (Install gets the catalog browser, Tools the embedded
         # power features, others the preset UI)
-        self.page_container = tk.Frame(host, bg=COLORS["bg"])
-        self.page_container.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        # M3 layout: the navigation rail (built above, packed left) is one
+        # column; everything else lives in a main column to its right: a top
+        # app bar carrying the destination title, then the page, then status.
+        main = self._main_col = tk.Frame(host, bg=COLORS["shell"])
+        main.pack(side="left", fill="both", expand=True)
+        # Top app bar: destination title + one-line description, on the shell.
+        appbar = tk.Frame(main, bg=COLORS["shell"], height=100)
+        appbar.pack(fill="x")
+        appbar.pack_propagate(False)
+        titles = tk.Frame(appbar, bg=COLORS["shell"])
+        titles.pack(side="left", padx=(8, 0), pady=(8, 0), anchor="n")
+        self._appbar_title = tk.Label(
+            titles, text=self.active_tab, font=(F, 18),
+            bg=COLORS["shell"], fg=COLORS["text"], anchor="w")
+        self._appbar_title.pack(anchor="w")
+        self._appbar_sub = tk.Label(
+            titles, text=self._TAB_SUBTITLES.get(self.active_tab, ""),
+            font=(F, 10), bg=COLORS["shell"], fg=COLORS["subtext"],
+            anchor="w")
+        self._appbar_sub.pack(anchor="w")
+        # The page lives in a rounded panel set into the shell (the Gmail /
+        # Drive / Gemini layout). The inner frame is inset by the corner-arc
+        # depth so its square corners never poke out of the rounded face.
+        panel = self._panel = tk.Canvas(main, bg=COLORS["shell"],
+                                        highlightthickness=0, bd=0)
+        panel.pack(fill="both", expand=True, padx=(0, 12), pady=(0, 12))
+        _p_r, _p_in = 24, 8
+        body = self._panel_body = tk.Frame(panel, bg=COLORS["bg"])
+        _p_win = panel.create_window(_p_in, _p_in, window=body, anchor="nw")
+
+        def _panel_cfg(e, _c=panel, _w=_p_win, _r=_p_r, _i=_p_in):
+            if e.width < 8 or e.height < 8:
+                return
+            _c.delete("face")
+            _c.create_polygon(
+                _round_rect_points(0, 0, e.width - 1, e.height - 1, _r),
+                smooth=True, fill=COLORS["bg"], outline="", tags="face")
+            _c.tag_lower("face")
+            _c.itemconfigure(_w, width=max(1, e.width - 2 * _i),
+                             height=max(1, e.height - 2 * _i))
+        panel.bind("<Configure>", _panel_cfg)
+        self.page_container = tk.Frame(body, bg=COLORS["bg"])
+        self.page_container.pack(fill="both", expand=True, padx=(0, 0),
+                                 pady=(0, 4))
         self.tabs = {}
         for name in TAB_NAMES:
             if name == "Install":
                 self.tabs[name] = InstallTab(self.page_container, self)
             elif name == "Tools":
                 self.tabs[name] = ToolsTab(self.page_container, self)
+            elif name == "Drivers":
+                from app.ui.tabs.driverstab import DriversTab
+                self.tabs[name] = DriversTab(self.page_container, self)
+            elif name == "Settings":
+                from app.ui.tabs.settingstab import SettingsTab
+                self.tabs[name] = SettingsTab(self.page_container, self)
             else:
                 self.tabs[name] = TaskTab(self.page_container, self, name)
         self._show_tab("Clean")
 
         # Bottom: status line + details disclosure + progress + disk
-        bottom = tk.Frame(host, bg=COLORS["bg"])
-        bottom.pack(fill="x", padx=26, pady=(2, 10))
+        bottom = tk.Frame(body, bg=COLORS["bg"])
+        bottom.pack(fill="x", padx=16, pady=(2, 8))
 
         stat_row = tk.Frame(bottom, bg=COLORS["bg"])
         stat_row.pack(fill="x")
-        self.status_lbl = tk.Label(stat_row, text="Ready.", font=(F, 10, "bold"),
+        self.status_lbl = tk.Label(stat_row, text="", font=(F, 10, "bold"),
                                    bg=COLORS["bg"], fg=COLORS["subtext"], anchor="w")
         self.status_lbl.pack(side="left")
         self._status_fade_ids = []
@@ -827,6 +896,74 @@ class Application:
         self._nudge_scan_token = [False]  # cancel token (app close / phase-6)
         self._last_drives: list = []      # raw monitor list (tooltip totals)
 
+        # Audit fix (Limited-mode clarity): this used to be a plain, inert
+        # label — the user had no way to get to Administrator rights again
+        # short of quitting and relaunching by hand. Clicking it in Limited
+        # mode now offers to restart elevated, same UAC flow AdminGateFrame
+        # already uses, just reachable after that first screen is gone.
+        #
+        # DESIGN AUDIT (2026-10): it lived in a top toolbar strip that held
+        # nothing else, so it cost a whole band of chrome to say one word.
+        # It is app state ("what can this process do right now"), which is
+        # exactly what the status row is for, so it moves here — packed
+        # side="right" BEFORE the drive chips above, so Tk's last-packed-
+        # furthest-left rule puts it to the left of them and it can never
+        # be pushed off the row by a newly discovered drive.
+        self._mode_lbl = tk.Label(stat_row, text="", font=(F, 9),
+                                  bg=COLORS["bg"], fg=COLORS["subtext"])
+        self._mode_lbl.pack(side="right", padx=(0, GAP_X))
+        self._refresh_mode_label()
+
+        # PC Health badge (2026-10): the always-visible half of PC Health.
+        # One word - Great / Good / Fair / Bad, or "Check PC" before the
+        # first check - and a click opens the check (which scans at once).
+        # It re-checks by itself on the schedule from Settings; that check
+        # is read-only (see app/health_badge.py).
+        self._health_lbl = tk.Label(stat_row, text="", font=(F, 9, "bold"),
+                                    bg=COLORS["bg"], fg=COLORS["subtext"],
+                                    cursor="hand2")
+        self._health_lbl.pack(side="right", padx=(0, GAP_X))
+        self._health_lbl.bind("<Button-1>", lambda e: self._open_health_report())
+        self._health_tip = None
+        self._health_checking = False
+        self._refresh_health_badge()
+
+        # Update notification banner (hidden by default, shown when an update
+        # is available). Also moved out of the deleted toolbar strip, for the
+        # same reason: it is transient information, and a notification that
+        # appears at the very top of the window reads as a blocking alert
+        # rather than as "there is a newer build, if you want it".
+        #
+        # REDESIGN 2026-10: the 🔄 emoji became the generated `update` asset,
+        # and the banner is now [icon][label] side by side rather than one
+        # Label carrying an emoji inside its text - an emoji inside a string
+        # cannot be themed or sized independently of the label's font.
+        # DECLUTTER 2026-10: a solid yellow block in the status row was the
+        # loudest thing in the window for a "there is a newer build". It is
+        # now a quiet yellow-on-black label like its neighbours.
+        self._update_banner_frame = tk.Frame(stat_row, bg=COLORS["bg"])
+        _upd_img = self._status_icon("update")
+        if _upd_img is not None:
+            self._update_banner_icon = tk.Label(
+                self._update_banner_frame, image=_upd_img,
+                bg=COLORS["bg"], bd=0, highlightthickness=0)
+            self._update_banner_icon.pack(side="left", padx=(8, 0), pady=4)
+            _upd_text = "Update available"
+        else:
+            self._update_banner_icon = None
+            _upd_text = "🔄 Update available"
+        self._update_banner_lbl = tk.Label(
+            self._update_banner_frame,
+            text=_upd_text,
+            font=(F, 9, "bold"),
+            bg=COLORS["bg"],
+            fg=COLORS["accent_yellow"],
+            cursor="hand2", bd=0)
+        self._update_banner_lbl.pack(side="left", padx=(6, 8), pady=4)
+        self._update_banner_lbl.bind("<Button-1>", lambda e: self._show_update_dialog())
+        self._update_banner_frame.pack(side="left", padx=(0, GAP_X))
+        self._update_banner_frame.pack_forget()  # Hidden by default
+
         # progress overlay (segmented animated bar) — hidden until a run
         # starts (gamers see a clean window, not an empty progress track)
         self.progress_bar = AnimatedProgressBar(bottom, accent=COLORS["accent_green"])
@@ -846,17 +983,48 @@ class Application:
         # empty slots on its last row, and both dialogs already existed
         # as ThemedModal popups launched the same way every other Tools
         # card is, so this is a straight relocation, not new plumbing.
-        # Three equal-width columns, each icon centered — gaps stay identical.
-        corners = tk.Frame(host, bg=COLORS["bg"])
-        corners.pack(fill="x", padx=26, pady=(0, 8))
-        for _ci in range(3):
-            corners.columnconfigure(_ci, weight=1, uniform="corner")
-
-        def _corner_icon(col, icon, tip, command):
-            lbl = tk.Label(corners, text=icon, font=(F, 13),
-                           bg=COLORS["bg"], fg=COLORS["subtext"],
-                           cursor="hand2", bd=0, highlightthickness=0)
-            lbl.grid(row=0, column=col)
+        #
+        # DESIGN AUDIT (2026-10): these were a full-width band of their own
+        # below the status row, three `uniform` columns across the entire
+        # window so three 16px glyphs could sit as far apart as the window is
+        # wide. They were the least dense, least purposeful row in the app:
+        # ~30px of height, spread edge to edge, to show three icons.
+        #
+        # They are now packed side="right" into the status row's own icon
+        # cluster, left of the privilege label, at the same weight as the
+        # drive chips beside them. Three related actions, one control strip,
+        # one band of height instead of two.
+        #
+        # REDESIGN 2026-10 (second pass): the glyphs were 🛠️ 🧰 📋 - full
+        # colour system emoji, and because they live in the STATUS ROW they
+        # were on screen in EVERY tab, all the time. That is the most-watched
+        # strip in the window, and it was the last place in the app where a
+        # control ignored the palette: Tk renders emoji from the system font,
+        # so no amount of theming reaches them.
+        #
+        # They keep their tooltips and click bindings; only the glyph changed,
+        # to themed assets from the same generated set the preset cards use
+        # (app/assets/preset_icons/, drawn in `subtext` because a global
+        # control must not wear whichever tab's accent happens to be open).
+        #
+        # Still a tk.Label, not an AnimatedButton: tools/smoke/tools.py
+        # asserts on `_corner_logs.cget("text")` and drives these through
+        # `_corner_cmd`, so the widget type and that hook both have to
+        # survive the change.
+        def _corner_icon(icon_key, tip, command):
+            img = self._status_icon(icon_key)
+            if img is not None:
+                lbl = tk.Label(stat_row, image=img, bg=COLORS["bg"],
+                               cursor="hand2", bd=0, highlightthickness=0)
+            else:
+                lbl = tk.Label(stat_row,
+                               text=_CORNER_FALLBACK.get(icon_key, "•"),
+                               font=(F, 12), bg=COLORS["bg"],
+                               fg=COLORS["subtext"],
+                               cursor="hand2", bd=0, highlightthickness=0)
+            # Built but NOT packed (DECLUTTER 2026-10): the "..." menu below
+            # is the visible control; these stay as the actions' single
+            # source of truth and as the smoke test's hooks.
             Tooltip(lbl, tip)
             lbl.bind("<Button-1>", lambda e: command(), add="+")
             lbl.bind("<Enter>", lambda e: lbl.config(fg=COLORS["text"]), add="+")
@@ -870,12 +1038,25 @@ class Application:
                 pass
             return lbl
 
+        # Built in reading order, packed in REVERSE (see below).
         self._corner_maint = _corner_icon(
-            0, "🛠️", "Auto Maintenance", lambda: self._show_schedule_dialog())
+            "automaint", "Auto Maintenance",
+            lambda: self._show_schedule_dialog())
         self._corner_quick = _corner_icon(
-            1, "🧰", "Quick Tools", lambda: self._open_quick_tools())
+            "quicktools", "Quick Tools", lambda: self._open_quick_tools())
         self._corner_logs = _corner_icon(
-            2, "📋", "Export Logs", lambda: self.export_logs())
+            "exports", "Export Logs", lambda: self.export_logs())
+        # Tk's pack(side="right") fills from the right edge inward, so the
+        # FIRST label packed is the RIGHTMOST one. Packing these in reading
+        # order would lay them out reversed - so reverse the PACK, not the
+        # declaration order, and the three still read left-to-right as Auto
+        # Maintenance, Quick Tools, Export Logs exactly as they did in the
+        # old uniform grid.
+        # DECLUTTER 2026-10 (second pass): these three corner actions now live
+        # in the Settings tab (Auto Maintenance, Export Logs) and the Tools tab
+        # (Quick Tools), so the strip carries no menu at all. The widgets are
+        # still BUILT - never packed - only because tools/smoke/tools.py
+        # drives their click handlers; they are not a user-facing control.
 
         self._build_log(bottom)
         self._start_disk_monitor()
@@ -905,10 +1086,25 @@ class Application:
         except Exception:
             pass
 
-        self.set_status("Ready. Pick a preset and press Run.")
+        # DESIGN AUDIT (2026-10) — TEXT-004. This used to be a hardcoded
+        # "Ready. Pick a preset and press Run." set here at the end of the
+        # build, immediately AFTER _show_tab("Clean") had already put the
+        # per-tab copy in the bar. So the one place the string was supposed
+        # to be the single source of truth was also the one place it
+        # overwrote the single source of truth — and it told the user to
+        # "pick a preset and press Run" on the Install and Tools tabs, which
+        # have neither a preset card nor a Run button.
+        #
+        # It now reads from _TAB_STATUS like every other tab switch does, so
+        # there is exactly one table and one rule. _show_tab has already run
+        # for "Clean" and set the same value, so this is now a no-op in the
+        # happy path; it is kept as an explicit initializer for the rebuild
+        # path (where _show_tab is not called) rather than left to chance.
+        self.set_status(_TAB_STATUS.get(self.active_tab, ""))
 
         # Check for updates in the background (non-blocking)
         self._schedule_update_check()
+        self._schedule_health_check()
 
         # F6: the window is up — pre-warm the first-entry Custom/Undo
         # bodies and the Install catalog in idle time instead of on the
@@ -932,6 +1128,74 @@ class Application:
             pass
         self._maybe_hide_for_tray()
 
+    # ---------------- PC Health badge ---------------- #
+
+    def _refresh_health_badge(self, checking=False):
+        """Repaint the badge from the saved result (or show 'Checking...')."""
+        from app import health_badge as hb
+        lbl = getattr(self, "_health_lbl", None)
+        if lbl is None:
+            return
+        try:
+            if checking:
+                lbl.config(text="PC: checking...", fg=COLORS["subtext"])
+                return
+            _mode, grade, ts = hb.load_state()
+            word, ckey = hb.badge_for(grade)
+            lbl.config(text=("PC: " + word) if grade else word,
+                       fg=COLORS.get(ckey, COLORS["subtext"]))
+            tip = ("PC health: %s (checked %s). Click to check and fix."
+                   % (word, hb.age_text(ts))) if grade else \
+                "Click to check your PC's health"
+            if self._health_tip is None:
+                self._health_tip = Tooltip(lbl, tip)
+            else:
+                try:
+                    self._health_tip.text = tip
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _schedule_health_check(self):
+        """Once, a few seconds after launch (after the update check), run the
+        read-only health check if the user's schedule says it is due."""
+        try:
+            self.root.after(4500, self._maybe_auto_health_check)
+        except Exception:
+            pass
+
+    def _maybe_auto_health_check(self):
+        from app import health_badge as hb
+        import os
+        # Test harnesses drive a real Application over the user's real
+        # config; a scheduled check would write health_last_* into it.
+        if os.environ.get("CLEANER_TOOL_NO_AUTO_HEALTH"):
+            return
+        mode, _grade, ts = hb.load_state()
+        if not hb.is_due(mode, ts, at_startup=True):
+            return
+        if self._health_checking or getattr(self, "_busy", False):
+            return
+        self._health_checking = True
+        self._refresh_health_badge(checking=True)
+
+        def _worker():
+            try:
+                hb.quick_check()
+            except Exception:
+                pass
+            try:
+                self._dispatch.post(self._health_check_done)
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _health_check_done(self):
+        self._health_checking = False
+        self._refresh_health_badge()
+
     # ---------------- Update checker ---------------- #
 
     def _schedule_update_check(self):
@@ -945,7 +1209,18 @@ class Application:
             try:
                 from app.update_checker import check_for_updates
                 result = check_for_updates(UPDATE_REPO, timeout=10)
-                if result.get('update_available'):
+                # U-006: a build that was downloaded but not yet applied must
+                # surface even when the network check finds nothing (offline,
+                # or the rolling release already matches), so the user can
+                # finish the update they started.
+                staged = False
+                try:
+                    from app import self_update
+                    staged = bool(self_update.staged_ready())
+                except Exception:
+                    staged = False
+                result['staged'] = staged
+                if result.get('update_available') or staged:
                     # Hand straight to the dispatcher. It owns the dead-root
                     # check (see TkDispatcher._pump) and it does it on the Tk
                     # thread.
@@ -982,49 +1257,13 @@ class Application:
             pass
     
     def _show_update_dialog(self):
-        """Show the update dialog with download link."""
-        try:
-            update_info = getattr(self, '_update_info', None)
-            if not update_info:
-                return
-            
-            latest_ver = update_info.get('latest_version', 'unknown')
-            current_ver = update_info.get('current_version', 'unknown')
-            download_url = update_info.get('download_url', '')
-            notes = update_info.get('release_notes', '')
-            
-            message = f"A new version of Cleaner Tool is available!\n\n"
-            message += f"Current version: {current_ver}\n"
-            message += f"Latest version: {latest_ver}\n\n"
-            
-            if notes:
-                # Truncate very long release notes
-                if len(notes) > 500:
-                    notes = notes[:500] + "..."
-                message += f"What's new:\n{notes}\n\n"
-            
-            message += "Click OK to open the download page in your browser."
+        """Open the app's own update dialog (U-006).
 
-            if messagebox.askyesno("Update Available", message):
-                if download_url:
-                    # MED-012: re-validate at the SINK, not just where the URL
-                    # was parsed. `_update_info` is an attribute that anything
-                    # could have written, so the open call must not be the only
-                    # thing standing between a server-controlled string and the
-                    # user's browser. check_for_updates already filters, but a
-                    # defence that lives in one place is a single point of
-                    # failure - this is the one that actually opens a browser.
-                    from app.update_checker import _trusted_release_url
-                    safe = _trusted_release_url(download_url, UPDATE_REPO)
-                    if not safe:
-                        self.set_status(
-                            "Refusing to open the update link: it is not an "
-                            "https GitHub address for this project.")
-                        return
-                    import webbrowser
-                    webbrowser.open(safe)
-        except Exception:
-            pass
+        This used to be a messagebox that could only hand the download URL to
+        the browser. app/self_update.py can now fetch+verify+apply the build,
+        so the choice lives in a real dialog. See app/ui/dialogs/registry.py.
+        """
+        open_dialog(self, "app_update")
 
     # ---------------- F6: idle pre-warm chain ---------------- #
 
@@ -1130,151 +1369,229 @@ class Application:
         found = resolve_asset_path(fname)
         return [pathlib.Path(found)] if found else []
 
-    # ---------------- pill switcher ---------------- #
+    # ---------------- Material 3 navigation rail ---------------- #
 
-    # User-approved faster switch (2026-09): 240 -> 160 ms. Still the same
-    # time-based ease-out at ~60 fps ticks; the slide just completes sooner.
-    SWITCH_ANIM_MS = 160
+    # The seven destinations live in a vertical M3 navigation rail on the left
+    # edge: an 88px column, each destination a 24px icon over a label, with a
+    # 56x32 secondary-container "active indicator" that grows out of the
+    # icon's centre when the destination is selected. Hover paints the 8%
+    # state layer inside the same 56x32 shape. Up/Down (and Left/Right) move
+    # between destinations from the keyboard.
+    _TAB_SUBTITLES = {
+        "Clean": "Free up space by clearing junk files and caches",
+        "Repair": "Fix Windows components and common problems",
+        "Tweak": "Tune Windows for speed and gaming",
+        "Install": "Install apps, runtimes and missing components",
+        "Drivers": "Keep your hardware drivers up to date",
+        "Tools": "Diagnostics and everyday utilities",
+        "Settings": "Customize how Cleaner Tool behaves",
+    }
+    RAIL_W = 88
+    RAIL_ITEM_H = 72          # 32 indicator + 4 gap + label + breathing room
+    RAIL_TOP = 12
+    RAIL_IND_W = 56
+    RAIL_IND_H = 32
+    SWITCH_ANIM_MS = 200
+    HOVER_ANIM_MS = 120
 
     def _build_tab_switch(self):
-        """One pill, three labels, one thumb that slides + recolors (#12,
-        user idea: 'combine the 3 tab buttons into one animated switch').
+        """Build the navigation rail (replaces the old top pill switcher)."""
+        rail = tk.Frame(self._content_host, bg=COLORS["shell"], width=self.RAIL_W)
+        rail.pack(side="left", fill="y")
+        rail.pack_propagate(False)
+        self._rail_frame = rail
 
-        Flicker fix (user feedback): all canvas items are created ONCE and
-        the animation only moves/recolors them (coords/itemconfigure). The
-        old version did delete("all") + full recreate every frame, which
-        leaves a blank-frame window between delete and recreate and
-        re-rasterizes the text glyphs each frame — that was the visible
-        flicker/micro-stutter. Persistent items let Tk repaint only the
-        small damaged region. Motion is also time-based (eased), so a late
-        frame never changes the animation's speed — only its smoothness."""
-        # Phase-2 fix: the switcher must live in the content host, below
-        # the custom title bar — packing to self.root slid it under the
-        # toolbar clip (user bug report: switcher clipped at the top)
-        switch_wrap = tk.Frame(self._content_host, bg=COLORS["bg"])
-        switch_wrap.pack(pady=(10, 10))
-        # width scales with the number of tabs (4 tabs now: Install added)
+        # Kept for icon-set contracts (never packed).
+        self._tab_icon_lbl = tk.Label(rail, bg=COLORS["shell"],
+                                      bd=0, highlightthickness=0)
+        self._load_tab_icons()
+        self._update_tab_icon()
+
         n_tabs = len(TAB_NAMES)
         self._switch_labels = TAB_NAMES
-        self._switch_w = max(444, 148 * n_tabs)
-        self.switch = tk.Canvas(switch_wrap, width=self._switch_w, height=44,
-                                highlightthickness=0, bd=0, bg=COLORS["bg"])
-        self.switch.pack()
-        self._seg = self._switch_w / n_tabs
+        self._switch_h = self.RAIL_TOP + n_tabs * self.RAIL_ITEM_H
+        self._switch_w = self.RAIL_W
         self._switch_pos = float(TAB_NAMES.index(self.active_tab))
+        self._switch_anim = None
         self._switch_anim_after = None
+        self._hover_seg = None
+        self._hover_t = 0.0
+        self._hover_anim = None
+        self._hover_anim_after = None
+        self._rail_t = [1.0 if nm == self.active_tab else 0.0
+                        for nm in TAB_NAMES]
+        self._pill_items = []      # (indicator_id, icon_id, text_id, y0, y1)
+        self._switch_texts = []
+        self._switch_icon_items = []
+        self._hover_bgs = []
+
+        self.switch = tk.Canvas(rail, width=self.RAIL_W,
+                                height=self._switch_h, highlightthickness=0,
+                                bd=0, bg=COLORS["shell"])
+        self.switch.pack(fill="both", expand=True)
         self.switch.bind("<Button-1>", self._on_switch_click)
         self.switch.bind("<Motion>", self._on_switch_motion)
-        self.switch.bind("<Leave>", lambda e: self.switch.config(cursor="arrow"))
-        # keyboard accessibility (audit a11y): the pill accepts Tab focus;
-        # Left/Right arrows move between tabs. Focus is indicated by the
-        # thumb's own canvas — no native highlightthickness rectangle
-        # (user feedback: stray outline).
+        self.switch.bind("<Leave>", self._on_switch_leave)
         self.switch.configure(takefocus=1, highlightthickness=0)
-        self.switch.bind("<Left>", lambda e: self._switch_to(
-            TAB_NAMES[max(0, TAB_NAMES.index(self.active_tab) - 1)]))
-        self.switch.bind("<Right>", lambda e: self._switch_to(
-            TAB_NAMES[min(len(TAB_NAMES) - 1, TAB_NAMES.index(self.active_tab) + 1)]))
-        self.switch.bind("<Return>", lambda e: None)  # arrows are the activation
+
+        def _step(delta):
+            i = TAB_NAMES.index(self.active_tab) + delta
+            i = max(0, min(len(TAB_NAMES) - 1, i))
+            self._switch_to(TAB_NAMES[i])
+        self.switch.bind("<Up>", lambda e: _step(-1))
+        self.switch.bind("<Left>", lambda e: _step(-1))
+        self.switch.bind("<Down>", lambda e: _step(1))
+        self.switch.bind("<Right>", lambda e: _step(1))
+        self.switch.bind("<Return>", lambda e: None)
         self.switch.bind("<space>", lambda e: None)
-        # persistent items — created once, never deleted. The canvas item ID
-        # is deliberately not kept: nothing ever moves or deletes the track
-        # (only _switch_thumb is repositioned), so storing it was a
-        # write-only attribute.
-        self._canvas_round_rect(
-            self.switch, 0, 0, self._switch_w, 44, 22,
-            fill=COLORS["bg_alt"], outline="")
-        thumb_w = self._seg - 8
-        x = self._thumb_x(self._switch_pos)
-        self._switch_thumb = self._canvas_round_rect(
-            self.switch, x, 4, x + thumb_w, 40, 18,
-            fill=TAB_ACCENTS[self.active_tab], outline="")
-        self._switch_texts = []
+
+        cx = self.RAIL_W / 2.0
         for i, name in enumerate(self._switch_labels):
-            cx = self._seg * i + self._seg / 2
-            self._switch_texts.append(self.switch.create_text(cx, 22, text=name))
-        self._style_switch_labels()
+            top = self.RAIL_TOP + i * self.RAIL_ITEM_H
+            hov = self._canvas_round_rect(
+                self.switch, cx - self.RAIL_IND_W / 2.0, top,
+                cx + self.RAIL_IND_W / 2.0, top + self.RAIL_IND_H,
+                self.RAIL_IND_H / 2.0, fill=COLORS["shell"], outline="")
+            self._hover_bgs.append(hov)
+            ind = self._canvas_round_rect(
+                self.switch, cx - 1, top, cx + 1, top + self.RAIL_IND_H, 1,
+                fill=COLORS["secondary_container"], outline="",
+                state="hidden")
+            icon = getattr(self, "_pill_icons", {}).get(name)
+            icon_id = None
+            if icon is not None:
+                icon_id = self.switch.create_image(
+                    cx, top + self.RAIL_IND_H / 2.0, image=icon)
+                self._switch_icon_items.append(icon_id)
+            text_id = self.switch.create_text(
+                cx, top + self.RAIL_IND_H + 4 + 8, text=name,
+                font=(F, 9), fill=COLORS["subtext"])
+            self._switch_texts.append(text_id)
+            self._pill_items.append(
+                (ind, icon_id, text_id, top, top + self.RAIL_ITEM_H))
+        self._paint_pills()
 
-    def _thumb_x(self, t):
-        thumb_w = self._seg - 8
-        return 4 + t * self._seg + (self._seg - thumb_w - 8) / 2
+    def _rail_indicator_points(self, i, t):
+        cx = self.RAIL_W / 2.0
+        top = self.RAIL_TOP + i * self.RAIL_ITEM_H
+        half = max(1.0, (self.RAIL_IND_W / 2.0) * max(0.0, min(1.0, t)))
+        return self._round_points(cx - half, top, cx + half,
+                                  top + self.RAIL_IND_H,
+                                  min(self.RAIL_IND_H / 2.0, half))
 
-    def _place_switch_thumb(self, t, fill):
-        thumb_w = self._seg - 8
-        x = self._thumb_x(t)
-        points = self._round_points(x, 4, x + thumb_w, 40, 18)
-        self.switch.coords(self._switch_thumb, *points)
-        self.switch.itemconfigure(self._switch_thumb, fill=fill)
+    def _paint_pills(self):
+        """Repaint indicators, hover layers and labels from current state."""
+        try:
+            for i, (ind, icon_id, text_id, y0, y1) in enumerate(
+                    self._pill_items):
+                t = self._rail_t[i]
+                is_active = (TAB_NAMES[i] == self.active_tab)
+                is_hover = (self._hover_seg == i and not is_active)
+                if t > 0.02:
+                    self.switch.coords(ind, *self._rail_indicator_points(i, t))
+                    self.switch.itemconfigure(ind, state="normal")
+                else:
+                    self.switch.itemconfigure(ind, state="hidden")
+                hov = COLORS["shell"]
+                if is_hover:
+                    hov = _hex_lerp(COLORS["shell"], COLORS["text"],
+                                    0.08 * self._hover_t)
+                self.switch.itemconfigure(self._hover_bgs[i], fill=hov)
+                self.switch.itemconfigure(
+                    text_id,
+                    fill=COLORS["text"] if is_active else COLORS["subtext"],
+                    font=(F, 9, "bold") if is_active else (F, 9))
+        except Exception:
+            pass
 
     def _style_switch_labels(self):
-        # Same-size labels for every state (user bug report: the active
-        # label's 10->11-bold growth read as the pill "jumping"). The
-        # active tab is marked by the thumb + black text alone — a
-        # color-only switch cannot shift pixels.
-        for i, tid in enumerate(self._switch_texts):
-            active = self._switch_labels[i] == self.active_tab
-            self.switch.itemconfigure(
-                tid,
-                fill=COLORS["black"] if active else COLORS["subtext"],
-                font=(F, 10, "bold") if active else (F, 10),
-            )
+        self._paint_pills()
+
+    def _seg_at(self, y):
+        i = int((y - self.RAIL_TOP) // self.RAIL_ITEM_H)
+        if 0 <= i < len(TAB_NAMES) and y >= self.RAIL_TOP:
+            return i
+        return None
 
     def _on_switch_click(self, event):
-        seg = min(len(TAB_NAMES) - 1, max(0, int(event.x // self._seg)))
-        self._switch_to(TAB_NAMES[seg])
+        seg = self._seg_at(event.y)
+        if seg is not None:
+            try:
+                self.switch.focus_set()
+            except Exception:
+                pass
+            self._switch_to(TAB_NAMES[seg])
 
     def _on_switch_motion(self, event):
-        seg = min(len(TAB_NAMES) - 1, max(0, int(event.x // self._seg)))
-        self.switch.config(cursor="hand2" if seg != TAB_NAMES.index(self.active_tab) else "arrow")
+        seg = self._seg_at(event.y)
+        active_idx = TAB_NAMES.index(self.active_tab)
+        self.switch.config(
+            cursor="hand2" if seg is not None and seg != active_idx else "arrow")
+        if seg == self._hover_seg:
+            return
+        self._hover_seg = seg
+        self._start_hover_anim()
+
+    def _on_switch_leave(self, _event=None):
+        self.switch.config(cursor="arrow")
+        if self._hover_seg is None:
+            return
+        self._hover_seg = None
+        self._start_hover_anim()
+
+    def _start_hover_anim(self):
+        if self._hover_anim_after is not None:
+            try:
+                self.root.after_cancel(self._hover_anim_after)
+            except Exception:
+                pass
+        self._hover_anim = {
+            "start_ms": time.monotonic(),
+            "start_t": self._hover_t,
+            "target_t": 1.0 if self._hover_seg is not None else 0.0,
+        }
+        self._tick_hover()
+
+    def _tick_hover(self):
+        anim = getattr(self, "_hover_anim", None)
+        if anim is None:
+            return
+        p = (time.monotonic() - anim["start_ms"]) * 1000.0 / self.HOVER_ANIM_MS
+        if p >= 1.0:
+            self._hover_t = anim["target_t"]
+            self._hover_anim = None
+            self._hover_anim_after = None
+            self._paint_pills()
+            return
+        eased = 1 - (1 - p) ** 3
+        self._hover_t = anim["start_t"] + (anim["target_t"] - anim["start_t"]) * eased
+        self._paint_pills()
+        self._hover_anim_after = self.root.after(16, self._tick_hover)
 
     def _switch_to(self, name):
         if self._busy or name == self.active_tab:
-            # audit fix (P2-08): silently swallowing clicks while busy reads
-            # as "app is frozen". Show the busy state instead.
             if self._busy:
-                self.set_status("Busy — wait for the current task to finish (or press ✕ Stop).")
+                self.set_status(
+                    "Busy \u2014 wait for the current task to finish (or press \u2715 Stop).")
             return
-        from_accent = TAB_ACCENTS[self.active_tab]
+        old_idx = TAB_NAMES.index(self.active_tab)
+        new_idx = TAB_NAMES.index(name)
         self.active_tab = name
         self._update_tab_icon()
-        # cancel any in-flight animation so a fast re-click retargets cleanly
         if self._switch_anim_after is not None:
             try:
                 self.root.after_cancel(self._switch_anim_after)
             except Exception:
                 pass
         self._switch_anim = {
-            "start_t": self._switch_pos,
-            "target_t": float(TAB_NAMES.index(name)),
+            "old": old_idx, "new": new_idx,
+            "old_t": self._rail_t[old_idx], "new_t": self._rail_t[new_idx],
             "start_ms": time.monotonic(),
-            "from_accent": from_accent,
-            "to_accent": TAB_ACCENTS[name],
         }
+        if self._hover_seg == new_idx:
+            self._hover_seg = None
+            self._hover_t = 0.0
         self._style_switch_labels()
-        # F5 (perf): swap the content page and flush its geometry BEFORE
-        # the slide starts. The old order ticked the thumb first and laid
-        # the new page out inside the 240 ms animation window — on heavy
-        # pages (Install ~950 widgets) the synchronous layout/paint stalled
-        # the slide, which then jumped to the end. update_idletasks() does
-        # the page's geometry pass once so the animation's first frame runs
-        # on an already-settled page.
-        #
-        # BENCHMARK A/B (2026-09): moving that flush out of the click
-        # handler (letting idle-time layout land inside the animation
-        # window) was measured as a net LOSS: click sync dropped ~10 ms,
-        # but total click-to-settled grew ~12 ms and one update round
-        # inside the slide absorbed the whole layout (~10 ms on the Tweak
-        # grids, maxR 0.8 -> 12 ms) — a dropped frame right where the
-        # slide should look smoothest. The flush stays here.
-        #
-        # Under the stacked-pages PROTO (see _show_tab) the warm-switch
-        # flush is near-free (the raised page was already laid out, so
-        # update_idletasks has ~nothing to do) but still required on a
-        # page's FIRST visit, where place() maps the whole subtree: that
-        # layout must settle before the slide's first frame, same as it
-        # did under pack. Re-checked by measurement (2026-09 bench, see
-        # the session report): warm flush cost stayed negligible, so the
-        # flush is kept under the PROTO as well.
         self._show_tab(name)
         self.root.update_idletasks()
         self._tick_switch()
@@ -1283,24 +1600,20 @@ class Application:
         anim = getattr(self, "_switch_anim", None)
         if anim is None:
             return
-        # monotonic() is in SECONDS — convert to ms before dividing by the
-        # ms-named duration (units bug made the slide take 240 *seconds*).
         p = (time.monotonic() - anim["start_ms"]) * 1000.0 / self.SWITCH_ANIM_MS
+        o, n = anim["old"], anim["new"]
         if p >= 1.0:
-            self._switch_pos = anim["target_t"]
-            self._place_switch_thumb(self._switch_pos, anim["to_accent"])
+            for i in range(len(self._rail_t)):
+                self._rail_t[i] = 1.0 if i == n else 0.0
+            self._switch_pos = float(n)
             self._switch_anim = None
             self._switch_anim_after = None
+            self._paint_pills()
             return
-        # ease-out cubic: fast start, gentle landing — no visible snap
         eased = 1 - (1 - p) ** 3
-        t = anim["start_t"] + (anim["target_t"] - anim["start_t"]) * eased
-        self._switch_pos = t
-        self._place_switch_thumb(t, _hex_lerp(anim["from_accent"], anim["to_accent"], eased))
-        # ~60 fps ticks (F5): Tk cannot present faster than the display
-        # refresh, and 100 wakeups/s during a 240 ms slide buys nothing —
-        # each tick just re-times the eased position, so the pacing is
-        # unchanged (time-based math above), only the wakeup rate drops.
+        self._rail_t[o] = anim["old_t"] * (1 - eased)
+        self._rail_t[n] = anim["new_t"] + (1.0 - anim["new_t"]) * eased
+        self._paint_pills()
         self._switch_anim_after = self.root.after(16, self._tick_switch)
 
     def _canvas_round_rect(self, c, x0, y0, x1, y1, r, **kw):
@@ -1313,6 +1626,58 @@ class Application:
             x1, y1 - r, x1, y1, x1 - r, y1, x0 + r, y1,
             x0, y1, x0, y1 - r, x0, y0 + r, x0, y0,
         ]
+
+    def _load_tab_icons(self):
+        """Load one icon asset per tab, subsampled to TAB_ICON_PX.
+
+        Split out of _build_main_ui (DESIGN AUDIT 2026-10) so the label that
+        displays them and the loading of them are not separated by a screen's
+        worth of layout code - the previous arrangement had the loader in
+        _build_main_ui and the label inside _build_tab_switch, which is
+        exactly the distance a parent mistake hides in.
+
+        PhotoImages are kept in self._tab_icons so Tk never garbage-collects
+        the currently displayed one (a Label holds only a name, not the
+        image).
+        """
+        self._tab_icons: dict = {}
+        self._pill_icons: dict = {}
+        for _tab, _fname in (("Clean", "clean.png"), ("Repair", "repair.png"),
+                             ("Tweak", "tweak.png"), ("Install", "install.png"),
+                             ("Drivers", "drivers.png"),
+                             ("Tools", "tools.png"),
+                             ("Settings", "settings.png")):
+            for _p in self._asset_candidates(_fname):
+                if not _p.is_file():
+                    continue
+                try:
+                    _img = tk.PhotoImage(file=str(_p))
+                    w, h = _img.width(), _img.height()
+                    # ICON SIZE CONTRACT (switcher-jump fix 2026-09, still
+                    # binding): every icon must DISPLAY at the same size or
+                    # the icon label changes height per tab and shoves the
+                    # whole navigation row - and everything under it - up or
+                    # down. That was the "few px jump" bug report.
+                    #
+                    # Assets are normalized to 72x72 on disk (verified), so the
+                    # normal path is a single subsample(2, 2). The computed
+                    # integer factor below is the defence against a stray
+                    # oversized PNG: it can never reintroduce the jump.
+                    if w > TAB_ICON_PX or h > TAB_ICON_PX:
+                        _f = 2
+                        while w // _f > TAB_ICON_PX or h // _f > TAB_ICON_PX:
+                            _f *= 2
+                        _img = _img.subsample(_f, _f)
+                    self._tab_icons[_tab] = _img
+                    # 24px copy shown INSIDE the pill beside the tab name
+                    # (72 / 3). Same one-source-PNG rule as above.
+                    _small = tk.PhotoImage(file=str(_p))
+                    if _small.width() >= 72:
+                        _small = _small.subsample(3, 3)
+                    self._pill_icons[_tab] = _small
+                    break
+                except Exception:
+                    continue
 
     def _update_tab_icon(self):
         """Swap the icon above the pill to the active tab's asset image."""
@@ -1367,6 +1732,11 @@ class Application:
                     _start()   # guarded: no-op when ready / already in flight
                 except Exception:
                     pass
+        try:
+            self._appbar_title.config(text=name)
+            self._appbar_sub.config(text=self._TAB_SUBTITLES.get(name, ""))
+        except Exception:
+            pass
         target = self.tabs[name]
         # TIMING (diagnostic): what the switch itself costs, and whether this
         # was a FIRST map of the page (large tree) or a plain re-raise.
@@ -1376,7 +1746,10 @@ class Application:
             target.place(relx=0, rely=0, relwidth=1, relheight=1)
         target.tkraise()
         try:
-            self.update_idletasks()
+            # B-0xx: this used to call self.update_idletasks() — Application has
+            # no such method, so it raised AttributeError every first map and
+            # the layout flush never happened. Call it on the real widget.
+            self.root.update_idletasks()
         except Exception:
             pass
         if name == "Install":
@@ -1437,6 +1810,37 @@ class Application:
 
     # ---------------- menu ---------------- #
 
+    def _status_icon(self, icon_key):
+        """A status-row glyph from the generated asset set, or None.
+
+        Same contract as TaskTab._preset_icon_image: a missing asset must
+        degrade to the emoji fallback rather than leave a hole, the
+        PhotoImage is cached on the instance (a widget holds only the image's
+        NAME, so an uncached one is collected and renders as nothing), and
+        nothing may raise - a status row that fails to build would take the
+        whole window with it.
+        """
+        if not icon_key:
+            return None
+        try:
+            if not hasattr(self, "_status_icons"):
+                self._status_icons = {}
+            if icon_key in self._status_icons:
+                return self._status_icons[icon_key]
+            from app.utils import resolve_asset_path
+            p = resolve_asset_path("preset_icons/%s.png" % icon_key)
+            img = None
+            if p:
+                img = tk.PhotoImage(file=str(p))
+                w, h = img.width(), img.height()
+                if w > STATUS_ICON_PX or h > STATUS_ICON_PX:
+                    f = max(2, int(round(max(w, h) / float(STATUS_ICON_PX))))
+                    img = img.subsample(f, f)
+            self._status_icons[icon_key] = img
+            return img
+        except Exception:
+            return None
+
     def _build_menu(self):
         # (user redesign 2026-09): the Quick Tools dropdown is GONE — its
         # items now live in the Tools tab as link-rows. This method keeps
@@ -1491,9 +1895,26 @@ class Application:
         except Exception:
             pass
         if is_admin():
-            self._mode_lbl.config(text="Administrator", cursor="")
+            # DECLUTTER 2026-10: full access is the normal state, so it says
+            # nothing. The label exists to flag the ONE state that needs the
+            # user's attention (Limited), not to read "Administrator" in the
+            # corner of every window forever.
+            self._mode_lbl.config(text="", cursor="")
+            try:
+                self._mode_lbl.pack_configure(padx=0)
+            except Exception:
+                pass
             return
-        self._mode_lbl.config(text="Limited — cleaning only  🔓",
+        try:
+            self._mode_lbl.pack_configure(padx=(0, GAP_X))
+        except Exception:
+            pass
+        # REDESIGN 2026-10: the 🔓 is gone. "Limited - cleaning only" already
+        # says everything the padlock was there to say, the whole label is
+        # clickable, and it carries a tooltip that spells out the action
+        # ("Click to unlock full features"). A padlock is a second, unthemeable
+        # copy of a word that is already on screen.
+        self._mode_lbl.config(text="Limited — cleaning only",
                               cursor="hand2")
         try:
             Tooltip(self._mode_lbl, "Click to unlock full features "
@@ -1521,8 +1942,8 @@ class Application:
                 accent=COLORS["accent_yellow"]):
             return
         if not relaunch_as_admin():
-            messagebox.showerror(
-                "Elevation Failed",
+            _themed_showerror(
+                self.root, "Elevation Failed",
                 "Could not request administrator rights. "
                 "You can keep using Limited mode.")
             return
@@ -1540,8 +1961,8 @@ class Application:
                     sys.exit(0)
                 else:
                     try:
-                        messagebox.showwarning(
-                            "Elevation Cancelled",
+                        _themed_showwarning(
+                            self.root, "Elevation Cancelled",
                             "Administrator elevation was cancelled or timed out.\n\n"
                             "If an elevated window opened, use that one and close this.")
                     except Exception:
@@ -1776,6 +2197,42 @@ class Application:
     def _open_pc_specs(self):
         """Opens the pc_specs dialog. See app/ui/dialogs/registry.py."""
         open_dialog(self, "pc_specs")
+
+    def _open_health_report(self):
+        """Opens the health_report dialog. See app/ui/dialogs/registry.py."""
+        open_dialog(self, "health_report")
+
+    def _open_network_connections(self):
+        """Opens the network_connections dialog. See app/ui/dialogs/registry.py."""
+        open_dialog(self, "network_connections")
+
+    def _open_services(self):
+        """Opens the services dialog. See app/ui/dialogs/registry.py."""
+        open_dialog(self, "services")
+
+    def _open_file_lock(self):
+        """Opens the file_lock dialog. See app/ui/dialogs/registry.py."""
+        open_dialog(self, "file_lock")
+
+    def _open_duplicates(self):
+        """Opens the duplicates dialog. See app/ui/dialogs/registry.py."""
+        open_dialog(self, "duplicates")
+
+    def _open_update_picker(self):
+        """Opens the update_picker dialog. See app/ui/dialogs/registry.py."""
+        open_dialog(self, "update_picker")
+
+    def _open_restore_points(self):
+        """Opens the restore_points dialog. See app/ui/dialogs/registry.py."""
+        open_dialog(self, "restore_points")
+
+    def _open_safety_center(self):
+        """Opens the safety_center dialog. See app/ui/dialogs/registry.py."""
+        open_dialog(self, "safety_center")
+
+    def _open_run_history(self):
+        """Opens the run_history dialog. See app/ui/dialogs/registry.py."""
+        open_dialog(self, "run_history")
 
     def _pilot_preset_tasks(self):
         """Task objects for the configured session preset (tolerant:
@@ -2047,8 +2504,8 @@ class Application:
     # ------------------------------------------------------------------ #
     # H15 forwarders. Each of these used to carry the logic; they now hand
     # off to SessionOrchestrator, which is the only thing that should own
-    # the Auto-Pilot's state. Kept as named methods because
-    # tools/smoke_async.py and PilotDialog call them by name.
+    # the Auto-Pilot's state. Kept as named methods because PilotDialog
+    # (and tests) call them by name.
     # ------------------------------------------------------------------ #
     @property
     def _pilot(self):
@@ -2402,21 +2859,23 @@ class Application:
             elif command in self._LAUNCH_DOCS:
                 os.startfile(command)  # noqa: S606 — allowlisted document only
             else:
-                messagebox.showerror("Could Not Launch", f"Refusing to launch unknown target: {command!r}")
+                _themed_showerror(self.root, "Could Not Launch",
+                                  f"Refusing to launch unknown target: {command!r}")
         except Exception as exc:
-            messagebox.showerror("Could Not Launch", str(exc))
+            _themed_showerror(self.root, "Could Not Launch", str(exc))
 
     def _launch_settings(self, uri: str):
         """Open a Windows Settings page via its ms-settings: URI."""
         try:
             os.startfile(uri)  # noqa: S606 — shell-resolved URI, not an exe
         except Exception as exc:
-            messagebox.showerror("Could Not Open", f"Couldn't open Windows Settings:\n{exc}")
+            _themed_showerror(self.root, "Could Not Open",
+                              f"Couldn't open Windows Settings:\n{exc}")
 
     # ---------------- Auto Maintenance dialog ---------------- #
 
     def _maybe_show_automaint_tip(self):
-        """One-time nudge toward Auto-Maintenance after the first
+        """One-time nudge toward Auto Maintenance (now in the Settings tab) after the first
         successful Clean run (see the audit-fix note at the call site).
         Never shown again after this, and never shown at all if the user
         already has a maintenance schedule set up."""
@@ -2448,10 +2907,11 @@ class Application:
                     self.root, "Keep it clean automatically?",
                     "Cleaner Tool can run this same clean on a schedule — "
                     "no need to remember to open it.\n\n"
-                    "Set up Auto-Maintenance now? (You can always find this "
-                    "later via the 🛠️ icon, bottom-left.)",
-                    accent=TAB_ACCENTS["Clean"]):
-                self._show_schedule_dialog()
+                    "Open Settings to set it up now? (You can always find "
+                    "it later in the Settings tab.)",
+                    accent=TAB_ACCENTS["Clean"], yes_text="Open Settings",
+                    no_text="Not now"):
+                self._switch_to("Settings")
         except Exception:
             pass
 
@@ -2542,24 +3002,39 @@ class Application:
         closetray_var = _toggle_row("Close to Tray", _closetray0,
                                "Window X hides to the tray instead of quitting")
 
+        # PC Health badge schedule. Read-only check; never fixes anything by
+        # itself. Stored as health_check_mode (off | startup | daily | weekly).
+        _HC = (("Off", "off"), ("At startup", "startup"),
+               ("Daily", "daily"), ("Weekly", "weekly"))
+        _hc_names = {k: n for n, k in _HC}
+        _hc_keys = {n: k for n, k in _HC}
+        health_var = tk.StringVar(value=_hc_names.get(
+            str(config.get("health_check_mode", "startup")), "At startup"))
+        hc_row = _row()
+        _hc_lbl = tk.Label(hc_row, text="PC Health check", bg=COLORS["bg"],
+                           fg=COLORS["text"], font=(F, 11))
+        _hc_lbl.pack(side="left")
+        hc_menu = M3Dropdown(_holder(hc_row), textvariable=health_var,
+                             values=[n for n, _k in _HC], state="readonly",
+                             width=max(len(n) for n, _k in _HC) + 1,
+                             font=(F, 10))
+        hc_menu.pack(fill="both", expand=True)
+        try:
+            Tooltip(_hc_lbl, "How often the PC Health badge re-checks your "
+                             "PC. Checking is read-only; it never changes "
+                             "anything.")
+        except Exception:
+            pass
+
         tk.Frame(col, height=1, bg=COLORS["hairline"]).pack(fill="x", pady=(10, 6))
 
         freq_row = _row()
         tk.Label(freq_row, text="How often", bg=COLORS["bg"], fg=COLORS["text"],
                  font=(F, 11)).pack(side="left")
         freq_var = tk.StringVar(value=freq)
-        freq_combo = tk.OptionMenu(_holder(freq_row), freq_var, "daily", "weekly", "monthly")
-        freq_combo.config(bg=COLORS["surface"], fg=COLORS["text"],
-                          activebackground=COLORS["surface_hover"], activeforeground=COLORS["text"],
-                          highlightthickness=0, bd=0, relief="flat",
-                          font=(F, 10), indicatoron=True)
-        try:
-            menu = freq_combo["menu"]
-            menu.config(bg=COLORS["surface"], fg=COLORS["text"],
-                        activebackground=COLORS["surface_hover"], activeforeground=COLORS["text"],
-                        bd=0, relief="flat", font=(F, 10))
-        except Exception:
-            pass
+        freq_combo = M3Dropdown(_holder(freq_row), textvariable=freq_var,
+                                values=["daily", "weekly", "monthly"],
+                                state="readonly", width=9, font=(F, 10))
         freq_combo.pack(fill="both", expand=True)
 
         time_row = _row()
@@ -2614,20 +3089,20 @@ class Application:
                 if ok:
                     results.append("Maintenance enabled")
                 else:
-                    messagebox.showerror("Failed", f"Could not create maintenance task:\n{msg}", parent=dlg)
+                    _themed_showerror(dlg, "Failed", f"Could not create maintenance task:\n{msg}")
             else:
                 ok, msg = disable_schedule()
                 if ok:
                     results.append("Maintenance disabled")
                 else:
-                    messagebox.showerror("Failed", f"Could not remove maintenance task:\n{msg}", parent=dlg)
+                    _themed_showerror(dlg, "Failed", f"Could not remove maintenance task:\n{msg}")
             # update-everything schedule (separate schtasks entry)
             if upd_var.get():
                 ok, msg = enable_schedule(freq_var.get(), time_var.get(), extra_args=["--auto-update"])
                 if ok:
                     results.append("Update Everything enabled")
                 else:
-                    messagebox.showerror("Failed", f"Could not create update task:\n{msg}", parent=dlg)
+                    _themed_showerror(dlg, "Failed", f"Could not create update task:\n{msg}")
             else:
                 ok, msg = disable_schedule(["--auto-update"])
                 if ok:
@@ -2689,6 +3164,13 @@ class Application:
                                else "Close to Tray off")
             except Exception as exc:
                 results.append(f"Close to Tray unset ({exc})")
+            try:
+                from app.config_persist import update_config as _upd_hc
+                _hc_val = _hc_keys.get(health_var.get(), "startup")
+                _upd_hc(lambda c, _v=_hc_val: c.__setitem__(
+                    "health_check_mode", _v))
+            except Exception as exc:
+                results.append(f"PC Health check unset ({exc})")
             refresh_status()
             # short + quiet: "Saved." unless something failed or is pending
             _attn = [r for r in results
@@ -2742,7 +3224,10 @@ class Application:
     # poll (30s) without a restart. MTP phone storage is deliberately out
     # of scope: no drive letter, slow/flaky free-space queries.
 
-    _MAX_INLINE_CHIPS = 3
+    # DECLUTTER 2026-10: only the system drive is shown in the status row; the
+    # others are listed in its tooltip (a row of drive chips next to the PC
+    # Health badge made the strip read as a dashboard).
+    _MAX_INLINE_CHIPS = 1
 
     @staticmethod
     def _query_drive_free_total(root_path: str):
@@ -2815,8 +3300,8 @@ class Application:
         try:
             _os.startfile(root)
         except Exception as exc:
-            messagebox.showerror("Could Not Open Drive",
-                                 f"Couldn't open {root}\n\n{exc}")
+            _themed_showerror(self.root, "Could Not Open Drive",
+                              f"Couldn't open {root}\n\n{exc}")
 
     def _show_extra_drives_menu(self):
         """The '+N ▾' overflow menu: every drive that didn't fit inline,
@@ -2947,14 +3432,14 @@ class Application:
                         break
             except Exception:
                 pass
-            box = tk.Frame(frame_holder, bg="#3A2C12")
+            box = tk.Frame(frame_holder, bg=COLORS["alert_amber_bg"])
             lbl = tk.Label(box, text=self._nudge_chip_text(letter, free_gb),
-                           font=(F, 9, "bold"), bg="#3A2C12",
+                           font=(F, 9, "bold"), bg=COLORS["alert_amber_bg"],
                            fg=COLORS["accent_yellow"], cursor="hand2")
             lbl.pack(side="left", padx=(8, 2), pady=3)
             lbl.bind("<Button-1>", lambda e: self._open_storage_insight())
             tip = Tooltip(lbl, self._nudge_tip_text(letter, free_gb, total_gb))
-            x = tk.Label(box, text="✕", font=(F, 8), bg="#3A2C12",
+            x = tk.Label(box, text="✕", font=(F, 8), bg=COLORS["alert_amber_bg"],
                          fg=COLORS["subtext"], cursor="hand2")
             x.pack(side="left", padx=(0, 8))
             x.bind("<Button-1>", lambda e, l=letter: self._dismiss_nudge(l))
@@ -3082,18 +3567,13 @@ class Application:
             # Storage Insight (feature 3): right-click opens the insight
             # dialog; left-click keeps the long-standing Explorer behavior
             lbl.bind("<Button-3>", lambda e: self._open_storage_insight())
+            _others = ("\n\nOther drives:\n" + "\n".join(
+                f"{d[0]}: {d[2]:.0f} GB free" for d in extra)) if extra else ""
             Tooltip(lbl, f"{root} — {free_gb:.0f} GB free of {total_gb:.0f} GB. "
-                         "Click to open in Explorer, right-click for Storage Insight.")
+                         "Click to open in Explorer, right-click for Storage "
+                         "Insight." + _others)
             self._drive_chips.append((lbl, root))
-        if extra:
-            self._drive_extra = extra
-            more = tk.Label(self._drive_chips_frame,
-                            text=f" +{len(extra)} drives ▾ ", font=(F, 9, "bold"),
-                            bg=COLORS["bg"], fg=COLORS["subtext"], cursor="hand2")
-            more.pack(side="left", padx=(6, 0))
-            more.bind("<Button-1>", lambda e: self._show_extra_drives_menu())
-            Tooltip(more, "More connected drives:\n" +
-                    "\n".join(f"{d[0]}: {d[2]:.0f} GB free" for d in extra))
+        self._drive_extra = extra
 
     def _start_disk_monitor(self):
         if hasattr(self, "_disk_monitor_after_id") and self._disk_monitor_after_id:
@@ -3232,14 +3712,30 @@ class Application:
             )
             with open(path, "w", encoding="utf-8") as f:
                 f.write(header + "\n".join(self._log_lines) + "\n")
+                # U-001: the app writes a diagnostics trail to events.log the
+                # whole time (elevation cookie failures, swallowed ops, ...),
+                # but it was never read back. A bug report should carry it, so
+                # append the tail. Best-effort: an unreadable log is skipped.
+                try:
+                    from app.config_events import read_events
+                    events = read_events(500)
+                except Exception:
+                    events = []
+                if events:
+                    f.write("\n" + ("-" * 60) + "\n")
+                    f.write("Diagnostics \u2014 swallowed failures / event log "
+                            "(last %d)\n" % len(events))
+                    f.write(("-" * 60) + "\n")
+                    f.write("\n".join(events) + "\n")
             # user bug: exporting mid-run overwrote the live "Running X…"
             # status with "Log saved to …" and it never came back. When a
             # run is active the status belongs to the run — log only.
             if not getattr(self, "_busy", False):
-                self.set_status(f"Log saved to {path}")
+                self.set_status("Log saved: " + os.path.basename(path))
             self.log(f"Log exported to {path}")
         except Exception as exc:
-            messagebox.showerror("Export Failed", f"Could not save the log:\n{exc}")
+            _themed_showerror(self.root, "Export Failed",
+                              f"Could not save the log:\n{exc}")
 
     def _windows_edition_str(self) -> str:
         try:
@@ -3826,7 +4322,7 @@ class Application:
         self.set_status(f"Starting {len(tasks)} task(s)...")
 
         # H10: the run owns its results list. `self._run_results` still points
-        # at it (tools/smoke_async.py reads that attribute after a run), but
+        # at it (a completed run's results stay readable there), but
         # rebinding it on the next run no longer corrupts this run's data: the
         # worker and the deferred result card both close over the local.
         run_results = []
@@ -3900,8 +4396,8 @@ class Application:
 
         Never raises: a registry read failure yields {}, because a badge is
         never worth an exception. The bare `get_tweak_state` name is resolved
-        at call time on purpose, so tools/smoke_async.py can still substitute
-        a deterministic registry by patching this module.
+        at call time on purpose, so a test can substitute a deterministic
+        registry by patching this module.
         """
         try:
             return dict(get_tweak_state() or {})
@@ -3969,6 +4465,16 @@ class Application:
         """
         try:
             self._release_run(ok=False)
+        except Exception:
+            pass
+        try:
+            # B-0xx: if the failure happened after _start_claimed_run disabled
+            # the Run buttons and showed the progress bar (its _set_buttons_
+            # enabled(False) / progress lines run before the worker exists),
+            # nothing else re-enabled them — the app looked stuck despite the
+            # "still usable" message. _set_buttons_enabled(True) also hides the
+            # progress bar.
+            self._set_buttons_enabled(True)
         except Exception:
             pass
         try:
@@ -4048,7 +4554,13 @@ class Application:
             self._last_run_ok = bool(ok)
             self._worker_thread = None
             self._state = RunState.IDLE
-        self._cancel_requested = False
+            # B-0xx: reset the cancel token INSIDE the critical section. It
+            # used to run one statement after the lock released, so a second
+            # run could claim the slot and have its Stop request wiped by this
+            # run's late reset — a Stop on the new run was silently ignored.
+            # Safe under the lock: the _cancel_requested setter does not take
+            # _busy_lock itself.
+            self._cancel_requested = False
 
     @property
     def last_run_outcome(self) -> "RunState | None":
@@ -4162,9 +4674,28 @@ class Application:
         # closure above, not this.
         self._run_before_bytes = run_before_bytes
         self._run_before_drives = run_before_drives
+        # N-002: a cheap memory / restart-flag reading, bracketed around the
+        # run exactly like the disk snapshots above (same worker thread, same
+        # fail-soft contract: an unreadable value is None and the scorecard
+        # simply omits that line rather than inventing a change).
+        try:
+            from app import benchmark as _bench
+            run_before_measure = _bench.snapshot()
+        except Exception:
+            run_before_measure = None
+        self._run_before_measure = run_before_measure
 
         ctx = TaskContext(log=self.log, set_status=self.set_status,
                           cancelled=lambda: self._cancel_requested)
+        # 2.5: opt-in Quarantine bin. Attached only for a real apply run; a
+        # revert restores registry tweaks and a dry_run/Storage-Insight ctx
+        # never deletes, so neither needs (or should get) a bin.
+        try:
+            from app import quarantine as _q
+            if mode != "revert" and _q.enabled():
+                ctx.quarantine = _q.Quarantine()
+        except Exception:
+            pass
 
         total_bytes = 0
         completed, failed = 0, 0
@@ -4437,6 +4968,7 @@ class Application:
                     on_run_again=run_again,
                     before_drives=run_before_drives,
                     after_drives=after_drives,
+                    measurements=(run_before_measure, after_measure),
                 )
                 card.wait()
                 # Audit fix (Auto-Maintenance discoverability): the
@@ -4477,6 +5009,14 @@ class Application:
                 self._query_drives, self._query_drive_free_total)
         except Exception:
             after_drives = {}
+        # N-002: the matching end-of-run reading for the scorecard's
+        # before/after block. Read HERE (worker thread, after the last task)
+        # so it never touches the Tk thread.
+        try:
+            from app import benchmark as _bench
+            after_measure = _bench.snapshot()
+        except Exception:
+            after_measure = None
 
         # Routed through the dispatcher rather than root.after(0) called from
         # this worker thread: a cross-thread .after() can be dropped outright,

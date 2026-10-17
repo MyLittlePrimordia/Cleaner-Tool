@@ -187,6 +187,7 @@ class TrayIcon:
         self._taskbar_created_msg = 0
         self._running = False
         self._wndproc_ref = None  # keep the CFUNCTYPE alive
+        self.last_error = ""      # why start() last failed (for the log)
 
     # ---------------- public ---------------- #
 
@@ -675,13 +676,32 @@ class TrayIcon:
             pass
         return False
 
+    #: Shell_NotifyIcon(NIM_ADD) fails outright while Explorer's taskbar does
+    #: not exist - which is exactly the state right after the Deep Clean /
+    #: Repair tasks restart Explorer (and on a slow login or a crashed shell).
+    #: One attempt turned that few-second gap into "Could not create the
+    #: system-tray icon" when the user then closed the window. Windows' own
+    #: guidance is to retry, so retry for up to ~6s (inside the 8s the
+    #: caller waits) before giving up.
+    ADD_ATTEMPTS = 12
+    ADD_INTERVAL_S = 0.5
+
     def _add_icon(self) -> bool:
         try:
             import ctypes
-            nid = self._nid(self.tooltip)
-            return bool(ctypes.windll.shell32.Shell_NotifyIconW(
-                NIM_ADD, ctypes.byref(nid)))
-        except Exception:
+            import time
+            for attempt in range(self.ADD_ATTEMPTS):
+                nid = self._nid(self.tooltip)
+                if ctypes.windll.shell32.Shell_NotifyIconW(
+                        NIM_ADD, ctypes.byref(nid)):
+                    return True
+                self.last_error = ("Shell_NotifyIcon(NIM_ADD) failed - the "
+                                   "taskbar was not ready (attempt %d of %d)"
+                                   % (attempt + 1, self.ADD_ATTEMPTS))
+                time.sleep(self.ADD_INTERVAL_S)
+            return False
+        except Exception as exc:                       # noqa: BLE001
+            self.last_error = "tray add raised: %s" % exc
             return False
 
     def _delete_icon(self) -> None:

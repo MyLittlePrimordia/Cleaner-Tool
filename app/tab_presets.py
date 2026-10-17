@@ -69,7 +69,10 @@ def _merge_tweak():
 # The three tabs
 # --------------------------------------------------------------------------- #
 
-TAB_NAMES = ["Clean", "Repair", "Tweak", "Install", "Tools"]
+# Order is the on-screen order. Drivers sits beside Install (both are "get
+# software onto this PC"); Settings is last, where people look for it.
+TAB_NAMES = ["Clean", "Repair", "Tweak", "Install", "Drivers", "Tools",
+             "Settings"]
 
 TABS = {
     "Clean": _merge_clean(),
@@ -89,6 +92,11 @@ TABS = {
     # implementation shadowing this tab. Saying otherwise in the source is how
     # the next person ends up "fixing" a duplicate that does not exist.
     "Tools": [],
+    # Drivers and Settings are full pages (app/ui/tabs/driverstab.py,
+    # settingstab.py), not task grids. Like Tools they carry an empty task
+    # list so the tab machinery needs no special cases.
+    "Drivers": [],
+    "Settings": [],
 }
 
 # --------------------------------------------------------------------------- #
@@ -211,7 +219,13 @@ CUSTOM_GROUPS = {
           "vrchat_cache", "fivem_cache", "starcitizen_cache",
           "riot_logs", "hoyoverse_logs", "rockstar_logs", "roblox_logs"]),
         ("Saves safety net",
-         ["backup_saves"]),
+         # BUG-043: Clean is the most destructive tab and had NO way to
+         # take a restore point first. Repair and Tweak both had one; the tab
+         # that deletes things did not, which is backwards. `restore_point`
+         # is the same task object the other two tabs use, so the 24-hour
+         # throttle, the TaskSkipped path and the failure wording are all
+         # already correct - this is a placement fix, not new machinery.
+         ["backup_saves", "restore_point"]),
         ("Windows temp & system junk",
          ["user_temp_files", "system_temp_files", "temp_deep_clean",
            "recycle_bin", "chk_fragments", "old_logs", "error_reports",
@@ -229,6 +243,8 @@ CUSTOM_GROUPS = {
          ["orphan_leftovers"]),
         ("Privacy traces",
          ["activity_traces", "terminal_history"]),
+        ("Space audits (nothing is deleted)",
+         ["downloads_audit", "ai_model_cache", "docker_wsl_usage"]),
         ("Quick fixes & bloat removal",
          ["dns_flush", "ram_purge", "remove_bloat"]),
     ],
@@ -244,8 +260,11 @@ CUSTOM_GROUPS = {
         ("Updates & downloads",
          ["wu_reset", "wu_bounce", "bits_reset", "time_sync", "gpupdate"]),
         ("Network & firewall",
-         ["network_reset", "firewall_reset", "arp_flush", "teredo_fix",
+         ["network_reset", "firewall_reset", "arp_flush", "dhcp_renew",
+           "teredo_fix",
           "hosts_restore", "firewall_backup", "network_light"]),
+         ("Windows activation & security",
+          ["activation_status", "secureboot_tpm"]),
          ("Apps, Xbox, devices & drivers",
           ["xbox_apps", "store_apps_reregister", "search_index",
            "print_spooler", "wmi_repair", "restart_audio",
@@ -253,7 +272,8 @@ CUSTOM_GROUPS = {
            "anticheat_repair", "icon_cache", "wsreset_store",
            "restart_explorer", "restart_camera", "restart_startmenu",
            "tray_icons", "driver_export", "micfix_audit", "nvidia_app_fix",
-           "gameinput_restart", "xboxlive_restart"]),
+           "gameinput_restart", "xboxlive_restart",
+            "driver_verifier_reset", "wsl_repair"]),
     ],
     "Tweak": [
         ("Safety net",
@@ -261,7 +281,8 @@ CUSTOM_GROUPS = {
         ("Gaming & CPU/GPU performance",
          ["ultimate_performance", "max_cpu_power", "max_performance_gpu",
           "game_mode", "games_priority", "priority_separation",
-          "power_throttling_off", "disable_game_dvr", "windowed_optimize",
+          "power_throttling_off", "disable_game_dvr", "gamebar_capture",
+          "windowed_optimize",
           "fullscreen_opt", "hags", "shader_cache_10gb", "background_apps",
           "mpo_fix", "adv_memory_compression", "gpu_preference_high",
           "refresh_rate_fix", "tdr_delay"]),
@@ -276,13 +297,14 @@ CUSTOM_GROUPS = {
           ["privacy_baseline", "stop_telemetry", "limit_telemetry",
            "nvidia_telemetry", "activity_history", "adv_copilot",
            "adv_disable_ai", "consumer_features", "stop_windows_ads",
-           "ad_blocker", "remote_assist", "location_tracking",
+           "ad_blocker", "remote_assist", "location_tracking", "cortana_off",
            "clipboard_sync_off", "mic_privacy_allow", "ads_master_off"]),
          ("Windows look, search & startup",
            ["classic_context_menu", "taskbar_cleanup", "local_search",
             "visual_effects", "explorer_auto_discovery",
             "startup_delay", "disable_fast_startup", "file_extensions",
-           "menu_delay", "aero_shake", "lock_screen", "edge_preload",
+           "menu_delay", "aero_shake", "lock_screen", "lockscreen_tips_off",
+           "transparency_off", "edge_preload",
            "dark_mode", "verbose_boot", "widgets_board_off",
            "snap_flyout_off", "taskbar_endtask", "clock_seconds",
            "taskbar_left", "taskbar_never_combine",

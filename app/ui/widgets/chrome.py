@@ -19,7 +19,7 @@ import sys
 
 from app.config import APP_NAME, WINDOW_MIN_SIZE
 from app.ui.widgets.tooltip import Tooltip
-from app.ui.theme import COLORS, F, TAB_ACCENTS, _round_rect_points
+from app.ui.theme import COLORS, F, TAB_ACCENTS, TYPE, _round_rect_points
 from app.utils import resolve_asset_path
 
 
@@ -44,7 +44,7 @@ class BorderlessChrome:
     """
 
     GRIP = 6          # resize edge thickness
-    RADIUS = 12       # corner radius (window)
+    RADIUS = 16       # corner radius (window) - M3 large shape
     TITLE_H = 40      # custom title bar height
 
     def __init__(self, root, app):
@@ -126,12 +126,12 @@ class BorderlessChrome:
         except Exception:
             # no transparency support: rounded corners would show black
             # notches — keep the borderless bar but square corners
-            self._transkey = COLORS["bg"]
+            self._transkey = COLORS["shell"]
         root.deiconify()
 
         # 2) rounded corner masks (lifted over ALL content)
         self._corners = []
-        r = self.RADIUS if self._transkey != COLORS["bg"] else 0
+        r = self.RADIUS if self._transkey != COLORS["shell"] else 0
         if r:
             for corner in ("nw", "ne", "sw", "se"):
                 c = tk.Canvas(root, width=r + 2, height=r + 2,
@@ -207,7 +207,7 @@ class BorderlessChrome:
             for c, (cx, cy) in zip(self._corners, centers):
                 c.delete("all")
                 c.create_oval(cx - r, cy - r, cx + r, cy + r,
-                              fill=COLORS["bg"], outline="")
+                              fill=COLORS["shell"], outline="")
         except Exception:
             pass
 
@@ -215,7 +215,7 @@ class BorderlessChrome:
 
     def _build_titlebar(self):
         root = self.root
-        bar = self._titlebar = tk.Frame(root, bg=COLORS["bg"], height=self.TITLE_H)
+        bar = self._titlebar = tk.Frame(root, bg=COLORS["shell"], height=self.TITLE_H)
         # packed LAST in _build_main_ui order? No — place() keeps it
         # independent of pack order, always at the very top:
         bar.place(x=0, y=0, relwidth=1.0, height=self.TITLE_H)
@@ -232,35 +232,38 @@ class BorderlessChrome:
             self._title_icon_img = None
         if self._title_icon_img is not None:
             try:
-                tk.Label(bar, image=self._title_icon_img, bg=COLORS["bg"],
+                tk.Label(bar, image=self._title_icon_img, bg=COLORS["shell"],
                          bd=0, highlightthickness=0).pack(
                              side="left", padx=(12, 6), pady=12)
             except Exception:
                 self._title_icon_img = None
         if self._title_icon_img is None:
-            icon = tk.Canvas(bar, width=16, height=16, bg=COLORS["bg"],
+            icon = tk.Canvas(bar, width=16, height=16, bg=COLORS["shell"],
                              highlightthickness=0, bd=0)
             try:
                 icon.create_oval(2, 2, 14, 14, fill=COLORS["accent_green"],
                                  outline="")
-                icon.create_oval(5, 5, 11, 11, fill=COLORS["bg"], outline="")
+                icon.create_oval(5, 5, 11, 11, fill=COLORS["shell"], outline="")
                 icon.create_oval(6.5, 6.5, 9.5, 9.5, fill=COLORS["accent_green"],
                                  outline="")
             except Exception:
                 pass
             icon.pack(side="left", padx=(14, 8), pady=12)
 
-        self._title_lbl = tk.Label(bar, text=APP_NAME, font=(F, 10, "bold"),
-                                   bg=COLORS["bg"], fg=COLORS["text"])
+        self._title_lbl = tk.Label(bar, text=APP_NAME, font=TYPE["title_medium"],
+                                   bg=COLORS["shell"], fg=COLORS["text"])
         self._title_lbl.pack(side="left", pady=(0, 0))
 
         # window buttons: minimize, maximize, close (X = red on hover)
         def _mkbtn(sym, tip):
             b = tk.Label(bar, text=sym, font=(F, 10, "bold"),
-                         bg=COLORS["bg"], fg=COLORS["subtext"],
+                         bg=COLORS["shell"], fg=COLORS["subtext"],
                          cursor="hand2", padx=10, pady=8)
-            b.bind("<Enter>", lambda _e: b.config(fg=COLORS["text"]))
-            b.bind("<Leave>", lambda _e: b.config(fg=COLORS["subtext"]))
+            # M3 state layer: hover tints the container with on-surface @ 8%
+            b.bind("<Enter>", lambda _e: b.config(
+                fg=COLORS["text"], bg=COLORS["surface"]))
+            b.bind("<Leave>", lambda _e: b.config(
+                fg=COLORS["subtext"], bg=COLORS["shell"]))
             try:
                 Tooltip(b, tip)
             except Exception:
@@ -280,8 +283,10 @@ class BorderlessChrome:
                 pass
 
         close = _mkbtn("✕", "Close")
-        close.bind("<Enter>", lambda _e: close.config(fg=COLORS["accent_red"]))
-        close.bind("<Leave>", lambda _e: close.config(fg=COLORS["subtext"]))
+        close.bind("<Enter>", lambda _e: close.config(
+            fg=COLORS["accent_red"], bg=COLORS["alert_red_bg"]))
+        close.bind("<Leave>", lambda _e: close.config(
+            fg=COLORS["subtext"], bg=COLORS["shell"]))
         close.bind("<Button-1>", lambda _e: self.app._on_close())
         close.pack(side="right", padx=(0, 8), pady=6)
         maxb = _mkbtn("❐", "Maximize")
@@ -390,7 +395,7 @@ class BorderlessChrome:
         }
         self._grip_widgets = {}
         for name, (rx, ry, rw, rh, side, cur, axis) in specs.items():
-            f = tk.Frame(root, bg=COLORS["bg"], cursor=cur)
+            f = tk.Frame(root, bg=COLORS["shell"], cursor=cur)
             self._grip_widgets[name] = f
             self._wire_grip(f, side, axis)
         # corners get diagonal cursors
@@ -399,7 +404,7 @@ class BorderlessChrome:
             "sw": ("size_sw_ne", "sw"), "se": ("size_se_nw", "se"),
         }
         for name, (cur, side) in corners.items():
-            f = tk.Frame(root, bg=COLORS["bg"])
+            f = tk.Frame(root, bg=COLORS["shell"])
             try:
                 f.config(cursor=cur)
             except Exception:

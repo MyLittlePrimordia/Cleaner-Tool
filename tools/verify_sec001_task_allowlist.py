@@ -1,531 +1,389 @@
-"""prior SEC-001 (report fix-order item 25, first half): elevated Tweak Undo
-trusted user-controlled registry targets.
+#!/usr/bin/env python3
+"""Drift guard for the SEC-001 per-task registry allowlist.
 
-`startup_disabled` and `tweak_snapshots` both live in the user's config.json.
-_prior SEC-001_ is the snapshot half: `get_tweak_snapshot()` reads persisted
-data, and `_restore_reg_values()` used to validate the (hive, path, name)
-triples only against a DENYLIST of persistence locations. So a same-user
-process edits `tweak_snapshots[task]["specs"]`, the user runs Undo while
-Cleaner Tool is ELEVATED, and an elevated process writes attacker-selected
-values - or deletes values - at any HKCU/HKLM/HKCR location that is not on the
-denylist.
+Why this exists
+---------------
+`_TASK_REG_ALLOWLIST` (+ `_TASK_REG_ALLOWLIST_MANUAL`, + the prefix table) is
+the primary control that stops a tampered `config.json` from redirecting a
+tweak's snapshot restore into an arbitrary registry key. It is only as good as
+its agreement with the code: if an apply function starts writing a new
+(hive, path, name) that the allowlist does not name, the allowlist silently
+stops covering that task.
 
-The report's words: "Derive restore targets exclusively from immutable
-code-owned task metadata. Match the persisted snapshot to the exact expected
-task and reject legacy/tampered snapshots that do not match exactly."
+This script exits non-zero when that agreement breaks:
 
-`_TASK_REG_ALLOWLIST` in app/tasks/tweak_tasks.py is that code-owned metadata:
-a snapshot spec is honoured only if the task itself is defined to touch that
-location.
+  * DRIFT — a LITERAL spec passed to `_snap_reg_values` / `_regn_apply` for a
+    task that IS allowlisted is missing from that task's allowlist entry;
+  * PREFIX DRIFT — a prefix rule's task writes a value name the rule does not
+    cover, names a path/hive its apply function never mentions, or declares a
+    name the function no longer writes;
+  * MANUAL DRIFT — a hand-transcribed entry names a location the owning apply
+    function never mentions (it would authorise more than the task writes);
+  * a table entry is malformed (unknown hive, empty path, wrong arity);
+  * `_TASK_REG_ALLOWED_NORM` does not match a fresh derivation from the tables
+    (a build-order bug in the normalisation step).
 
-The report's verification plan is followed literally, including the part that
-is easy to miss: ALTERNATE PATH SPELLINGS. A denylist-style substring test, or
-an allowlist compared with `==` on raw strings, can be walked straight past by
-writing "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Run" with different
-case, a doubled separator, or a trailing backslash. So matching normalises
-first, and that is asserted here.
+It also prints a coverage report (allowlisted vs total tweak tasks) so the
+remaining gap stays measured instead of drifting quietly.
 
-SCOPE, and this test does not pretend otherwise: the allowlist covers 40 of
-~65 registry-backed tweaks. The remainder (dynamic-path tasks like
-disable_nagle, and tasks that write without a snapshot list) are still governed
-by the denylist alone and are tracked in references/FINDINGS_LEDGER.txt. This
-check asserts the implemented scope and the drift guard; it does not assert
-the finding is closed.
+Prefix rules are verified by SOURCE, not by hand. A task whose registry path is
+built at run time (one subkey per network adapter, say) cannot be re-derived as
+a literal triple, so it is declared in `_TASK_REG_ALLOW_PREFIX` instead. That
+used to be the end of the guard's reach - the entry was "verified by hand" and
+anything the apply function later started writing under that prefix went
+unchecked. `_verify_prefix_rules` closes it: it locates the apply function that
+feeds the task id to `_regn_apply`, requires the rule's path and hive to appear
+as literals there, and requires the set of value names the function iterates to
+match the set of names the rule declares - EXACTLY. A new name added to the
+write loop without a matching rule entry is a hard failure, because that is the
+name a tampered snapshot could otherwise redirect.
+
+Scope limit (honest): a spec list is statically checkable only when it is built
+from literals and module-level constants (the shared evaluator follows `+`, `%`
+formatting, `NAME[i]` subscripts and comprehensions over constant lists). A list
+assembled from function-local or OS-dependent values (`taskbar_cleanup`) cannot
+be re-derived here; that one lives in `_TASK_REG_ALLOWLIST_MANUAL`. If a prefix
+rule's function stops iterating a literal tuple of names, this guard FAILS
+rather than skipping - fail-closed, so a refactor cannot silently reopen the
+hole.
 """
-
 from __future__ import annotations
 
 import ast
-import io
+import os
 import sys
 
-sys.path.insert(0, ".")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.tasks import tweak_tasks as tt  # noqa: E402
+from app.tasks import tweak_tasks as T  # noqa: E402
+from app.tasks import advanced_tasks as A  # noqa: E402
+from app.task_keys import CUT_TASK_KEYS  # noqa: E402
+# Shared AST helpers — the SAME code the Tweak "Preview changes" feature uses
+# (app/tweak_introspect.py), so the guard and the preview cannot disagree about
+# what a task writes. Kept under their original private names for the tests.
+from app.tweak_introspect import (  # noqa: E402
+    const_index as _const_index,
+    literal_specs as _literal_specs,
+    resolve_specs_node as _resolve_specs_node,
+    resolve_str as _resolve_str,
+    scan_reg_specs as _scan_reg_specs,
+)
+from app.utils import _HIVES  # noqa: E402
 
-FAILS = 0
-CHECKS = 0
-
-
-def ck(label, cond, detail=""):
-    global FAILS, CHECKS
-    CHECKS += 1
-    if cond:
-        print("  PASS  %s" % label)
-    else:
-        FAILS += 1
-        print("  FAIL  %s%s" % (label, ("  <- " + str(detail)) if detail else ""))
-
-
-A = tt._spec_allowed_for_task
-TABLE = tt._TASK_REG_ALLOWLIST
-
-print("[1] the allowlist exists and is code-owned")
-ck("_TASK_REG_ALLOWLIST is populated", isinstance(TABLE, dict) and len(TABLE) >= 30,
-   len(TABLE) if isinstance(TABLE, dict) else TABLE)
-ck("it is a module-level literal in tweak_tasks.py (not loaded from config)",
-   "_TASK_REG_ALLOWLIST = {" in io.open(r"app\tasks\tweak_tasks.py",
-                                          encoding="utf-8", newline="").read())
-ck("the scope gap is documented at the table, not hidden",
-   "THIS FINDING IS NOT CLOSED" in io.open(r"app\tasks\tweak_tasks.py",
-                                           encoding="utf-8", newline="").read())
-
-print()
-print("[2] a location the task DOES own is allowed")
-ck("hags -> GraphicsDrivers\\HwSchMode",
-   A("hags", "HKLM", "SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers", "HwSchMode") is True)
-ck("game_mode -> its own Software\\Microsoft\\GameBar values",
-   A("game_mode", "HKCU", "Software\\Microsoft\\GameBar", "AutoGameModeEnabled") is True)
-ck("privacy_baseline -> one of its 12",
-   A("privacy_baseline", "HKCU", "Software\\Microsoft\\Windows\\CurrentVersion\\AdvertisingInfo",
-     "Enabled") is True)
-
-print()
-print("[3] THE BUG: a location the task does NOT own is refused, even when benign")
-# This is the case the DENYLIST let through: not a persistence location, so
-# the old guard waved it through and an elevated process wrote it.
-ck("hags cannot be made to write a Run key",
-   A("hags", "HKLM", "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", "Evil") is False)
-ck("a Run value under a policy key is refused too",
-   A("game_mode", "HKLM", "SOFTWARE\\Policies\\Microsoft\\Windows\\Run", "x") is False)
-ck("cross-task confusion is refused (a task may not borrow another's key)",
-   A("hags", "HKCU", "Control Panel\\Mouse", "MouseSpeed") is False)
-ck("...in either direction",
-   A("mouse_accel", "HKLM", "SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers",
-     "HwSchMode") is False)
-
-print()
-print("[4] ALTERNATE PATH SPELLINGS cannot walk past the allowlist")
-OWNED = ("hags", "HKLM", "SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers", "HwSchMode")
-for label, (h, p, n) in {
-    "lowercase key": ("hklm", "system\\currentcontrolset\\control\\graphicsdrivers", "hwschmode"),
-    "trailing backslash": ("HKLM", "SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers\\", "HwSchMode"),
-    "doubled separators": ("HKLM", "SYSTEM\\\\CurrentControlSet\\\\Control\\\\GraphicsDrivers", "HwSchMode"),
-    "forward slashes": ("HKLM", "SYSTEM/CurrentControlSet/Control/GraphicsDrivers", "HwSchMode"),
-    "leading separator": ("HKLM", "\\SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers", "HwSchMode"),
-}.items():
-    ck("owned key still allowed via %s" % label, A("hags", h, p, n) is True, (h, p, n))
-
-print()
-print("[5] ...and the same tricks cannot be used to smuggle a DISALLOWED key in")
-for label, (h, p, n) in {
-    "lowercase Run key": ("HKLM", "software\\microsoft\\windows nt\\currentversion\\run", "evil"),
-    "doubled separators": ("HKLM", "SOFTWARE\\\\Microsoft\\\\Windows NT\\\\CurrentVersion\\\\Run", "evil"),
-    "trailing backslash": ("HKLM", "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Run\\", "evil"),
-    "forward slashes": ("HKLM", "SOFTWARE/Microsoft/Windows NT/CurrentVersion/Run", "evil"),
-}.items():
-    ck("disallowed Run key refused via %s" % label, A("hags", h, p, n) is False, (h, p, n))
-
-print()
-print("[6] the enforcement is actually WIRED into the restore path")
-_src = io.open(r"app\tasks\tweak_tasks.py", encoding="utf-8", newline="").read()
-_fn = ast.get_source_segment(_src, next(
-    n for n in ast.walk(ast.parse(_src))
-    if isinstance(n, ast.FunctionDef) and n.name == "_restore_reg_values")) or ""
-ck("_restore_reg_values calls the allowlist check", "_spec_allowed_for_task(" in _fn)
-ck("...and RAISES on a disallowed spec (fails closed, no partial write)",
-   "Refusing to restore" in _fn and "raise RuntimeError" in _fn)
-ck("the denylist is RETAINED underneath as defence in depth",
-   "_is_persistence_location(path)" in _fn)
-ck("SEC-001 is documented at the enforcement site", "SEC-001" in _fn)
-
-print()
-print("[7] DRIFT GUARD: the table must match what the task code actually declares")
-# Recompute the allowlist from this module's own source, the same way it was
-# generated, and compare. Without this, a tweak could gain a new registry
-# location, apply it, and quietly have no Undo - or worse, be Undo-able at a
-# location the table never sanctioned.
-_src_tree = ast.parse(_src)
-
-_expected = {}
+#: snapshot/write ids the code uses that are deliberately NOT Tweak task keys
+#: (cut tasks kept defensively, and per-feature sub-snapshots). Used only to
+#: keep the report readable; the scan itself decides what "expected" means.
+_INTERNAL_ID_SUFFIXES = ("_regs", "_pmz", "_specs")
 
 
-def _val(node, depth=0):
-    """Resolve a spec node, following module constants.
+def _task_keys():
+    try:
+        from app.tab_presets import TABS
+        return {t.key for t in TABS.get("Tweak", [])}
+    except Exception:
+        return set()
 
-    Four shapes occur in this module and all four had to be handled:
-      * a plain literal / a name bound to a literal list;
-      * a Name INSIDE an inline list - [("HKCU", _ADV, "TaskbarAl")];
-      * a list comprehension over a constant -
-        [w + ("REG_SZ",) for w in _ACCESSIBILITY_FLAGS];
-      * a subscript of a constant - _SENSE[0], _SENSE[1].
-    A resolver that handles only the first misses 14 of the tasks.
-    """
-    if depth > 8:
-        return None
-    if isinstance(node, ast.Constant):
-        return node.value
-    if isinstance(node, ast.Name):
-        return _C.get(node.id)
-    if isinstance(node, (ast.List, ast.Tuple)):
-        return [_val(e, depth + 1) for e in node.elts]
-    if isinstance(node, ast.Subscript):
-        base = _val(node.value, depth + 1)
-        idx = _val(node.slice, depth + 1)
+
+def _scan_source():
+    """task_id -> set of (hive, path, name) specs it snapshots/writes, resolved
+    from literal spec lists (and module-level constants) in the source.
+
+    Scans BOTH task modules: `tweak_tasks.py` (via `_snap_reg_values` /
+    `_regn_apply`) and `advanced_tasks.py` (which snapshots through its
+    `_apply_registry` helper — the shared scanner reads that as id-bearing too).
+    Uses the same scanner the Tweak preview does (app/tweak_introspect.py) so the
+    guard and the preview cannot disagree about what a task touches."""
+    merged = {}
+    for path in (T.__file__, A.__file__):
+        for tid, specs in _scan_reg_specs(path).items():
+            merged.setdefault(tid, set()).update(specs)
+    return merged
+
+
+def _call_name(node):
+    """The bare (last) name of a call target, or None."""
+    fn = getattr(node, "func", None)
+    return getattr(fn, "id", None) or getattr(fn, "attr", None)
+
+
+#: calls whose 2nd argument is a task/snapshot id (kept in step with
+#: app.tweak_introspect._ID_CALLS, the shared scanner's list).
+_ID_CALLS = ("_snap_reg_values", "_regn_apply", "_apply_registry")
+
+
+def _load_trees(paths, failures):
+    """Parse each source path once; a parse failure is itself a failure."""
+    trees = []
+    for path in paths:
         try:
-            return base[idx]
-        except Exception:
-            return None
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        # _STOP_ADS_SPECS is `[...] + [...]`, a list concat of two resolvable
-        # halves.
-        _l = _val(node.left, depth + 1)
-        _r = _val(node.right, depth + 1)
-        if isinstance(_l, list) and isinstance(_r, list):
-            return _l + _r
-        if isinstance(_l, list):
-            return _l
-        return _r
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
-        # classic_context_menu builds its path with %-formatting:
-        #   "Software\\Classes\\CLSID\\%s\\InprocServer32" % CONTEXT_MENU_CLSID
-        _f = _val(node.left, depth + 1)
-        if isinstance(_f, str):
-            try:
-                return _f % _val(node.right, depth + 1)
-            except Exception:
-                return None
-        return None
-    if isinstance(node, ast.ListComp):
-        # Evaluate the comprehension properly: bind the loop variable, then
-        # evaluate the ELEMENT expression for each item.
-        #
-        # Returning the iterable's contents instead - the earlier version - is
-        # wrong for [("HKCU", _ADS_CDM, n) for n in _ADS_CDM_NAMES], which
-        # yields a list of bare value NAMES rather than the (hive, path, name)
-        # triples the comprehension builds. That made stop_windows_ads (17
-        # specs) look dynamically built when it is a plain module constant.
-        #
-        # `ifs` is deliberately IGNORED: taskbar_cleanup filters on the running
-        # Windows version, and honouring it would make a derived table depend
-        # on the machine it was generated on. The unfiltered superset is the
-        # right shape - a snapshot can only hold a subset of what apply wrote.
-        _out = []
-        for _g in node.generators:
-            _it = _val(_g.iter, depth + 1)
-            if not isinstance(_it, (list, tuple)):
-                return None
-            for _item in _it:
-                if isinstance(_g.target, ast.Name):
-                    _names = [(_g.target.id, _item)]
-                elif isinstance(_g.target, (ast.Tuple, ast.List)):
-                    # taskbar_cleanup unpacks 5-tuples:
-                    #   [(h, p, n) for h, p, n, _v, _w in active]
-                    if not isinstance(_item, (list, tuple)):
-                        return None
-                    _names = []
-                    for _i, _t in enumerate(_g.target.elts):
-                        if not isinstance(_t, ast.Name):
-                            return None
-                        _names.append((_t.id,
-                                       _item[_i] if _i < len(_item) else None))
-                else:
-                    return None
-                _saved = {k: _C.get(k) for k, _ in _names}
-                try:
-                    for _k, _v in _names:
-                        _C[_k] = _v
-                    _out.append(_val(node.elt, depth + 1))
-                finally:
-                    for _k, _v in _saved.items():
-                        _C[_k] = _v
-        return _out
+            with open(path, "r", encoding="utf-8") as fh:
+                trees.append(ast.parse(fh.read(), filename=path))
+        except Exception as exc:                                  # pragma: no cover
+            failures.append(f"cannot parse {path!r}: {exc}")
+    return trees
+
+
+def _apply_fn_for_id(tree, tid, consts, nodes):
+    """The function that snapshots or writes `tid`, or None."""
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for sub in ast.walk(node):
+            if not isinstance(sub, ast.Call) or _call_name(sub) not in _ID_CALLS:
+                continue
+            if len(sub.args) < 2:
+                continue
+            if _resolve_str(sub.args[1], consts, nodes) == tid:
+                return node
     return None
 
 
-_C = {}
+def _find_fn(trees, tid):
+    """(function, its module consts) for the task, or (None, None)."""
+    for tree in trees:
+        consts, nodes = _const_index(tree)
+        fn = _apply_fn_for_id(tree, tid, consts, nodes)
+        if fn is not None:
+            return fn, consts
+    return None, None
 
 
-def _build_consts(tree):
-    """Resolve module-level constants to a FIXPOINT.
+def _prefix_facts(fn):
+    """(string literals in `fn`, literal string tuples `fn` iterates over).
 
-    One literal_eval pass is not enough. _IPV4_SPECS is
-
-        [("HKLM", _IPV4_PATH, "DisabledComponents", "REG_DWORD")]
-
-    which is perfectly static, but it REFERENCES another constant, so
-    literal_eval raises and the task looks dynamically-built when it is not.
-    Iterating the resolver over the module's own assignments resolves those
-    chains - and it is why prefer_ipv4 and disable_sticky_keys are statically
-    allowlistable at all.
-    """
-    # AnnAssign matters: `name: list[tuple] = [...]` is an AnnAssign, NOT an
-    # Assign, so collecting only Assign silently skipped _IPV4_SPECS - which is
-    # annotated - and made prefer_ipv4 look dynamically built. The drift guard
-    # then correctly complained that the table declared an entry no apply
-    # function seemed to write.
-    global _C
-    assigns = []
-    for _n in tree.body:
-        if isinstance(_n, ast.AnnAssign) and isinstance(_n.target, ast.Name):
-            assigns.append(_n)
-        elif (isinstance(_n, ast.Assign) and len(_n.targets) == 1
-                and isinstance(_n.targets[0], ast.Name)):
-            assigns.append(_n)
-    out = {}
-    for _ in range(6):
-        before = len(out)
-        # Publish incrementally: _val resolves Names out of the GLOBAL _C, so
-        # a purely local `out` means no Name ever resolves and the fixpoint
-        # silently degrades to plain literals. That is why _IPV4_SPECS (which
-        # just references _IPV4_PATH) looked dynamically built.
-        _C = out
-        for _n in assigns:
-            name = (_n.target.id if isinstance(_n, ast.AnnAssign)
-                    else _n.targets[0].id)
-            if name in out:
-                continue
-            try:
-                v = _val(_n.value)
-            except Exception:
-                v = None
-            if v is not None:
-                out[name] = v
-        if len(out) == before:
-            break
-    return out
+    A prefix-ruled write is built as
+        for name in ("TcpAckFrequency", "TCPNoDelay"):
+            writes.append(("HKLM", "%s\\%s" % (base, sub), name, 1))
+    so the value names are exactly the literal tuple that loop iterates, and the
+    path base is a string literal somewhere in the function."""
+    lits = set()
+    loops = []
+    for sub in ast.walk(fn):
+        if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+            lits.add(sub.value)
+        if isinstance(sub, ast.For) and isinstance(sub.iter, (ast.Tuple, ast.List)):
+            vals = [e.value for e in sub.iter.elts
+                    if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+            if vals and len(vals) == len(sub.iter.elts):
+                loops.append(set(vals))
+    return lits, loops
 
 
-_C = _build_consts(_src_tree)
+def _verify_prefix_rules(paths, failures) -> int:
+    """Check every PREFIX rule against the source; return the entries verified.
 
-# UNDO-003 moved the Advanced tab's registry-backed tasks onto the snapshot
-# helpers, so they own allowlist entries too. Scan that module as well, and
-# recognise _apply_registry -- the small local wrapper those applies use so
-# they stop each carrying their own subtly-wrong copy of the
-# had_snapshot / snapshot / try / clear sequence.
-#
-# Without this the drift guard flagged the four new entries as "declared by no
-# apply function", which would have made the guard cry wolf and get ignored.
-_adv_src = io.open(r"app\tasks\advanced_tasks.py", encoding="utf-8",
-                   newline="").read()
-_adv_tree = ast.parse(_adv_src)
-_SNAPSHOT_CALLS = ("_regn_apply", "_snap_reg_values", "_apply_registry")
+    Prefix-ruled tasks used to be skipped (`continue`), so the rule was
+    "verified by hand" and a new value name added to the write loop went
+    unnoticed — that name is exactly what a tampered snapshot could redirect.
+    This fails CLOSED: if the apply function cannot be found, or no longer
+    iterates a literal tuple of value names, that is a failure, not a skip."""
+    trees = _load_trees(paths, failures)
 
-# The spec lists in advanced_tasks.py reference their own module constants
-# (_AI_BASE, _AI_NAMES, _COPILOT_PATH, ...), and _val resolves Names out of
-# the global _C. Without those entries the lists look dynamically built and
-# the four new entries are reported as invented.
-#
-# Resolved in ISOLATION: _build_consts seeds its fixpoint from the global _C,
-# so running it with tweak_tasks' constants already loaded lets one module's
-# names bind to the other module's values -- which produced garbage specs
-# like ('HKCU', '...\\CLSID\\None\\InprocServer32', ''). Save, reset, build,
-# restore, then merge with tweak_tasks winning any genuine collision.
-_c_main = dict(_C)
-_C = {}
-_C_adv = _build_consts(_adv_tree)
-_C = _c_main
-for _k, _v in _C_adv.items():
-    _C.setdefault(_k, _v)
+    verified = 0
+    for tid, specs in sorted(T._TASK_REG_ALLOW_PREFIX.items()):
+        fn, _consts = _find_fn(trees, tid)
+        if fn is None:
+            failures.append(
+                f"PREFIX DRIFT: task {tid!r} is prefix-ruled but no apply "
+                f"function passes that id to _regn_apply")
+            continue
 
-# advanced_tasks.py names its entry points disable_* (disable_copilot,
-# disable_wpbt, ...) where tweak_tasks.py uses apply_*. Both are the "apply"
-# side, so both must be scanned or the Advanced tab's entries look invented.
-_APPLY_PREFIXES = ("apply_", "disable_")
+        lits, loops = _prefix_facts(fn)
+        if not loops:
+            failures.append(
+                f"PREFIX DRIFT: task {tid!r}: its apply function no longer "
+                f"iterates a literal tuple of value names, so the prefix rule "
+                f"cannot be verified — update this guard and the rule together")
+            continue
 
-for _fn2 in list(ast.walk(_src_tree)) + list(ast.walk(_adv_tree)):
-    if not (isinstance(_fn2, ast.FunctionDef)
-            and _fn2.name.startswith(_APPLY_PREFIXES)):
-        continue
-    _tid = None
-    _specs = None
-    for _c in ast.walk(_fn2):
-        if (isinstance(_c, ast.Call) and isinstance(_c.func, ast.Name)
-                and _c.func.id in _SNAPSHOT_CALLS):
-            _args = list(_c.args) + [k.value for k in _c.keywords]
-            for _a in _args:
-                if isinstance(_a, ast.Constant) and isinstance(_a.value, str) and _tid is None:
-                    _tid = _a.value
-            for _a in _args:
-                if isinstance(_a, ast.Constant) or (isinstance(_a, ast.Name)
-                                                    and _a.id in ("ctx", "task_id")):
+        written = set()
+        for names in loops:
+            written |= names
+        declared = set()
+        for spec in specs:
+            hive, path, name = spec[0], spec[1], spec[2]
+            if path not in lits:
+                failures.append(
+                    f"PREFIX DRIFT: {tid!r} rule names path {path!r} but "
+                    f"{fn.name}() never mentions it")
+            if hive not in lits:
+                failures.append(
+                    f"PREFIX DRIFT: {tid!r} rule names hive {hive!r} but "
+                    f"{fn.name}() never mentions it")
+            declared.add(name)
+            verified += 1
+        for name in sorted(written - declared):
+            failures.append(
+                f"PREFIX DRIFT: {fn.name}() writes value {name!r} under a "
+                f"run-time path but the {tid!r} prefix rule does not cover it "
+                f"— a tampered snapshot could redirect that name")
+        for name in sorted(declared - written):
+            failures.append(
+                f"PREFIX DRIFT: the {tid!r} prefix rule declares value {name!r} "
+                f"that {fn.name}() no longer iterates (stale rule)")
+    return verified
+
+
+def _manual_literals(fn, consts):
+    """Every string the function could build a spec from: its own literals, its
+    local `name = "..."` assignments, and the module's string constants."""
+    lits = {v for v in consts.values() if isinstance(v, str)}
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            lits.add(node.value)
+        elif isinstance(node, ast.Assign):
+            v = node.value
+            if isinstance(v, ast.Constant) and isinstance(v.value, str):
+                lits.add(v.value)
+    return lits
+
+
+def _verify_manual_rules(paths, derived, failures) -> int:
+    """Check the hand-written entries the scanner cannot derive.
+
+    `taskbar_cleanup` is version-FILTERED: it builds its write list in the
+    function and snapshots a subset of it, so the shared scanner sees no
+    literal spec list for it and never reports it (the guard's normal drift
+    check therefore cannot fire). The entry is transcribed by hand — which is
+    the whole reason this repository keeps a guard — so it is checked here:
+    every declared (hive, path, name) must still appear as a literal in the
+    owning apply function.
+
+    That is the security-relevant direction. An entry granting a location the
+    task does not write is what a tampered snapshot could exploit, so an entry
+    that has drifted away from the code must fail, not be trusted.
+
+    Entries the scanner CAN derive (`shader_cache_10gb`, `ssd_last_access`,
+    `nvidia_telemetry_regs` go through `_regn_apply` with literal lists) are
+    skipped here: the normal drift check already compares them exactly."""
+    trees = _load_trees(paths, failures)
+    verified = 0
+    for tid, specs in sorted(T._TASK_REG_ALLOWLIST_MANUAL.items()):
+        if tid in derived:
+            continue
+        fn, consts = _find_fn(trees, tid)
+        if fn is None:
+            failures.append(
+                f"MANUAL DRIFT: task {tid!r} is hand-allowlisted but no apply "
+                f"function snapshots or writes that id")
+            continue
+        lits = _manual_literals(fn, consts)
+        for spec in specs:
+            hive, path, name = spec[0], spec[1], spec[2]
+            missing = [label for label, value in
+                       (("hive", hive), ("path", path), ("name", name))
+                       if value not in lits]
+            if missing:
+                failures.append(
+                    f"MANUAL DRIFT: the {tid!r} entry names {'/'.join(missing)} "
+                    f"of ({hive!r}, {path!r}, {name!r}) that {fn.name}() never "
+                    f"mentions — the entry authorises more than the task writes")
+            else:
+                verified += 1
+    return verified
+
+
+def main() -> int:
+    failures = []
+    warnings = []
+    notes = []
+
+    task_keys = _task_keys()
+    allow_norm = T._TASK_REG_ALLOWED_NORM
+    allow_prefix = T._TASK_REG_ALLOW_PREFIX
+    norm = T._norm_reg_spec
+
+    # 1. structural validity of every table entry
+    tables = {
+        "_TASK_REG_ALLOWLIST": T._TASK_REG_ALLOWLIST,
+        "_TASK_REG_ALLOWLIST_MANUAL": T._TASK_REG_ALLOWLIST_MANUAL,
+        "_TASK_REG_ALLOW_PREFIX": T._TASK_REG_ALLOW_PREFIX,
+    }
+    for tname, table in tables.items():
+        for tid, specs in table.items():
+            for spec in specs:
+                if len(spec) < 3:
+                    failures.append(
+                        f"{tname}[{tid!r}]: spec {spec!r} has fewer than 3 elements")
                     continue
-                _v = _val(_a)
-                if isinstance(_v, list) and _v and isinstance(_v[0], (list, tuple)):
-                    _specs = _v
-    if _tid and _specs is not None:
-        _ok = [tuple(str(x) for x in _s[:3]) for _s in _specs
-               if isinstance(_s, (list, tuple)) and len(_s) >= 3
-               and all(isinstance(x, str) for x in _s[:3])]
-        if _ok:
-            _expected[_tid] = set(_ok)
+                hive, path, name = spec[0], spec[1], spec[2]
+                if hive not in _HIVES:
+                    failures.append(f"{tname}[{tid!r}]: unknown hive {hive!r}")
+                if not isinstance(path, str) or not path:
+                    failures.append(f"{tname}[{tid!r}]: bad path {path!r}")
+                if not isinstance(name, str):
+                    failures.append(f"{tname}[{tid!r}]: bad name {name!r}")
 
-_actual = {k: {tuple(s) for s in v} for k, v in TABLE.items()}
-ck("every table entry is declared by a real apply function",
-   set(_actual) <= set(_expected),
-   sorted(set(_actual) - set(_expected))[:5])
-_missing = {k: _expected[k] - _actual.get(k, set()) for k in _expected
-            if _expected[k] - _actual.get(k, set())}
-ck("the table declares EVERY location its apply function writes", not _missing,
-   {k: sorted(v)[:2] for k, v in list(_missing.items())[:3]})
-ck("no table entry invents a location no apply function writes",
-   not (set(_actual) - set(_expected)))
-ck("recomputing the table yields an identical result", _expected == _actual,
-   "table and source disagree")
+    # 2. the pre-normalised cache agrees with the tables (build-order bug check)
+    recomputed = {}
+    for tid, specs in T._TASK_REG_ALLOWLIST.items():
+        recomputed[tid] = frozenset(norm(*s) for s in specs)
+    for tid, specs in T._TASK_REG_ALLOWLIST_MANUAL.items():
+        recomputed[tid] = frozenset(norm(*s) for s in specs)
+    if recomputed != allow_norm:
+        failures.append("_TASK_REG_ALLOWED_NORM does not match a fresh derivation "
+                        "from _TASK_REG_ALLOWLIST/_TASK_REG_ALLOWLIST_MANUAL")
 
-print()
-print("[6b] BEHAVIOUR: a tampered snapshot is actually REFUSED, and no write happens")
-# The text checks in [6] are not enough on their own: `raise RuntimeError`
-# also appears in this function for malformed specs and bad value types, so a
-# sabotage that downgrades ONLY the allowlist refusal to a warning still
-# contains the string. This drives the real function instead.
-from tools._config_guard import ConfigGuard  # noqa: E402
+    # 3. static drift: literal specs for an allowlisted task must be allowlisted
+    found = _scan_source()
+    for tid, specs in sorted(found.items()):
+        if tid in allow_norm:
+            allowed = allow_norm[tid]
+            for spec in sorted(specs):
+                if norm(*spec) not in allowed:
+                    failures.append(
+                        f"DRIFT: task {tid!r} writes {spec!r} but its allowlist "
+                        f"entry does not cover it")
+        elif tid in allow_prefix:
+            # A prefix-ruled task's specs are resolved at run time, so the
+            # scanner cannot derive them and never reaches this branch with a
+            # non-empty spec set. Their rules are checked separately below.
+            continue
+        else:
+            warnings.append(f"task {tid!r} has literal specs but no allowlist entry "
+                            f"(denylist-only)")
 
+    # 3b. prefix rules are checked against the source, not trusted by hand
+    prefix_verified = _verify_prefix_rules((T.__file__, A.__file__), failures)
 
-class _Ctx:
-    def __init__(self):
-        self.logs = []
+    # 3c. so are the hand-transcribed entries the scanner cannot derive
+    manual_verified = _verify_manual_rules((T.__file__, A.__file__), found,
+                                           failures)
 
-    def log(self, m):
-        self.logs.append(str(m))
+    # 4. coverage / staleness report
+    if task_keys:
+        for k in sorted(set(allow_norm) - task_keys):
+            if k in found or k in CUT_TASK_KEYS or k.endswith(_INTERNAL_ID_SUFFIXES):
+                notes.append(f"allowlist id {k!r} is an internal snapshot id / cut "
+                             f"task (expected, not a task key)")
+            else:
+                warnings.append(
+                    f"allowlist id {k!r} is neither a Tweak task key nor an id "
+                    f"used in the source (possible stale or typo entry)")
 
-
-try:
-    from app.config_persist import save_tweak_snapshot
-    with ConfigGuard():
-        # a snapshot that names a Run key for the `hags` task
-        save_tweak_snapshot("hags", {
-            "specs": [["HKLM", "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
-                       "Evil"]],
-            "0:type": "REG_SZ",
-        })
-        _ctx = _Ctx()
-        _refused = None
-        try:
-            tt._restore_reg_values(_ctx, "hags")
-        except RuntimeError as exc:
-            _refused = str(exc)
-        except Exception as exc:                      # noqa: BLE001
-            _refused = "WRONG-TYPE: %s: %s" % (type(exc).__name__, exc)
-        ck("a tampered snapshot RAISES", _refused is not None, _refused)
-        ck("...with the allowlist refusal, not some unrelated error",
-           bool(_refused) and "not defined to" in _refused, _refused)
-
-        # positive control: the task's OWN key must NOT be refused by the
-        # allowlist (it may still fail for access reasons, which is fine - what
-        # must not happen is the allowlist refusal).
-        # save_tweak_snapshot only writes when NO snapshot exists - it keeps
-        # the ORIGINAL pre-tweak record on purpose, so a re-apply cannot
-        # overwrite it with the tweak's own output. That makes a second
-        # save_tweak_snapshot() for the same task a silent NO-OP, which is
-        # why this block looked like the allowlist was refusing a legitimate
-        # key. Clear first, then save.
-        from app.config_persist import clear_tweak_snapshot
-        clear_tweak_snapshot("hags")
-        save_tweak_snapshot("hags", {
-            "specs": [["HKLM", "SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers",
-                       "HwSchMode"]],
-            "0:type": "REG_DWORD",
-        })
-        _ctx2 = _Ctx()
-        # config_persist.load_config() serves a CACHE, so the snapshot written
-        # above is not visible until it is dropped. Without this the positive
-        # control re-read the TAMPERED snapshot from the previous block and
-        # failed for entirely the wrong reason. (Same caching behaviour that
-        # made tools/verify_prior004_defender_exclusion.py sections 3-7 fail.)
-        try:
-            import app.config_persist as _cp
-            _cp._config_cache = None
-        except Exception:
-            pass
-        try:
-            tt._restore_reg_values(_ctx2, "hags")
-            _msg = None
-        except RuntimeError as exc:
-            _msg = str(exc)
-        except Exception:                             # noqa: BLE001
-            _msg = None
-        ck("the task's own key is NOT refused by the allowlist",
-           not (_msg and "not defined to" in _msg), _msg)
-finally:
-    pass
-
-print()
-print("[8] PREFIX rules: disable_nagle writes a per-interface subkey")
-# disable_nagle enumerates network interfaces and writes a DIFFERENT subkey per
-# interface GUID, so no fixed path can be allowlisted. _TASK_REG_ALLOW_PREFIX
-# expresses it as hive + path prefix + value name. The two halves must both
-# hold, which is what the REFUSED cases below pin.
-_I = r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces"
-ck("the prefix table exists and covers disable_nagle",
-   "disable_nagle" in tt._TASK_REG_ALLOW_PREFIX)
-for label, (h, p, n), want in (
-    ("a real per-interface GUID", ("HKLM", _I + r"\{1a2b3c}", "TcpAckFrequency"), True),
-    ("the other value it writes", ("HKLM", _I + r"\{dead-beef}", "TCPNoDelay"), True),
-    ("the prefix key itself", ("HKLM", _I, "TCPNoDelay"), True),
-    ("lowercased + forward slashes",
-     ("HKLM", _I.lower().replace("\\", "/") + "/{x}", "tcpackfrequency"), True),
-    # ---- the interesting half ----
-    ("a SIBLING value under the same key", ("HKLM", _I + r"\{x}", "SysctlIp"), False),
-    ("the PARENT key, not under Interfaces",
-     ("HKLM", r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters", "TcpAckFrequency"), False),
-    ("segment-boundary bypass (InterfacesXyz)",
-     ("HKLM", r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\InterfacesXyz",
-      "TcpAckFrequency"), False),
-    ("traversal OUT of the prefix with ..",
-     ("HKLM", _I + r"\..\..\evil", "TcpAckFrequency"), False),
-    ("deep traversal out of the prefix",
-     ("HKLM", _I + r"\..\..\..\..\evil", "TcpAckFrequency"), False),
-    ("right path, WRONG HIVE", ("HKCU", _I + r"\{x}", "TcpAckFrequency"), False),
-):
-    ck("disable_nagle %-38s -> %s" % (label, want),
-       A("disable_nagle", h, p, n) is want, A("disable_nagle", h, p, n))
-
-print()
-print("[8b] the normaliser resolves . and .. (that is what closes the bypass)")
-ck("dotdot collapses lexically",
-   tt._norm_reg_spec("HKLM", _I + r"\..\..\evil", "x")[1].endswith(r"\tcpip\evil"),
-   tt._norm_reg_spec("HKLM", _I + r"\..\..\evil", "x")[1])
-ck("single dot segments are dropped",
-   tt._norm_reg_spec("HKLM", r"A\.\B", "x")[1] == "a\\b",
-   tt._norm_reg_spec("HKLM", r"A\.\B", "x")[1])
-ck("doubled separators collapse",
-   tt._norm_reg_spec("HKLM", r"A\\\\B", "x")[1] == "a\\b")
-ck("SEC-001 is documented at the prefix table", "SEC-001" in _src)
-ck("the prefix table is a module literal, not config-derived",
-   "_TASK_REG_ALLOW_PREFIX = {" in _src)
-
-print()
-print()
-print("[9] the hand-transcribed entries are checked, and named as weaker")
-# taskbar_cleanup's specs come from FUNCTION-LOCAL variables, so no
-# module-constant derivation can reach them and they are transcribed by hand.
-# The automatic drift guard cannot prove completeness for that one task, so it
-# is excluded from the completeness check EXPLICITLY, and instead each entry is
-# checked to appear literally in the owning apply function. Weaker - and
-# labelled as such rather than quietly folded into the strong check.
-MANUAL = tt._TASK_REG_ALLOWLIST_MANUAL
-ck("there is exactly one hand-transcribed task", set(MANUAL) == {"taskbar_cleanup"},
-   sorted(MANUAL))
-_derive = set(_expected)
-ck("the manual task is the only one outside the derivation",
-   set(MANUAL) - _derive == {"taskbar_cleanup"}, sorted(set(MANUAL) - _derive))
-ck("...and every other derived task is in the table",
-   not (_derive - set(TABLE) - set(MANUAL)),
-   sorted(_derive - set(TABLE) - set(MANUAL)))
-_fn = next((n for n in ast.walk(_src_tree)
-            if isinstance(n, ast.FunctionDef) and n.name == "apply_taskbar_cleanup"), None)
-ck("the owning apply function exists", _fn is not None)
-_body = (ast.get_source_segment(_src, _fn) or "") if _fn is not None else ""
-for _h, _p, _n in sorted(MANUAL["taskbar_cleanup"]):
-    ck("transcribed value %r appears literally in apply_taskbar_cleanup" % _n,
-       _n in _body, _n)
-ck("SEC-001 is documented at the manual table",
-   "cannot reach" in _src and "UNFILTERED superset" in _src)
-ck("a foreign target is refused for a manual task",
-   A("taskbar_cleanup", "HKLM", r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
-     "Evil") is False)
-ck("...a sibling value under its own key is refused too",
-   A("taskbar_cleanup", "HKCU",
-     r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced",
-     "TaskbarSi") is False)
-ck("...while its own key is allowed",
-   A("taskbar_cleanup", "HKCU",
-     r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced",
-     "TaskbarDa") is True)
+    print("SEC-001 allowlist check")
+    print(f"  allowlisted tasks        : {len(allow_norm)}")
+    print(f"  prefix-ruled tasks       : {len(allow_prefix)}")
+    print(f"  prefix entries verified  : {prefix_verified}")
+    print(f"  manual entries verified  : {manual_verified}")
+    print(f"  tweak task keys          : {len(task_keys)}")
+    print(f"  static-spec tasks found  : {len(found)}")
+    if notes:
+        print("\nNotes (expected, informational):")
+        for n in notes:
+            print(f"  - {n}")
+    if warnings:
+        print("\nWarnings (review):")
+        for w in warnings:
+            print(f"  - {w}")
+    if failures:
+        print("\nFAIL:")
+        for f in failures:
+            print(f"  - {f}")
+        return 1
+    print("\nOK: allowlist is structurally valid and has no static drift.")
+    return 0
 
 
-if FAILS:
-    print("PRIOR SEC-001 VERIFY: %d/%d FAILED -> %s" % (FAILS, CHECKS, FAILS))
-    sys.exit(1)
-print("PRIOR SEC-001 VERIFY: ALL PASS (%d checks)" % CHECKS)
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -808,6 +808,24 @@ GAME_METHODS = {
 }
 
 
+def method_note(key):
+    """The caveat line shown under a tab, or "" when there is none.
+
+    BUGFIX 2026-10: the dialog used GAME_METHODS.get(key, "") directly. The
+    23 publisher tabs are keyed company_0..company_22 while GAME_METHODS has
+    a single "companies" entry for them, so all 23 rendered an EMPTY caveat.
+    The measurements themselves were real and unchanged - it was the honesty
+    label that silently vanished, which is the one failure mode this module
+    exists to prevent, so it is fixed at the source rather than papered over
+    in the dialog.
+    """
+    if key in GAME_METHODS:
+        return GAME_METHODS[key]
+    if isinstance(key, str) and key.startswith("company_"):
+        return GAME_METHODS["companies"]
+    return ""
+
+
 def targets_for(key, custom_hosts=()):
     """[(row_key, title, kind, host, port_or_None)] for a tab key."""
     # ICMP-endpoint games

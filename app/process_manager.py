@@ -108,12 +108,21 @@ def _window_pids() -> set:
     try:
         import ctypes as _ct
         from ctypes import wintypes as _wt
-        user32 = _ct.windll.user32
+        # B-055-class: bind the signatures, or ctypes defaults every HWND
+        # argument to c_int and TRUNCATES the 64-bit window handle, so
+        # GetWindowThreadProcessId returns 0 for nearly every window and every
+        # process reads as Background. Same trap netconn._bind documents.
+        user32 = _ct.WinDLL("user32", use_last_error=True)
+        user32.EnumWindows.restype = _wt.BOOL
+        user32.EnumWindows.argtypes = [
+            _ct.WINFUNCTYPE(_wt.BOOL, _wt.HWND, _wt.LPARAM), _wt.LPARAM]
+        user32.IsWindowVisible.restype = _wt.BOOL
+        user32.IsWindowVisible.argtypes = [_wt.HWND]
+        user32.GetWindowThreadProcessId.restype = _wt.DWORD
+        user32.GetWindowThreadProcessId.argtypes = [
+            _wt.HWND, _ct.POINTER(_wt.DWORD)]
         pids: set = set()
-        try:
-            _CB = _ct.WINFUNCTYPE(_ct.c_bool, _ct.c_void_p, _ct.c_void_p)
-        except Exception:
-            return set()
+        _CB = _ct.WINFUNCTYPE(_wt.BOOL, _wt.HWND, _wt.LPARAM)
 
         def _cb(hwnd, _lp):
             try:
@@ -383,8 +392,23 @@ def _process_times(pid: int) -> Optional[Tuple[int, int]]:
         return None
     PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
     try:
-        h = ctypes.windll.kernel32.OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        from ctypes import wintypes
+        k = ctypes.windll.kernel32
+        # Bind the signatures, or the 64-bit HANDLE return overflows the
+        # default 32-bit c_int and OpenProcess "fails" / the handle is
+        # truncated before GetProcessTimes — the same trap _process_image_path
+        # documents. Without this, CPU% reads 0 for most processes.
+        k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k.OpenProcess.restype = wintypes.HANDLE
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        k.CloseHandle.restype = wintypes.BOOL
+        k.GetProcessTimes.argtypes = [wintypes.HANDLE,
+                                      ctypes.POINTER(_FILETIME),
+                                      ctypes.POINTER(_FILETIME),
+                                      ctypes.POINTER(_FILETIME),
+                                      ctypes.POINTER(_FILETIME)]
+        k.GetProcessTimes.restype = wintypes.BOOL
+        h = k.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
         if not h:
             return None
         try:
@@ -392,7 +416,7 @@ def _process_times(pid: int) -> Optional[Tuple[int, int]]:
             exit_ = _FILETIME()
             kernel = _FILETIME()
             user = _FILETIME()
-            ok = ctypes.windll.kernel32.GetProcessTimes(
+            ok = k.GetProcessTimes(
                 h, ctypes.byref(create), ctypes.byref(exit_),
                 ctypes.byref(kernel), ctypes.byref(user))
             if not ok:
@@ -402,7 +426,50 @@ def _process_times(pid: int) -> Optional[Tuple[int, int]]:
             # GetTickCount64 as coarse wall for delta ratio.
             return cpu, 0  # wall filled by sampler
         finally:
-            ctypes.windll.kernel32.CloseHandle(h)
+            k.CloseHandle(h)
+    except Exception:
+        return None
+
+
+def process_create_time(pid: int) -> Optional[int]:
+    """The process-creation FILETIME (as an int) for `pid`, or None.
+
+    PID-reuse guard: a PID is not a stable identity — Windows recycles them, so
+    a process seen during a scan can exit and its PID be reused by something
+    else before the user clicks Close. Recording this at scan time and
+    re-checking it at kill time refuses the wrong target.
+    """
+    if not IS_WINDOWS or pid <= 0:
+        return None
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    try:
+        from ctypes import wintypes
+        k = ctypes.windll.kernel32
+        k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k.OpenProcess.restype = wintypes.HANDLE
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        k.CloseHandle.restype = wintypes.BOOL
+        k.GetProcessTimes.argtypes = [wintypes.HANDLE,
+                                      ctypes.POINTER(_FILETIME),
+                                      ctypes.POINTER(_FILETIME),
+                                      ctypes.POINTER(_FILETIME),
+                                      ctypes.POINTER(_FILETIME)]
+        k.GetProcessTimes.restype = wintypes.BOOL
+        h = k.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not h:
+            return None
+        try:
+            create = _FILETIME()
+            exit_ = _FILETIME()
+            kernel = _FILETIME()
+            user = _FILETIME()
+            ok = k.GetProcessTimes(h, ctypes.byref(create), ctypes.byref(exit_),
+                                   ctypes.byref(kernel), ctypes.byref(user))
+            if not ok:
+                return None
+            return _ft_to_int(create)
+        finally:
+            k.CloseHandle(h)
     except Exception:
         return None
 
@@ -426,20 +493,30 @@ def _working_set_bytes(pid: int) -> Optional[int]:
                 ("PagefileUsage", ctypes.c_size_t),
                 ("PeakPagefileUsage", ctypes.c_size_t),
             ]
-        h = ctypes.windll.kernel32.OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        from ctypes import wintypes
+        k = ctypes.windll.kernel32
+        # Same 64-bit HANDLE-binding trap as _process_times/_process_image_path.
+        k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k.OpenProcess.restype = wintypes.HANDLE
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        k.CloseHandle.restype = wintypes.BOOL
+        psapi = ctypes.windll.psapi
+        psapi.GetProcessMemoryInfo.argtypes = [
+            wintypes.HANDLE, ctypes.POINTER(PROCESS_MEMORY_COUNTERS),
+            wintypes.DWORD]
+        psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+        h = k.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
         if not h:
             return None
         try:
             pmc = PROCESS_MEMORY_COUNTERS()
             pmc.cb = ctypes.sizeof(pmc)
-            ok = ctypes.windll.psapi.GetProcessMemoryInfo(
-                h, ctypes.byref(pmc), pmc.cb)
+            ok = psapi.GetProcessMemoryInfo(h, ctypes.byref(pmc), pmc.cb)
             if not ok:
                 return None
             return int(pmc.WorkingSetSize)
         finally:
-            ctypes.windll.kernel32.CloseHandle(h)
+            k.CloseHandle(h)
     except Exception:
         return None
 
@@ -546,6 +623,9 @@ class ProcessSampler:
                 "ram_mb": round(ram_kb / 1024.0, 1),
                 "safe": not _sys,
                 "kind": _kind,
+                # PID-reuse guard carrier: the creation time captured with this
+                # row, re-checked in close_process before taskkill.
+                "start": process_create_time(pid),
             })
         self._prev_cpu = new_cpu
 
@@ -557,11 +637,31 @@ class ProcessSampler:
         return results[: self.top_n]
 
 
-def close_process(pid: int, force: bool = True) -> bool:
+def close_process(pid: int, force: bool = False,
+                  expected_start: Optional[int] = None) -> bool:
     """Close a process by PID via taskkill. Returns True on success.
-    Never raises. Skips protected / self."""
+    Never raises. Skips protected / self.
+
+    `expected_start` (from the scanned row's "start" field) enables the
+    PID-reuse guard: if the PID's current creation time differs, the original
+    process exited and the PID was recycled, so this refuses instead of killing
+    an unrelated program.
+    """
     if not IS_WINDOWS or pid <= 0 or pid == os.getpid():
         return False
+    # PID-reuse guard: verify identity before acting.
+    if expected_start is not None:
+        cur = process_create_time(pid)
+        if cur is None or cur != expected_start:
+            return False
+    # B-007: actually honour "Skips protected". The old code only excluded
+    # self, so a caller that did not pre-filter could hard-kill lsass/dwm.
+    try:
+        img = _process_image_path(pid)
+        if img and is_system_process(os.path.basename(img)):
+            return False
+    except Exception:
+        pass
     try:
         from app.utils import resolve_exe
         exe = resolve_exe("taskkill")

@@ -190,7 +190,7 @@ class _CatalogPickerDialog(ThemedModal):
         row = tk.Frame(self._list_body, bg=COLORS["bg_alt"])
         inner = tk.Frame(row, bg=COLORS["bg_alt"])
         inner.pack(fill="both", expand=True)
-        chip = tk.Label(inner, text=g.get("launcher", "?"), font=(F, 8, "bold"),
+        chip = tk.Label(inner, text=g.get("launcher", "?"), font=(F, 9, "bold"),
                         bg=_hex_lerp(COLORS["bg_alt"], COLORS["accent_sky"], 0.18),
                         fg=COLORS["accent_sky"], padx=6, pady=2)
         chip.pack(side="left", padx=(8, 6), pady=6)

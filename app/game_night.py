@@ -56,13 +56,21 @@ def preset_task_keys():
 # that are safe to shut for an hour and obviously restartable. Nothing
 # game-related (Steam, Epic, launchers) and nothing driver/peripheral
 # related is listed — closing those breaks the session it is meant to
-# help.
+# help. (Overwolf/CurseForge are overlays and mod managers, not launchers:
+# closing them mid-game just drops the overlay and they reopen in a click.)
+#
+# This is a CANDIDATE pool, not the on-screen list: the Auto-Pilot dialog
+# shows only the entries whose app actually exists on the machine (see
+# PilotDialog._rebuild_close_rows), so the box never offers an option for
+# something that is not installed — and every row it does show has a real
+# icon.
 #
 # (key, friendly name, plain-English note, (exe names...))
 CLOSEABLE_APPS = (
     ("browsers", "Web browsers",
      "Chrome, Edge, Firefox — usually the biggest memory user",
-     ("chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe")),
+     ("chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe",
+      "vivaldi.exe")),
     ("discord", "Discord",
      "Only if you are not using it for voice chat",
      ("discord.exe",)),
@@ -72,9 +80,18 @@ CLOSEABLE_APPS = (
     ("onedrive", "OneDrive",
      "Pauses cloud syncing until you restart it",
      ("onedrive.exe",)),
-    ("chat", "Teams and Slack",
-     "Work chat apps",
-     ("ms-teams.exe", "teams.exe", "slack.exe")),
+    ("clouddrives", "Dropbox and Google Drive",
+     "They pause, then resync when you restart them",
+     ("dropbox.exe", "googledrivefs.exe")),
+    ("chat", "Chat and work apps",
+     "Teams, Slack and Zoom — not needed for the game itself",
+     ("ms-teams.exe", "teams.exe", "slack.exe", "zoom.exe", "skype.exe")),
+    ("wallpaper", "Wallpaper Engine",
+     "Animated wallpapers quietly use GPU and RAM",
+     ("wallpaper64.exe", "wallpaper32.exe")),
+    ("overlay", "Overwolf and CurseForge",
+     "Game overlays and mod managers you can reopen later",
+     ("overwolf.exe", "curseforge.exe")),
     ("creative", "Adobe Creative Cloud",
      "Background updater and syncing",
      ("creative cloud.exe", "adobe desktop service.exe",
@@ -84,20 +101,101 @@ CLOSEABLE_APPS = (
 APP_KEYS = tuple(a[0] for a in CLOSEABLE_APPS)
 
 
+# --------------------------------------------------------------------------- #
+# User-picked apps
+# --------------------------------------------------------------------------- #
+# The user can add their own programs to the close list (Auto-Pilot → Game
+# Mode → Add app). Those are stored as `custom:<exe name>` keys beside the
+# built-in ones, and the only thing ever kept or acted on is a plain process
+# NAME — never a path, never a command line. close_apps hands that name to
+# taskkill as a single argv element with shell=False, so even a hand-edited
+# config can only ask us to close a process whose name is a real exe name;
+# it cannot name an executable for us to run.
+CUSTOM_PREFIX = "custom:"
+
+#: Characters that can never appear in a process name we accept: the path
+#: separators would turn a name into a location, the rest are shell quirks.
+_UNSAFE_IN_EXE = '\\/:*?"<>|'
+
+
+def custom_exe_name(value):
+    """Validate one custom app: 'custom:steam.exe' or 'Steam.exe' -> the exe
+    name as given; anything else -> None.
+
+    Fail-closed on purpose: a name carrying a path separator, a (drive)
+    colon, a quote, a control character, or no `.exe` suffix is refused, so
+    nothing that could name a *location* or a command line survives."""
+    s = str(value or "").strip()
+    if s.lower().startswith(CUSTOM_PREFIX):
+        s = s[len(CUSTOM_PREFIX):].strip()
+    if not s or len(s) > 96 or not s.lower().endswith(".exe"):
+        return None
+    if s[0] in "-." or any(ch in _UNSAFE_IN_EXE or ord(ch) < 32 for ch in s):
+        return None
+    return s
+
+
+def custom_key(name):
+    """Storage key for a user-picked app: 'Steam.exe' -> 'custom:steam.exe'.
+    None when the name is not a plain exe name."""
+    n = custom_exe_name(name)
+    return (CUSTOM_PREFIX + n.lower()) if n else None
+
+
+def clean_custom_apps(names):
+    """Sanitised, de-duplicated, lowercase custom-app list (config hygiene)."""
+    out, seen = [], set()
+    for n in (names or []):
+        c = custom_exe_name(n)
+        if c is None:
+            continue
+        low = c.lower()
+        if low not in seen:
+            seen.add(low)
+            out.append(low)
+    return out[:25]
+
+
+def custom_label(name):
+    """Display name for a custom app: exe stem with the first letter up."""
+    s = str(name or "").strip()
+    if s.lower().endswith(".exe"):
+        s = s[:-4]
+    s = s.strip() or str(name or "").strip()
+    return (s[:1].upper() + s[1:]) if s else "?"
+
+
 def exe_names_for(keys):
     """Flat tuple of exe names for the ticked app keys. Unknown keys are
     ignored — a stale config can never ask us to close something that is
-    not on the reviewed list above."""
+    not on the reviewed list above — and a `custom:` key only contributes a
+    name that passes custom_exe_name (a plain exe basename, picked by the
+    user in the Auto-Pilot dialog)."""
     wanted = set(str(k) for k in (keys or []))
-    names = []
+    names, seen = [], set()
+
+    def _add(n):
+        if n.lower() not in seen:
+            seen.add(n.lower())
+            names.append(n)
+
     for key, _label, _note, exes in CLOSEABLE_APPS:
         if key in wanted:
-            names.extend(exes)
+            for exe in exes:
+                _add(exe)
+    for key in sorted(wanted):
+        exe = custom_exe_name(key)
+        if exe:
+            _add(exe)
     return tuple(names)
 
 
 def close_apps(keys, log=None):
     """Politely ask the ticked apps to close. Returns [closed friendly names].
+
+    Built-in keys come from the reviewed table above; `custom:` keys are
+    apps the user picked themselves (see custom_exe_name for what is
+    accepted).
 
     Uses `taskkill /IM <exe>` WITHOUT /F on purpose: that posts WM_CLOSE,
     which is the same thing clicking the window's X does. The app gets to
@@ -109,15 +207,28 @@ def close_apps(keys, log=None):
     reported as "not running" rather than a failure. Never raises."""
     if not sys.platform.startswith("win"):
         return []
+    wanted = set(str(k) for k in (keys or []))
     closed = []
     for key, label, _note, exes in CLOSEABLE_APPS:
-        if key not in set(str(k) for k in (keys or [])):
+        if key not in wanted:
             continue
         hit = False
         for exe in exes:
             if _taskkill(exe, log):
                 hit = True
         if hit:
+            closed.append(label)
+        elif log is not None:
+            try:
+                log(f"  · {label} was not running.")
+            except Exception:
+                pass
+    for key in sorted(wanted):
+        exe = custom_exe_name(key)
+        if not exe:
+            continue
+        label = custom_label(exe)
+        if _taskkill(exe, log):
             closed.append(label)
         elif log is not None:
             try:

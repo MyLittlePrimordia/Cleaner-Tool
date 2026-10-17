@@ -9,11 +9,14 @@ import sys
 import threading
 
 import tkinter as tk
+
+from app.ui.widgets.checkbox import M3Checkbutton
 from tkinter import ttk, messagebox
 from app.elevation import relaunch_as_admin
 from app.ui.theme import COLORS, F
 from app.ui.widgets import AnimatedButton
 from app.ui.tkdispatch import TkDispatcher
+from app.ui.base import _themed_showerror, _themed_showwarning
 
 
 class AdminGateFrame(tk.Frame):
@@ -24,7 +27,7 @@ class AdminGateFrame(tk.Frame):
         self.pack(fill="both", expand=True)
         wrapper = tk.Frame(self, bg=COLORS["bg"])
         wrapper.place(relx=0.5, rely=0.5, anchor="center")
-        tk.Label(wrapper, text="🛡️", font=("Segoe UI Emoji", 40), bg=COLORS["bg"],
+        tk.Label(wrapper, text="🛡️", font=("Segoe UI Emoji", 28), bg=COLORS["bg"],
                  fg=COLORS["accent_yellow"]).pack(pady=(0, 10))
         tk.Label(wrapper, text="Admin Needed", font=(F, 15, "bold"),
                  bg=COLORS["bg"], fg=COLORS["text"]).pack()
@@ -80,7 +83,7 @@ class AdminGateFrame(tk.Frame):
                  self._remember_limited_var)):
             try:
                 _pady = (10 if _var is self._auto_elevate_var else 2, 0)
-                tk.Checkbutton(wrapper, text=_text, variable=_var,
+                M3Checkbutton(wrapper, text=_text, variable=_var,
                                font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
                                selectcolor=COLORS["surface"],
                                activebackground=COLORS["bg"],
@@ -135,12 +138,11 @@ class AdminGateFrame(tk.Frame):
                             except Exception:
                                 pass
 
-                    tk.Button(
+                    AnimatedButton(
                         wrapper, text="Remove the folder exclusion",
                         font=(F, 9, "bold"), bg=COLORS["surface"],
-                        fg=COLORS["text"], activebackground=COLORS["surface_hover"],
-                        activeforeground=COLORS["text"], relief="flat", bd=0,
-                        cursor="hand2", command=_do_remove).pack(pady=(0, 4))
+                        fg=COLORS["text"], command=_do_remove,
+                        padx=16, pady=7).pack(pady=(0, 4))
         except Exception:
             pass
 
@@ -198,10 +200,11 @@ class AdminGateFrame(tk.Frame):
                         # window is often already running (old bug created
                         # two main windows). Let the user decide.
                         try:
-                            messagebox.showwarning("Elevation Cancelled",
-                                                   "Administrator elevation was cancelled or timed out.\n\n"
-                                                   "If an elevated window opened, use that one and close this.\n"
-                                                   "Otherwise click 'Continue Without Admin' to proceed in limited mode.")
+                            _themed_showwarning(
+                                self, "Elevation Cancelled",
+                                "Administrator elevation was cancelled or timed out.\n\n"
+                                "If an elevated window opened, use that one and close this.\n"
+                                "Otherwise click 'Continue Without Admin' to proceed in limited mode.")
                         except Exception:
                             pass
 
@@ -212,8 +215,8 @@ class AdminGateFrame(tk.Frame):
 
             threading.Thread(target=_wait_thread, daemon=True).start()
         else:
-            messagebox.showerror("Elevation Failed",
-                                 "Could not request administrator rights. You can still continue in limited mode.")
+            _themed_showerror(self, "Elevation Failed",
+                              "Could not request administrator rights. You can still continue in limited mode.")
 
     def _set_elevate_buttons_state(self, state: str):
         try:

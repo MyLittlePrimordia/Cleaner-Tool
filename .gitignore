@@ -1,4 +1,5 @@
 __pycache__/
+.pytest_cache/
 *.pyc
 build/
 dist/
@@ -7,5 +8,15 @@ dist/
 venv/
 *.egg-info/
 
-# tools/verify_catalog.py writes its offline report here on every run.
+# Local screenshot / verification output; not committed.
 shots/
+
+# Local scratch / one-off dev helpers that must not be shared or committed:
+#   _sf.py                 - per-machine screenshot helper (hardcoded %TEMP% path)
+#   test_elevation.py      - ad-hoc elevation diagnostic (not a pytest module)
+#   cleaner_smoke_export.txt - generated smoke-test log export
+#   screenshots/           - optional local README captures, not committed
+_sf.py
+test_elevation.py
+cleaner_smoke_export.txt
+screenshots/

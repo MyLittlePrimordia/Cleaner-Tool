@@ -9,18 +9,24 @@ from __future__ import annotations
 
 import tkinter as tk
 from tkinter import ttk, messagebox
-from app.ui.base import ThemedModal
-from app.ui.theme import COLORS, F, TAB_ACCENTS
-from app.ui.widgets import AnimatedButton
+from app.ui.dialogs._tool_page import ToolPage
+from app.ui.theme import COLORS, F, TAB_ACCENTS, _hex_lerp
+from app.ui.widgets import AnimatedButton, ScrollableRoundedPanel
+from app.ui.widgets.rounded_card import RoundedCard
 
 
-class SpecsDialog(ThemedModal):
+class SpecsDialog(ToolPage):
     """PC Specs: Speccy-style summary in plain words — left nav
     (Summary, OS, CPU, RAM, Board, Graphics, Storage, Audio, Network),
     one-line facts on the right, Copy Specs for support posts.
     Read-only engine (app/pc_specs.py); anything unreadable shows
     'Unknown', never a guess. No temperatures — those need a driver
-    stdlib code can't honestly read."""
+    stdlib code can't honestly read.
+
+    REDESIGN 2026-10: on the shared ToolPage shell — a Header banner,
+    the footer's Copy Specs is the one primary action and its note is
+    the shared StatusLine. The section nav stays anchored while the
+    DETAIL pane scrolls on its own."""
 
     _TABS = ("Summary", "OS", "CPU", "RAM", "Board", "Graphics",
              "Storage", "Audio", "Network")
@@ -28,36 +34,46 @@ class SpecsDialog(ThemedModal):
     def __init__(self, parent, app):
         self.app = app
         self._tab = "Summary"
-        super().__init__(parent, title="PC Specs", accent=TAB_ACCENTS["Clean"])
-        body = self.body
+        super().__init__(parent, title="PC Specs", accent=TAB_ACCENTS["Clean"],
+                         scope="Read-only hardware facts — nothing here is guessed.",
+                         scroll=False, fit=True)
+        self.banner.set_state("\U0001F4BB", TAB_ACCENTS["Clean"])
+        self.banner.set_title("What's inside this PC?")
+        self.banner.set_sub("Plain words, no guesswork.")
+        body = self.content
         cols = tk.Frame(body, bg=COLORS["bg"])
         cols.pack(fill="both", expand=True)
-        nav = tk.Frame(cols, bg=COLORS["bg_alt"], width=150)
-        nav.pack(side="left", fill="y", padx=(0, 8))
+        # REDESIGN 2026-10: the section nav was a bare tk.Frame - a hard
+        # grey rectangle with square corners sitting inside the rounded
+        # dialog (user report: "some don't have rounded corners inside
+        # their popup"). It is a RoundedCard now, and the ACTIVE section
+        # gets a tonal pill the way an M3 navigation rail marks the
+        # current destination (before this, no row was visibly selected).
+        nav = RoundedCard(cols, fill=COLORS["bg_alt"], bg=COLORS["bg"],
+                          radius=16, min_height=200)
         try:
-            nav.pack_propagate(False)
+            nav.configure(width=158)
         except Exception:
             pass
+        nav.pack(side="left", fill="y", padx=(0, 8))
         self._nav_btns = {}
         for tab in self._TABS:
-            b = AnimatedButton(nav, text=tab, command=lambda t=tab: self._show(t),
-                               bg=COLORS["bg_alt"], fg=COLORS["text"],
+            b = AnimatedButton(nav.body, text=tab,
+                               command=lambda t=tab: self._show(t),
+                               bg=COLORS["bg_alt"], fg=COLORS["subtext"],
                                font=(F, 9, "bold"), padx=10, pady=5)
             b.pack(fill="x", padx=6, pady=2)
             self._nav_btns[tab] = b
-        self._detail = tk.Frame(cols, bg=COLORS["bg"])
-        self._detail.pack(side="left", fill="both", expand=True)
-        foot = tk.Frame(body, bg=COLORS["bg"])
-        foot.pack(fill="x", pady=(8, 0))
-        tk.Label(foot, text="Unknown = couldn't be read, never guessed.",
-                 font=(F, 8), bg=COLORS["bg"], fg=COLORS["subtext"]).pack(side="left")
-        AnimatedButton(foot, text="Copy Specs",
-                       command=self._copy_specs,
-                       bg=COLORS["surface"], fg=COLORS["text"],
-                       font=(F, 9, "bold"), padx=14, pady=6).pack(side="right")
-        self._copy_note = tk.Label(foot, text="", font=(F, 8),
-                                   bg=COLORS["bg"], fg=COLORS["accent_green"])
-        self._copy_note.pack(side="right", padx=(0, 8))
+        self._detail_panel = ScrollableRoundedPanel(cols)
+        self._detail_panel.pack(side="left", fill="both", expand=True)
+        self._detail = self._detail_panel.inner
+        self._detail.bind("<Configure>", self._wrap_detail, add="+")
+        self._value_lbls = []
+
+        # REDESIGN 2026-10: shared footer — the note is the StatusLine and
+        # Copy Specs is the shell's one primary action.
+        self.status.stop("Unknown = couldn't be read, never guessed.")
+        self.add_button("Copy Specs", self._copy_specs, kind="primary")
         self.on_close(self._stop)
         self._show("Summary")
 
@@ -67,13 +83,54 @@ class SpecsDialog(ThemedModal):
                 child.destroy()
             except Exception:
                 pass
+        self._value_lbls = []
         for title, value in pairs:
             tk.Label(self._detail, text=title, font=(F, 11, "bold"),
                      bg=COLORS["bg"], fg=COLORS["text"],
                      anchor="w").pack(fill="x", pady=(8, 0))
-            tk.Label(self._detail, text=value or "Unknown", font=(F, 9),
-                     bg=COLORS["bg"], fg=COLORS["subtext"], anchor="w",
-                     justify="left", wraplength=560).pack(fill="x")
+            v = tk.Label(self._detail, text=value or "Unknown", font=(F, 9),
+                         bg=COLORS["bg"], fg=COLORS["subtext"], anchor="w",
+                         justify="left")
+            v.pack(fill="x")
+            self._value_lbls.append(v)
+        # REDESIGN 2026-10: no literal wraplength — the values wrap to the
+        # DETAIL pane's real width, re-measured on every <Configure>.
+        self._wrap_detail()
+        try:
+            self._detail_panel.refresh_scroll()
+        except Exception:
+            pass
+
+    def _paint_nav(self):
+        """Tonal pill on the active section, plain rows elsewhere (M3)."""
+        accent = TAB_ACCENTS["Clean"]
+        for tab, b in self._nav_btns.items():
+            sel = tab == self._tab
+            try:
+                if sel:
+                    b.set_style(
+                        bg=_hex_lerp(COLORS["bg_alt"], accent, 0.30),
+                        fg=COLORS["text"],
+                        hover_bg=_hex_lerp(COLORS["bg_alt"], accent, 0.40))
+                else:
+                    b.set_style(bg=COLORS["bg_alt"], fg=COLORS["subtext"],
+                                hover_bg=COLORS["surface"])
+            except Exception:
+                pass
+
+    def _wrap_detail(self, _event=None):
+        """Bind the value labels to the DETAIL pane's actual width."""
+        try:
+            w = self._detail.winfo_width() - 6
+        except Exception:
+            return
+        if w < 80:
+            return                      # not laid out yet; Configure returns
+        for lbl in getattr(self, "_value_lbls", []):
+            try:
+                lbl.config(wraplength=w)
+            except Exception:
+                pass
 
     def _show(self, tab):
         """Render a section, gathering the facts OFF the Tk thread.
@@ -89,6 +146,7 @@ class SpecsDialog(ThemedModal):
         and would drop the whole path back onto the Tk thread.
         """
         self._tab = tab
+        self._paint_nav()
         token = getattr(self, "_gather_seq", 0) + 1
         self._gather_seq = token
         self._rows([("Gathering...", "Reading this PC's hardware. One moment.")])
@@ -193,10 +251,10 @@ class SpecsDialog(ThemedModal):
                 raise ValueError("empty report")
             self._dlg.clipboard_clear()
             self._dlg.clipboard_append(text)
-            self._copy_note.config(text="Copied!")
+            self.status.stop("Copied!", COLORS["accent_green"])
         except Exception:
             try:
-                self._copy_note.config(text="Copy failed.")
+                self.status.stop("Copy failed.")
             except Exception:
                 pass
 

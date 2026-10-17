@@ -19,7 +19,7 @@ import tkinter.font as tkfont
 # The palette keeps living in app.config — this is a re-export, not a second
 # definition, so `from app.ui.theme import COLORS` and
 # `from app.config import COLORS` are the same object.
-from app.config import COLORS, FONT_FAMILY
+from app.config import COLORS, FONT_FAMILY, MONO_FONT_FAMILY
 
 TAB_ACCENTS = {
     "Clean": COLORS["accent_sky"],
@@ -31,26 +31,100 @@ TAB_ACCENTS = {
     # energetic for a power-tools page. Mauve was rejected as too close
     # to Tweak's violet.
     "Tools": COLORS["accent_pink"],
+    # Drivers (2026-10, 6th/7th tab). Orange: the one hue no other tab uses.
+    # Mauve was rejected (too close to Tweak's violet), teal (too close to
+    # Install's mint), red is reserved for danger.
+    "Drivers": COLORS["accent_orange"],
+    # Settings is a utility surface, not a mode you switch into, so it is
+    # deliberately neutral - the same reason the status-row glyphs are.
+    "Settings": COLORS["subtext"],
 }
 
-# TEXT-002 (design audit 2026-09-27): per-tab status-bar copy. Before this,
-# Application set ONE static string at startup ("Ready. Pick a preset and
-# press Run.") and never re-evaluated it per tab, so the Install and Tools
-# tabs -- which have no preset cards and no Run button -- instructed the user
-# to perform an action that does not exist on screen. Resolved on every tab
-# switch in Application._show_tab.
+# DESIGN AUDIT (2026-10): this module used to carry its OWN copy of
+# `_TAB_STATUS`, byte-identical to the one in app/ui/app.py, and nothing
+# imported it -- app/gui.py re-exported the app.py original. Two tables keyed
+# by tab name that must agree is exactly the kind of duplication that drifts,
+# so ONE copy now lives here, at the bottom of the layering, where both the
+# app shell (app/ui/app.py, which re-exports it for app/gui.py) and the tab
+# pages (app/ui/tabs/tasktab.py) can read it without either importing the
+# other. Importing it from app/ui/app.py instead would be a cycle: the shell
+# already imports TaskTab.
 #
 # Keyed by tab name, exactly like TAB_ACCENTS above, so the two per-tab
 # presentation tables sit together and cannot drift out of sync.
+#
+# TEXT-002 (design audit 2026-09-27): per-tab status-bar copy. Before this,
+# the shell set ONE static string at startup ("Ready. Pick a preset and press
+# Run.") and never re-evaluated it per tab, so the Install and Tools tabs --
+# which have no preset cards and no Run button -- instructed the user to
+# perform an action that does not exist on screen. Resolved on every tab
+# switch in Application._show_tab.
+# DECLUTTER 2026-10: the idle hints are empty. "Pick a preset to begin." sat
+# in the most-watched strip of the window on every launch, next to four other
+# things, to say what the preset cards already say by being the only thing on
+# the page. The row now speaks only when something is happening or has just
+# happened. The table stays (one key per tab) so callers need not change.
 _TAB_STATUS = {
-    "Clean": "Pick a preset to begin.",
-    "Repair": "Pick a preset to begin.",
-    "Tweak": "Pick a preset to begin.",
-    "Install": "Select apps to install.",
-    "Tools": "Choose a tool.",
+    "Clean": "",
+    "Repair": "",
+    "Tweak": "",
+    "Install": "",
+    "Tools": "",
 }
 
 F = FONT_FAMILY
+
+# Monospace face for paths, ports and addresses (Consolas on Windows).
+FM = MONO_FONT_FAMILY
+
+# ---------------------------------------------------------------------------
+# Material Design 3 foundations (redesign): shape scale, state layers and
+# the type scale. Widgets read these instead of carrying their own numbers,
+# so the whole app moves together.
+# ---------------------------------------------------------------------------
+
+# Shape scale (corner radii in px).
+SHAPE_XS = 4      # extra small  - tooltips, snackbars
+SHAPE_S = 8       # small        - chips, small fields
+SHAPE_M = 12      # medium       - cards
+SHAPE_L = 16      # large        - large cards, FAB
+SHAPE_XL = 28     # extra large  - dialogs, nav pills, sheets
+
+# State-layer opacities (M3 spec): a translucent overlay of the content colour
+# painted over the container. Tk has no alpha, so the overlay is pre-blended.
+STATE_HOVER = 0.08
+STATE_FOCUS = 0.10
+STATE_PRESS = 0.10
+STATE_DRAG = 0.16
+DISABLED_CONTENT = 0.38
+DISABLED_CONTAINER = 0.12
+
+# Type scale. Tk sizes are points (M3 sp * 0.75 at 100% scaling); Tk can only
+# do regular/bold, so M3's 500 weight maps to bold and 400 to regular.
+TYPE = {
+    "display_small":   (F, 27),
+    "headline_medium": (F, 21),
+    "headline_small":  (F, 18),
+    "title_large":     (F, 16),
+    "title_medium":    (F, 11, "bold"),
+    "title_small":     (F, 10, "bold"),
+    "body_large":      (F, 11),
+    "body_medium":     (F, 10),
+    "body_small":      (F, 9),
+    "label_large":     (F, 10, "bold"),
+    "label_medium":    (F, 9, "bold"),
+    "label_small":     (F, 8, "bold"),
+}
+
+
+def state_layer(container: str, content: str, opacity: float) -> str:
+    """`container` with a `content`-coloured M3 state layer at `opacity`."""
+    return _hex_lerp(container, content, opacity)
+
+
+def tonal(accent: str, base: str = None, amount: float = 0.16) -> str:
+    """A low-emphasis container tinted with `accent` (M3 tonal surface)."""
+    return _hex_lerp(base or COLORS["bg_alt"], accent, amount)
 
 # Icon metrics live here, not at each call site (user request: "I would like
 # things to be more symmetrical in my app as far as sizes and positions").
@@ -130,6 +204,40 @@ def _measure_font(root, font):
     if f is None:
         f = cache[font] = tkfont.Font(root=root, font=font)
     return f
+
+def ellipsize(text, font, room):
+    """`text` cut to fit `room` px in `font`, with a trailing ellipsis.
+
+    One implementation, because this problem has three call sites and they
+    must agree: ToolRow row titles, the 24 Tools card titles, and the preset
+    card titles. Before this existed, a too-long label was handled by nothing
+    - pack simply gave the Label less width than it asked for and Tk clipped
+    the glyphs. Because a Label's default anchor is CENTER, that clipped the
+    text at BOTH ends, so "Duplicate & Large Files" rendered as
+    "plicate & Large File" with the D sheared off, which reads as a
+    rendering fault rather than as truncation.
+
+    `font` may be a live tkfont.Font or any spec tuple. Returns `text`
+    unchanged when it already fits, so the common case costs one measure()
+    call and no visible change. Fails soft to the untruncated string.
+    """
+    text = str(text or "")
+    try:
+        if not text:
+            return ""
+        room = int(room)
+        if room < 24:
+            return text          # not laid out yet; show it all
+        measure = (font.measure if hasattr(font, "measure")
+                   else tkfont.Font(font=font).measure)
+        if measure(text) <= room:
+            return text
+        while text and measure(text + "…") > room:
+            text = text[:-1]
+        return (text + "…") if text else "…"
+    except Exception:
+        return text
+
 
 def _round_pts(x0, y0, x1, y1, r):
     return [

@@ -13,6 +13,7 @@ from app.ui.base import ThemedModal, Tooltip
 from app.ui.hardware.drives import _drive_gains
 from app.ui.theme import COLORS, F, TAB_ACCENTS, _hex_lerp, _round_rect_points
 from app.ui.widgets import AnimatedButton, ScrollableRoundedPanel
+from app.benchmark import compare as _measure_compare
 from app.utils import format_bytes
 
 
@@ -51,7 +52,7 @@ class ScorecardDialog(ThemedModal):
     def __init__(self, parent, *, tab_name, mode, cancelled, results,
                  total_bytes, before=None, after=None, needs_reboot=False,
                  on_run_again=None, ok_text="Close",
-                 before_drives=None, after_drives=None):
+                 before_drives=None, after_drives=None, measurements=None):
         self._run_again_cb = on_run_again
         # Feature 3 (Copy results) needs the raw numbers after the widgets
         # are built, so they are kept on the instance rather than living
@@ -70,6 +71,9 @@ class ScorecardDialog(ThemedModal):
         self._results = list(results)
         self._needs_reboot = bool(needs_reboot)
         self._gains = _drive_gains(before_drives, after_drives)
+        # N-002: (before, after) lightweight readings, or None. Rendered below
+        # the chips; an empty compare() means "no measurable change".
+        self._measurements = measurements
         tab_accent = TAB_ACCENTS.get(tab_name, COLORS["accent_green"])
         if cancelled:
             self._title = ("Undo Stopped" if mode == "revert"
@@ -153,6 +157,13 @@ class ScorecardDialog(ThemedModal):
             tk.Label(chips, text="◦  stopped early", font=(F, 10, "bold"),
                      bg=COLORS["bg"], fg=COLORS["accent_yellow"]).pack(side="left", padx=(12, 0))
 
+        # N-002: what else moved besides disk space (memory / restart flag).
+        # Nothing is shown when the readings never happened, and "no
+        # measurable change" is stated plainly rather than faked as a win.
+        self._measure_rows = None
+        self._measure_lbl = None
+        self._render_measurements(body)
+
         # per-drive breakdown (feature 4) — only when MORE THAN ONE drive
         # actually gained space. One drive is the normal case and the hero
         # number already says it; listing "C: +2.1 GB" under a "2.1 GB
@@ -230,10 +241,10 @@ class ScorecardDialog(ThemedModal):
         # reboot banner — amber, same tinted-banner pattern as Undo's
         self._reboot_banner = None
         if needs_reboot:
-            banner = self._reboot_banner = tk.Frame(body, bg="#3A2C12")
+            banner = self._reboot_banner = tk.Frame(body, bg=COLORS["alert_amber_bg"])
             tk.Label(banner,
                      text="⚠  Restart needed — some changes only take effect after a reboot.",
-                     font=(F, 9, "bold"), bg="#3A2C12",
+                     font=(F, 9, "bold"), bg=COLORS["alert_amber_bg"],
                      fg=COLORS["accent_yellow"]).pack(anchor="w", padx=10, pady=8)
             banner.pack(fill="x", padx=18, pady=(10, 0))
 
@@ -303,7 +314,7 @@ class ScorecardDialog(ThemedModal):
             fg = COLORS["subtext"]
         lbl = tk.Label(row, text=text, font=(F, 9), bg=COLORS["bg_alt"], fg=fg,
                        anchor="w", justify="left",
-                       wraplength=400)
+                       wraplength=self.body_width(28))
         lbl.pack(side="left", padx=(2, 0))
         if full_reason:
             try:
@@ -356,6 +367,49 @@ class ScorecardDialog(ThemedModal):
         except Exception:
             pass
 
+    # ---- before/after readings (N-002) --------------------------------- #
+
+    def _render_measurements(self, body):
+        """The memory / restart before/after block, or nothing.
+
+        Silent when no readings were taken (``compare`` returns None) so the
+        card never claims a change it could not see; a real "nothing moved"
+        is stated as such instead of being left blank."""
+        if not self._measurements:
+            return
+        try:
+            before, after = self._measurements
+        except (TypeError, ValueError):
+            return
+        rows = _measure_compare(before, after)
+        if rows is None:
+            return
+        wrap = tk.Frame(body, bg=COLORS["bg"])
+        wrap.pack(fill="x", padx=18, pady=(10, 0))
+        tk.Label(wrap, text="Before \u2192 after", font=(F, 9, "bold"),
+                 bg=COLORS["bg"], fg=COLORS["subtext"]).pack(anchor="w")
+        if not rows:
+            self._measure_lbl = tk.Label(
+                wrap, text="No measurable change to memory or restart state.",
+                font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
+                anchor="w", justify="left", wraplength=self.body_width(26))
+            self._measure_lbl.pack(anchor="w", pady=(3, 0))
+            return
+        tones = {"good": COLORS["accent_green"], "bad": COLORS["accent_red"],
+                 "warn": COLORS["accent_yellow"]}
+        self._measure_rows = []
+        for row in rows:
+            line = tk.Frame(wrap, bg=COLORS["bg"])
+            line.pack(fill="x", pady=1)
+            tk.Label(line, text=row.get("label", ""), font=(F, 9),
+                     bg=COLORS["bg"], fg=COLORS["text"],
+                     anchor="w").pack(side="left")
+            tk.Label(line, text=row.get("text", ""), font=(F, 9, "bold"),
+                     bg=COLORS["bg"],
+                     fg=tones.get(row.get("tone"), COLORS["text"])).pack(
+                         side="right")
+            self._measure_rows.append(line)
+
     # ---- summaries ------------------------------------------------------ #
 
     def _month_summary(self):
@@ -396,6 +450,22 @@ class ScorecardDialog(ThemedModal):
         lines.append("Result: " + ", ".join(parts))
         if self._needs_reboot:
             lines.append("Restart needed for some changes to take effect.")
+        # N-002: mirror the card's honest before/after into the copyable text.
+        if self._measurements:
+            try:
+                b, a = self._measurements
+                mrows = _measure_compare(b, a)
+            except (TypeError, ValueError):
+                mrows = None
+            if mrows is not None:
+                if mrows:
+                    lines.append("Before \u2192 after:")
+                    for row in mrows:
+                        lines.append("  %s: %s" % (row.get("label", ""),
+                                                   row.get("text", "")))
+                else:
+                    lines.append("No measurable change to memory or restart "
+                                 "state.")
         if self._results:
             lines.append("")
             for label, status, nbytes, reason in self._results:

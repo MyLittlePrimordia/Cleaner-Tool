@@ -2,7 +2,7 @@
 
 This module used to be the whole interface: 20,391 lines holding the theme,
 the hand-drawn widget set, the Win32 interop, 22 feature dialogs, 4 tab pages
-and the application shell. It is now 265 lines that re-export the public
+and the application shell. It is now 121 lines that re-export the public
 surface, so nothing outside the `app` package had to change when the layers
 moved out (H4/H5 widgets+theme+hardware, H12 dialogs, H13 tabs, H14 the shell).
 
@@ -21,10 +21,9 @@ and a widget never imports a dialog. The two exceptions are both pre-existing
 and documented at their definition sites — PilotDialog opens
 _CatalogPickerDialog, and InstallTab opens InstallProfilesDialog.
 
-app/gui.py stays because tools/smoke_gui.py imports ~40 names from it through
-`__import__("app.gui", ...)`. That contract is pinned by
-tools/check_architecture.py, which fails the build if any of these names stops
-resolving.
+app/gui.py stays as the public facade: app/__main__.py launches through
+`app.gui.launch`, and the re-exports below keep every name the old monolithic
+module exposed reachable from one place after the layers moved out.
 """
 from app.ui.theme import (  # noqa: F401
     COLORS, F, TAB_ACCENTS, _hex_lerp, _lerp, _measure_font, _round_pts,

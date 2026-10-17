@@ -9,7 +9,7 @@ import shutil
 from app.utils import (
     TaskCancelled, TaskContext, run_cmd, run_cmd_checked, create_restore_point,
     clean_folder_contents, restart_explorer, reg_get_value, reg_delete_value,
-    known_folder, atomic_write_text, resolve_exe,
+    known_folder, atomic_write_text, resolve_exe, TaskSkipped,
 )
 
 _WINDIR = os.environ.get("WINDIR", "C:\\Windows")
@@ -42,51 +42,107 @@ def repair_dism_checkhealth(ctx: TaskContext):
     run_cmd_checked(ctx, "DISM /Online /Cleanup-Image /CheckHealth", timeout=600, success_codes=(0, 3010))
 
 
+def _system_drive_spec() -> str:
+    """The system drive as chkdsk wants it: a letter and a colon ("C:").
+
+    NOT "C:\\". chkdsk takes a DRIVE, and `chkdsk C:\\ /scan` is rejected
+    with "The drive, the path, or the file name is not valid." (exit code 3).
+    An earlier version passed the trailing-backslash root, so on every PC the
+    scan failed at once - and because exit code 3 also means "errors found",
+    the task then told the user their drive HAD filesystem errors and to back
+    everything up. The drive was never checked. Validate strictly (one letter
+    and a colon) so an odd SYSTEMDRIVE can never become a different argument
+    (BUG-021) and fall back to C:.
+    """
+    sd = os.environ.get("SYSTEMDRIVE", "C:").strip().rstrip("\\/")
+    if len(sd) == 2 and sd[1] == ":" and sd[0].isalpha():
+        return sd.upper()
+    return "C:"
+
+
+def _volume_is_ntfs(ctx: TaskContext, drive: str) -> bool:
+    """chkdsk /scan and /spotfix are NTFS features. Asked through PowerShell
+    so the answer does not depend on the Windows display language."""
+    lines: list = []
+    run_cmd(ctx, [resolve_exe("powershell"), "-NoProfile", "-NonInteractive",
+                  "-Command",
+                  "(Get-Volume -DriveLetter %s -ErrorAction "
+                  "SilentlyContinue).FileSystem" % drive[0]],
+            shell=False, timeout=30, collect=lines)
+    return any(ln.strip().upper() == "NTFS" for ln in lines)
+
+
 def repair_chkdsk_scan(ctx: TaskContext):
-    ctx.set_status("Scanning the system drive for filesystem errors (read-only)...")
-    _sd = os.environ.get("SYSTEMDRIVE", "C:")
-    if len(_sd) == 2 and _sd[1] == ":":
-        _sd_root = _sd + "\\"
-    else:
-        _sd_root = _sd if _sd.endswith("\\") else _sd + "\\"
-    # F-5 audit fix: the exit code used to be discarded, so a drive WITH
-    # filesystem errors (chkdsk rc=3: "errors found, not fixed" — observed
-    # live) reported as a 'succeeded' task. smart_verdict/gpu_driver_age
-    # already raise on negative verdicts (this module's own honesty
-    # contract); chkdsk now does the same with a plain-language verdict.
-    # rc 0 = clean. rc 3 = errors found by the read-only scan. Anything
-    # else (or -1 cancel/timeout) is surfaced honestly below.
-    # BUG-021: this used to be
-    #     run_cmd(ctx, f"chkdsk {cmd_arg(_sd_root)} /scan", timeout=900)
-    # cmd_arg was documented as making metacharacters "travel as data, never as
-    # command separators", but it only ever quoted whitespace — it is
-    # subprocess.list2cmdline, which does not escape & | > % ^. A SYSTEMDRIVE of
-    # `C:^&calc` therefore produced `chkdsk C:^&calc /scan` run ELEVATED, and a
-    # merely-odd-but-legitimate SYSTEMDRIVE containing `&` silently truncated
-    # the command so chkdsk scanned the wrong volume and the app reported a
-    # repair that never happened.
-    # argv + shell=False is the fix: there is no shell, so nothing to parse a
-    # metacharacter. This is the pattern the other ~29 run_cmd(shell=False)
-    # call sites already use.
-    rc = run_cmd(ctx, ["chkdsk", _sd_root, "/scan"], shell=False, timeout=900)
-    if ctx.cancelled():
-        from app.utils import TaskCancelled
-        raise TaskCancelled(f"chkdsk scan of {_sd_root} was cancelled by user.")
+    """Scan the system drive for filesystem errors - and repair what it finds.
+
+    1. `chkdsk C: /scan`      online scan (the drive stays in use).
+    2. exit 0                 clean. Done.
+    3. exit 3                 errors found -> `chkdsk C: /spotfix`, which
+                              repairs the logged corruptions with the least
+                              downtime, then re-scan to PROVE it worked.
+    4. still dirty            the volume is in use and cannot be repaired
+                              online: mark it dirty (`fsutil dirty set`) so
+                              Windows runs a full check at the next restart -
+                              the same thing its own "Schedule disk check"
+                              prompt does - and say so.
+
+    A drive that is not NTFS is skipped with the reason (these switches do
+    not exist there), not reported as damaged.
+    """
+    from app.utils import TaskSkipped
+    drive = _system_drive_spec()
+    ctx.set_status("Scanning %s for filesystem errors..." % drive)
+    if not _volume_is_ntfs(ctx, drive):
+        raise TaskSkipped("%s is not an NTFS volume (or could not be "
+                          "identified), so chkdsk /scan does not apply." % drive)
+
+    def _cancel_check():
+        if ctx.cancelled():
+            raise TaskCancelled("Disk check of %s was cancelled by user." % drive)
+
+    rc = run_cmd(ctx, ["chkdsk", drive, "/scan"], shell=False, timeout=1800)
+    _cancel_check()
     if rc == 0:
-        ctx.log(f"VERDICT: {_sd_root} scanned clean — no filesystem errors found.")
+        ctx.log("VERDICT: %s scanned clean - no filesystem errors found." % drive)
         return
-    if rc == 3:
+    if rc in (1, 2):
+        ctx.log("VERDICT: %s - Windows corrected minor issues during the "
+                "scan (exit code %d)." % (drive, rc))
+        return
+    if rc != 3:
         raise RuntimeError(
-            f"Filesystem errors were FOUND on {_sd_root} (chkdsk exit code 3, "
-            "read-only scan). Back up important saves/files NOW, then fix them: "
-            "right-click the drive in Explorer > Properties > Tools > Check "
-            f"(or run 'chkdsk {_sd_root} /f' from an Administrator prompt and "
-            "reboot when it asks)."
-        )
+            "chkdsk could not scan %s (exit code %s). Close open programs and "
+            "try again, or run `chkdsk %s /scan` from an Administrator prompt."
+            % (drive, rc, drive))
+
+    ctx.log("Filesystem errors were found on %s - repairing (spot fix)..." % drive)
+    ctx.set_status("Repairing filesystem errors on %s..." % drive)
+    fix_rc = run_cmd(ctx, ["chkdsk", drive, "/spotfix"], shell=False,
+                     timeout=1800)
+    _cancel_check()
+    if fix_rc in (0, 1):
+        ctx.set_status("Re-scanning %s to confirm the repair..." % drive)
+        again = run_cmd(ctx, ["chkdsk", drive, "/scan"], shell=False,
+                        timeout=1800)
+        _cancel_check()
+        if again == 0:
+            ctx.log("VERDICT: %s had filesystem errors and they were "
+                    "repaired. A re-scan found none." % drive)
+            return
+    # Could not be fixed while Windows is running from this volume: have
+    # Windows finish the job at the next restart.
+    sched = run_cmd(ctx, ["fsutil", "dirty", "set", drive], shell=False,
+                    timeout=30)
+    if sched == 0:
+        ctx.log("VERDICT: %s still has filesystem errors that can only be "
+                "repaired while Windows is not running." % drive)
+        ctx.log("  [REBOOT] A full disk check is scheduled for the next "
+                "restart. It can take a while - let it finish.")
+        return
     raise RuntimeError(
-        f"chkdsk scan of {_sd_root} did not complete (exit code {rc}) — "
-        "close open files and retry, or run it from an Administrator prompt."
-    )
+        "Filesystem errors were found on %s and could not be repaired or "
+        "scheduled. Back up important files, then run `chkdsk %s /f` from an "
+        "Administrator prompt and restart." % (drive, drive))
 
 
 def _wsus_folder_has_content(folder: str) -> bool:
@@ -223,6 +279,7 @@ def repair_windows_update_reset(ctx: TaskContext):
                 except Exception as exc:
                     ctx.log(f"  ! could not rename {folder}: {exc}")
                     # Rollback any previously renamed folders
+                    rolled = []
                     for orig, bak in reversed(renamed):
                         # INFO-006: this used to rmtree(orig) and then
                         # rename(bak, orig), so a failing rename left the user
@@ -233,7 +290,11 @@ def repair_windows_update_reset(ctx: TaskContext):
                         if os.path.exists(bak):
                             if _restore_backup_safely(orig, bak, ctx):
                                 ctx.log(f"Rolled back {bak} -> {orig}")
-                    raise
+                                rolled.append((orig, bak))
+                    # B-0xx: drop the successfully-rolled-back pairs so the
+                    # finally block below doesn't advertise a "Backup kept"
+                    # path that no longer exists.
+                    renamed = [r for r in renamed if r not in rolled]
                     raise
     finally:
         for svc in reversed(stopped_services):
@@ -419,34 +480,52 @@ def repair_xbox_game_apps(ctx: TaskContext):
     # rc counted honestly — absent packages simply no-op under
     # SilentlyContinue, but a total failure raises.
     _ok = 0
+    _present = 0
     for pkg in packages:
         rc = run_cmd(
             ctx,
             ["powershell", "-NoProfile", "-Command",
-             f"Get-AppxPackage -Name '{pkg}' | "
-             f"ForEach-Object {{ Add-AppxPackage -DisableDevelopmentMode -Register "
-             f"($_.InstallLocation + '\\AppXManifest.xml') }}"],
+             # B-0xx: exit 2 (not 0) when the package is absent. The old
+             # pipeline exited 0 with the package missing, so every absent
+             # package was counted and logged as "Re-registered" — a false
+             # success on any PC without Xbox / Game Pass installed.
+             f"$p = Get-AppxPackage -Name '{pkg}'; if (-not $p) {{ exit 2 }}; "
+             f"Add-AppxPackage -DisableDevelopmentMode -Register "
+             f"($p.InstallLocation + '\\AppXManifest.xml')"],
             shell=False,
             timeout=120,
         )
         if rc == 0:
             _ok += 1
+            _present += 1
             ctx.log(f"  Re-registered {pkg}")
+        elif rc == 2:
+            ctx.log(f"  - {pkg} is not installed (skipped)")
         else:
+            _present += 1
             ctx.log(f"  ! re-register failed for {pkg} (exit {rc})")
     # GamingServices also installs a Win32 service pair; re-register its appx explicitly
     rc = run_cmd(
         ctx,
         ["powershell", "-NoProfile", "-Command",
-         "Get-AppxPackage -Name 'Microsoft.GamingServices' -AllUsers | "
-         "ForEach-Object { Add-AppxPackage -DisableDevelopmentMode -Register ($_.InstallLocation + '\\AppXManifest.xml') }"],
+         "$p = Get-AppxPackage -Name 'Microsoft.GamingServices' -AllUsers; "
+         "if (-not $p) { exit 2 }; "
+         "$p | ForEach-Object { Add-AppxPackage -DisableDevelopmentMode -Register ($_.InstallLocation + '\\AppXManifest.xml') }"],
         shell=False,
         timeout=120,
     )
     if rc == 0:
         _ok += 1
+        _present += 1
+    elif rc == 2:
+        ctx.log("  - Microsoft.GamingServices is not installed (skipped)")
     else:
+        _present += 1
         ctx.log(f"  ! re-register failed for Microsoft.GamingServices (-AllUsers, exit {rc})")
+    if _present == 0:
+        # Nothing was installed to repair — honest skip, not a fake success.
+        raise TaskSkipped("Xbox / Game Pass packages are not installed on this "
+                          "PC — nothing to repair.")
     if _ok == 0:
         raise RuntimeError("No Xbox package could be re-registered — see the log.")
     ctx.log("Xbox / Game Pass apps repaired. Reboot if the Xbox app still misbehaves.")
@@ -482,44 +561,116 @@ def repair_vss_restore_points(ctx: TaskContext):
 
 
 def repair_network_stack_defaults(ctx: TaskContext):
-    """Reset network stack to Microsoft defaults + normalize TCP autotuning/RSS.
-    Fixes damage left by other 'optimizers' (autotuning disabled causes slow
-    downloads on Steam/Epic)."""
-    ctx.set_status("Resetting network stack to Windows defaults...")
-    # H5: every step checked — the old fire-and-forget run_cmd calls logged
-    # success even when the stack was untouched.
+    """Fix Internet Connection: refresh DNS + DHCP, THEN reset the stack.
+
+    The order is the standard one Microsoft support gives, and it matters:
+
+        1. ipconfig /flushdns       clear the DNS resolver cache
+        2. ipconfig /release        drop the current address
+        3. ipconfig /renew          get a fresh one from DHCP
+        4. ipconfig /registerdns    re-register this PC's name
+        5. netsh winsock reset      } these two only take effect after a
+        6. netsh int ip reset       } restart, so they go LAST
+        7. TCP autotuning / RSS back to Windows defaults
+
+    The previous version ran 5 and 6 FIRST. A reset stack is pending a
+    restart and no longer gets an address, so the renew that followed timed
+    out after two minutes ("DHCP renew FAILED - this PC may be offline") on a
+    PC that was fine a minute earlier.
+
+    Safety, because release without a working renew leaves a PC with no
+    address:
+      * over Remote Desktop the release/renew pair is skipped (it would drop
+        the very session running this);
+      * renew is retried, with a longer timeout than before;
+      * a failed renew is reported but does not stop the remaining steps;
+      * `netsh int ip reset` printing "Access is denied" for ONE protected
+        key while resetting the rest and asking for a restart is a partial
+        success on many PCs, so it is a warning, not a failure.
+    """
+    import time as _time
+    ctx.set_status("Refreshing DNS and your network address...")
     failures: list = []
-    for cmd, to in (("netsh winsock reset", 60),
-                    ("netsh int ip reset", 60),
-                    ("netsh int tcp set global autotuninglevel=normal", 60),
-                    ("netsh int tcp set global rss=enabled", 60)):
-        if run_cmd(ctx, cmd, timeout=to) != 0:
-            failures.append(cmd)
-    # H5-offline risk: release+renew is the dangerous pair — if release
-    # succeeds and renew fails (router down, remote session), the machine
-    # is left without an IP. Check each side; abort loudly on renew failure.
-    if ctx.cancelled():
-        from app.utils import TaskCancelled
-        raise TaskCancelled("Network reset cancelled by user before DHCP renew.")
-    if run_cmd(ctx, "ipconfig /release", timeout=60) != 0:
-        failures.append("ipconfig /release")
-        ctx.log("  ! DHCP release failed — skipping renew (address left as-is).")
-    else:
-        if run_cmd(ctx, "ipconfig /renew", timeout=120) != 0:
-            raise RuntimeError(
-                "DHCP renew FAILED after release — this PC may be offline. "
-                "Check your router/cable, then run `ipconfig /renew` manually. "
-                "Earlier steps: "
-                + ("all ok" if not failures else f"also failed: {', '.join(failures)}")
-            )
-    if run_cmd(ctx, "ipconfig /flushdns", timeout=30) != 0:
+    warnings: list = []
+
+    def _cancelled():
+        if ctx.cancelled():
+            from app.utils import TaskCancelled
+            raise TaskCancelled("Network repair cancelled by user.")
+
+    # 1. DNS cache
+    if run_cmd(ctx, ["ipconfig", "/flushdns"], shell=False, timeout=30) != 0:
         failures.append("ipconfig /flushdns")
+    _cancelled()
+
+    # 2-3. release + renew
+    remote = os.environ.get("SESSIONNAME", "").upper().startswith("RDP")
+    if remote:
+        ctx.log("  Remote Desktop session detected - skipping DHCP "
+                "release/renew (it would disconnect you).")
+    else:
+        rel = run_cmd(ctx, ["ipconfig", "/release"], shell=False, timeout=60)
+        _cancelled()
+        if rel != 0:
+            ctx.log("  No DHCP address to release (static address, or no "
+                    "adapter is using DHCP) - skipping renew.")
+        else:
+            renewed = False
+            for attempt in (1, 2, 3):
+                ctx.set_status("Getting a new address from DHCP "
+                               "(attempt %d of 3)..." % attempt)
+                if run_cmd(ctx, ["ipconfig", "/renew"], shell=False,
+                           timeout=150) == 0:
+                    renewed = True
+                    break
+                _cancelled()
+                if attempt < 3:
+                    _time.sleep(5)
+            if not renewed:
+                failures.append("ipconfig /renew")
+                ctx.log("  ! Could not get a new address from DHCP after 3 "
+                        "tries - this PC may be offline. Check your "
+                        "router/cable, then run `ipconfig /renew`.")
+    _cancelled()
+
+    # 4. DNS registration (best effort)
+    if run_cmd(ctx, ["ipconfig", "/registerdns"], shell=False, timeout=60) != 0:
+        warnings.append("ipconfig /registerdns")
+
+    # 5. Winsock catalog
+    ctx.set_status("Resetting the Winsock catalog and TCP/IP stack...")
+    if run_cmd(ctx, ["netsh", "winsock", "reset"], shell=False, timeout=60) != 0:
+        failures.append("netsh winsock reset")
+    _cancelled()
+
+    # 6. TCP/IP stack
+    out: list = []
+    rc = run_cmd(ctx, ["netsh", "int", "ip", "reset"], shell=False,
+                 timeout=60, collect=out)
+    if rc != 0:
+        text = " ".join(out).lower()
+        if "restart the computer" in text and "ok" in text:
+            warnings.append("netsh int ip reset (one protected setting was "
+                            "skipped)")
+        else:
+            failures.append("netsh int ip reset")
+    _cancelled()
+
+    # 7. TCP tuning back to Windows defaults (undoes other 'optimizers')
+    for argv in (["netsh", "int", "tcp", "set", "global",
+                  "autotuninglevel=normal"],
+                 ["netsh", "int", "tcp", "set", "global", "rss=enabled"]):
+        if run_cmd(ctx, argv, shell=False, timeout=60) != 0:
+            failures.append(" ".join(argv[:4]) + " ...")
+
+    if warnings:
+        ctx.log("  Note: " + "; ".join(warnings))
     if failures:
         raise RuntimeError(
-            "Network reset partially failed: " + ", ".join(failures)
-            + ". A reboot is recommended, then re-run this task."
-        )
-    ctx.log("Network stack reset to defaults. A reboot is recommended.")
+            "Network repair partly failed: " + ", ".join(failures)
+            + ". Restart the PC and run this task again.")
+    ctx.log("Network refreshed and reset to Windows defaults.")
+    ctx.log("  [REBOOT] Restart your PC to finish the Winsock and TCP/IP reset.")
 
 
 def repair_network_light(ctx: TaskContext):
@@ -644,16 +795,25 @@ def repair_gpu_driver_age(ctx: TaskContext):
     if len(lines) < 2:
         raise RuntimeError("No GPU driver info available from WMI.")
     stale, seen_any = [], False
-    for row in lines[1:]:
-        parts = [p.strip('"') for p in row.split(",", 1)]
-        if len(parts) < 2 or not parts[1]:
+    # B-0xx: parse with csv, not split(","). A GPU name containing a comma
+    # ("Samsung SSD 870, EVO"-style) is quoted by ConvertTo-Csv; the old split
+    # misaligned the columns, the date parsed as garbage, the row was skipped,
+    # and the task could end with "Could not parse any driver dates".
+    import csv as _csv
+    import io as _io
+    try:
+        _rows = list(_csv.reader(_io.StringIO("\n".join(lines))))
+    except Exception:
+        _rows = []
+    for parts in _rows[1:]:
+        if len(parts) < 2 or not parts[1].strip():
             continue
-        name, date_raw = parts[0], parts[1]
+        name, date_raw = parts[0].strip(), parts[1].strip()
         try:
             # A1 fix: the pipeline above emits an invariant timestamp
             # ("yyyy-MM-dd HH:mm:ss", no culture-dependent short-date
             # format), so a single strict parse covers every machine.
-            d = datetime.strptime(date_raw.strip(), "%Y-%m-%d %H:%M:%S")
+            d = datetime.strptime(date_raw, "%Y-%m-%d %H:%M:%S")
         except ValueError:
             continue  # genuinely unparsable row — skip it, don't abort
         seen_any = True
@@ -676,29 +836,28 @@ def repair_gpu_driver_age(ctx: TaskContext):
 
 
 def get_gpu_manufacturer_download_url(gpu_name: str) -> str:
-    """Get the appropriate driver download URL based on GPU manufacturer.
-    
-    Args:
-        gpu_name: Name of the GPU from WMI
-        
-    Returns:
-        URL to the manufacturer's driver download page
+    """The official driver page for a GPU, from its Windows device name.
+
+    Matched on WHOLE WORDS, Intel before AMD. The earlier version tested the
+    bare substring "hd" under AMD first, and "Intel(R) UHD Graphics" contains
+    "hd" - so every Intel integrated GPU was sent to AMD's support page.
+    Returns "" when the vendor cannot be told (callers then show no link
+    rather than a wrong one).
     """
-    gpu_lower = gpu_name.lower()
-    
-    # NVIDIA
-    if any(keyword in gpu_lower for keyword in ['nvidia', 'geforce', 'rtx', 'gtx', 'quadro']):
+    import re as _re
+    name = (gpu_name or "").lower()
+
+    def has(*words):
+        return any(_re.search(r"(?<![a-z0-9])%s(?![a-z0-9])" % _re.escape(w),
+                              name) for w in words)
+
+    if has("nvidia", "geforce", "rtx", "gtx", "quadro", "titan"):
         return "https://www.nvidia.com/Download/index.aspx"
-    
-    # AMD
-    if any(keyword in gpu_lower for keyword in ['amd', 'radeon', 'rx', 'hd']):
-        return "https://www.amd.com/support"
-    
-    # Intel
-    if any(keyword in gpu_lower for keyword in ['intel', 'arc', 'iris', 'uhd', 'hd graphics']):
-        return "https://www.intel.com/content/www/us/en/download-center/home.html"
-    
-    # Default to Install tab
+    if has("intel", "iris", "uhd", "arc") or "hd graphics" in name:
+        return ("https://www.intel.com/content/www/us/en/download-center/"
+                "home.html")
+    if has("amd", "radeon", "rx", "ati", "vega"):
+        return "https://www.amd.com/en/support"
     return ""
 
 
@@ -918,6 +1077,10 @@ def repair_icon_cache(ctx: TaskContext):
 def repair_store_cache_reset(ctx: TaskContext):
     """Reset the Microsoft Store download cache (wsreset): fixes Store and
     Xbox-app downloads that fail, hang, or loop."""
+    from app.utils import TaskSkipped, store_available
+    if not store_available():
+        raise TaskSkipped("Microsoft Store is not installed on this version "
+                          "of Windows - nothing to reset.")
     ctx.set_status("Resetting the Store download cache (wsreset)...")
     run_cmd_checked(ctx, "wsreset.exe", timeout=600, success_codes=(0,))
     ctx.log("Store cache reset — reopen the Store and retry the download.")
@@ -1285,14 +1448,14 @@ def restart_startmenu_search(ctx: TaskContext):
             raise TaskCancelled("Start menu restart cancelled by user.")
         try:
             out = _sp.check_output(
-                'tasklist /fi "imagename eq StartMenuExperienceHost.exe" /fo csv /nh',
-                shell=True, text=True, timeout=10, stderr=_sp.DEVNULL,
+                ['tasklist', '/fi', 'imagename eq StartMenuExperienceHost.exe', '/fo', 'csv', '/nh'],
+                text=True, timeout=10, stderr=_sp.DEVNULL,
                 creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
             )
             start_ok = "startmenuexperiencehost.exe" in (out or "").lower()
             out2 = _sp.check_output(
-                'tasklist /fi "imagename eq SearchHost.exe" /fo csv /nh',
-                shell=True, text=True, timeout=10, stderr=_sp.DEVNULL,
+                ['tasklist', '/fi', 'imagename eq SearchHost.exe', '/fo', 'csv', '/nh'],
+                text=True, timeout=10, stderr=_sp.DEVNULL,
                 creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
             )
             search_ok = "searchhost.exe" in (out2 or "").lower()
@@ -1915,6 +2078,293 @@ def check_rebar_status(ctx: TaskContext):
 # what doesn't.
 # --------------------------------------------------------------------------- #
 
+
+# --------------------------------------------------------------------------- #
+# Round 2 additions: activation, Secure Boot/TPM, Driver Verifier reset,
+# DHCP renew, WSL repair.
+#
+# The first two are REPORT-ONLY in the same sense repair_smart_verdict is:
+# they tell the user the truth and change nothing. A health report that
+# "repairs" a licensing state would be dishonest, and there is no safe
+# automatic fix for either one.
+#
+# The last three are actions, but each is chosen because it REMOVES a
+# restrictive state rather than imposing one - Driver Verifier turns
+# verification OFF (it is a debugging tool that causes crashes and BSODs
+# when left enabled), and the other two are idempotent network/service
+# restarts. None of them delete user data.
+# --------------------------------------------------------------------------- #
+
+
+def check_windows_activation(ctx: TaskContext):
+    """Report whether Windows is activated. Report-only.
+
+    Reads the licence state through WMI (SoftwareLicensingProduct), which
+    needs no elevation and no third-party tool. Genuinely useful because a
+    de-activated or out-of-grace Windows silently starts refusing updates
+    and shows persistent watermarks, and "is my licence OK" is otherwise
+    buried in Settings > About.
+
+    LicenseStatus: 0 Unlicensed, 1 Licensed, 2 OOB Grace, 3 OOT Grace,
+    4 Non-Genuine Grace, 5 Notification, 6 Extended Grace.
+    """
+    ctx.set_status("Checking Windows activation...")
+    import subprocess as _sp
+    try:
+        out = _sp.run(
+            ["powershell", "-NoProfile", "-Command",
+             "(Get-CimInstance SoftwareLicensingProduct | "
+             "Where-Object { $_.PartialProductKey } | "
+             "Select-Object -First 1 -Property LicenseStatus, "
+             "Description, PartialProductKey | "
+             "ConvertTo-Csv -NoTypeInformation)"],
+            capture_output=True, text=True, timeout=60,
+            creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Could not read the Windows licence state: {exc}")
+    lines = [l.strip() for l in (out.stdout or "").splitlines()
+             if l.strip() and not l.startswith("#")]
+    if len(lines) < 2:
+        raise RuntimeError(
+            "Could not read the Windows licence state on this PC "
+            "(licensing service unavailable).")
+    parts = [p.strip().strip('"') for p in lines[1].split(",")]
+    status_raw = parts[0] if parts else "?"
+    key = parts[2] if len(parts) > 2 else ""
+    try:
+        status = int(status_raw)
+    except (TypeError, ValueError):
+        status = -1
+    ctx.log(f"Product key ending: {key or '(not reported)'}")
+
+    # 1 is the only genuinely healthy state. The grace states all still
+    # nag, and 5/6 mean Windows is actively complaining.
+    if status == 1:
+        # B-0xx: parts[1] was concatenated twice, producing
+        # "(Windows, Professional - Windows, Professional)".
+        _desc = parts[1] if len(parts) > 1 else ""
+        ctx.log(f"Windows is activated ({_desc})."
+                if _desc else "Windows is activated.")
+        return
+    meanings = {
+        0: "Windows is NOT activated.",
+        2: "Windows is in an Out-of-Box Grace period.",
+        3: "Windows is in an Out-of-Tolerance Grace period.",
+        4: "Windows is in a Non-Genuine Grace period.",
+        5: "Windows is NOT activated (notification mode).",
+        6: "Windows is in an Extended Grace period.",
+    }
+    ctx.log("! " + meanings.get(status, f"Licence status {status_raw}."))
+    ctx.log("  Settings > Update & Security > Activation shows the details "
+            "and the key that's installed.")
+    raise RuntimeError(
+        meanings.get(status, "Windows activation could not be confirmed."))
+
+
+def check_secureboot_tpm(ctx: TaskContext):
+    """Report Secure Boot state and TPM presence/version. Report-only.
+
+    Both are read-only queries and neither has a safe automatic fix, so this
+    only ever tells the user where they stand. Reported together because
+    they are the same question - "is my PC's boot chain intact?" - and
+    because anti-cheat and BitLocker both depend on the answer.
+
+    Secure Boot's query needs elevation, so without admin this reports the
+    TPM half and says plainly that the Secure Boot half needs Administrator
+    rather than pretending to have checked it.
+    """
+    ctx.set_status("Checking Secure Boot and TPM...")
+    from app.elevation import is_admin as _ia
+    admin = False
+    try:
+        admin = bool(_ia())
+    except Exception:
+        admin = False
+
+    import subprocess as _sp
+
+    def _ps(script, timeout=45):
+        try:
+            return _sp.run(
+                ["powershell", "-NoProfile", "-Command", script],
+                capture_output=True, text=True, timeout=timeout,
+                creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
+            )
+        except Exception as exc:
+            raise RuntimeError(str(exc))
+
+    # --- TPM ------------------------------------------------------------
+    tpm_ok = None
+    try:
+        out = _ps("(Get-Tpm | Select-Object TpmPresent, TpmReady, "
+                  "ManufacturerVersion | ConvertTo-Csv -NoTypeInformation)")
+        lines = [l.strip() for l in (out.stdout or "").splitlines()
+                 if l.strip() and not l.startswith("#")]
+        if len(lines) >= 2:
+            parts = [p.strip().strip('"') for p in lines[1].split(",")]
+            present = parts[0].strip().lower() == "true"
+            ready = (parts[1].strip().lower() == "true"
+                     if len(parts) > 1 else False)
+            tpm_ok = present
+            ctx.log(f"TPM present: {'yes' if present else 'no'}"
+                    f"   version: {parts[2] if len(parts) > 2 else '?'}")
+            # BUG-025: this fired whenever TpmReady was false, INCLUDING when
+            # no TPM exists at all - so a machine with no TPM logged both
+            # "TPM present: no" and "TPM is present but NOT READY", which
+            # contradict each other. The not-ready warning only makes sense
+            # for a TPM that is actually there.
+            if present and not ready:
+                ctx.log("! TPM is present but NOT READY - Windows may need "
+                        "another boot before it is usable.")
+    except Exception as exc:
+        ctx.log(f"  (could not read the TPM: {exc})")
+
+    # --- Secure Boot ----------------------------------------------------
+    if not admin:
+        ctx.log("Secure Boot: needs Administrator - restart as admin to "
+                "check this.")
+        if tpm_ok is None:
+            raise TaskSkipped("Secure Boot and TPM both need Administrator.")
+        return
+
+    try:
+        out = _ps("if (Confirm-SecureBootUEFI) { 'SecureBoot=True' } "
+                  "else { 'SecureBoot=False' }")
+        text = (out.stdout or "").strip()
+        if "True" in text:
+            ctx.log("Secure Boot: ON (the boot chain is verified).")
+        elif "False" in text:
+            ctx.log("! Secure Boot: OFF. Windows will still start, but "
+                    "drivers and Windows itself are not being verified.")
+        else:
+            ctx.log("  (Secure Boot is not supported on this firmware - "
+                    "common on legacy BIOS machines and some VMs.)")
+    except Exception as exc:
+        ctx.log(f"  (could not read Secure Boot: {exc})")
+
+
+def reset_driver_verifier(ctx: TaskContext):
+    """Turn Windows Driver Verifier OFF and clear any active verification.
+
+    Driver Verifier is a Microsoft debugging tool that puts the kernel into
+    a deliberately hostile mode to surface flaky drivers. People switch it
+    on to catch a BSOD, then forget - and a machine left verifying drivers
+    will crash at unpredictable moments, fail to boot, or refuse to start
+    signed drivers. `verifier /reset` removes the settings and requires a
+    reboot to take effect.
+
+    This is a REMOVAL, not an imposition: it only ever clears a state the
+    user opted into. If nothing was verifying, it reports that and stops.
+    """
+    ctx.set_status("Resetting Driver Verifier...")
+    import subprocess as _sp
+    try:
+        out = _sp.run(
+            ["verifier", "/reset"],
+            capture_output=True, text=True, timeout=60,
+            creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Could not run Driver Verifier: {exc}")
+    blob = ((out.stdout or "") + " " + (out.stderr or "")).lower()
+    if "not currently verifying" in blob or "no settings" in blob:
+        ctx.log("Driver Verifier was not active - nothing to reset.")
+        return
+    if out.returncode != 0 and "restart" not in blob and "reboot" in blob:
+        raise RuntimeError(
+            "Driver Verifier reset did not complete. Reboot and run again.")
+    if out.returncode != 0:
+        raise RuntimeError(
+            f"Driver Verifier reset failed (code {out.returncode}). "
+            "Reboot and try again.")
+    ctx.log("Driver Verifier cleared. REBOOT to finish - the old settings "
+            "stay active until you do.")
+    ctx.log("If you enabled Verifier to track down a BSOD, re-enable it "
+            "deliberately once this machine is stable.")
+
+
+def renew_dhcp_lease(ctx: TaskContext):
+    """Release and re-acquire the DHCP lease for every adapter.
+
+    The fix for a stale or conflicting address: the machine keeps an old
+    lease the router has since given to something else, so the PC believes
+    it is on the network while packets go nowhere. Releasing and renewing is
+    a normal, supported operation - it interrupts connectivity for a few
+    seconds and Windows rebuilds the address from the router.
+    """
+    ctx.set_status("Renewing network addresses...")
+    # B-0xx: never release/renew inside a Remote Desktop session — dropping the
+    # address tears down the very connection carrying the session, the same
+    # hazard repair_network_stack_defaults guards against.
+    if (os.environ.get("SESSIONNAME", "") or "").upper().startswith("RDP"):
+        raise TaskSkipped("This looks like a Remote Desktop session — releasing "
+                          "the network address would disconnect you. Run it "
+                          "from a local session instead.")
+    rc = run_cmd(ctx, ["ipconfig", "/release"], timeout=60)
+    renew_rc = run_cmd(ctx, ["ipconfig", "/renew"], timeout=120)
+    if rc not in (0, 1):
+        # ipconfig returns non-zero on adapters it could not touch; the
+        # renew is what matters and has already run.
+        ctx.log("  (release reported code %d on at least one adapter - "
+                "usually a disconnected or virtual one)" % rc)
+    if renew_rc not in (0, 1):
+        # B-0xx: the old code discarded the /renew result and ALWAYS claimed
+        # success — so a failed renew left the PC with no address while
+        # reporting "renewed". Report it honestly instead.
+        raise RuntimeError(
+            "Could not renew the network address (ipconfig /renew returned "
+            "%s). Check the adapter is connected, then run this again or "
+            "reboot." % renew_rc)
+    ctx.log("Network address renewed. Your connection may drop for a few "
+            "seconds.")
+
+
+def repair_wsl(ctx: TaskContext):
+    """Reset the WSL subsystem and update it to the current kernel.
+
+    Two steps, both non-destructive to your Linux files:
+      * `wsl --shutdown` stops every running distro cleanly (their files are
+        on disk and untouched), which clears the state behind "wsl is stuck"
+        and "the VM failed to start".
+      * `wsl --update` fetches the current kernel, which is what fixes
+        networking, WSL2 and Docker-Desktop integration failures after a
+        Windows update.
+
+    Skips honestly when WSL is not installed, which is the normal case on
+    the machines this app targets.
+    """
+    from app.utils import TaskSkipped
+    from app.utils import resolve_exe as _rx
+    try:
+        wsl = _rx("wsl")
+    except Exception:
+        wsl = None
+    if not wsl:
+        raise TaskSkipped(
+            "WSL is not installed on this PC - use the 'WSL (Ubuntu)' "
+            "row on the Install tab if you want it.")
+    ctx.set_status("Shutting down WSL...")
+    run_cmd(ctx, ["wsl", "--shutdown"], timeout=90)
+    ctx.log("All WSL distros shut down.")
+    ctx.set_status("Updating the WSL kernel...")
+    rc = run_cmd(ctx, ["wsl", "--update"], timeout=600)
+    if rc == 0:
+        ctx.log("WSL kernel updated.")
+    else:
+        # --update fails offline or on a Store-less machine; the shutdown
+        # already did its half of the work, so say what happened rather
+        # than reporting a total failure.
+        ctx.log("! The WSL kernel could not be updated (needs internet, and "
+                "on some builds a restart). The shutdown half still "
+                "succeeded.")
+        raise RuntimeError(
+            "WSL kernel update did not complete - check your connection and "
+            "restart, then run this again.")
+    ctx.log("WSL repaired.")
+
+
+
 TASKS = [
     Task("restore_point", "Safety Checkpoint", "Saves a restore point you can go back to", create_restore_point, default=True),
     Task("xbox_apps", "Fix Xbox / Game Pass Apps", "Repairs the Xbox app and Game Pass sign-in without reinstalling", repair_xbox_game_apps, default=False),
@@ -1927,7 +2377,7 @@ TASKS = [
     Task("dism_cleanup", "Cleanup Update Storage", "Cleans old update leftovers but keeps uninstall option", repair_dism_component_cleanup, default=False),
     Task("dism_scanhealth", "Scan Image Health", "Scans Windows image for corruption", repair_dism_scanhealth, default=False),
     Task("dism_checkhealth", "Check Image Health", "Quick check if image needs repair", repair_dism_checkhealth, default=False),
-    Task("chkdsk_scan", "Check Disk (Read-Only)", "Checks your drive for errors without restarting", repair_chkdsk_scan, default=False),
+    Task("chkdsk_scan", "Check & Repair Disk", "Scans your system drive for errors and repairs what it finds", repair_chkdsk_scan, default=False),
     Task("wu_reset", "Fix Stuck Updates", "Fixes Windows Update when it’s stuck or failing", repair_windows_update_reset, default=False),
     Task("bits_reset", "Fix Download Queue", "Clears stuck download jobs that block updates", repair_bits_reset, default=False),
     Task("time_sync", "Fix Clock Sync", "Fixes wrong clock that breaks updates and logins", repair_time_sync, default=False),
@@ -1972,4 +2422,9 @@ TASKS = [
     Task("dxdiag_report", "Save Diagnostics Report", "Saves a dxdiag report for support forums; changes nothing", run_dxdiag_report, default=False, admin_required=False),
     Task("xmp_check", "Is XMP/EXPO On?", "Checks your RAM runs at full speed; enabling it is a free BIOS toggle", check_xmp_status, default=False, admin_required=False),
     Task("rebar_check", "Is ReBAR On?", "Checks Resizable BAR for free FPS (NVIDIA auto-detect); enabling it is a BIOS toggle", check_rebar_status, default=False, admin_required=False),
+    Task("activation_status", "Check Windows Activation", "Says whether Windows is licensed - unactivated copies quietly stop getting updates", check_windows_activation, default=False, admin_required=False),
+    Task("secureboot_tpm", "Check Secure Boot & TPM", "Reports whether your boot chain is verified - anti-cheat and BitLocker both depend on it", check_secureboot_tpm, default=False, admin_required=True),
+    Task("driver_verifier_reset", "Reset Driver Verifier", "Turns off Driver Verifier, the Microsoft debugging tool that makes machines crash when left on", reset_driver_verifier, default=False, admin_required=True, risk="REBOOT REQUIRED"),
+    Task("dhcp_renew", "Renew Network Address (DHCP)", "Drops the stale network address this PC is holding and asks the router for a new one", renew_dhcp_lease, default=False, admin_required=True),
+    Task("wsl_repair", "Repair WSL (Linux Subsystem)", "Shuts WSL down cleanly and updates its kernel - fixes stuck distros and broken networking", repair_wsl, default=False, admin_required=False),
 ]

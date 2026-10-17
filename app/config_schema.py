@@ -435,6 +435,28 @@ def _game_night_keys(value, default):
     return _str_list(value, default, cap=SESSION_KEYS_MAX)
 
 
+def _game_night_custom_apps(value, default):
+    """Apps the user added to the Auto-Pilot close list: exe NAMES only.
+
+    Mirrors app.game_night.custom_exe_name, duplicated on purpose: this
+    module is loaded before the app modules and stays import-light, and
+    this copy only has to be no MORE permissive than the one that gates
+    the taskkill call. Anything carrying a path separator, a drive colon,
+    a quote or a control character is dropped rather than repaired."""
+    vals = _str_list(value, default, cap=25)
+    out, seen = [], set()
+    for v in vals:
+        s = str(v).strip().lower()
+        if (not s or len(s) > 96 or not s.endswith(".exe")
+                or s[0] in "-." or any(
+                    c in '\\/:*?"<>|' or ord(c) < 32 for c in s)):
+            continue
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
 def _legacy_tab_list(value, default):
     """A legacy tab's task keys, keeping the bare-string form INTACT.
 
@@ -487,6 +509,14 @@ SCHEMA = {
                                 "separate opt-in for the --auto-update task"),
     "schedule_frequency": (_schedule_frequency, "daily | weekly | monthly"),
     "schedule_time": (_schedule_time, "HH:MM 24h"),
+    "health_check_mode": (lambda v, d: _str(v, d, choices=("off", "startup", "daily", "weekly"), lower=True),
+                          "off | startup | daily | weekly - when the PC Health badge re-checks"),
+    "health_last_grade": (lambda v, d: _str(v, d, choices=("A", "B", "C", "D", "F")) if v else d,
+                          "overall grade of the last PC Health check, '' if never"),
+    "drivers_folder": (lambda v, d: v.strip()[:500] if isinstance(v, str) else d,
+                       "custom Drivers download folder, '' = default"),
+    "health_last_check": (lambda v, d: float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0 else d,
+                          "epoch seconds of the last PC Health check"),
 
     # --- task selection ------------------------------------------------- #
     "selected_tasks": (_selected_tasks, "per-tab list of task keys; folded "
@@ -511,6 +541,9 @@ SCHEMA = {
     "game_night_active": (_bool, "a Game Night session is in progress"),
     "game_night_keys": (_game_night_keys, "tweaks Game Night itself turned on"),
     "game_night_close_apps": (_game_night_keys, "optional apps to quiet"),
+    "game_night_custom_apps": (_game_night_custom_apps,
+                               "apps you added to the close list (exe names only; "
+                               "Auto-Pilot closes them by process name, never by path)"),
     "startup_disabled": (_startup_disabled, "records to restore disabled items"),
 
     # --- admin gate / tray ---------------------------------------------- #
@@ -562,9 +595,9 @@ def apply_schema(data, defaults, extra=()):
 def validate_schema(defaults):
     """Return a list of drift problems between SCHEMA and DEFAULT_CONFIG.
 
-    Called by tools/verify_config_schema.py. An empty list means the two
-    declarations agree, which is the property that makes DEFAULT_CONFIG the
-    single source of truth rather than two lists that rot apart.
+    An empty list means the two declarations agree, which is the property
+    that makes DEFAULT_CONFIG the single source of truth rather than two
+    lists that rot apart.
     """
     problems = []
     for key in sorted(set(SCHEMA) - set(defaults)):

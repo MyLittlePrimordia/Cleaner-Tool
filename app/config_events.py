@@ -99,3 +99,21 @@ def log_security_event(category: str, message: str) -> None:
                 pass
     except Exception:
         pass
+
+
+def read_events(limit: int = 400) -> "list[str]":
+    """The most recent event-log lines, oldest first.
+
+    U-001: the app has been writing this trail all along (elevation cookie
+    failures, swallowed state-changing ops, ...) but nothing ever read it
+    back, so it was invisible to a user filing a bug report. The log-export
+    path calls this to append the tail, and it never raises — a missing or
+    unreadable log is simply an empty trail, not an error."""
+    try:
+        text = EVENTS_LOG_FILE.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return []
+    lines = text.splitlines()
+    if limit and limit > 0:
+        return lines[-limit:]
+    return lines

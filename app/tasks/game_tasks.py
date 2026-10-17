@@ -280,8 +280,8 @@ def _process_running(image: str):
     try:
         import subprocess as _sp
         out = _sp.check_output(
-            f'tasklist /fi "imagename eq {image}" /fo csv /nh',
-            shell=True, text=True, timeout=10, stderr=_sp.DEVNULL,
+            ['tasklist', '/fi', f'imagename eq {image}', '/fo', 'csv', '/nh'],
+            text=True, timeout=10, stderr=_sp.DEVNULL,
             creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
         )
         return image.lower() in (out or "").lower()
@@ -509,7 +509,11 @@ def clean_starcitizen_cache(ctx: TaskContext):
                         total += clean_folder_contents(ctx, path, remove_root=True)
                     else:
                         size = os.path.getsize(path)
-                        os.remove(path)
+                        # B-0xx: honour dry_run. The sibling _clean_files and
+                        # clean_folder_contents both refuse to delete in a
+                        # measuring pass; this branch deleted regardless.
+                        if not getattr(ctx, "dry_run", False):
+                            os.remove(path)
                         total += size
                 except OSError:
                     continue
@@ -572,7 +576,6 @@ def clean_hoyoverse_logs(ctx: TaskContext):
     Only those exact log/dump names — screenshots, configs and game
     data next to them are never touched. (Player.log here is already
     covered by the Unity sweep; this adds output_log.txt + dumps.)"""
-    import glob as _glob
     ctx.set_status("Cleaning HoYoverse logs...")
     userprofile = os.environ.get("USERPROFILE", "")
     low = os.path.join(userprofile, "AppData", "LocalLow") if userprofile else ""
@@ -580,17 +583,24 @@ def clean_hoyoverse_logs(ctx: TaskContext):
         ctx.log("LocalLow folder not found — nothing to do.")
         return 0
     found: list[str] = []
+    # L-3 fix: bounded-depth walk instead of glob("**", recursive=True). The
+    # log/dump files live at the game root or one level under it, so an unbounded
+    # walk could descend a huge (or looping) LocalLow tree for no benefit.
+    _MAX_DEPTH = 3
     for vendor in ("miHoYo", "Cognosphere", "HoYoverse"):
         vdir = os.path.join(low, vendor)
         if not os.path.isdir(vdir):
             continue
-        for pat in ("output_log*.txt", "*.dmp", "crash*.log"):
-            try:
-                for hit in _glob.glob(os.path.join(vdir, "**", pat), recursive=True):
-                    if os.path.isfile(hit):
-                        found.append(hit)
-            except Exception:
-                continue
+        base_depth = vdir.rstrip("\\/").count(os.sep)
+        for root, dirs, files in os.walk(vdir):
+            if root.count(os.sep) - base_depth >= _MAX_DEPTH:
+                dirs[:] = []          # stop descending deeper
+            for fn in files:
+                lf = fn.lower()
+                if (lf.startswith("output_log") and lf.endswith(".txt")) \
+                        or lf.endswith(".dmp") \
+                        or (lf.startswith("crash") and lf.endswith(".log")):
+                    found.append(os.path.join(root, fn))
     found = list(dict.fromkeys(f for f in found if f))
     if not found:
         ctx.log("No HoYoverse logs found — nothing to do.")
@@ -662,8 +672,8 @@ def clean_steam_stuck_downloads(ctx: TaskContext):
     # Steam running? -> active downloads could be writing right now
     try:
         out = subprocess.check_output(
-            'tasklist /fi "imagename eq steam.exe" /fo csv /nh',
-            shell=True, text=True, timeout=10, stderr=subprocess.DEVNULL,
+            ['tasklist', '/fi', 'imagename eq steam.exe', '/fo', 'csv', '/nh'],
+            text=True, timeout=10, stderr=subprocess.DEVNULL,
         )
         if "steam.exe" in out.lower():
             ctx.log("Steam is running — skipping to avoid touching active downloads.")

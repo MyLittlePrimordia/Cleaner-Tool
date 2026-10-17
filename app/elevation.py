@@ -28,6 +28,13 @@ def _log_or_swallow_fallback(msg: str, exc: BaseException | None = None) -> None
         if exc is not None:
             text += f" ({type(exc).__name__}: {exc})"
         print(text, file=sys.stderr)
+        # Also write to temp file for debugging fast closes
+        try:
+            log_path = os.path.join(tempfile.gettempdir(), "cleaner_tool_elevation.log")
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"[{os.getpid()}] {text}\n")
+        except Exception:
+            pass
         try:
             from app.config_persist import log_security_event
             log_security_event("ops", text.strip())
@@ -247,6 +254,7 @@ def _wait_for_elevated_process(timeout: float = 60.0) -> bool:
     """
     expected_token = _read_pending_token()
     own_exe = _get_own_exe_name()
+    _log_or_swallow_fallback(f"_wait_for_elevated_process: starting wait, expected_token={expected_token[:8] if expected_token else 'None'}...")
     start_time = time.time()
     while time.time() - start_time < timeout:
         pid, token = _read_elevation_cookie()
@@ -262,6 +270,7 @@ def _wait_for_elevated_process(timeout: float = 60.0) -> bool:
                 time.sleep(0.2)
                 continue
             if token != expected_token:
+                _log_or_swallow_fallback(f"_wait_for_elevated_process: token mismatch, got={token[:8] if token else 'None'}")
                 time.sleep(0.2)
                 continue
             # Verify the process is still alive
@@ -280,6 +289,7 @@ def _wait_for_elevated_process(timeout: float = 60.0) -> bool:
                                 # Also require the PID's own image name to match this app
                                 image_name = _process_image_name(pid)
                                 if image_name != own_exe:
+                                    _log_or_swallow_fallback(f"_wait_for_elevated_process: image name mismatch, got={image_name}, expected={own_exe}")
                                     time.sleep(0.2)
                                     continue
                                 # NOTE: no _process_is_elevated(pid) gate here
@@ -293,6 +303,7 @@ def _wait_for_elevated_process(timeout: float = 60.0) -> bool:
                                 # verification.
                                 _clear_elevation_cookie()
                                 _clear_pending_token()
+                                _log_or_swallow_fallback(f"_wait_for_elevated_process: elevation succeeded (pid {pid})")
                                 try:
                                     from app.config_persist import log_security_event
                                     log_security_event("elevation", f"Elevation succeeded (pid {pid}).")
@@ -301,7 +312,8 @@ def _wait_for_elevated_process(timeout: float = 60.0) -> bool:
                                 return True
                     finally:
                         ctypes.windll.kernel32.CloseHandle(handle)
-            except Exception:
+            except Exception as exc:
+                _log_or_swallow_fallback("_wait_for_elevated_process: exception checking process", exc)
                 pass
         time.sleep(0.2)
     # audit fix (H10): a timed-out wait left the pending token (and any
@@ -309,6 +321,7 @@ def _wait_for_elevated_process(timeout: float = 60.0) -> bool:
     # the temp path — or a delayed cookie write arriving after we've given
     # up and moved on — could then be accepted by a *different* wait call
     # as if it were this one. Clear both on timeout so a give-up is final.
+    _log_or_swallow_fallback("_wait_for_elevated_process: timed out")
     _clear_pending_token()
     _clear_elevation_cookie()
     try:
@@ -324,7 +337,7 @@ def relaunch_as_admin() -> bool:
     Re-launch the current program (frozen .exe or `python main.py`) with a UAC
     elevation prompt. Returns True if the relaunch was *requested* successfully
     (Windows will show the UAC dialog next -- the user can still cancel there).
-    
+
     Note: The caller should call wait_for_elevated_process() after this returns True
     to ensure the elevated process actually started before exiting.
     """
@@ -338,27 +351,53 @@ def relaunch_as_admin() -> bool:
         if getattr(sys, "frozen", False):
             # Running as a PyInstaller-built .exe
             executable = sys.executable
-            argv = list(sys.argv[1:]) + [f"--elevation-token={token}"]
+            argv = [executable] + list(sys.argv[1:]) + [f"--elevation-token={token}"]
+            _log_or_swallow_fallback(f"relaunch_as_admin: frozen mode, exe={executable}, argv={argv}")
         else:
             # Running as a normal python script: relaunch python.exe with the
             # script path as the first argument.
             executable = sys.executable
             script = os.path.abspath(sys.argv[0])
-            argv = [script] + list(sys.argv[1:]) + [f"--elevation-token={token}"]
+            argv = [executable, script] + list(sys.argv[1:]) + [f"--elevation-token={token}"]
+            _log_or_swallow_fallback(f"relaunch_as_admin: script mode, exe={executable}, script={script}, argv={argv}")
 
-        # subprocess.list2cmdline applies correct Windows argument quoting and
-        # escapes any embedded quotes, preventing argument injection.
-        params = subprocess.list2cmdline(argv)
+        # Build the full command line
+        cmd_line = subprocess.list2cmdline(argv)
+        _log_or_swallow_fallback(f"relaunch_as_admin: cmd_line={cmd_line}")
 
-        rc = ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", executable, params, None, 1
+        # Use PowerShell to run the command elevated - this is more reliable
+        # for passing arguments to Python scripts than ShellExecuteW directly.
+        # NOTE: the entire argument list (and the executable path) must be
+        # single-quoted as one PS string. Leaving it bare makes PowerShell
+        # parse parentheses / spaces in the path as syntax (e.g. folders
+        # named "...(3)"), which failed elevation in real installs.
+        _ps_exe = executable.replace("'", "''")
+        _ps_args = subprocess.list2cmdline(argv[1:]).replace("'", "''")
+        ps_cmd = f"Start-Process -FilePath '{_ps_exe}' -ArgumentList '{_ps_args}' -Verb RunAs"
+        _log_or_swallow_fallback(f"relaunch_as_admin: ps_cmd={ps_cmd}")
+
+        ps_exe = os.path.join(
+            os.environ.get("SystemRoot", r"C:\Windows"),
+            "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+
+        result = subprocess.run(
+            [ps_exe, "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+            shell=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
-        # ShellExecuteW returns a value > 32 on success
-        if int(rc) <= 32:
+
+        if result.returncode != 0:
+            _log_or_swallow_fallback(f"relaunch_as_admin: PowerShell failed with rc={result.returncode}, stderr={result.stderr}")
             _clear_pending_token()
             return False
+
+        _log_or_swallow_fallback("relaunch_as_admin: PowerShell succeeded")
         return True
-    except Exception:
+    except Exception as exc:
+        _log_or_swallow_fallback("relaunch_as_admin: exception", exc)
         try:
             _clear_pending_token()
         except Exception:
@@ -392,6 +431,7 @@ def signal_elevated_startup() -> None:
         # a pending token file exists (means we were launched via relaunch).
         pending = _read_pending_token()
         if pending is None:
+            _log_or_swallow_fallback("signal_elevated_startup: no token and no pending token")
             return
         token = pending
     # Only signal if we're actually admin — a non-elevated process must never
@@ -399,8 +439,10 @@ def signal_elevated_startup() -> None:
     # later, unrelated process start answers the original app's wait loop).
     try:
         if not is_admin():
+            _log_or_swallow_fallback("signal_elevated_startup: not admin, cannot signal")
             return
-    except Exception:
+    except Exception as exc:
+        _log_or_swallow_fallback("signal_elevated_startup: admin check failed", exc)
         return
     _write_elevation_cookie(os.getpid(), token)
 

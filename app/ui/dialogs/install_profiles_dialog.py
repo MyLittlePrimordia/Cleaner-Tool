@@ -45,7 +45,7 @@ class InstallProfilesDialog(ThemedModal):
         tk.Label(body, text="Handy after a fresh Windows install — tick your "
                             "usual apps once, save them, load them next time.",
                  font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
-                 anchor="w", wraplength=700, justify="left").pack(
+                 anchor="w", wraplength=self.body_width(28), justify="left").pack(
                      fill="x", pady=(0, 14))
 
         # --- save row ---

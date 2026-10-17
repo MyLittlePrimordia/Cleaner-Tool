@@ -29,8 +29,8 @@ APP_VERSION = "2.0.0"
 # The fix is to stop guessing an absolute size and derive it from the work
 # area instead, which is what actually determines how big the window can
 # usefully be. compute_window_size() below is PURE -- it takes numbers and
-# returns numbers -- so tools/verify_window_size.py can pin the clamping
-# behaviour without needing a display.
+# returns numbers -- so the clamping behaviour is unit-testable without a
+# display.
 
 # Fallback when the work area cannot be read (headless, or a locked-down Tk).
 WINDOW_DEFAULT_SIZE = (1280, 900)
@@ -134,26 +134,59 @@ def resolve_window_size(root=None, default=None):
         return fallback
 
 COLORS = {
-    # Base surfaces (dark navy)
-    "bg": "#0D1117",            # window base
-    "bg_alt": "#151B24",        # cards / panels
-    "bg_widget": "#10141C",     # log well / progress track
-    "surface": "#1C2430",       # buttons / controls
-    "surface_hover": "#263041",
-    "hairline": "#232B38",      # 1px borders
-    # Text
-    "text": "#EAEFF5",
-    "subtext": "#7C8797",
-    # Accents — tab identity + statuses
-    "accent_green": "#3ED598",  # Clean (mint)
-    "accent_teal": "#2EE6A8",   # bright mint (hover variant)
-    "accent_yellow": "#F2B84B", # Repair (amber)
-    "accent_sky": "#38BDF8",    # Install alt (sky blue — downloads/cloud feel)
-    "accent_pink": "#F472B6",   # spare accent (tried for Install, unused)
-    "accent_blue": "#7C6CF0",   # Tweak (violet)
-    "accent_mauve": "#B48CFF",
-    "accent_red": "#F2555F",    # Undo / danger / reboot badge
-    "black": "#0B0E13",         # text on bright accent fills
+    # ---------------------------------------------------------------------
+    # Material Design 3 - dark scheme, Google blue seed.
+    #
+    # Key NAMES are unchanged on purpose: ~30k lines of tabs and dialogs read
+    # these tokens, so re-mapping the VALUES to M3 colour roles re-skins every
+    # surface at once. The role each token now plays is noted per line.
+    #
+    # Surfaces use M3's tonal elevation (lighter = higher) rather than shadow
+    # or hairline tricks: surface < container-low < container < high < highest.
+    # Values are the Google dark-theme neutrals (the ones Gmail / Drive /
+    # Gemini ship), not the purple baseline.
+    # ---------------------------------------------------------------------
+    "bg":           "#131314",   # M3 surface
+    "bg_alt":       "#1E1F20",   # M3 surface-container (cards, panels, rows)
+    "bg_widget":    "#282A2C",   # M3 surface-container-high (log well, tracks)
+    "surface":      "#282A2C",   # controls / chips / neutral buttons
+    "surface_hover":"#333537",   # M3 surface-container-highest
+    "hairline":     "#444746",   # M3 outline-variant (dividers, outlines)
+    "muted":        "#8E918F",   # M3 outline (de-emphasised text, idle dots)
+    # Alert containers (M3 error-container / tertiary-container, dark).
+    "alert_red_bg":   "#601410",
+    "alert_amber_bg": "#3D2E00",
+    # Text: on-surface and on-surface-variant.
+    "text":         "#E3E3E3",
+    "subtext":      "#C4C7C5",
+    # Text drawn ON a pastel accent fill (M3 on-primary family, tone 20).
+    "black":        "#1F1F1F",
+    # ---- M3 role tokens (new; used by the redesigned shell/widgets) ------
+    "primary":                "#A8C7FA",   # Google blue 80
+    "on_primary":             "#062E6F",
+    "primary_container":      "#0842A0",
+    "on_primary_container":   "#D3E3FD",
+    "secondary_container":    "#004A77",   # nav-rail indicator / tonal button
+    "on_secondary_container": "#C2E7FF",
+    "surface_container_low":  "#1B1B1C",
+    # App shell: window chrome, navigation rail and top app bar sit on this
+    # tone; the page lives in a rounded "bg" panel set into it (the Gmail /
+    # Drive / Gemini layout).
+    "shell":                  "#1E1F20",
+    "scrim":                  "#000000",
+    # ---------------------------------------------------------------------
+    # Accents: Google's tone-80 hues. Tab identity is kept (blue/yellow/
+    # violet/green/...), expressed as M3 tonal colours instead of neon.
+    # ---------------------------------------------------------------------
+    "accent_green": "#6DD58C",   # Install
+    "accent_teal":  "#7AE7DC",
+    "accent_yellow":"#FDD663",   # Repair
+    "accent_sky":   "#7FCFFF",   # Clean
+    "accent_pink":  "#FFADD2",   # Tools
+    "accent_blue":  "#A8C7FA",   # Tweak / primary
+    "accent_mauve": "#D0BCFF",
+    "accent_orange": "#FFB77C",  # Drivers
+    "accent_red":   "#F28B82",   # Undo / danger / reboot badge
 }
 
 FONT_FAMILY = "Segoe UI"

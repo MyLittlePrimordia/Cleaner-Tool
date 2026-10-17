@@ -9,7 +9,7 @@ import subprocess
 from app.config_persist import load_config, save_config, update_config
 from app.elevation import is_admin
 from app.utils import resolve_exe
-from app.runner.task_runner import run_batch
+from app.runner.task_runner import run_batch, print_context
 
 TASK_NAME = "CleanerTool_AutoMaintenance"
 TASK_DESC = "Cleaner Tool automatic maintenance run"
@@ -83,8 +83,9 @@ def _startup_tr_matches(out: str, exe_override: str | None = None) -> "bool | No
                     return None
                 live = line.split(":", 1)[1].strip().strip('"')
                 return live == _want_startup_tr(exe_override).strip().strip('"')
-    except Exception:
-        pass
+    except Exception as exc:
+        from app.utils import log_or_swallow
+        log_or_swallow(None, "scheduler.startup_query", exc)
     return None
 
 
@@ -95,8 +96,9 @@ def _set_startup_flag(on: bool) -> None:
         def _mut(cfg, _on=bool(on)):
             cfg["startup_tray_enabled"] = _on
         update_config(_mut)
-    except Exception:
-        pass
+    except Exception as exc:
+        from app.utils import log_or_swallow
+        log_or_swallow(None, "scheduler.startup_flag", exc)
 
 
 def enable_startup_tray() -> "tuple[bool, str]":
@@ -107,8 +109,9 @@ def enable_startup_tray() -> "tuple[bool, str]":
         if ok and _startup_tr_matches(out) is True:
             _set_startup_flag(True)
             return True, "Startup entry already up to date."
-    except Exception:
-        pass
+    except Exception as exc:
+        from app.utils import log_or_swallow
+        log_or_swallow(None, "scheduler.enable_startup_probe", exc)
     ok, msg = _run_schtasks(_build_startup_cmd())
     if ok:
         _set_startup_flag(True)
@@ -128,8 +131,9 @@ def disable_startup_tray() -> "tuple[bool, str]":
         if not exists:
             _set_startup_flag(False)
             return True, "Startup entry already absent."
-    except Exception:
-        pass
+    except Exception as exc:
+        from app.utils import log_or_swallow
+        log_or_swallow(None, "scheduler.disable_startup_probe", exc)
     return False, msg
 
 
@@ -138,12 +142,15 @@ def resync_startup_flag() -> bool:
     hazard resync_schedule_flag covers for the maintenance tasks)."""
     try:
         ok, _out = get_startup_status()
-    except Exception:
+    except Exception as exc:
+        from app.utils import log_or_swallow
+        log_or_swallow(None, "scheduler.resync_startup_probe", exc)
         ok = False
     try:
         _set_startup_flag(bool(ok))
-    except Exception:
-        pass
+    except Exception as exc:
+        from app.utils import log_or_swallow
+        log_or_swallow(None, "scheduler.resync_startup_persist", exc)
     return bool(ok)
 
 
@@ -397,8 +404,9 @@ def enable_schedule(frequency="weekly", time_str="03:00", extra_args=None):
                             return _m
                         update_config(_mut())
                         return True, "Schedule already up to date."
-    except Exception:
-        pass
+    except Exception as exc:
+        from app.utils import log_or_swallow
+        log_or_swallow(None, "scheduler.enable_schedule_probe", exc)
     cmd = _build_schtasks_cmd(frequency, time_str, extra_args)
     try:
         result = subprocess.run(cmd, shell=False, capture_output=True, text=True, timeout=30)
@@ -462,8 +470,9 @@ def resync_schedule_flag(extra_args=None) -> bool:
             cfg["schedule_enabled"] = bool(ok)
     try:
         update_config(_mut)
-    except Exception:
-        pass
+    except Exception as exc:
+        from app.utils import log_or_swallow
+        log_or_swallow(None, "scheduler.resync_schedule_persist", exc)
     return ok
 
 
@@ -471,23 +480,12 @@ def run_auto_update():
     """Headless 'Update Everything' run for the --auto-update schedule:
     winget upgrade --all with the same honest-logging contract as
     run_auto_clean. Returns (ok, summary)."""
-    from app.utils import TaskContext, TaskCancelled
+    from app.utils import TaskCancelled
     from app.tasks.install_tasks import update_all_apps
 
-    class AutoCtx(TaskContext):
-        def __init__(self):
-            super().__init__(log=self._log, set_status=self._set_status,
-                             cancelled=lambda: False)
-        def _log(self, msg):
-            print(f"[AUTO-UPD] {msg}")
-        def _set_status(self, msg):
-            print(f"[AUTO-UPD STATUS] {msg}")
-        def log(self, msg):  # type: ignore[override]
-            self._log(msg)
-        def set_status(self, msg):  # type: ignore[override]
-            self._set_status(msg)
-
-    ctx = AutoCtx()
+    # ARCH-004 (3.4): one shared headless context (was a local AutoCtx that
+    # duplicated run_auto_clean's). Only the print prefixes differ.
+    ctx = print_context("[AUTO-UPD]", "[AUTO-UPD STATUS]")
     try:
         update_all_apps(ctx)
         return True, "Auto-update complete: all apps current."
@@ -511,7 +509,6 @@ def run_auto_clean(selected_tasks_by_tab):
     """
     # H8: TaskSkipped/TaskCancelled are no longer imported here — the
     # outcome mapping moved to app.runner.task_runner, which owns both.
-    from app.utils import TaskContext
     from app.tasks import clean_tasks, repair_tasks, tweak_tasks, game_tasks, advanced_tasks
     import threading
     import time
@@ -578,36 +575,21 @@ def run_auto_clean(selected_tasks_by_tab):
         warnings = check_dangerous_combos(all_keys)  # type: ignore[arg-type]
         try:
             warnings = list(warnings) + list(check_info_notices(all_keys))  # type: ignore[arg-type]
-        except Exception:
-            pass
+        except Exception as exc:
+            from app.utils import log_or_swallow
+            log_or_swallow(None, "scheduler.info_notices", exc)
         if warnings:
             # Log but don't block scheduled run — user not present to confirm
             print("[AUTO] Cross-tab warnings: " + " | ".join(warnings))
-    except Exception:
-        pass
+    except Exception as exc:
+        from app.utils import log_or_swallow
+        log_or_swallow(None, "scheduler.combo_check", exc)
     
-    # Run synchronously (this is called from the scheduled task, not GUI)
-    # Must satisfy TaskContext contract (log, set_status, cancelled)
-    class AutoCtx(TaskContext):
-        def __init__(self):
-            self.logs = []
-            super().__init__(
-                log=self._log,
-                set_status=self._set_status,
-                cancelled=lambda: False,
-            )
-        def _log(self, msg):
-            self.logs.append(msg)
-            print(f"[AUTO] {msg}")
-        def _set_status(self, msg):
-            print(f"[AUTO STATUS] {msg}")
-        # Keep public aliases for callers that reference .log/.set_status directly
-        def log(self, msg):  # type: ignore[override]
-            self._log(msg)
-        def set_status(self, msg):  # type: ignore[override]
-            self._set_status(msg)
-
-    ctx = AutoCtx()
+    # Run synchronously (this is called from the scheduled task, not GUI).
+    # ARCH-004 (3.4): the shared headless context lives in the runner now — the
+    # local AutoCtx here duplicated run_auto_update's (and its `logs` list was
+    # written but never read).
+    ctx = print_context()
     total_bytes = 0
     completed, failed = 0, 0
     skipped_n = 0
@@ -628,8 +610,9 @@ def run_auto_clean(selected_tasks_by_tab):
                 _summary = "Auto-clean skipped: all selected tasks need Administrator rights."
                 ctx.log(_summary)
                 return True, _summary
-    except Exception:
-        pass
+    except Exception as exc:
+        from app.utils import log_or_swallow
+        log_or_swallow(None, "scheduler.admin_gate", exc)
 
     # Show the scheduled-run toast (audit dead-code fix: notify_scheduled_run
     # existed with zero callers — a scheduled run was invisible unless the

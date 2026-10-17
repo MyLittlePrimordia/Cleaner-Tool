@@ -39,7 +39,7 @@ from app.utils import (TaskContext, reg_set_value, reg_set_value_checked, reg_de
 # monitor_test_dialog.py already uses for the display-mode helpers.
 from app.tasks.tweak_tasks import (  # noqa: E402
     _snap_reg_values, _restore_reg_values,
-    get_tweak_snapshot, clear_tweak_snapshot,
+    get_tweak_snapshot, clear_tweak_snapshot, save_tweak_snapshot,
 )
 
 if IS_WINDOWS:
@@ -56,14 +56,18 @@ def _apply_registry(ctx: TaskContext, task_id: str, specs, writes):
     """
     had_snapshot = bool(get_tweak_snapshot(task_id))
     _snap_reg_values(ctx, task_id, specs)
+    landed = 0
     try:
         for hive, path, name, value, vtype in writes:
             reg_set_value_checked(ctx, hive, path, name, value, value_type=vtype)
+            landed += 1
     except BaseException:
-        # Nothing landed, so there is nothing to undo — drop the record we
-        # just took unless a previous good one was already on file, which is
-        # what keeps a failed re-apply retryable instead of destructive.
-        if not had_snapshot:
+        # B-028: only drop the snapshot when NOTHING landed. For a multi-write
+        # task a later write can fail after earlier ones succeeded; clearing
+        # the snapshot then discarded the real prior state and revert fell back
+        # to documented defaults (e.g. turning HVCI back on for a user who had
+        # it legitimately off — the UNDO-003 regression).
+        if not had_snapshot and landed == 0:
             try:
                 clear_tweak_snapshot(task_id)
             except Exception:
@@ -190,15 +194,39 @@ def revert_copilot(ctx: TaskContext):
     ctx.log("Copilot policy restored.")
 
 
+def _hibernation_enabled() -> bool:
+    """True when hibernation is on, approximated by hiberfil.sys existing.
+
+    Powercfg has no query-free way to read this; the hibernation file is the
+    documented on/off artifact Windows creates and removes with `powercfg -h`.
+    """
+    drive = os.environ.get("SYSTEMDRIVE", "C:")
+    return os.path.isfile(os.path.join(drive + os.sep, "hiberfil.sys"))
+
+
 def disable_hibernation(ctx: TaskContext):
     ctx.log("[Advanced] Disable Windows Hibernation (Reclaims disk space equal to RAM size)")
+    # H-014: record the prior state so Undo never enables hibernation on a
+    # machine that never had it (which would silently authorize a RAM-sized
+    # hiberfil.sys).
+    save_tweak_snapshot("adv_hibernation", {"enabled": bool(_hibernation_enabled())})
     run_cmd_checked(ctx, "powercfg -h off", timeout=60)
     ctx.log("Hibernation disabled (powercfg -h off). Disk space reclaimed equal to RAM.")
 
 
 def revert_hibernation(ctx: TaskContext):
+    snap = get_tweak_snapshot("adv_hibernation") or {}
+    prior = snap.get("enabled")
+    if prior is False:
+        ctx.log("Hibernation was already OFF before this tweak ran — leaving it "
+                "off (not creating a RAM-sized hiberfil.sys).")
+        clear_tweak_snapshot("adv_hibernation")
+        return
+    if prior is None:
+        ctx.log("  (no snapshot — assuming hibernation was on; running powercfg -h on)")
     ctx.log("Re-enabling Windows Hibernation...")
     run_cmd_checked(ctx, "powercfg -h on", timeout=60)
+    clear_tweak_snapshot("adv_hibernation")
     ctx.log("Hibernation re-enabled (powercfg -h on).")
 
 

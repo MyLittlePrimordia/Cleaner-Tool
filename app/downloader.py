@@ -314,7 +314,12 @@ def install_directx_runtimes(ctx: TaskContext):
             sentinels = [os.path.join(windir, "System32", "d3dx9_43.dll"),
                          os.path.join(windir, "SysWOW64", "d3dx9_43.dll")]
             missing = [p for p in sentinels if not os.path.isfile(p)]
-            if missing and rc != 1638:
+            # M-5 fix: the sentinel check IS the verification, so it must run
+            # for EVERY accepted exit code — including 1638 ("another version
+            # already installed"), which is exactly the case where a stale
+            # registration can claim success while the DLLs are absent. When
+            # 1638 is truthful, `missing` is empty and nothing is raised.
+            if missing:
                 raise RuntimeError(
                     "DirectX installer reported success but the runtime DLLs "
                     f"are still missing ({', '.join(missing)}). Re-run as "
@@ -417,6 +422,11 @@ _network_probe_cache: list = [None, 0.0]  # [result, timestamp monotonic]
 # element store atomic; do NOT "clean this up" into `cached, stamp = result,
 # now` rebinding.
 _NETWORK_PROBE_TTL = 30.0
+# I-014: negative results are cached too, but only briefly. Failures used to
+# never be cached, so an offline preflight / Auto-Pilot run paid the full
+# timeout (8s) on EVERY probe. 10s is short enough that a just-reconnected
+# cable is picked up well before the next real attempt.
+_NETWORK_PROBE_NEG_TTL = 10.0
 
 
 def has_network(timeout: float = 8.0) -> bool:
@@ -428,13 +438,17 @@ def has_network(timeout: float = 8.0) -> bool:
 
     Cached for 30s (audit fix): a mixed Essentials+catalog run probed
     sequentially up to 8 times — 8x the timeout budget for one bit of
-    information that does not change mid-run. A fresh probe is forced after
-    a failure so a just-plugged cable is picked up quickly."""
+    information that does not change mid-run. A failure is now cached briefly
+    (I-014) so repeated offline probes do not each pay the full timeout; a
+    just-plugged cable is still noticed within ~10s."""
     import time as _time
     now = _time.monotonic()
     cached, stamp = _network_probe_cache
-    if cached is True and (now - stamp) < _NETWORK_PROBE_TTL:
+    age = now - stamp
+    if cached is True and age < _NETWORK_PROBE_TTL:
         return True
+    if cached is False and age < _NETWORK_PROBE_NEG_TTL:
+        return False
     try:
         req = urllib.request.Request(
             "https://www.microsoft.com",
@@ -447,8 +461,10 @@ def has_network(timeout: float = 8.0) -> bool:
         _network_probe_cache[0], _network_probe_cache[1] = True, now
         return True   # got an HTTP response -> we're online
     except Exception:
-        # don't cache failures — retry the next call (cheap, and lets a
-        # transient blip heal immediately)
+        # I-014: cache the failure too, but only for the short negative TTL —
+        # lets a transient blip heal quickly without re-probing (and blocking
+        # for the full timeout) on every call while the link is down.
+        _network_probe_cache[0], _network_probe_cache[1] = False, now
         return False
 
 
@@ -499,7 +515,7 @@ def install_winget_app(ctx: TaskContext, package_id: str, app_name: str,
 def _winget_silent(ctx: TaskContext, pkg_id: str, timeout: int = 900, force: bool = False) -> int:
     """VC++-batch installer path — also routed through run_cmd so the Stop
     button kills it too (same user-reported bug as install_winget_app)."""
-    cmd = [resolve_exe("winget"), "install", "--id", pkg_id, "--source", "winget",
+    cmd = [resolve_exe("winget"), "install", "--id", pkg_id, "--exact", "--source", "winget",
            "--accept-package-agreements", "--accept-source-agreements",
            "--silent", "--disable-interactivity"]
     if force:

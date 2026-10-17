@@ -10,15 +10,18 @@ from __future__ import annotations
 import os
 
 import tkinter as tk
+
+from app.ui.widgets.rounded_card import RoundedCard
 from tkinter import ttk, messagebox
-from app.ui.base import ThemedModal, Tooltip
+from app.ui.base import Tooltip
+from app.ui.dialogs._tool_page import ToolPage, _ellipsize
 from app.ui.theme import COLORS, F, TAB_ACCENTS
 from app.ui.widgets import AnimatedProgressBar
 
 
-class HardwareMonitorDialog(ThemedModal):
+class HardwareMonitorDialog(ToolPage):
     """Hardware Monitor (Tools tab card): Task-Manager-style live stats —
-    CPU/RAM, GPU/VRAM, Disk/Network in a 2-column x 3-row grid —
+    CPU/RAM, GPU/VRAM, Disk/Network in a 3-column x 2-row grid —
     read-only, ~1s refresh. Same on-tick-directly pattern MicCheckDialog
     uses for its level meter (the underlying Win32/PDH calls are fast
     synchronous reads, not I/O, so no worker thread is needed).
@@ -55,8 +58,17 @@ class HardwareMonitorDialog(ThemedModal):
         self._gpu_sel = 0
         self._cpu_info = {"name": "Unknown CPU", "logical_cores": 0}
         super().__init__(parent, title="Hardware Monitor",
-                         accent=TAB_ACCENTS.get("Tweak", COLORS["accent_blue"]))
-        body = self.body
+                         accent=TAB_ACCENTS.get("Tweak", COLORS["accent_blue"]),
+                         scope="Read-only live readings — nothing is changed.",
+                         scroll=False, fit=True)
+        # REDESIGN 2026-10: on the shared ToolPage shell; the Header banner
+        # opens the dialog and the stat-card grid fills the content zone. The
+        # big card numbers are live read-outs and stay exactly as they were.
+        body = self.content
+        _accent = TAB_ACCENTS.get("Tweak", COLORS["accent_blue"])
+        self.banner.set_state("\u25A3", _accent)
+        self.banner.set_title("What is your PC doing right now?")
+        self.banner.set_sub("CPU, memory, graphics, disk and network, live.")
 
         try:
             from app.hw_monitor import cpu_static_info, gpu_list
@@ -69,15 +81,21 @@ class HardwareMonitorDialog(ThemedModal):
                                "total_vram_bytes": None,
                                "total_vram_approx": False}]
 
-        # 2x3 uniform grid (Health-card geometry: uniform columns AND
+        # 3x2 uniform grid (Health-card geometry: uniform columns AND
         # rows with a minsize floor so live paints never move layout).
-        # Two wide columns (~370px each) so device names fit on one
-        # line; GPU sits above VRAM so the pair reads top-to-bottom.
+        # LAYOUT 2026-10 (popup-fit pass): this was 2x3 and came to 672px of
+        # content against a 535px content zone at 150% DPI - the bottom row
+        # of cards is what the user saw half-cut behind a scrollbar. Twelve
+        # hundred pixels of width divided three ways still leaves ~300px a
+        # card, and each COLUMN now reads as a pair: CPU over RAM, GPU over
+        # VRAM (the pair the comment below always wanted adjacent), Disk over
+        # Network. The grid fills the zone, so the cards grow into a tall
+        # window instead of leaving a band of empty space under them.
         grid = self._grid = tk.Frame(body, bg=COLORS["bg"])
-        grid.pack(fill="x", pady=(2, 0))
-        for c in (0, 1):
+        grid.pack(fill="both", expand=True, pady=(2, 0))
+        for c in (0, 1, 2):
             grid.columnconfigure(c, weight=1, uniform="hwcol")
-        for r in (0, 1, 2):
+        for r in (0, 1):
             grid.rowconfigure(r, weight=1, uniform="hwrow",
                               minsize=self._CARD_H + 10)
 
@@ -85,11 +103,11 @@ class HardwareMonitorDialog(ThemedModal):
         # chrome); the network arrow always exists (Auto + NICs).
         _gpu_picker = "gpu" if len(self._gpu_list) > 1 else None
         self._cpu = self._make_card(grid, 0, 0, "CPU")
-        self._ram = self._make_card(grid, 0, 1, "RAM")
-        self._gpu = self._make_card(grid, 1, 0, "GPU", picker=_gpu_picker)
+        self._gpu = self._make_card(grid, 0, 1, "GPU", picker=_gpu_picker)
+        self._disk = self._make_card(grid, 0, 2, "Disk")
+        self._ram = self._make_card(grid, 1, 0, "RAM")
         self._vram = self._make_card(grid, 1, 1, "VRAM")
-        self._disk = self._make_card(grid, 2, 0, "Disk")
-        self._net = self._make_card(grid, 2, 1, "Network", picker="net")
+        self._net = self._make_card(grid, 1, 2, "Network", picker="net")
 
         # Picker state: GPU index into gpu_list; network None = auto
         # (busiest interface each tick) or a pinned interface name.
@@ -99,7 +117,7 @@ class HardwareMonitorDialog(ThemedModal):
         # Honesty note only (empty = zero-height): GPU counters missing
         # entirely. No Close button — the popup X already closes this.
         self._note_lbl = tk.Label(
-            body, text="", font=(F, 8), bg=COLORS["bg"], fg=COLORS["subtext"],
+            body, text="", font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
             anchor="center", justify="center")
         self._note_lbl.pack(fill="x")
 
@@ -139,14 +157,15 @@ class HardwareMonitorDialog(ThemedModal):
         "net") adds a small ▾ arrow beside the title that pops a dark
         menu; the card face itself only ever shows the SELECTED name.
         Returns a dict of handles ("pick" = arrow label or None)."""
-        outer = tk.Frame(parent, bg=COLORS["hairline"], bd=0)
+        outer = RoundedCard(parent, fill=COLORS["bg_alt"], bg=COLORS["bg"],
+                            radius=16, min_height=self._CARD_H)
         outer.grid(row=row, column=col, sticky="nsew", padx=5, pady=5)
-        inner = tk.Frame(outer, bg=COLORS["bg_alt"], height=self._CARD_H)
-        inner.pack(fill="x", padx=1, pady=1)
-        try:
-            inner.pack_propagate(False)
-        except Exception:
-            pass
+        inner = outer.body
+        # Popup-fit pass 2026-10: a zero-height spacer above and below, both
+        # growing. The grid now fills the content zone, so a card can be
+        # TALLER than the read-out it holds; without the spacers the extra
+        # height pooled under the last label and every card read top-heavy.
+        tk.Frame(inner, bg=COLORS["bg_alt"]).pack(fill="both", expand=True)
         trow = tk.Frame(inner, bg=COLORS["bg_alt"])
         trow.pack(anchor="center", pady=(10, 0))
         title_lbl = tk.Label(trow, text=title, font=(F, 9, "bold"),
@@ -182,17 +201,78 @@ class HardwareMonitorDialog(ThemedModal):
         val_lbl.pack(anchor="center", pady=(2, 0))
         bar = AnimatedProgressBar(inner, accent=COLORS["accent_green"])
         bar.pack(fill="x", padx=14, pady=(8, 6))
-        name_lbl = tk.Label(inner, text="", font=(F, 8),
+        name_lbl = tk.Label(inner, text="", font=(F, 9),
                             bg=COLORS["bg_alt"], fg=COLORS["subtext"],
                             anchor="center", justify="center")
         name_lbl.pack(fill="x", padx=12)
-        sub_lbl = tk.Label(inner, text="", font=(F, 8),
+        sub_lbl = tk.Label(inner, text="", font=(F, 9),
                            bg=COLORS["bg_alt"], fg=COLORS["subtext"],
                            anchor="center", justify="center")
         sub_lbl.pack(fill="x", padx=12)
+        tk.Frame(inner, bg=COLORS["bg_alt"]).pack(fill="both", expand=True)
+        # Captions are width-fitted (see _set_card_text): a 3-column grid
+        # gives a card ~300px, and a device name is longer than that. The
+        # re-fit on <Configure> also covers the very first paint, which runs
+        # before the packer has given the labels their real width.
+        for _lbl in (name_lbl, sub_lbl):
+            _lbl.bind("<Configure>",
+                      lambda _e, w=_lbl: self._fit_card_text(w), add="+")
+            # One more pass once the packer has settled: the first fit runs
+            # before the label has a width, and the text it picks can itself
+            # change the column width (the card's requested width follows the
+            # longest caption) - so converge at idle, on the final width.
+            try:
+                self._dlg.after_idle(
+                    lambda w=_lbl: self._fit_card_text(w))
+            except Exception:
+                pass
         return {"outer": outer, "inner": inner, "title": title_lbl,
                 "val": val_lbl, "bar": bar, "name": name_lbl,
                 "sub": sub_lbl, "pick": pick_lbl}
+
+    def _set_card_text(self, widget, text):
+        """Caption setter for the card's name/sub lines: remembers the FULL
+        string on the widget and shows as much of it as fits. Same contract as
+        StatusLine in _tool_page (the tooltip on the name label still carries
+        the untruncated text)."""
+        try:
+            widget._raw_text = str(text or "")
+        except Exception:
+            return
+        self._fit_card_text(widget)
+
+    def _fit_card_text(self, widget):
+        """Show the longest prefix of the widget's remembered caption that
+        fits, ending in an ellipsis.
+
+        Popup-fit pass 2026-10: the 3-column grid gives a card ~300px, and a
+        device name ("AMD Ryzen 7 8845HS w/ Radeon 780M Graphics") is longer
+        than that. The old fixed 44-character cut then still ran past the card
+        edge, which the off-screen audit flags as TEXT-CUT - a sheared glyph
+        reads as a rendering fault, not as truncation. Measure instead. Falls
+        back to the character cut while the label has no width yet (the first
+        paint runs before the packer lays the labels out); the <Configure>
+        binding re-fits the moment it has a real width."""
+        raw = getattr(widget, "_raw_text", "")
+        try:
+            avail = int(widget.winfo_width()) - 8
+        except Exception:
+            avail = 0
+        if avail <= 20:
+            txt = self._short(raw)
+        else:
+            try:
+                import tkinter.font as _tkfont
+                f = _tkfont.Font(font=widget.cget("font"))
+                txt = (raw if f.measure(raw) <= avail
+                       else _ellipsize(f, raw, avail))
+            except Exception:
+                txt = self._short(raw)
+        try:
+            if widget.cget("text") != txt:
+                widget.config(text=txt)
+        except Exception:
+            pass
 
     def _paint_card(self, card, percent, value_text, name_text,
                     sub_text, name_tip=None):
@@ -209,8 +289,8 @@ class HardwareMonitorDialog(ThemedModal):
                                COLORS["accent_yellow"] if percent < 90 else
                                COLORS["accent_red"])
                 bar.set_fraction(max(0.0, min(1.0, percent / 100.0)))
-            card["name"].config(text=name_text or "")
-            card["sub"].config(text=sub_text or "")
+            self._set_card_text(card["name"], name_text)
+            self._set_card_text(card["sub"], sub_text)
             # Tooltip once per distinct text (this paints every second —
             # re-binding each tick would churn hover hooks forever).
             if name_tip and card.get("_tip_for") != name_tip:

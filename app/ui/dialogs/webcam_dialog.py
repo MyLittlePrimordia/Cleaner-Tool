@@ -9,12 +9,12 @@ from __future__ import annotations
 
 import tkinter as tk
 from tkinter import ttk, messagebox
-from app.ui.base import ThemedModal, Tooltip
+from app.ui.dialogs._tool_page import ToolPage
+from app.ui.base import Tooltip
 from app.ui.theme import COLORS, F, TAB_ACCENTS
-from app.ui.widgets import AnimatedButton
 
 
-class WebcamDialog(ThemedModal):
+class WebcamDialog(ToolPage):
     """Webcam Test: one button, live preview, camera released on close.
 
     The camera itself is opened by the user's browser via getUserMedia,
@@ -25,6 +25,11 @@ class WebcamDialog(ThemedModal):
     This dialog owns only the plumbing: start the local page, hand it to
     a browser window, watch the heartbeat, and tear everything down the
     moment either side closes so the camera never stays claimed.
+
+    REDESIGN 2026-10: on the shared ToolPage shell — the bespoke hero
+    (icon + headline + line) is replaced by the Header banner, the live
+    status label stays in self.content and the two actions are footer
+    buttons. The poll/heartbeat engine is untouched.
     """
 
     _POLL_MS = 700
@@ -35,62 +40,35 @@ class WebcamDialog(ThemedModal):
         self._poll_after = None
         self._running = False
         self._announced = False
-        super().__init__(parent, title="Webcam Test", accent=TAB_ACCENTS["Clean"])
-        body = self.body
+        super().__init__(
+            parent, title="Webcam Test", accent=TAB_ACCENTS["Clean"],
+            scope="Uses your browser's camera permission; nothing is "
+                  "installed or written to disk.",
+            scroll=False)
+        self.banner.set_state("\u25C9", TAB_ACCENTS["Clean"])
+        self.banner.set_title("Test your camera.")
+        self.banner.set_sub("Opens in your browser \u2014 choose Allow when "
+                            "asked.")
+        body = self.content
 
-        tk.Label(body, text="Check your camera before you go live.",
-                 font=(F, 10, "bold"), bg=COLORS["bg"],
-                 fg=COLORS["text"], anchor="w").pack(fill="x", pady=(0, 2))
-        tk.Label(body,
-                 text=("Opens a private test window on this PC. Your browser "
-                       "asks for camera permission — choose Allow, and you "
-                       "should see yourself straight away."),
-                 font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
-                 anchor="w", justify="left", wraplength=700).pack(
-                     fill="x", pady=(0, 14))
-
-        # What the test actually reports, so the card is not a black box
-        # before it is pressed.
-        card = tk.Frame(body, bg=COLORS["bg_alt"], bd=0, highlightthickness=1,
-                        highlightbackground=COLORS["hairline"])
-        card.pack(fill="x", pady=(0, 16))
-        for _line in (
-                "\u2022  Live picture — proves the camera, driver and cable all work",
-                "\u2022  Resolution, megapixels and shape of the picture it sends",
-                "\u2022  Frames per second, measured from the real stream",
-                "\u2022  A plain-English reason when it will not start",
-        ):
-            tk.Label(card, text=_line, font=(F, 9), bg=COLORS["bg_alt"],
-                     fg=COLORS["subtext"], anchor="w").pack(
-                         fill="x", padx=16, pady=(9 if _line.endswith("work")
-                                                  else 0, 9))
-
-        row = tk.Frame(body, bg=COLORS["bg"])
-        row.pack()
-        self._toggle_btn = AnimatedButton(row, text="Start Webcam Test",
-                                          command=self._toggle,
-                                          bg=COLORS["accent_green"],
-                                          fg=COLORS["black"],
-                                          font=(F, 10, "bold"), padx=26, pady=9)
-        self._toggle_btn.pack(side="left", padx=4)
-        self._settings_btn = AnimatedButton(
-            row, text="Camera Privacy Settings",
-            command=self._open_privacy,
-            bg=COLORS["surface"], fg=COLORS["text"],
-            font=(F, 9, "bold"), padx=16, pady=9)
-        self._settings_btn.pack(side="left", padx=4)
+        # Simplified: one status line, two actions. The banner carries the
+        # headline; the buttons live in the shared footer.
+        hero = tk.Frame(body, bg=COLORS["bg"])
+        hero.pack(expand=True)
+        self._toggle_btn = self.add_button("Start test", self._toggle,
+                                           kind="primary")
+        self._settings_btn = self.add_button("Privacy settings",
+                                             self._open_privacy)
         Tooltip(self._toggle_btn,
                 "Opens the test window and asks your browser for camera access")
         Tooltip(self._settings_btn,
-                "Windows' own camera permission page — needed if access is "
-                "blocked system-wide")
+                "Windows' own camera permission page")
 
         self._info_lbl = tk.Label(
-            body, text="Ready. Closing the test window releases your camera "
-                       "for OBS, Discord or Teams.",
-            font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
-            wraplength=700, justify="center")
-        self._info_lbl.pack(pady=(14, 0))
+            hero, text="Ready", font=(F, 10), bg=COLORS["bg"],
+            fg=COLORS["subtext"], wraplength=self.body_width(120),
+            justify="center")
+        self._info_lbl.pack(pady=(22, 0))
 
         self.on_close(self._shutdown)
 

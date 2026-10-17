@@ -8,22 +8,33 @@ about any other dialog except where noted.
 from __future__ import annotations
 
 import tkinter as tk
+
+from app.ui.widgets.dropdown import M3Dropdown
 from tkinter import ttk, messagebox
-from app.ui.base import ThemedModal, Tooltip
+from app.ui.base import Tooltip
+from app.ui.dialogs._tool_page import ToolPage
 from app.ui.hardware.mmdev import _PadReportStats
 from app.ui.hardware.xinput import _XINPUT_BUTTONS, _XINPUT_RUMBLE_MS, _XINPUT_STICK_DEADZONE, _xinput_rumble, _xinput_state_fn
 from app.ui.theme import COLORS, F, TAB_ACCENTS
 from app.ui.widgets import AnimatedButton
 
 
-class GamepadDialog(ThemedModal):
+class GamepadDialog(ToolPage):
     """Gamepad Tester (user-requested Tools feature): live view of an
     XInput controller — buttons, triggers, both sticks. Auto follows
     the first live pad; the picker pins slots 1..4 for multi-pad rigs.
 
     Strictly read-only (GetState polls only; rumble/remap APIs are never
     bound). Polls on the Tk thread via after() — no worker threads, so no
-    threading rules to break. Fits the shared 800x600 card."""
+    threading rules to break. Fits the shared 800x600 card.
+
+    REDESIGN 2026-10: on the shared ToolPage shell — the Header banner
+    carries the headline and the pad artwork lives in the content zone.
+    fit=True: the pad artwork plus the stat strip are taller than a short
+    window's content zone. The pad highlights are driven by XInput polling,
+    not by mouse hit-testing, so nothing depends on the artwork staying put:
+    if it has to scroll, it scrolls - which beats the stat strip being cut.
+    The overlay coordinates stay canvas-absolute either way."""
 
     _TICK_MS = 60
 
@@ -40,32 +51,43 @@ class GamepadDialog(ThemedModal):
         self._weak_var = None
         self._strong_var = None
         self._rumble_after = None
-        # UI fix: pad artwork read too small, and the LT/RT bars sat too
-        # thin/close under their %-text. Bumped the artwork's subsample
-        # from /4 (300px) to /3 (400px) — every overlay coordinate below
-        # (buttons, sticks, trigger bars) was measured at the old /4 scale
-        # and is multiplied by _SCALE at draw time so nothing drifts out
-        # of alignment with the bigger image.
-        self._SCALE = 4.0 / 3.0
+        # Artwork size. Every overlay coordinate below is authored in the
+        # artwork's orig/4 (300px) grid and multiplied by _SCALE at draw
+        # time, so alignment is exact for any size that divides the source.
+        #   history: /4 = 300px (original) -> /3 = 400px (readability fix,
+        #   "pad artwork read too small") -> back to /4 = 300px (2026-10
+        #   popup-fit pass: a 400px pad plus the rows around it came to
+        #   660px against a 535px content zone, which is exactly what put a
+        #   scrollbar inside the Gamepad Tester popup).
+        self._ART_PX = 300
+        self._SUB = 1200 // self._ART_PX
+        self._SCALE = self._ART_PX / 300.0
         super().__init__(parent, title="Gamepad Tester",
-                         accent=TAB_ACCENTS["Clean"])
-        body = self.body
+                         accent=TAB_ACCENTS["Clean"],
+                         scope="Read-only: it polls the pad and never binds "
+                               "rumble or remap APIs on its own.",
+                         scroll=False, fit=True)
+        self.banner.set_state("\U0001F3AE", TAB_ACCENTS["Clean"])
+        self.banner.set_title("Does your controller work?")
+        self.banner.set_sub("Press the buttons and move the sticks — they "
+                            "light up here.")
+        body = self.content
         self._status_lbl = tk.Label(body, text="Looking for a controller…",
                                     font=(F, 10, "bold"), bg=COLORS["bg"],
                                     fg=COLORS["subtext"], anchor="w")
-        self._status_lbl.pack(fill="x", pady=(0, 2))
+        self._status_lbl.pack(fill="x", pady=(0, 1))
         # Slot picker: XInput has 4 slots. Auto = first live pad (old
         # behavior); 1..4 pins polling + rumble to that slot so
         # multi-controller setups are testable. DirectInput-only pads
         # stay invisible — labeled honestly below.
         slot_row = tk.Frame(body, bg=COLORS["bg"])
-        slot_row.pack(fill="x", pady=(0, 2))
+        slot_row.pack(fill="x", pady=(0, 1))
         tk.Label(slot_row, text="Controller:", font=(F, 9, "bold"),
                  bg=COLORS["bg"], fg=COLORS["text"]).pack(side="left")
         try:
             import tkinter.ttk as _ttk
             self._slot_var = tk.StringVar(value="Auto")
-            _slot_combo = _ttk.Combobox(slot_row, textvariable=self._slot_var,
+            _slot_combo = M3Dropdown(slot_row, textvariable=self._slot_var,
                                         values=["Auto", "1", "2", "3", "4"],
                                         state="readonly", width=8, font=(F, 9))
             _slot_combo.pack(side="left", padx=(6, 0))
@@ -73,42 +95,30 @@ class GamepadDialog(ThemedModal):
         except Exception:
             self._slot_var = None
         tk.Label(slot_row, text="XInput only — DirectInput pads won't show.",
-                 font=(F, 8), bg=COLORS["bg"],
+                 font=(F, 9), bg=COLORS["bg"],
                  fg=COLORS["subtext"]).pack(side="left", padx=(10, 0))
         # Center piece: the pad artwork with horizontal trigger bars
         # drawn right above the shoulders (LT left, RT right). Artwork is
         # the white-outline Xbox stock (Noun Project, CC BY — credited in
         # code) at app/assets/gamepad_outline.png, 1200x1200, shown
-        # subsampled /3 (400px). Button zones were measured off the
+        # subsampled by _SUB (300px). Button zones were measured off the
         # artwork's pixel clusters at /4 and scaled up by _SCALE.
         self._trig_views = []  # (fill_id, track_tuple, pct_item, canvas)
-        _pad_px = int(300 * self._SCALE)
+        _pad_px = self._ART_PX
         self._pad_cv = tk.Canvas(body, width=_pad_px, height=_pad_px,
                                  bg=COLORS["bg"], bd=0, highlightthickness=0)
-        self._pad_cv.pack(pady=(0, 2))
+        self._pad_cv.pack(pady=(0, 1))
         self._overlay_triggers()
         self._pad_btns = {}   # name -> (shape_id, None); paint floods green
         self._stick_l = None
         self._stick_r = None
-        # Re-zero sits in its own row directly above the stat strip,
-        # centered over the DRIFT column (it calibrates drift, so it
-        # reads as that column's control) rather than packed to the
-        # dialog's outer right edge, which crowded the rounded corner
-        # and read as clipped (audit fix). It uses its own 3-column
-        # uniform group so it can't force the stat row's columns wider
-        # the way sharing DRIFT's cell did previously.
-        rez_row = tk.Frame(body, bg=COLORS["bg"])
-        rez_row.pack(fill="x", pady=(4, 0))
-        for c in range(3):
-            rez_row.grid_columnconfigure(c, weight=1, uniform="padstats_rez")
-        _rez = AnimatedButton(rez_row, text="Re-zero",
-                              command=self._calibrate,
-                              bg=COLORS["surface"], fg=COLORS["text"],
-                              font=(F, 8, "bold"), padx=10, pady=3)
-        _rez.grid(row=0, column=2)
-        Tooltip(_rez, "Learns the sticks' rest position to measure drift — "
-                      "take your thumbs off first.")
-        # stats strip: three evenly spaced blocks
+        # stats strip: three evenly spaced blocks, plus the drift Re-zero
+        # button in a fourth cell. It used to have its own row above the strip
+        # (so it read as the DRIFT column's control) and was moved into the
+        # strip's row by the 2026-10 popup-fit pass: that row cost 35px, which
+        # was the difference between this popup fitting its content zone and
+        # scrolling at 150% DPI. It still sits directly beside DRIFT, so it
+        # still reads as that column's control.
         stats = tk.Frame(body, bg=COLORS["bg"])
         stats.pack(fill="x", pady=(2, 0))
         for c in range(3):
@@ -116,9 +126,16 @@ class GamepadDialog(ThemedModal):
         self._stat_rate_val, _ = self._stat_block(stats, 0, "POLLING")
         self._stat_ms_val, _ = self._stat_block(stats, 1, "INTERVAL")
         self._stat_drift_val, _drift_cell = self._stat_block(stats, 2, "DRIFT")
+        _rez = AnimatedButton(stats, text="Re-zero",
+                              command=self._calibrate,
+                              bg=COLORS["surface"], fg=COLORS["text"],
+                              font=(F, 9, "bold"), padx=10, pady=2)
+        _rez.grid(row=0, column=3, sticky="e", padx=(6, 0))
+        Tooltip(_rez, "Learns the sticks' rest position to measure drift — "
+                      "take your thumbs off first.")
         # rumble row: themed sliders + test share one line
         rumble = tk.Frame(body, bg=COLORS["bg"])
-        rumble.pack(fill="x", pady=(6, 0))
+        rumble.pack(fill="x", pady=(4, 0))
         tk.Label(rumble, text="Rumble", font=(F, 9, "bold"),
                  bg=COLORS["bg"], fg=COLORS["text"],
                  anchor="w").pack(side="left", padx=(0, 8))
@@ -130,7 +147,7 @@ class GamepadDialog(ThemedModal):
         self._rumble_btn = AnimatedButton(
             rumble, text="Test Rumble", command=self._test_rumble,
             bg=COLORS["surface"], fg=COLORS["text"],
-            font=(F, 9, "bold"), padx=18, pady=6)
+            font=(F, 9, "bold"), padx=14, pady=4)
         self._rumble_btn.pack(side="left", padx=(12, 0))
         self._rumble_btn.set_enabled(False)
         self._pad_img = None
@@ -152,9 +169,9 @@ class GamepadDialog(ThemedModal):
         try:
             cell = tk.Frame(parent, bg=COLORS["bg"])
             cell.grid(row=0, column=col, sticky="nsew", padx=12)
-            tk.Label(cell, text=title, font=(F, 8), bg=COLORS["bg"],
+            tk.Label(cell, text=title, font=(F, 9), bg=COLORS["bg"],
                      fg=COLORS["subtext"]).pack()
-            val = tk.Label(cell, text="—", font=(F, 11, "bold"),
+            val = tk.Label(cell, text="—", font=(F, 10, "bold"),
                            bg=COLORS["bg"], fg=COLORS["text"])
             val.pack()
             return val, cell
@@ -174,12 +191,25 @@ class GamepadDialog(ThemedModal):
             path = None
         if path is None:
             raise FileNotFoundError("gamepad_outline.png")
-        img = _tk.PhotoImage(file=str(path)).subsample(3, 3)
+        full = _tk.PhotoImage(file=str(path))
+        # Subsample by whatever integer lands on the artwork size we laid the
+        # canvas out for, then re-derive _SCALE from the size we actually got
+        # (the overlays are authored in the 300px /4 grid, so a source that
+        # isn't exactly 1200px wide still lines up).
+        try:
+            sub = max(1, int(round(full.width() / float(self._ART_PX))))
+        except Exception:
+            sub = self._SUB
+        img = full.subsample(sub, sub)
         self._pad_img = img  # kept: Tk unmaps otherwise
+        try:
+            self._SCALE = img.width() / 300.0
+        except Exception:
+            pass
         self._pad_cv.create_image(0, 0, anchor="nw", image=img)
         S = self._SCALE
         # overlays: transparent idle, green press (coords measured at
-        # orig/4, scaled up by S to line up with the bigger orig/3 image)
+        # orig/4 — which _SCALE maps onto whatever artwork size loaded)
         for cx, cy, name in ((229, 84, "Y"), (209, 104, "X"),
                              (249, 104, "B"), (229, 124, "A")):
             self._ov_circle(cx * S, cy * S, 12 * S, name)
@@ -266,14 +296,18 @@ class GamepadDialog(ThemedModal):
 
     def _slider_row(self, parent, title, var):
         """Theme-native slider: dark track, green fill, light knob —
-        drag (or click) to set. Same look language as the app's pills."""
+        drag (or click) to set. Same look language as the app's pills.
+
+        ONE line per slider (title, track, value) since the 2026-10
+        popup-fit pass: stacking the title above the track made each slider
+        62px tall, which was the last thing keeping this popup's content
+        taller than its content zone.
+        """
         row = tk.Frame(parent, bg=COLORS["bg"])
-        row.pack(side="left", padx=(0, 12))
+        row.pack(side="left", padx=(0, 14))
         tk.Label(row, text=title, font=(F, 9), bg=COLORS["bg"],
-                 fg=COLORS["subtext"], anchor="w").pack(fill="x")
-        box = tk.Frame(row, bg=COLORS["bg"])
-        box.pack(fill="x")
-        cv = tk.Canvas(box, width=150, height=18, bg=COLORS["bg"],
+                 fg=COLORS["subtext"]).pack(side="left", padx=(0, 6))
+        cv = tk.Canvas(row, width=150, height=18, bg=COLORS["bg"],
                        bd=0, highlightthickness=0)
         cv.pack(side="left")
         track = cv.create_rectangle(0, 4, 150, 14, fill=COLORS["surface"],
@@ -282,7 +316,7 @@ class GamepadDialog(ThemedModal):
                                    outline="")
         knob = cv.create_rectangle(70, 1, 80, 17, fill=COLORS["text"],
                                    outline="")
-        val = tk.Label(box, text="0.50", font=(F, 9), bg=COLORS["bg"],
+        val = tk.Label(row, text="0.50", font=(F, 9), bg=COLORS["bg"],
                        fg=COLORS["text"], width=5, anchor="e")
         val.pack(side="left", padx=(6, 0))
         state = {"drag": False}

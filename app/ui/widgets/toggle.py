@@ -9,36 +9,24 @@ import tkinter as tk
 from app.ui.theme import COLORS, _hex_lerp, F
 
 class ToggleSwitch(tk.Canvas):
-    """iOS-style toggle, MK3 (user feedback: 'low-res, unpolished, hover
-    shows a framework outline').
+    """Material 3 switch: 52x32 track, 16px thumb (off) growing to 24px (on).
 
-    What changed vs MK2:
-      * SIZE: 44x24 (iOS 'mini' proportions — same shape language, less
-        vertical bulk, enables 2-column Custom grids).
-      * ANTIALIASING: Tk's create_oval/create_rectangle are NOT antialiased
-        on Windows — the capsule caps and knob had visibly jagged edges
-        (the 'low-res' look). Everything is now drawn with smooth=True
-        polygons (Tk antialiases those), so all edges are crisp.
-      * NO HOVER RIM: the old hover affordance drew 3 outline shapes
-        slightly OUTSIDE the capsule bounds — at this scale it read as a
-        boxy 'framework outline' around the clickable area (user-reported).
-        Hover now just brightens the track; keyboard focus brightens it
-        slightly more. No outlines anywhere.
+    Off: hollow pill — the surface behind the switch shows through, ringed
+    by a 2px outline with an outline-coloured thumb. On: primary track,
+    on-primary thumb carrying a check glyph. Hover and keyboard focus paint
+    the M3 state-layer halo around the thumb. Everything is a smooth polygon
+    so edges stay antialiased on Windows."""
 
-    Motion: unchanged critically-damped ease-out (~200ms), no overshoot.
-    Track color crossfades muted slate → iOS green (#34C759); knob white
-    when ON, gray when OFF so state reads at a glance."""
-
-    # iOS-mini metrics (points ≈ px at 100% scaling)
-    W, H = 44, 24
-    INSET = 1.5
-    KNOB_INSET = 2.5
-    GREEN = "#34C759"        # Apple system green
-    KNOB_ON = "#FFFFFF"
-    KNOB_OFF = "#C3CAD4"     # gray when off — state reads at a glance
-    SHADOW = "#000000"
-    OFF_TRACK = "#3E4A5A"     # neutral slate, matches dark UI
+    W, H = 52, 32
     EASE = 0.32              # per-tick approach @16ms (settles ~200ms)
+    #: Fallback only: the OFF track is painted in the surface BEHIND the
+    #: switch (see _off_track), so the pill stays hollow on any card or row.
+    TRACK_OFF = COLORS["surface_hover"]
+    OUTLINE_OFF = COLORS["muted"]
+    THUMB_OFF = COLORS["muted"]
+    TRACK_ON = COLORS["primary"]
+    THUMB_ON = COLORS["on_primary"]
+    ICON_ON = COLORS["on_primary_container"]
 
     def __init__(self, parent, variable: tk.BooleanVar, command=None,
                  accent=None, **kw):  # accent kept for API compat, ignored
@@ -114,40 +102,52 @@ class ToggleSwitch(tk.Canvas):
 
     # -- rendering ------------------------------------------------------ #
 
-    @property
-    def _knob_d(self):
-        return self.H - self.KNOB_INSET * 2
+    def _off_track(self):
+        """Colour of the unselected track: the surface behind the switch.
 
-    def _travel(self):
-        return self.W - self.KNOB_INSET * 2 - self._knob_d
+        M3 specifies surfaceContainerHighest here, which on this dark
+        palette is #333537 — on a #1E1F20 card that renders as a grey
+        FILLED pill and reads as a disabled control (user report 2026-10:
+        "the gray fill for the toggle options looks weird"). Painting the
+        track in the switch's own background leaves exactly the M3
+        outline + thumb pill on every surface the switch is placed on
+        (cards, rows, popovers), and still eases cleanly into the primary
+        fill as it turns on."""
+        try:
+            return self.cget("bg")
+        except Exception:
+            return self.TRACK_OFF
 
     def _draw(self, hover=False):
         self.delete("all")
         w, h = self.W, self.H
-        ins = self.INSET
-        self._focused_now = self._focused
-        # track: ONE smooth capsule polygon (rect middle + semicircle ends
-        # in a single antialiased shape) — MK2's rect+2-ovals had unantialiased
-        # seams and jagged caps.
-        r = (h - ins * 2) / 2
-        x0, y0, x1, y1 = ins, ins, w - ins, h - ins
-        track = _hex_lerp(self.OFF_TRACK, self.GREEN, self._pos)
-        if hover and self._enabled:
-            track = _hex_lerp(track, "#FFFFFF", 0.12)
-        elif self._focused_now and self._enabled:
-            track = _hex_lerp(track, "#FFFFFF", 0.08)
-        self._capsule(x0, y0, x1, y1, r, fill=track)
-        # knob: smooth-polygon circle (antialiased, unlike create_oval)
-        kd = self._knob_d
-        cx = self.KNOB_INSET + kd / 2 + self._pos * self._travel()
-        knob = _hex_lerp(self.KNOB_OFF, self.KNOB_ON, self._pos)
+        p = self._pos
+        cy = h / 2
         if self._enabled:
-            self._circle(cx + 0.5, self.KNOB_INSET + kd / 2 + 1.5, kd,
-                          fill=self.SHADOW, stipple="gray25")
-        self._circle(cx, self.KNOB_INSET + kd / 2, kd, fill=knob)
-        # NOTE (user feedback): the old hover rim — 3 outline shapes drawn
-        # slightly outside the capsule — is GONE. It read as a 'framework
-        # outline' around the clickable area at this scale.
+            track = _hex_lerp(self._off_track(), self.TRACK_ON, p)
+            rim = _hex_lerp(self.OUTLINE_OFF, self.TRACK_ON, p)
+            thumb = _hex_lerp(self.THUMB_OFF, self.THUMB_ON, p)
+        else:
+            track = _hex_lerp(COLORS["bg"], COLORS["text"], 0.12)
+            rim = track
+            thumb = _hex_lerp(COLORS["bg"], COLORS["text"], 0.38)
+        # outline (fades out as the switch turns on), then the track inside it
+        self._capsule(1, 1, w - 1, h - 1, (h - 2) / 2, fill=rim)
+        if p < 0.999 or not self._enabled:
+            self._capsule(3, 3, w - 3, h - 3, (h - 6) / 2, fill=track)
+        d = 16 + 8 * p
+        cx = 16 + p * (w - 32)
+        if self._enabled and (hover or self._focused):
+            halo = _hex_lerp(track, thumb, 0.18)
+            self._circle(cx, cy, h - 2, fill=halo)
+        self._circle(cx, cy, d, fill=thumb)
+        if p > 0.85 and self._enabled:
+            # check glyph on the selected thumb
+            k = d / 24.0
+            self.create_line(cx - 4.5 * k, cy + 0.2 * k, cx - 1.5 * k,
+                             cy + 3.2 * k, cx + 4.5 * k, cy - 3.2 * k,
+                             fill=self.ICON_ON, width=2, capstyle="round",
+                             joinstyle="round")
 
     def _capsule(self, x0, y0, x1, y1, r, **kw):
         """One smooth polygon: rectangle with two TRUE semicircle caps. The

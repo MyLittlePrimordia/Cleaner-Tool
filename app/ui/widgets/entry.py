@@ -17,13 +17,15 @@ class RoundedEntry(tk.Frame):
     Entry it replaces (textvariable, binds, width all live there).
     Focus ring turns the tab accent on focus, hairline otherwise."""
 
-    RADIUS = 9
+    RADIUS = 8      # M3 "small" shape
     PAD_Y = 5
 
     def __init__(self, parent, textvariable=None, width=20, font=None,
                  entry_bg=None, accent=None, **kw):
         super().__init__(parent, bg=parent["bg"] if isinstance(parent, tk.Frame) else COLORS["bg"])
-        self._accent = accent or COLORS["accent_green"]
+        # M3 text field: the focus ring is always the primary colour, not the
+        # tab accent (kept as a param for API compatibility).
+        self._accent = COLORS["primary"]
         self._fill = entry_bg or COLORS["surface"]
         self._cv = tk.Canvas(self, highlightthickness=0, bd=0, bg=self["bg"])
         self._cv.place(relx=0, rely=0, relwidth=1, relheight=1)
@@ -49,7 +51,8 @@ class RoundedEntry(tk.Frame):
             self._cv.create_polygon(
                 _round_rect_points(1, 1, w - 1, h - 1, self.RADIUS),
                 smooth=True, fill=self._fill,
-                outline=self._accent if focused else COLORS["hairline"], width=2)
+                outline=self._accent if focused else "",
+                width=2 if focused else 1)
         except Exception:
             pass
 

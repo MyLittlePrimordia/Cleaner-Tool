@@ -16,8 +16,8 @@ from tkinter import messagebox
 
 from app.config import FONT_FAMILY
 from app.ui.theme import (
-    COLORS, F, _next_transparent_color, _release_transparent_color,
-    _round_rect_points,
+    COLORS, F, SHAPE_XL, TYPE, _next_transparent_color,
+    _release_transparent_color, _round_rect_points,
 )
 # The themed message boxes moved in from app/gui.py build their buttons with
 # AnimatedButton. This is base -> widgets, which is the allowed direction
@@ -365,8 +365,8 @@ class ThemedModal:
         card.pack(fill="both", expand=True)
         try:
             card.create_polygon(
-                _round_rect_points(0, 0, w - 1, h - 1, self.RADIUS),
-                smooth=True, fill=COLORS["bg"], outline=COLORS["hairline"])
+                _round_rect_points(0, 0, w - 1, h - 1, SHAPE_XL),
+                smooth=True, fill=COLORS["bg"], outline="")
         except Exception:
             pass
         self._modal_w, self._modal_h = w, h
@@ -378,12 +378,11 @@ class ThemedModal:
         # have no background rect, so the rounding shows through).
         self._x_btn = None
         try:
-            card.create_oval(16, 9, 26, 19, fill=self._modal_accent,
-                             outline="")
+            pass     # M3: dialogs carry no accent dot
         except Exception:
             pass
         try:
-            card.create_text(36, 8, text=title, font=(F, 11, "bold"),
+            card.create_text(24, 9, text=title, font=(F, 13),
                              fill=COLORS["text"], anchor="nw")
         except Exception:
             pass
@@ -413,8 +412,7 @@ class ThemedModal:
                 pass
         # hairline under the title row
         try:
-            card.create_line(self.RADIUS + 4, self._TITLE_H, w - self.RADIUS - 5,
-                             self._TITLE_H, fill=COLORS["hairline"])
+            pass     # M3: no divider under the dialog title
         except Exception:
             pass
         # drag-to-move by the title strip (custom chrome needs a
@@ -525,6 +523,22 @@ class ThemedModal:
         """Extra cleanup to run when the dialog closes (cancel tokens,
         unregisters — subclasses wire their own bookkeeping)."""
         self._modal_on_close = cb
+
+    def body_width(self, margin=0):
+        """Real content width in px, less an optional per-call margin.
+
+        The ToolShell twin of this exists because a hardcoded wraplength is
+        correct at exactly one window size - and these dialogs are
+        PROPORTIONAL. 42 literals were audited across app/ (150px through
+        720px, none derived from the window), and the visible symptom is
+        text that wraps mid-phrase on one machine and overflows on a wider
+        one. The `_modal_w` default is what _geometry() sets before the first
+        <Configure>, so this is safe to call during __init__.
+
+        Floor of 180px matches ToolShell: below that a wrap produces one
+        character per line, which is worse than no wrap at all.
+        """
+        return max(180, int(getattr(self, "_modal_w", 800)) - int(margin))
 
     def close(self):
         """Single close path: run hook, drop the scrim, destroy. Safe to
@@ -667,7 +681,7 @@ def _themed_askyesno(parent, title: str, message: str, accent: str = None,
                     size=None, scrim=True)
         body = modal.body
         tk.Label(body, text=message, font=(FONT_FAMILY, 9), bg=COLORS["bg"],
-                 fg=COLORS["text"], wraplength=440,
+                 fg=COLORS["text"], wraplength=modal.body_width(28),
                  justify="left").pack(fill="x", pady=(8, 10))
 
         def _yes():
@@ -682,12 +696,12 @@ def _themed_askyesno(parent, title: str, message: str, accent: str = None,
         brow.pack(fill="x", pady=(2, 8))
         AnimatedButton(brow, text=no_text, command=_no,
                        bg=COLORS["surface"], fg=COLORS["text"],
-                       font=(FONT_FAMILY, 9, "bold"), padx=18,
+                       font=(FONT_FAMILY, 9, "bold"), padx=22,
                        pady=7).pack(side="right", padx=(8, 0))
         AnimatedButton(brow, text=yes_text, command=_yes,
                        bg=accent or COLORS["accent_yellow"],
                        fg=COLORS["black"], font=(FONT_FAMILY, 9, "bold"),
-                       padx=18, pady=7).pack(side="right")
+                       padx=22, pady=7).pack(side="right")
         modal._dlg.bind("<Return>", lambda _e: _yes())
         # Escape default: No (already bound to close by the base — the
         # False result stands because nothing overrode result["ok"])
@@ -700,34 +714,68 @@ def _themed_askyesno(parent, title: str, message: str, accent: str = None,
             return False
 
 
-def _themed_showinfo(parent, title: str, message: str, accent: str = None,
-                     ok_text: str = "OK") -> None:
-    """Dark-themed info dialog (in-app modal, ThemedModal chrome)."""
+def _themed_notice(parent, title: str, message: str, accent: str,
+                   ok_text: str, fallback) -> None:
+    """Dark-themed one-button notice (in-app modal, ThemedModal chrome).
+
+    Shared body of the info / warning / error prompts: they differ only in
+    accent colour and the native `fallback` used when the themed window
+    itself cannot be built. Keeping one implementation means the three read
+    identically on screen and cannot drift apart.
+    """
     try:
         _TM = globals().get("ThemedModal")
         if _TM is None:
-            messagebox.showinfo(title, message)
+            fallback(title, message)
             return
-        modal = _TM(parent, title=title,
-                    accent=accent or COLORS["accent_green"],
+        modal = _TM(parent, title=title, accent=accent,
                     size=None, scrim=True)
         body = modal.body
         tk.Label(body, text=message, font=(FONT_FAMILY, 9), bg=COLORS["bg"],
-                 fg=COLORS["text"], wraplength=440,
+                 fg=COLORS["text"], wraplength=modal.body_width(28),
                  justify="left").pack(fill="x", pady=(8, 10))
         brow = tk.Frame(body, bg=COLORS["bg"])
         brow.pack(fill="x", pady=(2, 8))
         AnimatedButton(brow, text=ok_text, command=modal.close,
-                       bg=accent or COLORS["accent_green"],
+                       bg=accent,
                        fg=COLORS["black"], font=(FONT_FAMILY, 9, "bold"),
                        padx=22, pady=7).pack(side="right")
         modal._dlg.bind("<Return>", lambda _e: modal.close())
         modal.wait()
     except Exception:
         try:
-            messagebox.showinfo(title, message)
+            fallback(title, message)
         except Exception:
             pass
+
+
+def _themed_showinfo(parent, title: str, message: str, accent: str = None,
+                     ok_text: str = "OK") -> None:
+    """Dark-themed info dialog (in-app modal, ThemedModal chrome)."""
+    _themed_notice(parent, title, message,
+                   accent or COLORS["accent_green"], ok_text,
+                   messagebox.showinfo)
+
+
+def _themed_showwarning(parent, title: str, message: str, accent: str = None,
+                        ok_text: str = "OK") -> None:
+    """Dark-themed warning dialog (yellow accent).
+
+    Yellow matches the confirm prompt, so "something needs your attention"
+    reads the same everywhere in the app.
+    """
+    _themed_notice(parent, title, message,
+                   accent or COLORS["accent_yellow"], ok_text,
+                   messagebox.showwarning)
+
+
+def _themed_showerror(parent, title: str, message: str, accent: str = None,
+                      ok_text: str = "OK") -> None:
+    """Dark-themed error dialog (red accent — the danger colour, reserved
+    for failures so they never look like a routine notice)."""
+    _themed_notice(parent, title, message,
+                   accent or COLORS["accent_red"], ok_text,
+                   messagebox.showerror)
 
 
 

@@ -117,7 +117,7 @@ class SessionOrchestrator:
     @property
     def pilot(self):
         """The SessionPilot object, or None. Application._pilot forwards
-        here; tools/smoke_async.py reads it to drive the watcher directly."""
+        here; tests read it to drive the watcher directly."""
         return self._pilot
 
     @pilot.setter
@@ -134,9 +134,9 @@ class SessionOrchestrator:
         # keying the pump off ensure_pump() alone meant the "no pilot attached
         # -> don't schedule" rule cancelled the loop before it ever began, and
         # every detect sat in the queue forever. Keying it off attachment
-        # removes the call-order dependency entirely — and also covers
-        # tools/smoke_async.py, which starts the watcher by calling
-        # `app._pilot.start(...)` directly and so never goes through here.
+        # removes the call-order dependency entirely - and also covers a
+        # caller that starts the watcher by calling `app._pilot.start(...)`
+        # directly and so never goes through here.
         self.ensure_pump()
 
     @property

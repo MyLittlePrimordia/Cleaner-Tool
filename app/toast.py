@@ -109,7 +109,9 @@ def _ensure_aumid() -> str:
                 if icon:
                     winreg.SetValueEx(k, "IconUri", 0, winreg.REG_SZ, icon)
             aumid = _AUMID
-        except Exception:
+        except Exception as exc:
+            from app.utils import log_or_swallow
+            log_or_swallow(None, "toast.aumid_register", exc)
             aumid = _FALLBACK_AUMID
         _aumid_cache = aumid
         return aumid

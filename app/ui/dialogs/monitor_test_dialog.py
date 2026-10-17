@@ -9,17 +9,51 @@ from __future__ import annotations
 
 import tkinter as tk
 from tkinter import ttk, messagebox
-from app.ui.base import ThemedModal
+from app.ui.dialogs._tool_page import ToolPage
 from app.ui.theme import COLORS, F, TAB_ACCENTS, _hex_lerp
 from app.ui.widgets import AnimatedButton
 
 
-class MonitorTestDialog(ThemedModal):
+def _mask_corners(cv, r=26):
+    """Round a canvas' corners by painting page-coloured corner cut-outs
+    over whatever is drawn (a Canvas is always rectangular)."""
+    import math
+    cv.delete("corner")
+    w, h = cv.winfo_width(), cv.winfo_height()
+    if w < 4 * r or h < 4 * r:
+        return
+    bg = COLORS["bg"]
+    n = 12
+
+    def arc(cx, cy, t0, t1):
+        return [(cx + r * math.cos(t0 + (t1 - t0) * i / n),
+                 cy + r * math.sin(t0 + (t1 - t0) * i / n))
+                for i in range(n + 1)]
+    corners = (
+        [(0, 0)] + arc(r, r, -math.pi / 2, -math.pi),
+        [(w, 0)] + arc(w - r, r, -math.pi / 2, 0),
+        [(0, h)] + arc(r, h - r, math.pi, math.pi / 2),
+        [(w, h)] + arc(w - r, h - r, 0, math.pi / 2),
+    )
+    for pts in corners:
+        flat = [c for p in pts for c in p]
+        cv.create_polygon(flat, fill=bg, outline=bg, tags="corner")
+    cv.tag_raise("corner")
+
+
+class MonitorTestDialog(ToolPage):
     """Monitor Test (Option A): Info shows the real current mode via the
     existing tweak_tasks query; Dead Pixels shows solid color fields with
     an optional fullscreen Start, auto-advance timer and gradient check.
     Fullscreen keeps an autohide control bar (taskbar-style) so edge
-    pixels stay inspectable. No refresh measurement claim."""
+    pixels stay inspectable. No refresh measurement claim.
+
+    REDESIGN 2026-10: moved onto the shared ToolPage shell — one Header
+    banner replaces the bare title, the specs row and pixel canvas stay
+    in self.content, and the three tester controls are footer buttons.
+    The canvas deliberately does NOT sit in a scroll panel: it fills the
+    card (fill="both", expand=True), which a shared ScrollableRoundedPanel
+    would defeat."""
 
     _COLORS_CYCLE = ("#000000", "#FFFFFF", "#FF0000", "#00FF00", "#0000FF", "#808080")
     _AUTO_MS_ON = 3000
@@ -40,34 +74,44 @@ class MonitorTestDialog(ThemedModal):
         self._fs_grad_btn = None
         self._fs_mode_lbl = None
         self._fs_hide_after = None
-        super().__init__(parent, title="Monitor Test", accent=TAB_ACCENTS["Clean"])
-        body = self.body
+        super().__init__(
+            parent, title="Monitor Test", accent=TAB_ACCENTS["Clean"],
+            scope="Solid colour fields, auto-cycle and a gradient ramp for "
+                  "checking a screen for dead pixels.",
+            scroll=False, fit=True)
+        self.banner.set_state("\u25A3", TAB_ACCENTS["Clean"])
+        self.banner.set_title("Check your screen for dead pixels.")
+        self.banner.set_sub("Play the colour fields full-screen and look for "
+                            "a stuck dot.")
+        body = self.content
         # UI fix: this used to be two tab pages (Info / Dead Pixels) for
         # what's really one small screen's worth of content — an extra
         # click for nothing. Everything now lives on one row: resolution,
         # max Hz at that resolution, and (when the panel's EDID is
         # readable) the monitor's own model name, evenly spaced.
         self._build_specs_row(body)
-        self._pixel_cv = tk.Canvas(body, width=680, height=260,
+        # The preview now fills the popup (it was a fixed 680x260 box with a
+        # lot of dead space around it) and has rounded corners.
+        self._pixel_cv = tk.Canvas(body, width=680, height=300,
                                    bg=self._COLORS_CYCLE[self._color_idx], bd=0,
                                    highlightthickness=0)
-        self._pixel_cv.pack(pady=(4, 8))
+        self._pixel_cv.pack(fill="both", expand=True, padx=6, pady=(6, 12))
+        self._pixel_cv.bind("<Configure>", lambda _e: self._render_swatch())
         self._mode_lbl = None
         # One row, three buttons: Fullscreen / Cycle (solids + gradient)
         # / Auto On-Off at a fixed 3s cadence.
-        row = tk.Frame(body, bg=COLORS["bg"])
-        row.pack(pady=(4, 0))
-        AnimatedButton(row, text="Fullscreen",
-                       command=self._open_fullscreen_pixels,
-                       bg=COLORS["surface"], fg=COLORS["text"],
-                       font=(F, 9, "bold"), padx=16, pady=6).pack(side="left", padx=4)
-        AnimatedButton(row, text="Cycle Colors", command=self._next_pixel_color,
-                       bg=COLORS["surface"], fg=COLORS["text"],
-                       font=(F, 9, "bold"), padx=16, pady=6).pack(side="left", padx=4)
-        self._auto_btn = AnimatedButton(row, text="Auto Cycle: Off", command=self._toggle_auto,
-                                        bg=COLORS["surface"], fg=COLORS["text"],
-                                        font=(F, 9, "bold"), padx=16, pady=6)
-        self._auto_btn.pack(side="left", padx=4)
+        # REDESIGN 2026-10: these used to be a hand-built row inside the
+        # body; they are now footer buttons with ToolPage roles. "Auto
+        # Cycle" is role="primary" (a filled container) on purpose:
+        # _update_mode_ui repaints it green/red via set_style, and only a
+        # filled button honours a new bg — an outlined one keeps the page
+        # colour and renders the black label invisible.
+        self.add_button("Fullscreen", self._open_fullscreen_pixels,
+                        kind="primary")
+        self.add_button("Cycle Colors", self._next_pixel_color,
+                        kind="secondary")
+        self._auto_btn = self.add_button("Auto Cycle: Off", self._toggle_auto,
+                                         kind="primary")
         self._update_mode_ui()
         self.on_close(self._stop)
 
@@ -95,10 +139,11 @@ class MonitorTestDialog(ThemedModal):
         def stat(col, title, value):
             cell = tk.Frame(rows, bg=COLORS["bg"])
             cell.grid(row=0, column=col, sticky="nsew", padx=12, pady=6)
-            tk.Label(cell, text=title, font=(F, 8), bg=COLORS["bg"],
+            tk.Label(cell, text=title, font=(F, 9), bg=COLORS["bg"],
                      fg=COLORS["subtext"]).pack()
-            tk.Label(cell, text=value, font=(F, 13, "bold"), bg=COLORS["bg"],
-                     fg=COLORS["text"], wraplength=180).pack()
+            tk.Label(cell, text=value, font=(F, 14, "bold"), bg=COLORS["bg"],
+                     fg=COLORS["text"],
+                     wraplength=max(120, self.body_width(90) // 3)).pack()
 
         if current and current[0] and current[1]:
             try:
@@ -135,8 +180,8 @@ class MonitorTestDialog(ThemedModal):
                 except Exception:
                     pass
                 try:
-                    w = int(cv.cget("width") or 680)
-                    h = int(cv.cget("height") or 260)
+                    w = int(cv.winfo_width() or cv.cget("width") or 680)
+                    h = int(cv.winfo_height() or cv.cget("height") or 260)
                 except Exception:
                     w, h = 680, 260
                 steps = 64
@@ -155,6 +200,10 @@ class MonitorTestDialog(ThemedModal):
                     cv.config(bg=self._COLORS_CYCLE[self._color_idx])
                 except Exception:
                     pass
+        except Exception:
+            pass
+        try:
+            _mask_corners(self._pixel_cv)
         except Exception:
             pass
         self._update_mode_ui()
@@ -224,7 +273,7 @@ class MonitorTestDialog(ThemedModal):
                         _b.set_style(bg=COLORS["accent_green"], fg=COLORS["black"],
                                      hover_bg=_hex_lerp(COLORS["accent_green"], "#FFFFFF", 0.08))
                     else:
-                        _b.set_style(bg=COLORS["accent_red"], fg="#FFFFFF",
+                        _b.set_style(bg=COLORS["accent_red"], fg=COLORS["black"],
                                      hover_bg=_hex_lerp(COLORS["accent_red"], "#FFFFFF", 0.08))
                 except Exception:
                     pass

@@ -118,7 +118,8 @@ def resolve_exe(name: str) -> str:
 
 
 def atomic_write_text(dest: str, content: str, newline: str = "\n",
-                      *, restore_readonly: bool = False) -> None:
+                      *, restore_readonly: bool = False,
+                      errors: str = "strict") -> None:
     """Write `content` to `dest` atomically via a unique temp file in the
     SAME directory + os.replace — readers never observe a half-written file,
     and a crash/lock mid-write leaves the original untouched. Written with
@@ -143,7 +144,8 @@ def atomic_write_text(dest: str, content: str, newline: str = "\n",
         except Exception:
             pass
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline=newline) as fh:
+        with os.fdopen(fd, "w", encoding="utf-8", newline=newline,
+                       errors=errors) as fh:
             fh.write(content)
             fh.flush()
             try:
@@ -168,7 +170,8 @@ import threading
 import queue
 
 
-def exclusive_create_text(dest: str, content: str, newline: str = "\n") -> bool:
+def exclusive_create_text(dest: str, content: str, newline: str = "\n",
+                          errors: str = "strict") -> bool:
     """Create `dest` with `content` ONLY if nothing already exists there,
     atomically (SEC-001 audit fix). The old hosts-backup call site did
     `if not os.path.isfile(path): open(path, "w")` — a plain check-then-write
@@ -214,7 +217,8 @@ def exclusive_create_text(dest: str, content: str, newline: str = "\n") -> bool:
     except FileExistsError:
         return False
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline=newline) as fh:
+        with os.fdopen(fd, "w", encoding="utf-8", newline=newline,
+                       errors=errors) as fh:
             fh.write(content)
             fh.flush()
             try:
@@ -264,7 +268,7 @@ def _kill_proc(proc: subprocess.Popen):
 
     BUG-006: the order was wrong. `proc.kill()` ran FIRST and synchronously,
     and only then was the `taskkill /T` tree walk fired off in a thread. With
-    the default shell=True, `proc` is cmd.exe and the real tool (DISM.exe,
+    a shell=True run, `proc` is cmd.exe and the real tool (DISM.exe,
     sfc.exe, winget.exe) is its child -- so by the time taskkill ran, the
     parent was already gone and /T had no tree left to enumerate. Measured:
     taskkill exited 128, "The process "N" not found.", and the child was still
@@ -331,6 +335,13 @@ class TaskContext:
     byte-identical; the scan engine passes dry_run=True so all pure
     folder-cleaning tasks can be invoked directly for honest estimates
     with zero changes to any task module."""
+
+    quarantine: Optional[object] = None
+    """Optional app.quarantine.Quarantine handle (roadmap 2.5). When set, the
+    clean funnel (clean_folder_contents) MOVES matched files into the bin
+    instead of deleting them. Default None = ordinary deletes, so every
+    existing caller is unchanged. Typed `object` to keep utils free of an
+    import on the quarantine module."""
 
 
 def log_or_swallow(ctx: "TaskContext | None", msg: str, exc: BaseException | None = None, *, level: str = "!") -> None:
@@ -411,17 +422,96 @@ class TaskCancelled(RuntimeError):
 # parse them. That is the pattern the rest of this codebase already uses.
 
 
-def run_cmd(ctx: TaskContext, command, shell: bool = True, timeout: Optional[int] = None,
+import re as _re
+
+#: DISM prints "[=====   8.8%   ]" and SFC prints "Verification 45% complete."
+#: hundreds of times per run. In a deep repair that was ~600 of the log's 970
+#: lines, drowning the lines that matter. One line per 10% is enough to show
+#: progress; the rest are dropped.
+_PROGRESS_RES = (
+    _re.compile(r"^\[[= ]*\s*(\d+(?:\.\d+)?)%\s*[= ]*\]$"),       # DISM
+    _re.compile(r"^Verification\s+(\d+)%\s+complete\.?$", _re.I),   # SFC
+)
+
+
+def _progress_percent(line: str):
+    """The percentage in a DISM/SFC progress line, else None."""
+    for rx in _PROGRESS_RES:
+        m = rx.match(line)
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                return None
+    return None
+
+
+def store_available() -> bool:
+    """True only when the Microsoft Store app is installed for this user.
+
+    LTSC, IoT, Server and N/KN-stripped images ship without it. On those,
+    `wsreset.exe` has nothing to reset and instead opens an
+    "ms-windows-store:" link that no app owns, so Windows pops a "Get an app
+    to open this link" / "not found" prompt in the middle of a clean. A
+    cleanup tool must not trigger prompts on the user's desktop, so Store
+    tasks check first and skip.
+
+    When the check itself cannot run (PowerShell blocked, timeout) this
+    returns False: a skipped Store-cache reset costs nothing, a stray popup
+    does.
+    """
+    if not IS_WINDOWS:
+        return False
+    try:
+        out = subprocess.check_output(
+            [resolve_exe("powershell"), "-NoProfile", "-NonInteractive",
+             "-Command",
+             "if (Get-AppxPackage -Name Microsoft.WindowsStore "
+             "-ErrorAction SilentlyContinue) { 'STORE_YES' } "
+             "else { 'STORE_NO' }"],
+            text=True, timeout=25, stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return "STORE_YES" in (out or "")
+    except Exception:
+        return False
+
+
+def _popen_command(command, shell: bool):
+    """What to hand subprocess.Popen for `command` WITHOUT involving a shell.
+
+    A list/tuple is already an argv and passes through. A STRING with
+    shell=False is the common legacy form ("sfc /scannow", "net stop X"):
+      * on Windows, Popen hands the string straight to CreateProcess, which
+        parses it with the C runtime's quoting rules and runs the program
+        directly - there is no cmd.exe, so `& | > ^ %` are ordinary
+        characters. This is exactly how the argv form behaves, with the
+        quoting already written out.
+      * elsewhere (the Linux test harness) the string is split with shlex,
+        because Popen would otherwise try to execute the whole string as one
+        program name.
+    shell=True is still honoured for a caller that explicitly asks for
+    cmd.exe features, but nothing in the app does (tools/verify_run_cmd_no_shell
+    fails the build if one appears).
+    """
+    if shell or isinstance(command, (list, tuple)):
+        return command
+    if IS_WINDOWS:
+        return command
+    import shlex
+    return shlex.split(command)
+
+
+def run_cmd(ctx: TaskContext, command, shell: bool = False, timeout: Optional[int] = None,
             collect: "list | None" = None) -> int:
     """Run a command, streaming each output line to ctx.log.
 
-    `command` is either a command string (with `shell=True`, the default) or an
-    argv SEQUENCE, which you must pair with `shell=False`. Prefer the sequence
-    form for anything derived from the environment, the registry, or a
-    user-writable path: with `shell=False` there is no shell to parse
-    metacharacters, so `&`, `|`, `>`, `^` and `%` are just characters in an
-    argument. That is the only construction that makes those characters inert
-    (BUG-021).
+    `command` is an argv SEQUENCE (preferred) or a command string. The default
+    is `shell=False` (BUG-RES-001): there is no cmd.exe, so `&`, `|`, `>`, `^`
+    and `%` are just characters in an argument - the only construction that
+    makes them inert (BUG-021). A string is run directly by CreateProcess on
+    Windows (see `_popen_command`), so existing "tool /switch" strings keep
+    working. Pass `shell=True` only for a command that genuinely needs
+    cmd.exe built-ins; the build fails if one is added.
 
     `collect` (optional): when given a list, every stripped non-empty output
     line is also appended to it — lets long batch runs (e.g. `winget
@@ -442,9 +532,14 @@ def run_cmd(ctx: TaskContext, command, shell: bool = True, timeout: Optional[int
             creationflags = subprocess.CREATE_NO_WINDOW
 
         proc = subprocess.Popen(
-            command,
+            _popen_command(command, shell),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            # A GUI process has no console stdin. Commands that ask a
+            # question (chkdsk's "schedule at next restart? (Y/N)") would
+            # block or fail on the inherited handle; give them a closed
+            # input so they take their default and exit.
+            stdin=subprocess.DEVNULL,
             text=True,
             # H2 fix: default text-mode decoding is strict and can raise on
             # undefined bytes in localized (non-English) OEM/cp1252 output
@@ -467,6 +562,7 @@ def run_cmd(ctx: TaskContext, command, shell: bool = True, timeout: Optional[int
             # without blocking on readline(). This fixes the hang where silent
             # commands (sfc, DISM) emit nothing for minutes and Cancel never fires.
             q: queue.Queue[Optional[str]] = queue.Queue()
+            _last_bucket = [-1]       # last 10% step logged (progress lines)
 
             def _reader():
                 try:
@@ -518,8 +614,19 @@ def run_cmd(ctx: TaskContext, command, shell: bool = True, timeout: Optional[int
                             ctx.log("  ! command cancelled")
                             return -1
                     break
-                line = item.strip()
+                # SFC writes UTF-16: read as an 8-bit codepage every character
+                # is followed by a NUL ("B\x00e\x00g\x00i\x00n..."). That filled
+                # the log with garbage AND made every substring check on SFC's
+                # verdict ("did not find any integrity violations") fail.
+                # Dropping the NULs recovers the ASCII text exactly.
+                line = item.replace("\x00", "").strip()
                 if line:
+                    pct = _progress_percent(line)
+                    if pct is not None:
+                        bucket = int(pct // 10)
+                        if bucket == _last_bucket[0]:
+                            continue
+                        _last_bucket[0] = bucket
                     ctx.log("  > " + line)
                     if collect is not None:
                         collect.append(line)
@@ -578,7 +685,7 @@ def run_cmd(ctx: TaskContext, command, shell: bool = True, timeout: Optional[int
         _set_current_proc(None)
 
 
-def run_cmd_checked(ctx: TaskContext, command: str, shell: bool = True, timeout: Optional[int] = None,
+def run_cmd_checked(ctx: TaskContext, command, shell: bool = False, timeout: Optional[int] = None,
                     success_codes=(0,)):
     """Run a command and raise only if its return code is NOT in success_codes.
 
@@ -642,9 +749,17 @@ def format_run_summary(succeeded: int, failed: int, skipped: int, freed_bytes: i
     return title, body
 
 
-def format_bytes(size_bytes: float) -> str:
+def format_bytes(size_bytes: float, compact: bool = False) -> str:
+    """Human byte count.
+
+    `compact=True` gives the short form a stat tile can hold - "1.5 GB",
+    "512 B" - with at most one decimal and no trailing ".00". Six Tools
+    popups had each grown their own byte formatter, which is why the same
+    number rendered differently in different windows; the second mode lives
+    here so there is still exactly one implementation.
+    """
     if size_bytes <= 0:
-        return "0 Bytes"
+        return "0 B" if compact else "0 Bytes"
     # audit fix: every boundary must compare the ROUNDED-UP byte count to
     # the threshold — the old float compare rendered 1023.6 B as
     # "1024 Bytes", 1048575.9 B as "1024.00 KB" (pseudo-units: a value
@@ -655,22 +770,32 @@ def format_bytes(size_bytes: float) -> str:
     import math
     n = math.ceil(size_bytes)
     kib, mib, gib = 1024, 1024 ** 2, 1024 ** 3
+
+    def out(value, unit):
+        if not compact:
+            return f"{value:.2f} {unit}"
+        if value >= 100:
+            return f"{value:.0f} {unit}"
+        if value >= 10:
+            return f"{value:.0f} {unit}"
+        return (f"{value:.1f} {unit}").replace(".0 ", " ")
+
     if n >= gib:
         v = n / gib
         if round(v, 2) < 1024:
-            return f"{v:.2f} GB"
-        return f"{n / (gib * 1024):.2f} TB"
+            return out(v, "GB")
+        return out(n / (gib * 1024), "TB")
     if n >= mib:
         v = n / mib
         if round(v, 2) < 1024:
-            return f"{v:.2f} MB"
-        return f"{v / 1024:.2f} GB"
+            return out(v, "MB")
+        return out(n / 1024, "GB")
     if n >= kib:
         v = n / kib
         if round(v, 2) < 1024:
-            return f"{v:.2f} KB"
-        return f"{v / 1024:.2f} MB"
-    return f"{n} Bytes"
+            return out(v, "KB")
+        return out(n / 1024, "MB")
+    return (f"{n} B") if compact else (f"{n} Bytes")
 
 
 # --------------------------------------------------------------------------- #
@@ -784,6 +909,50 @@ def _is_protected_root(path: str) -> bool:
         return True
 
 
+def _own_runtime_roots() -> tuple:
+    """Folders this running app depends on, which a cleaner must never touch.
+
+    A PyInstaller one-file build unpacks itself into %TEMP%\\_MEIxxxxx and
+    loads its assets and lazily-imported modules from there for as long as it
+    runs. The temp-file cleaners walk %TEMP%; Windows keeps the files it has
+    open locked (so they were skipped), but everything it had NOT opened yet
+    was deleted out from under the running program. The next import or icon
+    load after a Deep Clean then failed and the window vanished - consistent
+    with a Deep Clean that "just closed the app". Nothing the app is running
+    from, and nothing it saves to, is junk.
+    """
+    roots = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        roots.append(meipass)
+    if getattr(sys, "frozen", False):
+        try:
+            roots.append(os.path.dirname(sys.executable))
+        except Exception:
+            pass
+    try:
+        from app.config_paths import CONFIG_DIR
+        roots.append(str(CONFIG_DIR))             # config, logs, backups
+    except Exception:
+        pass
+    out = []
+    for r in roots:
+        try:
+            out.append(os.path.normcase(os.path.abspath(r)))
+        except Exception:
+            continue
+    return tuple(out)
+
+
+def _is_own_runtime(path: str, roots: Optional[tuple] = None) -> bool:
+    roots = _own_runtime_roots() if roots is None else roots
+    try:
+        p = os.path.normcase(os.path.abspath(path))
+    except Exception:
+        return False
+    return any(p == r or p.startswith(r + os.sep) for r in roots)
+
+
 def clean_folder_contents(ctx: TaskContext, folder_path: str, remove_root: bool = False,
                            extensions: Optional[List[str]] = None) -> int:
     bytes_freed = 0
@@ -815,12 +984,17 @@ def clean_folder_contents(ctx: TaskContext, folder_path: str, remove_root: bool 
     # The flag is ctx-carried (not a parameter) so every pure task
     # function (_clean_many callers) measures correctly with no edits.
     dry = bool(getattr(ctx, "dry_run", False))
+    # 2.5: opt-in Quarantine bin. When present, files are MOVED there instead
+    # of deleted (see the file loop below). None = ordinary deletes.
+    quarantine = getattr(ctx, "quarantine", None)
+    moved_to_quarantine = 0
 
     # Security guard (audit HIGH finding): os.walk(topdown=False) cannot
     # prune and does not treat Windows junctions as links — a junction
     # anywhere under folder_path redirected deletions into its target
     # (empirically verified). Walk top-down and skip reparse points.
     stopped = False
+    _own = _own_runtime_roots()       # never delete what we are running from
     for root, dirs, files in os.walk(folder_path, topdown=True, followlinks=False):
         # F-3 audit fix: the Stop button previously only killed the tracked
         # SUBPROCESS — this pure-Python walker kept deleting for minutes on
@@ -832,12 +1006,13 @@ def clean_folder_contents(ctx: TaskContext, folder_path: str, remove_root: bool 
             stopped = True
             break
         # never descend into junctions / symlinked dirs
-        dirs[:] = [d for d in dirs if not _is_reparse_point(os.path.join(root, d))]
+        dirs[:] = [d for d in dirs if not _is_reparse_point(os.path.join(root, d))
+                   and not _is_own_runtime(os.path.join(root, d), _own)]
         for f in files:
             if extensions and not any(f.lower().endswith(e.lower()) for e in extensions):
                 continue
             filepath = os.path.join(root, f)
-            if _is_reparse_point(filepath):
+            if _is_reparse_point(filepath) or _is_own_runtime(filepath, _own):
                 skipped += 1
                 continue
             if ctx.cancelled():
@@ -855,7 +1030,14 @@ def clean_folder_contents(ctx: TaskContext, folder_path: str, remove_root: bool 
                     if _is_reparse_point(filepath):
                         skipped += 1
                         continue
-                    os.remove(filepath)
+                    # 2.5: with the Quarantine bin active, move the file there
+                    # rather than deleting it. stash() returns False when it
+                    # cannot take the file (size cap, or a move error), and we
+                    # then delete as normal so the clean still cleans.
+                    if quarantine is not None and quarantine.stash(filepath):
+                        moved_to_quarantine += 1
+                    else:
+                        os.remove(filepath)
                 bytes_freed += size
             except (PermissionError, OSError, FileNotFoundError):
                 skipped += 1
@@ -898,6 +1080,16 @@ def clean_folder_contents(ctx: TaskContext, folder_path: str, remove_root: bool 
             ctx.log(f"  (skipped {skipped} unreadable files in {folder_path})")
         else:
             ctx.log(f"  (skipped {skipped} locked files in {folder_path})")
+    if moved_to_quarantine and not dry:
+        # Honesty: these bytes were moved, not reclaimed. Say so, and say how
+        # to actually get the space back, instead of letting the "freed"
+        # counter imply the disk is lighter than it is.
+        try:
+            ctx.log(f"  moved {moved_to_quarantine} file(s) under {folder_path} "
+                    "to the Quarantine bin — empty it in Settings to reclaim "
+                    "the space")
+        except Exception:
+            pass
     return bytes_freed
 
 
@@ -968,17 +1160,48 @@ def _reg_access(write: bool = True) -> int:
         return base
 
 
-def reg_set_value(ctx: TaskContext, hive: str, path: str, name: str, value, value_type: str = "REG_DWORD") -> bool:
+def _describe_reg_write_error(exc: BaseException) -> str:
+    """Turn a registry-write exception into an honest, specific reason.
+
+    3.3: every failure used to be reported as "Administrator rights may be
+    required", which sent users (and the audit) chasing permissions for causes
+    that had nothing to do with access — a KeyError on an unknown value type is
+    the exact bug that masked H-3. Split the common cases so the message names
+    the real cause.
+    """
+    if isinstance(exc, KeyError):
+        return (f"unknown registry value type {exc!r} "
+                "(internal error — NOT a permissions problem)")
+    if isinstance(exc, PermissionError) or getattr(exc, "winerror", None) == 5:
+        return ("access denied — run as Administrator, or a policy/ACL "
+                "protects this key")
+    if getattr(exc, "winerror", None) in (2, 3):
+        return "the key path could not be created (it does not exist)"
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _reg_set_value_ex(ctx: TaskContext, hive: str, path: str, name: str, value,
+                      value_type: str = "REG_DWORD"):
+    """Write a registry value. Returns (ok, reason) — `reason` is a specific,
+    user-facing explanation when ok is False, "" when it succeeded."""
+    # H-3 (HIGH) fix: callers may pass value_type=None (the Advanced tab's write
+    # specs and _VISUAL_EFFECTS_DEFAULTS use None to mean "the default DWORD").
+    # Because the parameter has a default, an EXPLICIT None bypassed it, and
+    # _TYPE_MAP[None] raised KeyError — which the except below logged as the
+    # misleading "Administrator rights may be required" message. Normalise
+    # falsy to the documented default here.
+    if not value_type:
+        value_type = "REG_DWORD"
     ctx.log(f"reg add {hive}\\{path} /v {name or '(Default)'} /d {value}")
     key = None
     try:
         root = _HIVES[hive]
         key = winreg.CreateKeyEx(root, path, 0, _reg_access(write=True))
         winreg.SetValueEx(key, name if name else None, 0, _TYPE_MAP[value_type], value)
-        return True
+        return True, ""
     except Exception as exc:
         ctx.log(f"  ! registry write failed: {exc}")
-        return False
+        return False, _describe_reg_write_error(exc)
     finally:
         if key is not None:
             try:
@@ -987,9 +1210,13 @@ def reg_set_value(ctx: TaskContext, hive: str, path: str, name: str, value, valu
                 pass
 
 
+def reg_set_value(ctx: TaskContext, hive: str, path: str, name: str, value, value_type: str = "REG_DWORD") -> bool:
+    return _reg_set_value_ex(ctx, hive, path, name, value, value_type=value_type)[0]
+
+
 def reg_set_value_checked(ctx: TaskContext, hive: str, path: str, name: str, value,
                           value_type: str = "REG_DWORD") -> None:
-    """reg_set_value that RAISES on failure (F-005).
+    """reg_set_value that RAISES on failure (F-005 / F-023).
 
     The run/revert engine counts any task that does not raise as
     'succeeded' and marks the tweak applied (the '✓ Active' badge).
@@ -998,15 +1225,21 @@ def reg_set_value_checked(ctx: TaskContext, hive: str, path: str, name: str, val
     never actually wrote (typical case: HKLM policy values in limited
     mode). This wrapper converts a failed write into an honest task
     failure, so the runner reports it and never marks it applied.
+
+    3.3: the message now carries the specific reason from the write
+    (_describe_reg_write_error) instead of always blaming Administrator
+    rights, so an unknown-type or missing-key failure is no longer
+    misreported as a permissions problem.
+
     Reverts in this codebase write the complete target state (they are
     not incremental undo), so a partially-applied task self-heals when
     the user re-runs it or runs Undo."""
-    if not reg_set_value(ctx, hive, path, name, value, value_type=value_type):
+    _ok, reason = _reg_set_value_ex(ctx, hive, path, name, value, value_type=value_type)
+    if not _ok:
         raise RuntimeError(
             f"Could not write {hive}\\{path}"
             + (f"\\{name}" if name else "")
-            + " — the change did NOT apply (Administrator rights may be "
-              "required, or policy is blocking the key). Nothing was marked "
+            + f" — {reason}. The change did NOT apply; nothing was marked "
               "as applied.")
 
 
@@ -1149,8 +1382,8 @@ def powercfg_query_indexes(ctx: TaskContext, subgroup: str, setting: str) -> "tu
     try:
         powercfg_exe = resolve_exe("powercfg")
         result = subprocess.run(
-            f'"{powercfg_exe}" /q scheme_current {sub} {set_guid}',
-            shell=True, capture_output=True, text=True, timeout=15,
+            [powercfg_exe, "/q", "scheme_current", str(sub), str(set_guid)],
+            capture_output=True, text=True, timeout=15,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         out = result.stdout or ""
@@ -1309,8 +1542,9 @@ def _is_explorer_running():
     try:
         tasklist_exe = resolve_exe("tasklist")
         out = subprocess.check_output(
-            f'"{tasklist_exe}" /fi "imagename eq explorer.exe" /fo csv /nh',
-            shell=True, text=True, timeout=5, stderr=subprocess.DEVNULL,
+            [tasklist_exe, "/fi", "imagename eq explorer.exe", "/fo", "csv",
+             "/nh"],
+            text=True, timeout=5, stderr=subprocess.DEVNULL,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         return "explorer.exe" in out.lower()
@@ -1403,32 +1637,53 @@ def restart_explorer(ctx: TaskContext) -> bool:
     return False
 
 
+def restore_point_create_ps(description: str = "Cleaner Tool - safety point") -> str:
+    """PowerShell that creates one System Restore checkpoint and prints a
+    LANGUAGE-NEUTRAL status token.
+
+    B-056: Windows returns a LOCALIZED error when the 24-hour throttle trips
+    ("... 1440 minutes ..." exists only in English), so matching that text
+    broke on non-English systems — a throttled create was reported as a hard
+    failure. Instead of parsing text, the script asks the API how old the
+    newest point is and prints RESTORE_THROTTLED itself; on success it prints
+    RESTORE_OK. Callers classify on those tokens first and only fall back to
+    text matching for genuinely unexpected errors.
+    """
+    safe = (description or "Cleaner Tool - safety point").replace("'", "''")
+    return (
+        "$ErrorActionPreference='Stop';"
+        "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+        "$last = Get-ComputerRestorePoint | Sort-Object CreationTime "
+        "-Descending | Select-Object -First 1;"
+        "if ($last -and ((Get-Date) - $last.CreationTime).TotalMinutes -lt 1440) "
+        "{ Write-Output 'RESTORE_THROTTLED'; return };"
+        "Checkpoint-Computer -Description '%s' -RestorePointType MODIFY_SETTINGS;"
+        "Write-Output 'RESTORE_OK'" % safe
+    )
+
+
 def create_restore_point(ctx: TaskContext, description: str = "GamerOpt Cleaner - before changes") -> bool:
     ctx.set_status("Creating a System Restore point (safety net)...")
     # audit hardening: description flows into a shell=True string — pass it
     # as an argv list (shell=False) so no escaping/quoting games are needed.
-    ps_script = (
-        f"Checkpoint-Computer -Description '{description.replace(chr(39), chr(39)*2)}' "
-        "-RestorePointType MODIFY_SETTINGS"
-    )
+    ps_script = restore_point_create_ps(description)
     out: list = []
     rc = run_cmd(ctx, ["powershell", "-NoProfile", "-Command", ps_script],
                  shell=False, timeout=120, collect=out)
-    if rc == 0:
-        ctx.log("Restore point created successfully.")
-        return True
-    # BUG-013: Windows allows only ONE System Restore checkpoint per 24 hours.
-    # Checkpoint-Computer exits non-zero when throttled, and this used to fall
-    # straight through to the "System Protection may be off" failure below --
-    # a wrong diagnosis, plus an instruction to go enable a setting that is
-    # very likely already on. warnings.py already promises this case is
-    # "shown as info, not failure", so raise the skip the run engine
-    # already understands instead of inventing a third state here.
-    blob = "\n".join(out).lower()
-    if "1440 minutes" in blob or "restore point cannot be created" in blob:
+    blob = "\n".join(out)
+    # BUG-013 / B-056: Windows allows only ONE System Restore checkpoint per 24
+    # hours. The script prints RESTORE_THROTTLED (language-neutral) when the
+    # newest point is younger than that, so a throttled create is a skip, not a
+    # failure. The English phrasings are kept only as a fallback.
+    low = blob.lower()
+    if "restore_throttled" in low or "1440 minutes" in low or \
+            "restore point cannot be created" in low:
         ctx.log("  i Skipped: Windows allows only one restore point per 24 hours,")
         ctx.log("  i and one was already created today. Nothing to do.")
         raise TaskSkipped("a restore point was already created in the last 24h")
+    if rc == 0 or "restore_ok" in low:
+        ctx.log("Restore point created successfully.")
+        return True
     ctx.log("  ! Could not create a restore point (System Protection may be off for this drive).")
     ctx.log("  ! Enable it: Settings > System > About > System protection, then retry.")
     return False

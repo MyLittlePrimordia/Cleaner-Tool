@@ -61,8 +61,8 @@ def enable_dpi_awareness() -> bool:
 
     Must run BEFORE any Tk window exists. Tk 9 does not opt in by itself,
     and calling this after Tk init has no effect, which is why it is an
-    import-time side effect on every entry path (app/__main__.py, and now
-    the smoke harness via tools/smoke_gui.py).
+    import-time side effect on every entry path (app/__main__.py, before
+    the GUI is imported).
 
     Best-effort by design: ask for Per-Monitor V2, fall back to
     system-DPI aware on older Windows, then fall back to nothing at all.

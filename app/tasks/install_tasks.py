@@ -299,18 +299,43 @@ def install_xbox_stack(ctx: TaskContext):
 
 
 def install_game_bar(ctx: TaskContext):
-    """Xbox Game Bar — the Win+G overlay (clips, screenshots, perf stats)."""
-    if not has_network():
-        raise RuntimeError("No internet connection — Game Bar needs to download.")
+    """Xbox Game Bar — the Win+G overlay (clips, screenshots, perf stats).
+
+    Installing the app is not enough on stripped Windows: its capture values
+    ship as 0, so the screenshot/record buttons arrive GREYED OUT. So after the
+    app is in place this applies the same Game Bar *capture* fix the Tweak tab
+    exposes (see gamebar_capture in tweak_tasks) — snapshotted there, so it is
+    undoable from that tab even though this installer is not."""
     if cap.has_game_bar():
-        ctx.log("Game Bar already installed — nothing to do.")
-        return
-    _ensure_winget(ctx)
-    _winget_install(ctx, "9NZKPSTSNW4P", "Xbox Game Bar")
-    cap.invalidate_caches()
-    if not cap.has_game_bar():
-        raise RuntimeError("Game Bar install did not verify — try rebooting and running again.")
-    ctx.log("Game Bar installed and verified.")
+        ctx.log("Game Bar already installed.")
+    else:
+        if not has_network():
+            raise RuntimeError("No internet connection — Game Bar needs to download.")
+        _ensure_winget(ctx)
+        _winget_install(ctx, "9NZKPSTSNW4P", "Xbox Game Bar")
+        cap.invalidate_caches()
+        if not cap.has_game_bar():
+            raise RuntimeError("Game Bar install did not verify — try rebooting and running again.")
+        ctx.log("Game Bar installed and verified.")
+    _apply_gamebar_capture_fix(ctx)
+
+
+def _apply_gamebar_capture_fix(ctx: TaskContext) -> None:
+    """Turn on Game Bar screenshots/recording after the app is present.
+
+    Best-effort by design: this runs on the tail of an install that already
+    succeeded, so a failure here must never fail the install. The fix is the
+    gamebar_capture tweak's own apply, so it snapshots the prior values and can
+    be undone (or redone) from the Tweak tab; mark_tweak_applied is what makes
+    that tab show it as applied."""
+    try:
+        from app.tasks.tweak_tasks import apply_gamebar_capture
+        from app.config_persist import mark_tweak_applied
+        apply_gamebar_capture(ctx)
+        mark_tweak_applied("gamebar_capture")
+    except Exception as exc:  # noqa: BLE001 - the install itself already passed
+        ctx.log(f"  (Game Bar capture fix not applied: {exc})")
+        ctx.log("  Turn it on from the Tweak tab: 'Game Bar Screenshots & Clips'.")
 
 
 def install_video_codecs(ctx: TaskContext):
@@ -1487,42 +1512,205 @@ def install_wsl_ubuntu(ctx: TaskContext):
 # is slow, so it is computed once per process, in a worker thread)
 _INSTALLED_CACHE: list = [None]   # [set-of-lowercase-ids-or-None]
 
+# M-2 fix: MSSTORE product ids NEVER appear as an id token in `winget list`
+# (Store apps print as `MSIX\<PackageFamilyName>_<ver>_<arch>__<hash>`), so the
+# token-membership match below can never badge them. Match the catalog's Store
+# apps by an unambiguous display-name substring instead, as a FALLBACK.
+#
+# 1.3 (durable fix): a store id does not appear in `winget export`/`winget list`,
+# but the app's MSIX package identity Name DOES appear via `Get-AppxPackage`, so
+# `_MSSTORE_IDENTITY` below badges a Store app EXACTLY. The name hints remain for
+# a Store id with no MSIX identity (NVIDIA App is Win32-packaged and the Store
+# API names no package for it) and for hosts where Get-AppxPackage is missing.
+_MSSTORE_NAME_HINTS = {
+    "9NKSQGP7F2NH": ("whatsapp",),
+    "9NBLGGH30XJ3": ("xbox accessories",),
+    "9P4CLT2RJ1RS": ("musicbee",),
+    "XP8CLZL93F5Z4P": ("nvidia app",),
+}
 
-def get_installed_ids(refresh: bool = False) -> "set[str] | None":
-    """Set of winget IDs already installed on this PC (lowercased), or
-    None if not (yet) known. Cached per-process; `refresh=True` recomputes.
-    Uses `winget list` output which the unified installer's log format
-    keeps stable enough to parse line-by-line."""
-    if _INSTALLED_CACHE[0] is not None and not refresh:
-        return _INSTALLED_CACHE[0]
+# store_id -> MSIX package identity Name(s), lower-cased. Taken from Microsoft's
+# Store product API (`Payload.PackageFamilyNames`, publisher-hash suffix
+# stripped) — the same identity Windows reports through Get-AppxPackage. This is
+# static reference data, never fetched at runtime. An id with no entry is simply
+# not badged this way (the name hints still cover it).
+_MSSTORE_IDENTITY = {
+    "9MSMLRH6LZF3": ("microsoft.windowsnotepad",),          # Windows Notepad
+    "9MV0B5HZVK9Z": ("microsoft.gamingapp",),               # Xbox
+    "9MVZQVXJBQ9V": ("microsoft.av1videoextension",),       # AV1 Video Extension
+    "9MZ95KL8MR0L": ("microsoft.screensketch",),            # Snipping Tool
+    "9N4D0MSMP0PT": ("microsoft.vp9videoextensions",),      # VP9 Video Extensions
+    "9N5TDP8VCMHS": ("microsoft.webmediaextensions",),      # Web Media Extensions
+    "9N95Q1ZZPMH4": ("microsoft.mpeg2videoextension",),     # MPEG-2 Video Extension
+    "9NBLGGH30XJ3": ("microsoft.xboxdevices",),             # Xbox Accessories
+    "9NBLGGH4QGHW": ("microsoft.microsoftstickynotes",),    # Sticky Notes
+    "9NCTDW2W1BH8": ("microsoft.rawimageextension",),       # Raw Image Extension
+    "9NKSQGP7F2NH": ("5319275a.whatsappdesktop",),          # WhatsApp
+    "9NMPJ99VJBWV": ("microsoft.yourphone",),               # Phone Link
+    "9NZKPSTSNW4P": ("microsoft.xboxgamingoverlay",),       # Game Bar
+    "9P4CLT2RJ1RS": ("50072stevenmayall.musicbee",),        # MusicBee
+    "9P7BP5VNWKX5": ("microsoftcorporationii.quickassist",),  # Quick Assist
+    "9PCFS5B6T72H": ("microsoft.paint",),                   # Paint
+    "9PG2DK419DRG": ("microsoft.webpimageextension",),      # WebP Image Extension
+    "9PMMSR1CGPWG": ("microsoft.heifimageextension",),      # HEIF Image Extension
+    "9WZDNCRFHVN5": ("microsoft.windowscalculator",),       # Calculator
+    "9WZDNCRFHWKN": ("microsoft.windowssoundrecorder",),    # Sound Recorder
+    "9WZDNCRFJ3PR": ("microsoft.windowsalarms",),           # Clock
+    "9WZDNCRFJ3PT": ("microsoft.zunemusic",),               # Media Player
+    "9WZDNCRFJBBG": ("microsoft.windowscamera",),           # Camera
+    "9WZDNCRFJBH4": ("microsoft.windows.photos",),          # Photos
+}
+
+
+def _installed_package_names() -> "set[str] | None":
+    """Lower-cased Store/MSIX package identity Names installed for this user
+    (`microsoft.windowsnotepad`, `5319275a.whatsappdesktop`, ...), or None if
+    Windows could not be asked.
+
+    Read-only: `Get-AppxPackage` is the same API the Settings > Apps list uses.
+    Returns None (not an empty set) on failure so an "unknown" never reads as
+    "nothing installed"."""
     import subprocess as _sp
     try:
-        out = _sp.run(
-            [resolve_exe("winget"), "list", "--accept-source-agreements", "--disable-interactivity"],
-            capture_output=True, text=True, timeout=120,
-            creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
+        proc = _sp.run(
+            [resolve_exe("powershell"), "-NoProfile", "-NonInteractive",
+             "-Command",
+             "Get-AppxPackage | Select-Object -ExpandProperty Name"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=60, creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
         )
     except Exception:
         return None
-    # H7: match tokens against the KNOWN catalog/Store IDs instead of
-    # guessing the Id column position. The old heuristic read parts[-2]
-    # (the Version/Available column when a Source column is present, so
-    # versions like "1.2.3" were recorded as IDs) and its Store-ID branch
-    # (`isalnum and len==12 and isdigit`) only accepted 12-digit numbers —
-    # real Store IDs (e.g. 9MV0B5HZVK9Z) never matched. Token membership
-    # is immune to column shifts and locale.
+    if getattr(proc, "returncode", 0) != 0:
+        return None
+    out = proc.stdout or ""
+    return {line.strip().lower() for line in out.splitlines() if line.strip()}
+
+
+def _run_winget(args, timeout: int = 120) -> "str | None":
+    """Run winget and return its stdout as text, or None on failure.
+
+    3.2: force a UTF-8 decode. winget emits UTF-8; under a non-English console
+    codepage the default locale decoding can raise UnicodeDecodeError or mojibake
+    the package ids. errors='replace' keeps a stray byte from aborting the parse.
+    """
+    import subprocess as _sp
+    try:
+        out = _sp.run(
+            [resolve_exe("winget"), *args],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout,
+            creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
+        )
+        return out.stdout or ""
+    except Exception:
+        return None
+
+
+def _installed_ids_from_export() -> "set[str] | None":
+    """Installed winget IDs from `winget export` JSON.
+
+    3.1: exact PackageIdentifiers grouped by source — no column or locale
+    parsing at all. This is what removes the M-2/M-4 *class* of bugs for
+    winget-source apps. Returns a lowercased set, or None when export is
+    unavailable/unsupported (older winget) so the caller falls back to the text
+    listing. An EMPTY set is a valid, definite answer (nothing installed via
+    winget) and is NOT the same as None.
+    """
+    import json
+    import os as _os
+    import tempfile
+    path = None
+    try:
+        fd, path = tempfile.mkstemp(suffix=".json", prefix="ct_winget_export_")
+        _os.close(fd)
+        text = _run_winget(
+            ["export", "--include-versions", "--accept-source-agreements", "-o", path])
+        if text is None:
+            return None
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict):
+            return None
+        ids = set()
+        for src in data.get("Sources", []) or []:
+            if not isinstance(src, dict):
+                continue
+            for pkg in src.get("Packages", []) or []:
+                if not isinstance(pkg, dict):
+                    continue
+                pid = str(pkg.get("PackageIdentifier", "")).strip().lower()
+                if pid:
+                    ids.add(pid)
+        return ids
+    except Exception:
+        return None
+    finally:
+        try:
+            if path and _os.path.isfile(path):
+                _os.remove(path)
+        except Exception:
+            pass
+
+
+def get_installed_ids(refresh: bool = False) -> "set[str] | None":
+    """Set of winget IDs already installed on this PC (lowercased), or None
+    if not (yet) known. Cached per-process; `refresh=True` recomputes.
+
+    3.1: the primary source is now `winget export` JSON (exact ids, no column/
+    locale parsing). The `winget list` text parse is kept only as a fallback
+    when export is unavailable, plus the Store display-name hints (Store apps
+    are absent from the export). Both winget calls are cached once per process,
+    in a worker thread."""
+    if _INSTALLED_CACHE[0] is not None and not refresh:
+        return _INSTALLED_CACHE[0]
+
+    # H7: match tokens against the KNOWN catalog/Store IDs instead of guessing
+    # the Id column position. The old heuristic read parts[-2] (the Version/
+    # Available column when a Source column is present, so versions like
+    # "1.2.3" were recorded as IDs). Token membership is immune to column
+    # shifts and locale, so it survives as the text FALLBACK below.
     try:
         from app.app_catalog import APP_CATALOG, MSSTORE_IDS
-        known = {a.get("id", "").lower() for a in APP_CATALOG if not a.get("id", "").startswith("manual:")}
+        known = {a.get("id", "").lower() for a in APP_CATALOG
+                 if not a.get("id", "").startswith("manual:")}
         known |= {m.lower() for m in MSSTORE_IDS}
     except Exception:
         known = set()
-    found = set()
-    for line in (out.stdout or "").splitlines():
-        for tok in line.split():
-            t = tok.strip().strip(",;").lower()
-            if t and t in known:
-                found.add(t)
+
+    exported = _installed_ids_from_export()
+    found = set(exported) if exported is not None else set()
+
+    listing = _run_winget(
+        ["list", "--accept-source-agreements", "--disable-interactivity"])
+    if listing is not None:
+        if exported is None:
+            for line in listing.splitlines():
+                for tok in line.split():
+                    t = tok.strip().strip(",;").lower()
+                    if t and t in known:
+                        found.add(t)
+        # M-2 fix: badge Store apps by name (their product id is absent from
+        # the listing AND from the export — see _MSSTORE_NAME_HINTS).
+        low_out = listing.lower()
+        for sid, hints in _MSSTORE_NAME_HINTS.items():
+            if any(h in low_out for h in hints):
+                found.add(sid.lower())
+
+    if exported is None and listing is None:
+        return None  # nothing worked — keep the honest "unknown" contract
+
+    # 1.3: exact Store-app detection. Get-AppxPackage reports the package
+    # identity Name of every Store/MSIX app, so a store id is badged only when
+    # its real package is installed — no locale or display-name guessing. This
+    # unions with the name hints above: an app the hints miss is now caught
+    # exactly, and a hint's false positive is only ever additive.
+    pkg_names = _installed_package_names()
+    if pkg_names is not None:
+        for sid, identities in _MSSTORE_IDENTITY.items():
+            if any(i in pkg_names for i in identities):
+                found.add(sid.lower())
+
     _INSTALLED_CACHE[0] = found
     return found
 
@@ -1545,9 +1733,20 @@ def _is_upgrade_footer_line(low: str) -> bool:
     # startswith("the following")` — but the parenthesized form can't be
     # misread (or re-ordered by a future edit into `(A or B) and C`).
     # low[0] is safe: callers only pass non-empty stripped lines.
-    return (low.startswith("no ")
-            or ("upgrade" in low and low[0].isdigit())
-            or low.startswith("the following"))
+    if low.startswith("the following"):
+        return True
+    if "upgrade" in low and low[0].isdigit():
+        return True
+    # M-4 fix: a genuine "No ..." footer always names packages/upgrades/versions
+    # ("No installed package found...", "No applicable update found.", "No newer
+    # package versions are available..."). Requiring one of those words stops an
+    # app whose NAME starts with "No " (e.g. "No Man's Sky") from being discarded
+    # as a footer and lost from the "Update Apps (N)" count.
+    if low.startswith("no ") and any(
+            w in low for w in ("upgrade", "package", "version", "applicable",
+                               "installed", "update", "found")):
+        return True
+    return False
 
 
 def get_upgradable_count(refresh: bool = False) -> "int | None":
@@ -1573,7 +1772,8 @@ def get_upgradable_count(refresh: bool = False) -> "int | None":
     try:
         out = _sp.run(
             [resolve_exe("winget"), "upgrade", "--accept-source-agreements", "--disable-interactivity"],
-            capture_output=True, text=True, timeout=120,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=120,
             creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
         )
     except Exception:
@@ -1796,7 +1996,7 @@ TASKS = [
     Task("install_store", "Install Microsoft Store", "Adds the Store to stripped Windows like LTSC (takes several minutes)", install_microsoft_store, default=False, admin_required=True, group="LTSC Missing Components"),
     Task("install_winget_unigetui", "Install winget + UniGetUI", "Bootstraps winget if missing, then adds the UniGetUI update GUI — no terminal needed", install_winget_unigetui, default=False, admin_required=False, group="LTSC Missing Components"),
     Task("install_xbox_stack", "Install Xbox & Game Pass", "Adds Xbox app, Gaming Services and sign-in needed for Game Pass games", install_xbox_stack, default=False, admin_required=True, group="LTSC Missing Components"),
-    Task("install_game_bar", "Install Game Bar (Win+G)", "Adds the Win+G overlay for clips, screenshots and performance info", install_game_bar, default=False, admin_required=True, group="LTSC Missing Components"),
+    Task("install_game_bar", "Install Game Bar (Win+G)", "Adds the Win+G overlay for clips, screenshots and performance info, and enables its screenshots/recording", install_game_bar, default=False, admin_required=True, group="LTSC Missing Components"),
     Task("install_codecs_bundle", "Install Windows Codecs (AV1, VP9 + Web Media)", "One click for the codecs behind broken or black in-game cutscenes", install_codecs_bundle, default=False, admin_required=False, group="LTSC Missing Components"),
     Task("install_webview2", "Install WebView2 Runtime", "Evergreen runtime required by EA App, CurseForge, Battle.net and more", install_webview2, default=False, admin_required=False, group="LTSC Missing Components"),
     Task("install_camera", "Camera App", "Adds the Windows Camera app for webcam photos and video", install_camera_app, default=False, admin_required=False, group="LTSC Missing Components"),

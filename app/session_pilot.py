@@ -214,20 +214,21 @@ class SessionPilot:
         self._active_hit = None
         self._stop = False
         self._thread = None
-        # BUG-023 generation counter. `_gen` is the generation of the run that
-        # is CURRENTLY polling; `_generation` is the high-water mark handed out
-        # to each start(). A thread only ever speaks for its own `_gen`, so a
-        # consumer can compare and drop anything stale.
-        self._generation = 0
-        self._gen = 0
-        self._gen_lock = threading.Lock()
+        # Serialises start()/stop(). Without it, two concurrent start() calls
+        # can both observe "no live thread" and each spawn a watcher (two
+        # pilots clobbering each other's apply/revert), and a stop() can
+        # interleave with a start() — which would clear _stop and let the old
+        # thread keep running. The stale-callback guard itself is the `_stop`
+        # re-check in tick(); the generation counter that used to live here was
+        # written but never read, so it was removed.
+        self._lifecycle_lock = threading.Lock()
         # matching state: basenames always; path-verified dirs per basename
         self._watched_names = set()
         self._watched_dirs = {}   # basename -> {normparent, ...}
         if get_processes is None:
             # F1-3: resolve the module-global at CALL time, not construction.
             # The sync tests/harness swap session_pilot.default_get_processes
-            # AFTER __init__ (smoke_async does exactly that), and a patched
+            # AFTER __init__, and a patched
             # source shaped like `lambda timeout=10:` must keep working —
             # hence the TypeError fallback to the legacy call signature.
             def _default_source(timeout: int = 10):
@@ -375,34 +376,27 @@ class SessionPilot:
 
     def start(self, interval_s: float = POLL_INTERVAL_S) -> bool:
         """Begin background polling. Returns False if already running."""
-        if self._thread is not None and self._thread.is_alive():
-            return False
-        self._stop = False
-        # BUG-023: every start() is a new GENERATION. Anything a previous
-        # generation still produces - a late tick, an already-queued message -
-        # can be recognised as stale and dropped, instead of the code having to
-        # bet that stop() was thorough enough. Cheap, and it makes the
-        # "stop() actually stopped" property checkable rather than assumed.
-        with self._gen_lock:
-            self._generation += 1
-            self._gen = self._generation
+        with self._lifecycle_lock:
+            if self._thread is not None and self._thread.is_alive():
+                return False
+            self._stop = False
 
-        def _loop():
-            while not self._stop:
-                self.tick()
-                for _ in range(int(max(1.0, interval_s) * 10)):
-                    if self._stop:
-                        break
-                    time.sleep(0.1)
+            def _loop():
+                while not self._stop:
+                    self.tick()
+                    for _ in range(int(max(1.0, interval_s) * 10)):
+                        if self._stop:
+                            break
+                        time.sleep(0.1)
 
-        try:
-            self._thread = threading.Thread(target=_loop, daemon=True,
-                                            name="SessionPilot")
-            self._thread.start()
-            return True
-        except Exception:
-            self._thread = None
-            return False
+            try:
+                self._thread = threading.Thread(target=_loop, daemon=True,
+                                                name="SessionPilot")
+                self._thread.start()
+                return True
+            except Exception:
+                self._thread = None
+                return False
 
     def stop(self, join_timeout: float = None) -> bool:
         """Ask the watcher to finish, and WAIT for it to actually finish.
@@ -428,23 +422,26 @@ class SessionPilot:
 
         Returns True if the thread is confirmed dead.
         """
-        self._stop = True
-        th, self._thread = self._thread, None
-        if th is None:
+        # Hold the lifecycle lock across the whole stop so a concurrent start()
+        # cannot clear _stop mid-join and resurrect the old thread.
+        with self._lifecycle_lock:
+            self._stop = True
+            th, self._thread = self._thread, None
+            if th is None:
+                return True
+            try:
+                if th.is_alive() and th is not threading.current_thread():
+                    if join_timeout is None:
+                        # cover an in-flight poll: the process source's own
+                        # timeout, plus slack for the ctypes path pass
+                        join_timeout = POLL_TIMEOUT_S + 5.0
+                    th.join(timeout=join_timeout)
+                    if th.is_alive():
+                        # Still running. Report it rather than pretending.
+                        return False
+            except Exception:
+                return False
             return True
-        try:
-            if th.is_alive() and th is not threading.current_thread():
-                if join_timeout is None:
-                    # cover an in-flight poll: the process source's own
-                    # timeout, plus slack for the ctypes path pass
-                    join_timeout = POLL_TIMEOUT_S + 5.0
-                th.join(timeout=join_timeout)
-                if th.is_alive():
-                    # Still running. Report it rather than pretending.
-                    return False
-        except Exception:
-            return False
-        return True
 
     def running(self) -> bool:
         try:

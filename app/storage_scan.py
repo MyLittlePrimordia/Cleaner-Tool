@@ -144,8 +144,17 @@ def measure_clean_tasks(ctx: TaskContext, keys) -> dict:
         if ctx.cancelled():
             break
         task = by_key.get(key)
-        if task is None or key not in SCAN_ALLOWLIST:
+        if key not in SCAN_ALLOWLIST:
+            # A key outside the allowlist is deliberately NOT measured; callers
+            # report those to the user as "skipped", and 0 is the documented
+            # contract for them (see tasktab's preview).
             out[key] = 0
+            continue
+        if task is None:
+            # Allowlisted but no task resolved for it: we genuinely could not
+            # measure it. That is None (unknown), never 0 — the old code lumped
+            # this with the skipped case and painted a real category as empty.
+            out[key] = None
             continue
         try:
             out[key] = task.run(ctx) or 0

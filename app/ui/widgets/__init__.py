@@ -6,21 +6,37 @@ is stdlib-only). Each module is extracted verbatim from app/gui.py and
 depends only on app.ui.theme.
 """
 from app.ui.widgets.button import AnimatedButton
+from app.ui.widgets.detail_pane import DetailPane
+from app.ui.widgets.empty_state import EmptyState
 from app.ui.widgets.entry import RoundedEntry
 from app.ui.widgets.gauge import GaugeDial
 from app.ui.widgets.progress import AnimatedProgressBar
+from app.ui.widgets.progress_strip import ProgressStrip
+from app.ui.widgets.rounded_card import RoundedCard
 from app.ui.widgets.scroll import ScrollableRoundedPanel
+from app.ui.widgets.search_field import SearchField
 from app.ui.widgets.segmented import SegmentedTabs
+from app.ui.widgets.split_shell import SplitShell
+from app.ui.widgets.stat_tile import StatTile
 from app.ui.widgets.toggle import ToggleSwitch
+from app.ui.widgets.tool_row import ToolRow
 from app.ui.widgets.tooltip import Tooltip
 
 __all__ = [
     "AnimatedButton",
     "AnimatedProgressBar",
+    "DetailPane",
+    "EmptyState",
     "GaugeDial",
+    "ProgressStrip",
+    "RoundedCard",
     "RoundedEntry",
     "ScrollableRoundedPanel",
+    "SearchField",
     "SegmentedTabs",
+    "SplitShell",
+    "StatTile",
     "ToggleSwitch",
+    "ToolRow",
     "Tooltip",
 ]

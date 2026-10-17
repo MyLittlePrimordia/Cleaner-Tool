@@ -163,6 +163,14 @@ def icon_ppm_bytes(icon_spec, size=20, bg_rgb=(30, 30, 30)):
             return None
         bgra, w, h = _extract_icon_rgba(path, index)
         if not bgra:
+            # The file exists but carries no icon resource of its own -
+            # plenty of service/redist binaries do not, and ExtractIconEx
+            # then returns nothing, leaving the row blank. Ask the shell
+            # for the icon it would show for this file (the same generic
+            # application icon Explorer draws) so the row is never empty.
+            if os.path.isfile(path):
+                bgra, w, h = _shell_icon_bgra(path)
+        if not bgra:
             return None
         rgb = _composite_rgb(bgra, w, h, bg_rgb)
         if not rgb:
@@ -216,6 +224,47 @@ class _ICONINFO(ctypes.Structure):
         ("hbmMask", ctypes.c_void_p),
         ("hbmColor", ctypes.c_void_p),
     ]
+
+
+class _SHFILEINFO(ctypes.Structure):
+    # SHFILEINFOW: the struct SHGetFileInfoW fills with an icon handle.
+    _fields_ = [
+        ("hIcon", ctypes.c_void_p),
+        ("iIcon", ctypes.c_int),
+        ("dwAttributes", ctypes.c_ulong),
+        ("szDisplayName", ctypes.c_wchar * 260),
+        ("szTypeName", ctypes.c_wchar * 80),
+    ]
+
+
+def _shell_icon_bgra(path):
+    """-> (bgra_bytes, w, h) for the icon the SHELL shows for `path`.
+
+    Fallback for files that carry no icon resource of their own (many
+    service/redist binaries): SHGetFileInfoW returns the same icon
+    Explorer would draw - including the generic application icon - so the
+    row is never blank. Windows-only; returns (None, 0, 0) on any failure.
+    """
+    try:
+        shell32 = ctypes.windll.shell32
+        user32 = ctypes.windll.user32
+        SHGFI_ICON = 0x000000100
+        SHGFI_SMALLICON = 0x000000001
+        info = _SHFILEINFO()
+        res = shell32.SHGetFileInfoW(
+            ctypes.c_wchar_p(path), ctypes.c_uint(0), ctypes.byref(info),
+            ctypes.sizeof(info), SHGFI_ICON | SHGFI_SMALLICON)
+        if not res or not info.hIcon:
+            return None, 0, 0
+        try:
+            return _hicon_to_bgra(info.hIcon)
+        finally:
+            try:
+                user32.DestroyIcon(info.hIcon)
+            except Exception:
+                pass
+    except Exception:
+        return None, 0, 0
 
 
 class _BITMAP(ctypes.Structure):

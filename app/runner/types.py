@@ -71,8 +71,8 @@ OUTCOME_STATES = frozenset({RunState.DONE, RunState.ERROR})
 LIVE_STATES = frozenset(RunState) - OUTCOME_STATES
 
 #: Legal transitions of the LIVE state, i.e. of `Application._state`.
-#: Anything not listed here is a bug, and tools/verify_run_state.py walks
-#: every edge.
+#: Anything not listed here is a bug; this table is the single source of
+#: truth for which edges exist.
 #:
 #: DONE and ERROR are deliberately absent as targets: they are terminal
 #: classifications of a finished run, reported by `Application.last_run_outcome`

@@ -22,7 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Iterable, Optional
 
-from app.utils import TaskCancelled, TaskSkipped
+from app.utils import TaskCancelled, TaskSkipped, TaskContext
 
 # The five outcomes. Strings rather than an Enum because the GUI's existing
 # call sites compare against literals and the tuple shape is part of its
@@ -163,3 +163,23 @@ def run_batch(ctx, tasks: Iterable, mode: str = "run", strict_ok: bool = True,
         if outcome.stopped:
             break
     return summary
+
+
+def print_context(log_prefix: str = "[AUTO]",
+                  status_prefix: str = "[AUTO STATUS]") -> TaskContext:
+    """The headless scheduler's TaskContext: logs print to stdout.
+
+    ARCH-004 (3.4): `run_auto_clean` and `run_auto_update` each defined their own
+    `AutoCtx` with identical `_log`/`_set_status` bodies (plus `log`/`set_status`
+    overrides the dataclass's instance attributes already shadowed, so they were
+    dead). One definition lives here now so the two headless paths cannot drift;
+    only the print prefixes differ. `cancelled` is always False — a scheduled run
+    has no user to press Stop.
+    """
+    def _log(msg: str) -> None:
+        print(f"{log_prefix} {msg}")
+
+    def _set_status(msg: str) -> None:
+        print(f"{status_prefix} {msg}")
+
+    return TaskContext(log=_log, set_status=_set_status, cancelled=lambda: False)

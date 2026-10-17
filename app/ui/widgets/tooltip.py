@@ -59,8 +59,20 @@ class Tooltip:
                 except Exception:
                     pass
 
-        enter_id = widget.bind("<Enter>", self._on_enter)
-        leave_id = widget.bind("<Leave>", self._hide)
+        # add="+" on the hover pair. This used to bind them WITHOUT add, which
+        # silently wiped any <Enter>/<Leave> the widget already had - and the
+        # app has two of those: ToolRow's hover tint, and the disclosure-card
+        # hover in the health report. Both had to be installed AFTER the
+        # Tooltip and to know about a house rule that existed only in a
+        # comment. Appending makes the ordering irrelevant instead.
+        #
+        # Safe against BUG-012 above: with add="+" tkinter still returns the
+        # funcid of the script it appended, so the previous instance's
+        # commands are still retirable by name. Verified: bind() with '+'
+        # returns the new funcid and deletecommand removes exactly that
+        # script, leaving the earlier ones intact.
+        enter_id = widget.bind("<Enter>", self._on_enter, add="+")
+        leave_id = widget.bind("<Leave>", self._hide, add="+")
         # F8: a destroyed widget must not leave a pending timer behind --
         # Tk after-ids outlive the widget that scheduled them, so the timer
         # is cancelled here (add="+": never wipe another <Destroy> handler).
@@ -96,7 +108,7 @@ class Tooltip:
             root = widget.winfo_toplevel()
             cls._shared_tip = tw = tk.Toplevel(root)
             tw.wm_overrideredirect(True)
-            tw.configure(bg=COLORS["hairline"])
+            # NOT hairline: that is a border colour, and a #242424 tooltip\n            # window on a true-black canvas is a barely-visible smudge that\n            # happens to contain the text. A tooltip is a raised surface - it\n            # gets the surface tier, with hairline as its own edge.\n            tw.configure(bg=COLORS["surface"])
             cls._shared_label = tk.Label(
                 tw, text="", bg=COLORS["surface"], fg=COLORS["text"],
                 font=(F, 9), justify="left", wraplength=420,

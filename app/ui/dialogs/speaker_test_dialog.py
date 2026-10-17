@@ -10,20 +10,29 @@ from __future__ import annotations
 import threading
 
 import tkinter as tk
+
+from app.ui.widgets.dropdown import M3Dropdown
 from tkinter import ttk, messagebox
-from app.ui.base import ThemedModal, Tooltip
+from app.ui.base import Tooltip
+from app.ui.dialogs._tool_page import ToolPage
 from app.ui.theme import COLORS, F, TAB_ACCENTS, _hex_lerp
 from app.ui.widgets import AnimatedButton
 
 
-class SpeakerTestDialog(ThemedModal):
+class SpeakerTestDialog(ToolPage):
     """Speaker Test: 8-direction surround check (Dolby-Atmos style) on
     any connected output. Tones are real stereo WAVs panned in code
-    (front = true pan, side/rear = level-stepped simulation, stated
+    (front = true pan, side/rear = simulated placement, stated
     in-UI). The picker chooses which device is TESTED — playback goes
     straight to it via waveOut, so the Windows default is never
     flipped. Unmatched devices fall back to default output, flagged
-    honestly in the status line."""
+    honestly in the status line.
+
+    REDESIGN 2026-10: on the shared ToolPage shell — the headline moves
+    into the Header banner, the L/R and 3x3 direction buttons stay in
+    self.content, and the footer carries the Sweep/Stop actions with the
+    'Playing/Could not play' line on self.status. Audio engine untouched.
+    """
 
     _ARROWS = {"FL": "\u2196", "FC": "\u2191", "FR": "\u2197",
                "SL": "\u2190", "SR": "\u2192",
@@ -55,17 +64,17 @@ class SpeakerTestDialog(ThemedModal):
         self._audio_inbox = []
         self._audio_poll_after = None
         self._dir_btns = {}  # play key -> AnimatedButton (for play highlight)
-        super().__init__(parent, title="Speaker Test", accent=TAB_ACCENTS["Clean"])
-        body = self.body
-        tk.Label(body, text="Check each direction plays where it should.",
-                 font=(F, 10, "bold"), bg=COLORS["bg"],
-                 fg=COLORS["subtext"], anchor="w").pack(fill="x", pady=(0, 6))
+        super().__init__(
+            parent, title="Speaker Test", accent=TAB_ACCENTS["Clean"],
+            scope="Tones play on the picked output; the Windows default is "
+                  "never changed.",
+            scroll=False)
+        self.banner.set_state("\u25B6", TAB_ACCENTS["Clean"])
+        self.banner.set_title("Tap a direction to hear it.")
+        self.banner.set_sub("Checks which speaker each channel reaches.")
+        body = self.content
         # Test-target picker — only when >1 active output exists.
         self._out_row = tk.Frame(body, bg=COLORS["bg"])
-        self._stat_lbl = tk.Label(body, text="", font=(F, 9),
-                                  bg=COLORS["bg"], fg=COLORS["subtext"],
-                                  wraplength=640)
-        self._stat_lbl.pack(pady=(0, 2))
         # L/R identity check — separate from the 8-dir surround
         # simulation below. Same tone, hard-panned: answers "is left
         # actually plugged into left" without pitch tricks. Fixed equal
@@ -75,16 +84,18 @@ class SpeakerTestDialog(ThemedModal):
         lr.pack(pady=(4, 10))
         _lr_l = AnimatedButton(lr, text="\u25c0 LEFT",
                                command=lambda: self._play_identity("L"),
-                               bg=COLORS["surface"], fg=COLORS["text"],
-                               font=(F, 10, "bold"), width=120, padx=22, pady=6)
-        _lr_l.pack(side="left", padx=4)
+                               bg=COLORS["secondary_container"],
+                               fg=COLORS["on_secondary_container"],
+                               font=(F, 11, "bold"), width=136, padx=22, pady=8)
+        _lr_l.pack(side="left", padx=6)
         self._dir_btns["L"] = _lr_l
         Tooltip(_lr_l, "Left speaker wiring check — same tone, hard-panned left")
         _lr_r = AnimatedButton(lr, text="RIGHT \u25b6",
                                command=lambda: self._play_identity("R"),
-                               bg=COLORS["surface"], fg=COLORS["text"],
-                               font=(F, 10, "bold"), width=120, padx=22, pady=6)
-        _lr_r.pack(side="left", padx=4)
+                               bg=COLORS["secondary_container"],
+                               fg=COLORS["on_secondary_container"],
+                               font=(F, 11, "bold"), width=136, padx=22, pady=8)
+        _lr_r.pack(side="left", padx=6)
         self._dir_btns["R"] = _lr_r
         Tooltip(_lr_r, "Right speaker wiring check — same tone, hard-panned right")
         grid = tk.Frame(body, bg=COLORS["bg"])
@@ -105,7 +116,7 @@ class SpeakerTestDialog(ThemedModal):
         # was a different size, reading as misaligned. Giving all nine
         # buttons the exact same fixed pixel square sidesteps that
         # entirely — no stretch/redraw mismatch is possible.
-        _SQ = 54
+        _SQ = 64
         _SIM = {"SL", "SR", "RL", "RC", "RR"}
         for key, label, _pan, _db, _hz in _DIRS:
             r, c = _cells.get(key, (1, 1))
@@ -116,10 +127,13 @@ class SpeakerTestDialog(ThemedModal):
             b.grid(row=r, column=c, padx=4, pady=4)
             self._dir_btns[key] = b
             Tooltip(b, label + (" (simulated on stereo)" if key in _SIM else ""))
-        _ctr = AnimatedButton(grid, text="\u25cf",
+        # a letter, not the "\u25cf" glyph: its metrics sat off-centre in the
+        # circle on Windows fonts
+        _ctr = AnimatedButton(grid, text="C",
                               command=lambda: self._play("FC", source="C"),
-                              bg=COLORS["surface"], fg=COLORS["text"],
-                              font=(F, 16, "bold"), width=_SQ, height=_SQ)
+                              bg=COLORS["primary_container"],
+                              fg=COLORS["on_primary_container"],
+                              font=(F, 15, "bold"), width=_SQ, height=_SQ)
         _ctr.grid(row=1, column=1, padx=4, pady=4)
         self._dir_btns["C"] = _ctr
         Tooltip(_ctr, "Center channel")
@@ -127,16 +141,11 @@ class SpeakerTestDialog(ThemedModal):
             grid.grid_columnconfigure(ci, weight=1, uniform="spkdirs")
         for ri in range(3):
             grid.grid_rowconfigure(ri, weight=1, uniform="spkdirs")
-        ctl = tk.Frame(body, bg=COLORS["bg"])
-        ctl.pack(pady=(12, 0))
-        AnimatedButton(ctl, text="Sweep",
-                       command=self._play_all,
-                       bg=COLORS["surface"], fg=COLORS["text"],
-                       font=(F, 9, "bold"), padx=22, pady=6).pack(side="left", padx=4)
-        AnimatedButton(ctl, text="Stop",
-                       command=self._stop_sweep,
-                       bg=COLORS["surface"], fg=COLORS["text"],
-                       font=(F, 9, "bold"), padx=22, pady=6).pack(side="left", padx=4)
+        # REDESIGN 2026-10: Sweep/Stop move from a hand-built body row to
+        # the shared ToolPage footer; the 'Playing…' line they used to
+        # write into a body label is now the shell's self.status.
+        self.add_button("Sweep", self._play_all, kind="primary")
+        self.add_button("Stop", self._stop_sweep, kind="secondary")
         self._build_out_row()
         self.on_close(self._stop)
         self._poll_audio()
@@ -191,11 +200,9 @@ class SpeakerTestDialog(ThemedModal):
         self._out_var.set(pick or (names[0] if names else ""))
         try:
             import tkinter.ttk as _ttk
-            tk.Label(self._out_row, text="Output Device:", font=(F, 9, "bold"),
-                     bg=COLORS["bg"], fg=COLORS["text"]).pack(pady=(0, 4))
-            _ttk.Combobox(self._out_row, textvariable=self._out_var,
+            M3Dropdown(self._out_row, textvariable=self._out_var,
                           values=names, state="readonly",
-                          width=44, font=(F, 9)).pack()
+                          width=44, font=(F, 10)).pack()
             self._out_row.pack(pady=(16, 0))
         except Exception:
             pass
@@ -220,7 +227,7 @@ class SpeakerTestDialog(ThemedModal):
 
     def _say(self, text):
         try:
-            self._stat_lbl.config(text=text)
+            self.status.set_text(text)
         except Exception:
             pass
 

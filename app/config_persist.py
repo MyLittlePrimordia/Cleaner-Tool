@@ -2,11 +2,13 @@
 Config persistence for scheduled runs and user preferences.
 """
 
+import contextlib
 import copy
 import json
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 
 # H2/H3: path resolution and the event log now live in leaf modules, and are
@@ -42,6 +44,19 @@ DEFAULT_CONFIG = {
     "schedule_update_enabled": False,
     "schedule_frequency": "weekly",  # daily, weekly, monthly
     "schedule_time": "03:00",
+    # PC Health badge (2026-10): when to re-check automatically, and the
+    # last result so the badge is right the instant the window opens.
+    # mode: off | startup | daily | weekly. The check is read-only.
+    "health_check_mode": "startup",
+    "health_last_grade": "",
+    "health_last_check": 0.0,
+    # Drivers tab download folder. '' = the default: a "Drivers" folder next
+    # to the .exe (or %LOCALAPPDATA%\CleanerTool\Drivers when that is not
+    # writable). See app/drivers/folder.py.
+    "drivers_folder": "",
+    # 2.5: move cleaned files into a Quarantine bin instead of deleting them,
+    # so a mistaken clean can be undone from Settings. OFF by default.
+    "quarantine_enabled": False,
     # Phase 2 (#12): 5 tabs merged to 3 — Games folded into Clean, Advanced
     # into Tweak. Kept as an explicit dict so load_config can migrate old
     # saved configs (see _migrate_selected_tasks).
@@ -102,6 +117,11 @@ DEFAULT_CONFIG = {
     "game_night_active": False,
     "game_night_keys": [],
     "game_night_close_apps": [],
+    # Apps the user added themselves to the close list (Add app in Auto-Pilot):
+    # exe names, lowercase, never paths. Kept apart from the tick list above so
+    # an entry the user unticked stays visible in the dialog instead of
+    # disappearing.
+    "game_night_custom_apps": [],
     # Startup Manager: items the user has disabled, enough data to put
     # each one back exactly as it was. Registry items store {source,
     # name, command, value_type}; Startup-folder items store {source,
@@ -452,9 +472,17 @@ def load_config() -> dict:
         if _config_cache is not None:
             try:
                 mt = _disk_mtime()
-                if mt is None or (_config_mtime is not None and mt != _config_mtime):
-                    if mt is None and not CONFIG_FILE.exists():
+                # B-002: `_config_mtime is None` must trigger a reload. When the
+                # first load happened with no config.json on disk, _config_mtime
+                # stayed None; a later writer (scheduler, elevated twin)
+                # creating the file then matched NEITHER old disjunct and the
+                # stale empty cache was served forever.
+                if mt is None:
+                    if not CONFIG_FILE.exists():
                         return copy.deepcopy(_config_cache)
+                    _config_cache = _load_config_from_disk()
+                    _config_mtime = _disk_mtime()
+                elif _config_mtime is None or mt != _config_mtime:
                     _config_cache = _load_config_from_disk()
                     _config_mtime = _disk_mtime()
             except Exception:
@@ -495,12 +523,81 @@ def _prune_stale_config_temps(max_age_s: int = 3600) -> int:
     return removed
 
 
+# H-009: in-process guard + reentrancy counter for the cross-process lock.
+_config_file_lock_guard = threading.RLock()
+_config_file_lock_depth = 0
+
+
+@contextlib.contextmanager
+def _config_file_lock():
+    """Cross-process advisory lock around the load-mutate-save window (H-009).
+
+    _config_lock only serialises threads inside one process. The GUI and a
+    headless --auto-clean/--auto-update process (deliberately exempt from
+    single-instance) both read-modify-write config.json, so two interleaved
+    update_config() calls could each load the same base and both save,
+    silently dropping one whole mutation (e.g. a tweak snapshot). Serialise
+    the window with a lock file.
+
+    Reentrant within a process: update_config() holds this while calling
+    save_config(), which would otherwise deadlock re-locking the same byte.
+    """
+    global _config_file_lock_depth
+    with _config_file_lock_guard:
+        if _config_file_lock_depth > 0:
+            _config_file_lock_depth += 1
+            try:
+                yield
+            finally:
+                _config_file_lock_depth -= 1
+            return
+        handle = None
+        locked = False
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            lock_path = CONFIG_FILE.with_name(CONFIG_FILE.name + ".lock")
+            handle = open(lock_path, "a+")
+            if sys.platform.startswith("win"):
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            locked = True
+        except Exception:
+            # A locking failure must never block config I/O. The unique temp
+            # name + atomic os.replace still keep each individual write safe;
+            # only the cross-process lost-update window is left unguarded.
+            locked = False
+        _config_file_lock_depth = 1
+        try:
+            yield
+        finally:
+            _config_file_lock_depth = 0
+            if handle is not None:
+                try:
+                    if locked and sys.platform.startswith("win"):
+                        import msvcrt
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                except Exception:
+                    pass
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+
+
 def save_config(config: dict) -> None:
     """Save config to disk atomically (write to temp then replace). Thread-safe. Raises on failure."""
     global _config_cache, _config_mtime
     # (audit fix: the old `global` statement also named _config_dirty, a
     # variable that never existed anywhere else — removed.)
-    with _config_lock:
+    #
+    # B-001: the whole body runs under _config_lock (and the cross-process
+    # lock). Previously only the mkdir/import sat inside the `with`, so the
+    # temp write, backup copy, os.replace and the cache/mtime refresh all ran
+    # unlocked and could interleave with update_config() — corrupting both the
+    # file on disk and the in-memory cache despite the docstring's promise.
+    import secrets
+    with _config_lock, _config_file_lock():
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         # audit fix (H9): a fixed name (config.json.tmp) let the GUI process
         # and a concurrent --auto-clean/--auto-update process interleave —
@@ -510,70 +607,67 @@ def save_config(config: dict) -> None:
         # writer (pid + a random token) so two processes never touch the
         # same file; only the final os.replace (atomic on the same volume)
         # decides what lands in config.json.
-        import secrets
-    tmp = CONFIG_FILE.with_name(f"{CONFIG_FILE.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
-    # LOW-008: json.dump() raising (a TypeError from a non-serializable value
-    # reaches here, because it escapes the `with` BEFORE the os.replace
-    # try/except below) used to leave the temp file on disk forever, and
-    # nothing ever pruned config.json.*.tmp. The dump is wrapped so a failure
-    # removes its own temp file, and a cheap sweep clears any left by a
-    # previous crash.
-    _prune_stale_config_temps()
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=2)
+        tmp = CONFIG_FILE.with_name(f"{CONFIG_FILE.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+        # LOW-008: json.dump() raising (a TypeError from a non-serializable
+        # value) used to leave the temp file on disk forever, and nothing ever
+        # pruned config.json.*.tmp. The dump is wrapped so a failure removes
+        # its own temp file, and a cheap sweep clears any left by a previous
+        # crash.
+        _prune_stale_config_temps()
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2)
+                try:
+                    f.flush()
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+        except Exception:
             try:
-                f.flush()
-                os.fsync(f.fileno())
-            except Exception:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
                 pass
-    except Exception:
+            raise
+        # UX-001: keep a single last-good backup so a later quarantine
+        # can restore applied_tweaks / snapshots instead of wiping undo
+        # history.
         try:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-        except OSError:
-            pass
-        raise
-    # UX-001: keep a single last-good backup so a later quarantine
-    # can restore applied_tweaks / snapshots instead of wiping undo history.
-    try:
-        if CONFIG_FILE.exists():
-            bak = CONFIG_FILE.with_suffix(CONFIG_FILE.suffix + ".bak")
-            import shutil
-            shutil.copy2(CONFIG_FILE, bak)
-    except Exception:
-        pass
-    # Atomic replace
-    try:
-        os.replace(tmp, CONFIG_FILE)
-    except Exception as e:
-        # Cleanup temp on failure and propagate
-        try:
-            if tmp.exists():
-                tmp.unlink()
+            if CONFIG_FILE.exists():
+                bak = CONFIG_FILE.with_suffix(CONFIG_FILE.suffix + ".bak")
+                import shutil
+                shutil.copy2(CONFIG_FILE, bak)
         except Exception:
             pass
-        raise
-
-    # The file on disk now holds `config`, so refresh the cache HERE.
-    #
-    # This block used to sit AFTER the `raise` above, which made it
-    # unreachable: `_config_cache` and `_config_mtime` were never updated on
-    # a successful write. Two consequences, both observed in production:
-    #
-    #   1. `_config_mtime` kept pointing at the pre-write file, so
-    #      load_config() took the mismatch branch on the very next read and
-    #      re-ran `_load_config_from_disk` -- and therefore apply_schema --
-    #      after EVERY save rather than only at startup. That is what made
-    #      the _tweak_snapshots validator's data loss fire on every apply
-    #      instead of only at restart.
-    #   2. Anything that read the config back before the mtime granularity
-    #      caught up could be served the previous contents.
-    #
-    # deepcopy, not the caller's dict: callers mutate the object they passed
-    # in, and the cache must not alias it.
-    _config_cache = copy.deepcopy(config)
-    _config_mtime = _disk_mtime()
+        # Atomic replace
+        try:
+            os.replace(tmp, CONFIG_FILE)
+        except Exception:
+            # Cleanup temp on failure and propagate
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
+            raise
+        # The file on disk now holds `config`, so refresh the cache HERE.
+        #
+        # This block used to sit AFTER the `raise` above, which made it
+        # unreachable: `_config_cache` and `_config_mtime` were never updated
+        # on a successful write. Two consequences, both observed in
+        # production:
+        #
+        #   1. `_config_mtime` kept pointing at the pre-write file, so
+        #      load_config() took the mismatch branch on the very next read
+        #      and re-ran `_load_config_from_disk` -- and therefore
+        #      apply_schema -- after EVERY save rather than only at startup.
+        #   2. Anything that read the config back before the mtime
+        #      granularity caught up could be served the previous contents.
+        #
+        # deepcopy, not the caller's dict: callers mutate the object they
+        # passed in, and the cache must not alias it.
+        _config_cache = copy.deepcopy(config)
+        _config_mtime = _disk_mtime()
 
 
 def update_config(mutate) -> dict:
@@ -591,7 +685,10 @@ def update_config(mutate) -> dict:
     happen while _config_lock is held, so no other config read/write can
     interleave. Returns the config actually saved.
     """
-    with _config_lock:
+    # H-009: also hold the cross-process lock so a concurrent headless
+    # --auto-clean/--auto-update process cannot interleave its own
+    # load-mutate-save with ours and lose a whole mutation.
+    with _config_lock, _config_file_lock():
         cfg = load_config()
         result = mutate(cfg)
         if result is not None:
@@ -711,6 +808,89 @@ def get_tweak_state() -> dict:
     state = {tid: True for tid in cfg.get("tweak_snapshots", {})}
     state.update({tid: True for tid in cfg.get("applied_tweaks", [])})
     return state
+
+
+# --------------------------------------------------------------------------- #
+# Phase 2 — portable tweak snapshot export/import (backup & move to a new PC)
+# --------------------------------------------------------------------------- #
+# The undo history — tweak_snapshots + applied_tweaks — is the one thing a user
+# cannot get back once it is gone. These two calls make it a file the user can
+# keep: on a USB stick, in cloud backup, or carried to a new machine before an
+# in-place Windows upgrade wipes the profile.
+#
+# Import is additive and fail-closed by design:
+#   * it NEVER replaces a snapshot already on file for a task id (merge=True,
+#     the default) — the value that was true before the tweak is the one Undo
+#     needs, and a stale backup must not overwrite a fresher record;
+#   * it validates the JSON shape before touching the config, so a truncated or
+#     hand-edited file raises ValueError instead of corrupting the registry.
+
+_SNAPSHOT_BUNDLE_VERSION = 1
+
+
+def export_tweak_snapshots(path: str) -> int:
+    """Write {applied_tweaks, tweak_snapshots} to a portable JSON file.
+
+    Reads the config under the lock so a concurrent apply cannot be captured
+    half-written. Returns the number of tweaks (snapshot entries) written.
+    Propagates OSError (unwritable path) and TypeError (non-serialisable data)
+    to the caller — a backup that silently failed is worse than none.
+    """
+    with _config_lock:
+        cfg = load_config()  # private copy, read under the lock
+        bundle = {
+            "version": _SNAPSHOT_BUNDLE_VERSION,
+            "exported_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "applied_tweaks": list(cfg.get("applied_tweaks", []) or []),
+            "tweak_snapshots": copy.deepcopy(cfg.get("tweak_snapshots", {}) or {}),
+        }
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(bundle, fh, indent=2, ensure_ascii=False)
+    return len(bundle["tweak_snapshots"])
+
+
+def import_tweak_snapshots(path: str, merge: bool = True) -> int:
+    """Merge a bundle written by export_tweak_snapshots() into this config.
+
+    Returns the number of NEW task ids added. Raises ValueError on a malformed
+    or oversized file (nothing is written in that case).
+    """
+    with open(path, "r", encoding="utf-8") as fh:
+        raw = fh.read(_MAX_CONFIG_BYTES + 1)
+    if len(raw) > _MAX_CONFIG_BYTES:
+        raise ValueError("Snapshot file is too large to import.")
+    try:
+        data = json.loads(raw)
+    except Exception as exc:
+        raise ValueError(f"Not a valid JSON snapshot file: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError("Snapshot file must contain a JSON object.")
+    snaps = data.get("tweak_snapshots", {})
+    applied = data.get("applied_tweaks", [])
+    if not isinstance(snaps, dict) or not isinstance(applied, list):
+        raise ValueError(
+            "Snapshot file is missing 'tweak_snapshots' or 'applied_tweaks'.")
+
+    added = 0
+
+    def _mutate(cfg):
+        nonlocal added
+        cur = cfg.setdefault("tweak_snapshots", {})
+        for tid, val in snaps.items():
+            if not isinstance(tid, str) or not isinstance(val, dict):
+                continue
+            if merge and cur.get(tid):
+                continue  # keep the fresher local record
+            cur[tid] = copy.deepcopy(val)
+            added += 1
+        app = cfg.setdefault("applied_tweaks", [])
+        for tid in applied:
+            if isinstance(tid, str) and tid not in app:
+                app.append(tid)
+
+    update_config(_mutate)
+    return added
+
 
 
 # --------------------------------------------------------------------------- #
@@ -858,16 +1038,20 @@ def delete_install_profile(name: str) -> bool:
 # --------------------------------------------------------------------------- #
 
 def get_game_night() -> dict:
-    """{"active": bool, "keys": [str], "close_apps": [str]}."""
+    """{"active": bool, "keys": [str], "close_apps": [str],
+    "custom_apps": [str]} — custom_apps being the user's own picks (exe
+    names), which the close list references as `custom:<name>` keys."""
     try:
         cfg = load_config()
         return {
             "active": bool(cfg.get("game_night_active", False)),
             "keys": list(cfg.get("game_night_keys", []) or []),
             "close_apps": list(cfg.get("game_night_close_apps", []) or []),
+            "custom_apps": list(cfg.get("game_night_custom_apps", []) or []),
         }
     except Exception:
-        return {"active": False, "keys": [], "close_apps": []}
+        return {"active": False, "keys": [], "close_apps": [],
+                "custom_apps": []}
 
 
 def set_game_night(active: bool, keys=None) -> None:
@@ -891,6 +1075,24 @@ def set_game_night_close_apps(keys) -> None:
     try:
         klist = [str(k) for k in (keys or []) if str(k).strip()][:50]
         update_config(lambda cfg: cfg.__setitem__("game_night_close_apps", klist))
+    except Exception:
+        pass
+
+
+def set_game_night_custom_apps(names) -> None:
+    """Persist the user's own close-list apps (Add app in Auto-Pilot).
+
+    Sanitised through game_night.clean_custom_apps — exe basenames only —
+    so what is written back is exactly what the close path is allowed to
+    act on, and a name that fails validation never reaches the config."""
+    try:
+        from app.game_night import clean_custom_apps
+        cleaned = clean_custom_apps(names)
+    except Exception:
+        cleaned = []
+    try:
+        update_config(
+            lambda cfg: cfg.__setitem__("game_night_custom_apps", cleaned))
     except Exception:
         pass
 

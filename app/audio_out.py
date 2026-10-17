@@ -14,7 +14,7 @@ raises.
 
 2. Directional test tones: short stereo WAVs (bytes) with
 constant-power panning, played with winsound SND_MEMORY. Front row is
-true-panned; side/rear rows are level-stepped simulations for stereo
+true-panned; side/rear rows are simulated placement for stereo
 setups and are labeled as such in-UI — never a fake surround claim.
 """
 

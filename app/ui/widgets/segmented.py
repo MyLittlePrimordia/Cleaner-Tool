@@ -7,7 +7,7 @@ from __future__ import annotations
 import time
 import tkinter as tk
 
-from app.ui.theme import (COLORS, _measure_font,
+from app.ui.theme import (COLORS, _measure_font, _hex_lerp,
                                 _round_rect_points, F)
 
 class SegmentedTabs(tk.Canvas):
@@ -47,15 +47,20 @@ class SegmentedTabs(tk.Canvas):
         # Segment width: caller override, else measured max label + padding.
         # Measured with the shared cached font (no throwaway widgets).
         if seg_w is not None:
-            self._seg = max(72, int(seg_w))
+            self._seg_want = max(72, int(seg_w))
         else:
             try:
                 fnt = _measure_font(parent.winfo_toplevel(), self._font)
                 widest = max((fnt.measure(t) for t in self._labels),
                              default=60)
-                self._seg = max(96, min(200, int(widest) + 44))
+                self._seg_want = max(96, min(200, int(widest) + 44))
             except Exception:
-                self._seg = 148
+                self._seg_want = 148
+        # BUG-034: `_seg` is the EFFECTIVE width and may be smaller than
+        # `_seg_want` when the parent cannot give us the label-derived width.
+        # `want` is kept separately so the control can grow back when there is
+        # room again. See _fit().
+        self._seg = self._seg_want
         # NOTE: _w/_h are tkinter's reserved widget-path attribute names
         # (see AnimatedButton._measure) — pixel size lives under _bw/_bh.
         self._bw = self._seg * n
@@ -78,12 +83,13 @@ class SegmentedTabs(tk.Canvas):
             self._track = self.create_polygon(
                 _round_rect_points(0, 0, self._bw, self._bh,
                                    self._bh // 2),
-                smooth=True, fill=COLORS["bg_alt"], outline="")
+                smooth=True, fill=COLORS["surface"], outline="")  # tonal track, no stroke
             x = self._thumb_x(self._pos)
             self._thumb = self.create_polygon(
                 _round_rect_points(x, 3, x + self._seg - 6,
                                    self._bh - 3, (self._bh - 6) // 2),
-                smooth=True, fill=self._accent, outline="")
+                smooth=True, fill=_hex_lerp(COLORS["surface"], self._accent, 0.40),
+                outline="")   # M3 selected segment: tonal container
             self._texts = []
             for i, lab in enumerate(self._labels):
                 cx = self._seg * i + self._seg / 2
@@ -96,6 +102,9 @@ class SegmentedTabs(tk.Canvas):
         try:
             self.bind("<Button-1>", self._on_click)
             self.bind("<Motion>", self._on_motion)
+            # BUG-034: fit to whatever width we are actually given. add="+"
+            # so this composes with any handler already bound here.
+            self.bind("<Configure>", lambda e: self._fit(e.width), add="+")
             self.bind("<Leave>",
                       lambda e: self.config(cursor="arrow"))
             self.configure(takefocus=1, highlightthickness=0)
@@ -110,6 +119,94 @@ class SegmentedTabs(tk.Canvas):
 
     # -- geometry -------------------------------------------------- #
 
+    #: Below this a chip stops being readable. A caller with many segments
+    #: needs fewer of them or a wider dialog, not thinner ones.
+    MIN_SEG = 56
+
+    def _fit(self, width=None):
+        """Shrink the segment width so the control fits the space given.
+
+        BUG-034 (user screenshot): __init__ derives the control's width from
+        its labels (`_seg_want = max(96, min(200, widest + 44))`, so
+        `_bw = _seg_want * n`) and the control is a fixed-size Canvas. When
+        the parent hands it less than that, the Canvas silently CROPS its own
+        items - measured in ServicesDialog at DPI scaling 2.0, where five
+        chips wanted 1001 px and the canvas was 730, so 271 px of chip simply
+        did not exist.
+
+        This is genuinely hard to catch from outside: a Canvas reports an
+        in-bounds `winfo_width()` while its items run past the edge, so
+        walking the widget tree for overflowing children never sees it. Only
+        `bbox("all")` does. Hence the fix lives here rather than in the
+        dialog: the control should fit what it is given.
+
+        `_seg` is the single source of truth for the track, the thumb, every
+        label position, and click hit-testing, so re-deriving it here keeps
+        all four consistent. Applied only when the effective width actually
+        changes, which also stops the <Configure> feedback loop that
+        reconfiguring the Canvas would otherwise create.
+        """
+        try:
+            w = int(width if width is not None else self.winfo_width())
+        except Exception:
+            return
+        if w <= 1:
+            return
+        n = max(1, len(self._labels))
+        want = int(getattr(self, "_seg_want", self._seg))
+        target = want if (w // n) >= want else max(self.MIN_SEG, w // n)
+        if target == self._seg:
+            return
+        self._seg = target
+        self._bw = target * n
+        try:
+            self.configure(width=self._bw)
+        except Exception:
+            pass
+        if getattr(self, "_track", None) is None:
+            return
+        try:
+            self.coords(self._track, *_round_rect_points(
+                0, 0, self._bw, self._bh, self._bh // 2))
+            self._place_thumb(getattr(self, "_pos", 0.0))
+            for i, tid in enumerate(self._texts):
+                self.coords(tid, target * i + target / 2, self._bh // 2)
+            self._fit_labels(target)
+        except Exception:
+            pass
+
+    def _fit_labels(self, seg_w):
+        """Ellipsize any label wider than its own segment.
+
+        _fit above shrinks the SEGMENT when the control is handed less room
+        than the labels want, and until now it did nothing about the TEXT -
+        so with five chips in a 358px column each segment came out at 71px
+        while "Not Microsoft" is 74px wide. Measured: the labels overlapped
+        their neighbours and the last one ran 17px past the canvas edge,
+        which the canvas silently cropped.
+
+        Ellipsizing is the honest response at that width: the alternative is
+        overlapping text, and the full label is one hover away (the dialog
+        owns the tooltip). The threshold is generous, so at a width where
+        the labels genuinely fit this never fires and nothing is truncated.
+        """
+        try:
+            budget = max(8, int(seg_w) - 10)
+            for i, tid in enumerate(self._texts):
+                label = self._labels[i]
+                if _measure_font(self.winfo_toplevel(),
+                                 self._font).measure(label) <= budget:
+                    self.itemconfigure(tid, text=label)
+                    continue
+                text = label
+                while text and _measure_font(
+                        self.winfo_toplevel(),
+                        self._font).measure(text + "…") > budget:
+                    text = text[:-1]
+                self.itemconfigure(tid, text=(text + "…") if text else "…")
+        except Exception:
+            pass
+
     def _thumb_x(self, t):
         return 3 + t * self._seg + 3
 
@@ -120,7 +217,8 @@ class SegmentedTabs(tk.Canvas):
                                      self._bh - 3, (self._bh - 6) // 2)
             self.coords(self._thumb, *pts)
             if fill is not None:
-                self.itemconfigure(self._thumb, fill=fill)
+                self.itemconfigure(
+                    self._thumb, fill=_hex_lerp(COLORS["surface"], fill, 0.40))
         except Exception:
             pass
 
@@ -130,7 +228,7 @@ class SegmentedTabs(tk.Canvas):
                 active = (i == self._index)
                 self.itemconfigure(
                     tid,
-                    fill=COLORS["black"] if active else COLORS["subtext"],
+                    fill=COLORS["text"] if active else COLORS["subtext"],
                     font=self._font if active else self._font_off)
             except Exception:
                 pass

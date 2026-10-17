@@ -11,13 +11,14 @@ import time
 # that needs it already does its own local `import subprocess`.
 
 from app.utils import (
-    TaskCancelled, TaskContext, clean_folder_contents, run_cmd,
-    restart_explorer, resolve_exe,
+    TaskCancelled, TaskContext, clean_folder_contents, create_restore_point,
+    run_cmd, restart_explorer, resolve_exe,
 )
 from app.tasks.launcher_paths import (
     ALL_LAUNCHER_CACHE_PATHS, GPU_SHADER_CACHE_ALL, refresh_dynamic_paths,
 )
 
+_USERPROFILE = os.environ.get("USERPROFILE", "")
 _LOCALAPPDATA = os.environ.get("LOCALAPPDATA", "")
 _APPDATA = os.environ.get("APPDATA", "")
 _TEMP = os.environ.get("TEMP", "")
@@ -33,14 +34,36 @@ _WINDIR = os.environ.get("WINDIR", f"{_SYSTEMDRIVE_ROOT}Windows")
 _PROGRAMDATA = os.environ.get("ProgramData", f"{_SYSTEMDRIVE_ROOT}ProgramData")
 
 
+def _dry(ctx: TaskContext) -> bool:
+    """True during a read-only measuring pass (Storage Insight / Health Report).
+
+    H-001: run_cmd() ignores ctx.dry_run, so every side effect beyond
+    clean_folder_contents() must check this itself. Otherwise a future
+    SCAN_ALLOWLIST edit or a new dry_run caller could really stop services,
+    empty the Recycle Bin, uninstall packages or wipe event logs during a scan
+    that is meant to change nothing.
+    """
+    return bool(getattr(ctx, "dry_run", False))
+
+
 def _clean_many(ctx: TaskContext, folders, label):
     total = 0
+    # REDESIGN 2026-10: the log said "Cleaning <label>: <folder>" even during
+    # a MEASURING pass. Storage Insight and the PC Health Report both invoke
+    # these same task functions with a dry_run context purely to size them up,
+    # so a read-only scan printed "Cleaning dev caches:
+    # C:\Users\...\pip\Cache" - which directly contradicts the Health Report's
+    # own "It changes NOTHING" rule and reads to any user as files being
+    # deleted. Nothing was deleted (clean_folder_contents honours ctx.dry_run),
+    # but the sentence was a lie about the only thing that matters here.
+    dry = bool(getattr(ctx, "dry_run", False))
+    verb = "Measuring" if dry else "Cleaning"
     for folder in folders:
-        # Guard: if env var was missing, os.path.join("", "X") yields relative path — skip to avoid deleting CWD fixtures
+        # Guard: if env var was missing, os.path.join("", "X") yields relative path - skip to avoid deleting CWD fixtures
         if not folder or not os.path.isabs(folder):
             continue
         if os.path.exists(folder):
-            ctx.log(f"Cleaning {label}: {folder}")
+            ctx.log(f"{verb} {label}: {folder}")
             total += clean_folder_contents(ctx, folder)
     return total
 
@@ -190,24 +213,28 @@ def clean_system_temp_files(ctx: TaskContext):
 
 def clean_windows_update_cache(ctx: TaskContext):
     ctx.set_status("Clearing update download cache...")
+    if _dry(ctx):
+        # H-001: never stop/start services in a read-only pass — measure only.
+        return clean_folder_contents(ctx, f"{_WINDIR}\\SoftwareDistribution\\Download")
     # Track which services were actually stopped so we don't start ones that were disabled
-    # In dry-run, run_cmd returns 0 without stopping, so don't record
     stopped = []
     for svc in ("wuauserv", "bits"):
-        rc = run_cmd(ctx, f"net stop {svc}", timeout=30)
+        rc = run_cmd(ctx, f"net stop {svc}", timeout=90)
         if rc == 0:
             stopped.append(svc)
     try:
         total = clean_folder_contents(ctx, f"{_WINDIR}\\SoftwareDistribution\\Download")
     finally:
         for svc in reversed(stopped):
-            run_cmd(ctx, f"net start {svc}", timeout=30)
+            run_cmd(ctx, f"net start {svc}", timeout=90)
     return total
 
 
 def clean_delivery_optimization(ctx: TaskContext):
     # M13: stop DoSvc first (same stopped[] pattern as the update-cache
     # sibling) — otherwise its files stay locked and the clean under-delivers.
+    if _dry(ctx):
+        return clean_folder_contents(ctx, f"{_WINDIR}\\SoftwareDistribution\\DeliveryOptimization")
     stopped = run_cmd(ctx, "net stop DoSvc", timeout=30) == 0
     try:
         return clean_folder_contents(ctx, f"{_WINDIR}\\SoftwareDistribution\\DeliveryOptimization")
@@ -270,8 +297,15 @@ def clean_recycle_bin_and_dumps(ctx: TaskContext):
                     ctx.log(f"Cleaning crash dump: {memory_dump} ({size} bytes)")
         except OSError:
             ctx.log(f"  (skipped locked dump: {memory_dump})")
-    ctx.log("Emptying Recycle Bin (silent)...")
-    run_cmd(ctx, 'powershell -NoProfile -Command "Clear-RecycleBin -Force -ErrorAction SilentlyContinue"')
+    if _dry(ctx):
+        # H-001: a read-only measuring pass must never permanently destroy the
+        # one place Windows keeps deleted data for undo.
+        ctx.log("[dry-run] would empty the Recycle Bin.")
+    else:
+        ctx.log("Emptying Recycle Bin (silent)...")
+        rc = run_cmd(ctx, 'powershell -NoProfile -Command "Clear-RecycleBin -Force -ErrorAction SilentlyContinue"')
+        if rc != 0:
+            ctx.log("  (Recycle Bin could not be emptied — some items may be in use.)")
     return total
 
 
@@ -314,7 +348,34 @@ def clean_inet_cache(ctx: TaskContext):
     return _clean_many(ctx, folders, "internet cache")
 
 
+def _office_running():
+    """True if any Office app is running, False if definitely not, None if unknown.
+
+    Fail-closed probe: the Office Document Cache holds staged copies of
+    documents opened from SharePoint/OneDrive, so deleting it while an offline
+    edit has not synced can lose that edit. On any probe failure we return None
+    and the caller treats it as "possibly running" (same posture as
+    _steam_running).
+    """
+    import subprocess as _sp
+    images = ("winword.exe", "excel.exe", "powerpnt.exe", "outlook.exe",
+              "onenote.exe", "msaccess.exe", "mspub.exe")
+    try:
+        out = _sp.check_output(
+            ["tasklist", "/fo", "csv", "/nh"], text=True, stderr=_sp.DEVNULL,
+            timeout=10, creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0))
+    except Exception:
+        return None
+    low = (out or "").lower()
+    return any(img in low for img in images)
+
+
 def clean_office_cache(ctx: TaskContext):
+    # B-029: never delete the Office Document Cache while Office is running.
+    if _office_running() is not False:
+        ctx.log("  ! Office may be running — skipping the Office cache so "
+                "unsynced offline edits are not lost. Close Office and run again.")
+        return 0
     folders = [
         os.path.join(_LOCALAPPDATA, "Microsoft\\Office\\16.0\\OfficeFileCache"),
         os.path.join(_LOCALAPPDATA, "Microsoft\\Office\\15.0\\OfficeFileCache"),
@@ -396,6 +457,10 @@ def clean_thumbnail_icon_cache(ctx: TaskContext):
         ctx.log("  ! cancelled — leaving Explorer running.")
         return 0
     explorer_dir = os.path.join(_LOCALAPPDATA, "Microsoft\\Windows\\Explorer")
+    if _dry(ctx):
+        # H-001 / H-005: never force-kill the shell during a read-only pass.
+        ctx.log("[dry-run] would restart Explorer to release the thumbnail cache.")
+        return clean_folder_contents(ctx, explorer_dir, extensions=[".db"])
     run_cmd(ctx, "taskkill /f /im explorer.exe", timeout=10)
     total = clean_folder_contents(ctx, explorer_dir, extensions=[".db"])
     # Always bring Explorer back — detached, non-blocking (see docstring above)
@@ -424,7 +489,7 @@ def _check_browser_running(ctx: TaskContext) -> list[str]:
         # Use timeout to avoid indefinite hang if tasklist/WMI stalls; not routed via run_cmd deliberately
         # but we add timeout and handle TimeoutExpired gracefully.
         output = subprocess.check_output(
-            "tasklist /fo csv /nh", shell=True, text=True, stderr=subprocess.DEVNULL, timeout=10
+            ["tasklist", "/fo", "csv", "/nh"], text=True, stderr=subprocess.DEVNULL, timeout=10
         )
         for line in output.splitlines():
             if ctx.cancelled():
@@ -512,6 +577,9 @@ def clean_browser_caches(ctx: TaskContext):
 
 def clean_font_cache(ctx: TaskContext):
     ctx.set_status("Rebuilding font cache...")
+    if _dry(ctx):
+        return clean_folder_contents(
+            ctx, f"{_WINDIR}\\ServiceProfiles\\LocalService\\AppData\\Local\\FontCache")
     # M13: track the stop like clean_windows_update_cache does — the old
     # code unconditionally ran `net start`, which would START a service the
     # admin deliberately disabled. Restart only what WE stopped, in a
@@ -540,8 +608,8 @@ def _wait_and_close_store_app(ctx: TaskContext, attempts: int = 10,
     for _ in range(attempts):
         try:
             out = _sp.check_output(
-                f'tasklist /fi "imagename eq {image}" /fo csv /nh',
-                shell=True, text=True, timeout=5, stderr=_sp.DEVNULL,
+                ['tasklist', '/fi', f'imagename eq {image}', '/fo', 'csv', '/nh'],
+                text=True, timeout=5, stderr=_sp.DEVNULL,
                 creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
             )
             if image.lower() in (out or "").lower():
@@ -553,7 +621,18 @@ def _wait_and_close_store_app(ctx: TaskContext, attempts: int = 10,
 
 
 def clean_store_cache(ctx: TaskContext):
+    from app.utils import TaskSkipped, store_available
+    # wsreset.exe opens the Store when it finishes. Without a Store (LTSC /
+    # IoT / Server) that is an "ms-windows-store:" link nothing can open, and
+    # Windows shows a "not found" popup mid-clean.
+    if not store_available():
+        raise TaskSkipped("Microsoft Store is not installed on this version "
+                          "of Windows - nothing to reset.")
     ctx.log("Resetting Microsoft Store cache...")
+    if _dry(ctx):
+        # H-001: wsreset is a real side effect; measure only in a scan.
+        ctx.log("[dry-run] would run wsreset.exe.")
+        return 0
     # muse_spark audit fix (honest return code): this used to discard
     # run_cmd's return value and unconditionally `return 0`, so a failed
     # wsreset.exe (blocked, missing, permission denied) still reported
@@ -607,6 +686,9 @@ def purge_ram_working_sets(ctx: TaskContext):
         "ForEach-Object { try { $h = $_.Handle; $t::SetProcessWorkingSetSize($h, -1, -1) } catch {} }"
     )
     ctx.log("Trimming working sets of running processes (releases unused RAM)...")
+    if _dry(ctx):
+        ctx.log("[dry-run] would trim process working sets.")
+        return 0
     rc = run_cmd(
         ctx,
         ["powershell", "-NoProfile", "-Command", ps_script],
@@ -670,7 +752,6 @@ def clean_windows_update_leftovers(ctx: TaskContext):
     ]
     keep_root_folders = [
         os.path.join(_SYSTEMDRIVE_ROOT, "ESD"),
-        os.path.join(_SYSTEMDRIVE_ROOT, "Intel"),
         os.path.join(_SYSTEMDRIVE_ROOT, "PerfLogs"),
     ]
     windows_old = os.path.join(_SYSTEMDRIVE_ROOT, "Windows.old")
@@ -701,6 +782,25 @@ def clean_windows_update_leftovers(ctx: TaskContext):
         if os.path.exists(folder):
             ctx.log(f"Cleaning update leftover (keeping folder): {folder}")
             total += clean_folder_contents(ctx, folder, remove_root=False)
+    # B-030: C:\Intel can hold a driver package the user may still need for an
+    # offline reinstall. The sibling clean_driver_junk gates C:\Intel\Driver
+    # through _is_driver_leftover_folder for exactly this reason; instead of
+    # deleting everything under C:\Intel unconditionally, apply the same gate
+    # per subfolder.
+    intel_root = os.path.join(_SYSTEMDRIVE_ROOT, "Intel")
+    if os.path.isdir(intel_root):
+        try:
+            for name in os.listdir(intel_root):
+                sub = os.path.join(intel_root, name)
+                if not os.path.isdir(sub):
+                    continue
+                if _is_driver_leftover_folder(sub):
+                    ctx.log(f"Cleaning update leftover (keeping folder): {sub}")
+                    total += clean_folder_contents(ctx, sub, remove_root=False)
+                else:
+                    ctx.log(f"Skipping {sub} (may contain active drivers)")
+        except OSError:
+            pass
     if total > 0:
         ctx.log(f"Removed {total / 1024 / 1024:.0f} MB of Windows Update leftovers.")
     else:
@@ -868,6 +968,9 @@ _CLEANMGR_SAGE_CATEGORIES = (
 
 def run_disk_cleanup(ctx: TaskContext):
     ctx.log("[Clean] Disk Cleanup - Run")
+    if _dry(ctx):
+        ctx.log("[dry-run] would run Windows Disk Cleanup (cleanmgr /sagerun).")
+        return 0
     # cleanmgr's /VERYLOWDISK switch is meant for the OS's own low-disk
     # nudge, not scripted use — it can still land a completion dialog
     # that needs a manual OK. /sagerun is Microsoft's documented silent
@@ -931,26 +1034,21 @@ def run_disk_cleanup(ctx: TaskContext):
             f"{'y' if flagged == 1 else 'ies'}).")
     return 0
 
-# Removes temp files via PowerShell #
+# Removes temp files (H-1: no shell-out — the Python walkers own the safety) #
 def remove_temp_files_deep(ctx: TaskContext):
     ctx.log("[Clean] Temporary Files - Remove")
-    # shell=False argv + PowerShell double quotes (variables expand in PS
-    # double-quoted strings; no backslash escaping — \" would end the PS
-    # string early with a ParserError). Timeouts + cancel checks so Stop works.
-    for script in (
-        'Remove-Item -Path "$Env:Temp\\*" -Recurse -Force -ErrorAction SilentlyContinue',
-        'Remove-Item -Path "$Env:SystemRoot\\Temp\\*" -Recurse -Force -ErrorAction SilentlyContinue',
-    ):
-        if ctx.cancelled():
-            break
-        run_cmd(ctx, ["powershell", "-NoProfile", "-Command", script],
-                shell=False, timeout=120)
-    # audit fix: both _clean_many return values were discarded and the task
-    # reported 0 bytes freed. The fallback walkers do the real accounting
-    # (they stat+remove and count) — the PS pass above only catches what
-    # escaped between runs.
-    total = _clean_many(ctx, [_TEMP], "user temp folder (fallback)")
-    total += _clean_many(ctx, [f"{_WINDIR}\\Temp"], "system temp folder (fallback)")
+    # H-1 (HIGH) fix: this used to run two PowerShell passes
+    #   Remove-Item -Path "$Env:Temp\*" -Recurse -Force -ErrorAction SilentlyContinue
+    # with NO guard on the environment variable. If %TEMP% (or %SystemRoot%) is
+    # empty — a service, a sandbox, a stripped profile — the path collapses to
+    # "\*" (the root of the CURRENT DRIVE) and -Recurse -Force walks it, and it
+    # follows junctions, all outside every safety rail this app has (no dry-run
+    # respect, no reparse-point refusal, no byte accounting). The _clean_many
+    # calls below already do the same job through clean_folder_contents — which
+    # IS dry-run aware, refuses reparse points, skips locked files and counts
+    # bytes freed — so the PS pass only added risk.
+    total = _clean_many(ctx, [_TEMP], "user temp folder")
+    total += _clean_many(ctx, [f"{_WINDIR}\\Temp"], "system temp folder")
     return total
 
 # Removes Windows bloat #
@@ -959,6 +1057,9 @@ def remove_windows_bloat(ctx: TaskContext):
     packages (Game Pass) and codec/media extensions (video playback).
     Package names verified: Clipchamp family is 'Clipchamp.Clipchamp' (store id 9P1J8S7CCWWT)."""
     ctx.log("[Clean] Remove Windows Bloat")
+    if _dry(ctx):
+        ctx.log("[dry-run] would remove Windows bloat packages.")
+        return 0
     bloat = [
         "Clipchamp.Clipchamp",             # Clipchamp (verified real name — old 'Microsoft.Clipchamp' matched nothing)
         "Clipchamp.Clipchamp.ShellExtension",
@@ -1072,6 +1173,9 @@ def clean_event_logs(ctx: TaskContext):
     start fresh; fixes bloated evtx files, admin).
     F04: the Security channel is never touched (audit/forensic trail);
     failures log the real exit code instead of claiming 'in-use'."""
+    if _dry(ctx):
+        ctx.log("[dry-run] would clear Windows event logs.")
+        return 0
     collected: "list[str]" = []
     # shell=False argv lists: channel names are system output and must never
     # be interpolated into a shell=True string (injection via crafted
@@ -1151,8 +1255,8 @@ def _steam_running():
     try:
         import subprocess as _sp
         out = _sp.check_output(
-            'tasklist /fi "imagename eq steam.exe" /fo csv /nh',
-            shell=True, text=True, timeout=10, stderr=_sp.DEVNULL,
+            ['tasklist', '/fi', 'imagename eq steam.exe', '/fo', 'csv', '/nh'],
+            text=True, timeout=10, stderr=_sp.DEVNULL,
             creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
         )
         return "steam.exe" in (out or "").lower()
@@ -1467,6 +1571,11 @@ def _looks_like_residual_folder(folder_path: str) -> bool:
     }
     has_exe_or_dll = False
     only_residual = True
+    # B-026: a folder holding only throwaway log/temp files is deletable on its
+    # own; a small folder holding config/save data (.json/.xml/.dat/.db/.sqlite)
+    # is NOT, however few files it has.
+    only_pure_junk = True
+    _PURE_JUNK_EXTS = (".log", ".tmp", ".old", ".bak", ".dmp")
     total_files = 0
     reparse_pruned = 0
     # MED-003: this used to be `os.path.islink(...)`, which is the wrong test
@@ -1500,6 +1609,8 @@ def _looks_like_residual_folder(folder_path: str) -> bool:
                 total_files += 1
                 low = f.lower()
                 ext = os.path.splitext(low)[1]
+                if ext not in _PURE_JUNK_EXTS:
+                    only_pure_junk = False
                 if ext in (".exe", ".dll", ".sys", ".msi"):
                     has_exe_or_dll = True
                     only_residual = False
@@ -1532,7 +1643,11 @@ def _looks_like_residual_folder(folder_path: str) -> bool:
         return True
     if only_residual and not has_exe_or_dll:
         return True
-    if not has_exe_or_dll and total_files <= 8:
+    # B-026: the old rule was `not has_exe_or_dll and total_files <= 8`, which
+    # deleted any small folder with no .exe/.dll — including an installed app's
+    # `settings.cfg` / `save.sav` / `profile.ini` directory. Restrict it to
+    # folders that contain nothing but log/temp/dump files.
+    if not has_exe_or_dll and only_pure_junk:
         return True
     return False
 
@@ -1551,6 +1666,19 @@ def clean_orphan_program_leftovers(ctx: TaskContext):
         installed = installed_display_names()
     except Exception as exc:
         ctx.log(f"  ! could not read installed programs list: {exc}")
+        return 0
+
+    # H-4 (HIGH) fix: fail CLOSED. The orphan test is "the folder name matches
+    # NO still-installed program", so an empty or partial installed-programs set
+    # inverts it into "matches nothing" and the residual heuristic alone decides
+    # whether to delete — which can flag a real, still-installed program's
+    # folder. installed_display_names() returns a partial set (or empty) when
+    # the Uninstall hive is policy-blocked or partially unreadable, with no
+    # error. A floor keeps that from happening. 25 is deliberately low: any real
+    # desktop has far more uninstall entries than that.
+    if len(installed) < 25:
+        ctx.log(f"  ! only {len(installed)} registered program names were readable "
+                "— refusing the orphan scan (needs a trustworthy installed list).")
         return 0
 
     ctx.log(f"Orphan scan: {len(installed)} registered program names on this PC")
@@ -1602,6 +1730,261 @@ def clean_orphan_program_leftovers(ctx: TaskContext):
 
 from app.tasks import Task  # noqa: E402
 
+# --------------------------------------------------------------------------- #
+# Phase 5: three REPORT-ONLY space audits.
+#
+# All three follow the app's non-destructive rule: they MEASURE and REPORT,
+# and delete nothing. That is a deliberate departure from most rows on this
+# tab, and it is the point:
+#
+#   * Downloads is full of things a user may still want (a receipt, an
+#     installer they have not run yet, a photo they meant to move).
+#   * AI model caches are re-downloadable but expensive to re-download, so
+#     silently deleting a 20 GB model someone uses daily is a bad trade.
+#   * Docker/WSL virtual disks hold live container and distro state; the
+#     only safe way to shrink one is a deliberate, informed command.
+#
+# So each one reports where the space went and names the exact next step.
+# Anything genuinely removable belongs behind an explicit, confirmed
+# affordance - which is what Storage Insight is for.
+# --------------------------------------------------------------------------- #
+
+
+def _folder_bytes(path: str, cap: int = 400000) -> int:
+    """Total bytes under `path`, fail-closed.
+
+    Uses fs_safe.safe_walk so a junction or symlink is never descended into
+    - a user with their profile redirected to a network drive, or a dev
+    folder containing a loop, would otherwise hang the clean. `cap` bounds
+    the walk so a pathological tree cannot stall the run either.
+    """
+    total = 0
+    seen = 0
+    try:
+        from app.infra.fs_safe import safe_walk
+    except Exception:
+        return 0
+    try:
+        for root, _dirs, files in safe_walk(path):
+            for name in files:
+                seen += 1
+                if seen > cap:
+                    return total
+                try:
+                    total += os.path.getsize(os.path.join(root, name))
+                except OSError:
+                    continue
+    except Exception:
+        return total
+    return total
+
+
+def _report_rows(ctx: TaskContext, title: str, rows) -> int:
+    """Log `rows` of (label, path, bytes) with a total. Returns the total.
+
+    A shared shape so all three audits read identically in the run log.
+    """
+    from app.utils import format_bytes as _fb
+    total = 0
+    for label, path, size in rows:
+        total += size
+        ctx.log(f"  {_fb(size):>10}  {label}")
+        ctx.log(f"              {path}")
+    if total:
+        ctx.log(f"  {_fb(total):>10}  TOTAL {title}")
+    return total
+
+
+def audit_downloads_folder(ctx: TaskContext):
+    """Report old and large files sitting in Downloads. Deletes NOTHING.
+
+    Downloads is the folder that quietly becomes a second documents folder:
+    installers, archives, screenshots and duplicates nobody has looked at in
+    a year. Deleting from it unattended is not safe, so this only measures
+    and prints - you decide what goes.
+
+    Flags a file when it is over 250 MB, or older than a year, and says
+    which of the two it was.
+    """
+    from app.utils import known_folder, format_bytes as _fb
+    # BUG-027: known_folder() does not always RAISE when it cannot resolve a
+    # folder - on this machine it returns an empty string. The original
+    # guard only fell back to %USERPROFILE%\\Downloads on an exception, so
+    # an empty return skipped the audit entirely and reported "No Downloads
+    # folder found" while C:\\Users\\User\\Downloads demonstrably existed. A
+    # falsy return and a raised error mean the same thing here, so both take
+    # the fallback.
+    try:
+        dl = known_folder("Downloads") or ""
+    except Exception:
+        dl = ""
+    if not dl:
+        dl = os.path.join(_USERPROFILE, "Downloads")
+    if not os.path.isdir(dl):
+        ctx.log("No Downloads folder found - nothing to audit.")
+        return
+
+    from app.infra.fs_safe import safe_walk, is_safe_to_delete
+    now = time.time()
+    big, old, biggest = [], [], 0
+    for root, _dirs, files in safe_walk(dl):
+        for name in files:
+            p = os.path.join(root, name)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            if not is_safe_to_delete(p):
+                continue
+            biggest = max(biggest, st.st_size)
+            age_days = int((now - st.st_mtime) // 86400)
+            if st.st_size >= 250 * 1024 * 1024:
+                big.append((_fb(st.st_size), p))
+            elif age_days >= 365:
+                old.append((_fb(st.st_size), age_days, p))
+
+    ctx.log(f"Downloads: {dl}")
+    if not big and not old:
+        ctx.log("  Nothing large or a year old. Your Downloads folder is "
+                "already tidy.")
+        return
+
+    if big:
+        big.sort(reverse=True)
+        ctx.log(f"{len(big)} file(s) over 250 MB:")
+        for size_s, p in big[:15]:
+            ctx.log(f"  {size_s:>10}  {p}")
+        if len(big) > 15:
+            ctx.log(f"  ...and {len(big) - 15} more")
+    if old:
+        old.sort(reverse=True)
+        ctx.log(f"{len(old)} file(s) older than a year:")
+        for size_s, age, p in old[:15]:
+            ctx.log(f"  {size_s:>10}  {p}  ({age // 365}y old)")
+        if len(old) > 15:
+            ctx.log(f"  ...and {len(old) - 15} more")
+
+    total = biggest if False else 0
+    ctx.log("Nothing was deleted. Open the folder and remove what you don't "
+            "need:")
+    ctx.log(f"  {dl}")
+    if old:
+        oldest = max(age for _s, age, _p in old)
+        ctx.log(f"  (your oldest untouched file is {oldest // 365} years old)")
+
+
+def audit_ai_model_caches(ctx: TaskContext):
+    """Report how much space local-AI model caches are using. Deletes NOTHING.
+
+    The app offers LM Studio, Ollama, GPT4All, Jan and opencode, so a
+    typical install here accumulates tens of gigabytes of model weights.
+    They are re-downloadable, but a 20 GB model someone uses every day is
+    not junk - so this measures and explains, and names the real commands for
+    anyone who does want to reclaim it.
+    """
+    rows = []
+    home = _USERPROFILE
+
+    # Hugging Face hub cache - where transformers, diffusers and most local
+    # model tooling keep their weights.
+    hf = os.environ.get("HF_HOME") or os.path.join(home, ".cache", "huggingface")
+    if os.path.isdir(hf):
+        size = _folder_bytes(hf)
+        if size:
+            rows.append(("Hugging Face cache", hf, size))
+
+    # Ollama
+    ollama = os.path.join(home, ".ollama", "models")
+    if os.path.isdir(ollama):
+        size = _folder_bytes(ollama)
+        if size:
+            rows.append(("Ollama models", ollama, size))
+
+    # LM Studio
+    lms = os.path.join(home, ".cache", "lm-studio", "models")
+    if os.path.isdir(lms):
+        size = _folder_bytes(lms)
+        if size:
+            rows.append(("LM Studio models", lms, size))
+
+    # GPT4All
+    g4a = os.path.join(home, ".cache", "huggingface")
+    if os.path.isdir(g4a) and not any("Hugging Face" in r[0] for r in rows):
+        size = _folder_bytes(g4a)
+        if size:
+            rows.append(("GPT4All / HF cache", g4a, size))
+
+    if not rows:
+        ctx.log("No local-AI model caches found - nothing to report.")
+        return
+
+    rows.sort(key=lambda r: r[2], reverse=True)
+    total = _report_rows(ctx, "local-AI caches", rows)
+    ctx.log("Nothing was deleted. To see what you can remove safely:")
+    ctx.log("  ollama list        then   ollama rm <model>")
+    ctx.log("  LM Studio / GPT4All: delete a model inside the app's own UI")
+    ctx.log(f"  Together these hold about {total and 'the amount above' or '0'}.")
+
+
+def audit_docker_wsl_usage(ctx: TaskContext):
+    """Report Docker and WSL disk usage. Deletes NOTHING.
+
+    Both store their data in one or more large virtual disk files, so a
+    long-lived install grows quietly and the space is invisible in Explorer -
+    which is exactly why this reports. Neither is shrunk automatically: the
+    safe commands involve pruning images or compacting a VHDX, and both need
+    the user to choose what goes.
+    """
+    from app.utils import format_bytes as _fb, resolve_exe as _rx
+    rows = []
+
+    # WSL virtual disks live in the AppData package store.
+    pk = os.path.join(_LOCALAPPDATA, "Packages")
+    if os.path.isdir(pk):
+        try:
+            names = os.listdir(pk)
+        except OSError:
+            names = []
+        for n in names:
+            if not n.lower().startswith("microsoftcorp.windowsintuneprovisioning"):
+                continue
+            base = os.path.join(pk, n, "LocalState")
+            if os.path.isdir(base):
+                size = _folder_bytes(base)
+                if size:
+                    rows.append(("WSL distro disk", base, size))
+
+    if not rows and os.path.isdir(pk):
+        ctx.log("No WSL distro disks found.")
+
+    # Docker, if the CLI is on PATH. `docker system df` is read-only.
+    try:
+        docker = _rx("docker")
+    except Exception:
+        docker = None
+    if docker:
+        rc = run_cmd(ctx, ["docker", "system", "df"], timeout=60)
+        if rc == 0:
+            ctx.log("Docker disk usage (from `docker system df`): the build "
+                    "cache and dangling images above are what grow fastest.")
+        else:
+            ctx.log("Docker is installed but not responding (daemon off?) - "
+                    "start Docker Desktop and run this again.")
+    else:
+        ctx.log("Docker CLI not found - skipped.")
+
+    if not rows:
+        ctx.log("Nothing to report.")
+        return
+    rows.sort(key=lambda r: r[2], reverse=True)
+    _report_rows(ctx, "container / WSL storage", rows)
+    ctx.log("Nothing was deleted. To reclaim space yourself:")
+    ctx.log("  docker system prune        (removes unused images + cache)")
+    ctx.log("  wsl --manage <distro> --set-sparse true   (reclaims sparse "
+            "space; expand the VHDX afterwards from Disk Management)")
+
+
+
 TASKS = [
     Task("shader_cache", "Clear Shader Cache", "Removes temp graphics files that help fix stutter", clean_shader_cache, default=True, admin_required=False),
     Task("launcher_cache", "Clean Launchers & Chat", "Clears every game store plus Discord, Slack, Teams, Spotify junk", clean_launcher_cache, default=True, admin_required=False),
@@ -1647,4 +2030,18 @@ TASKS = [
     Task("orphan_leftovers", "Clean Orphan Program Leftovers",
          "Removes high-confidence leftover folders from programs already uninstalled; Microsoft/Windows/runtimes never touched",
          clean_orphan_program_leftovers, default=False, admin_required=True),
+    Task("downloads_audit", "Audit Downloads Folder", "Lists big and year-old files sitting in Downloads - deletes nothing, you pick", audit_downloads_folder, default=False, admin_required=False),
+    Task("ai_model_cache", "Audit Local-AI Model Caches", "Reports how much space LM Studio / Ollama / Hugging Face models use - deletes nothing", audit_ai_model_caches, default=False, admin_required=False),
+    Task("docker_wsl_usage", "Audit Docker & WSL Storage", "Reports the space hidden inside Docker images and WSL virtual disks - deletes nothing", audit_docker_wsl_usage, default=False, admin_required=False),
+    # BUG-043: Clean is the most destructive tab and had NO way to take a
+    # restore point first, while Repair and Tweak both did - backwards. This
+    # reuses the SAME task object the other two tabs use, so the 24-hour
+    # throttle, the TaskSkipped path and the failure wording are already
+    # correct. Placement fix only, no new machinery.
+    #
+    # default=False: it costs real time and some disk space, so it stays
+    # opt-in rather than silently slowing down every Quick Clean.
+    Task("restore_point", "Safety Checkpoint",
+         "Saves a restore point you can go back to", create_restore_point,
+         default=False, admin_required=True),
 ]

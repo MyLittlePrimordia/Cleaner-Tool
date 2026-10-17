@@ -11,13 +11,14 @@ import os
 
 import tkinter as tk
 from tkinter import ttk, messagebox
-from app.ui.base import ThemedModal, _themed_askyesno
+from app.ui.base import _themed_askyesno
+from app.ui.dialogs._tool_page import ToolPage
 from app.ui.theme import (COLORS, F, ICON_ROW_PX, TAB_ACCENTS,
                           icon_bg_rgb)
-from app.ui.widgets import AnimatedButton, ScrollableRoundedPanel
+from app.ui.widgets import AnimatedButton
 
 
-class ProcessManagerDialog(ThemedModal):
+class ProcessManagerDialog(ToolPage):
     """Process Manager (Tools tab card): gamer-friendly task manager.
 
     One row per app — processes from the same program are summed into a
@@ -31,6 +32,10 @@ class ProcessManagerDialog(ThemedModal):
     tick (labels + button commands only). A full rebuild happens only
     when the grouped set actually changes (app opened/closed). Close
     uses taskkill /PID /F (same path Game Night already trusts).
+
+    REDESIGN 2026-10: on the shared ToolPage shell — a Header banner and a
+    SCROLLING content zone (this is a plain list that can exceed the card),
+    with the stats line promoted to the shared StatusLine.
     """
 
     #: Reserved icon slot, in Tk text units at the default font. Sized
@@ -63,20 +68,26 @@ class ProcessManagerDialog(ThemedModal):
         self._last_items = []
         self._shown_groups = []
         super().__init__(parent, title="Process Manager",
-                         accent=TAB_ACCENTS["Tools"])
-        body = self.body
+                         accent=TAB_ACCENTS["Tools"],
+                         scope="Refreshes itself every few seconds; the ✕ "
+                               "closes it.",
+                         scroll=True)
+        self.banner.set_state("\u25A6", TAB_ACCENTS["Tools"])
+        self.banner.set_title("What is your PC working on?")
+        self.banner.set_sub("The apps using the most CPU and memory right "
+                            "now.")
+        # REDESIGN 2026-10: scroll=True builds the shared
+        # ScrollableRoundedPanel; keep the old `_panel` name pointing at it
+        # so the row/scroll code below (self._panel.refresh_scroll) is
+        # untouched. Rows now build into self.content, which lives in the
+        # panel's inner frame.
+        self._panel = self._content_panel
 
-        self._panel = ScrollableRoundedPanel(body)
-        self._panel.config(height=460)
-        self._panel.pack(fill="both", expand=True)
-
-        # Bottom-center stats (single clean line, replaces the old
-        # "Top 10 · heaviest:" footer and the Refresh/Close buttons —
-        # the dialog auto-refreshes and the title-bar X closes it).
-        self._status = tk.Label(body, text="Scanning…", font=(F, 9),
-                                bg=COLORS["bg"], fg=COLORS["subtext"],
-                                anchor="center", justify="center")
-        self._status.pack(fill="x", pady=(10, 0))
+        # Bottom stats (single clean line, replaces the old "Top 10 ·
+        # heaviest:" footer and the Refresh/Close buttons — the dialog
+        # auto-refreshes and the title-bar X closes it). REDESIGN 2026-10:
+        # this is the shared footer StatusLine now.
+        self.status.stop("Scanning…")
 
         try:
             from app.process_manager import ProcessSampler
@@ -122,7 +133,7 @@ class ProcessManagerDialog(ThemedModal):
 
     def _say(self, text):
         try:
-            self._status.config(text=text)
+            self.status.stop(text)
         except Exception:
             pass
 
@@ -176,17 +187,28 @@ class ProcessManagerDialog(ThemedModal):
 
         def _work():
             items, groups = [], []
+            err = None
             try:
                 if self._sampler is not None:
                     items = self._sampler.sample()
-            except Exception:
-                items = []
-            # _last_items feeds the End-task action, so it must be
-            # updated even though only `groups` reaches the UI.
-            self._last_items = list(items or [])
+            except Exception as exc:
+                # BUGFIX 2026-10: this used to be `items = []`, which made a
+                # failed sample indistinguishable from an empty machine - the
+                # dialog then said "Nothing running right now." on a 3-second
+                # loop, forever. An empty result is a real answer; a failed
+                # read is not, and it now says which one happened.
+                err = str(exc)
+                items = None
+            if items is not None:
+                # _last_items feeds the End-task action, so it must be updated
+                # even though only `groups` reaches the UI. Skipped on failure
+                # so a transient error does not wipe the rows the user can
+                # still act on.
+                self._last_items = list(items or [])
             try:
                 from app.process_manager import group_processes
-                groups = group_processes(list(items or []))[: self._MAX_GROUPS]
+                groups = group_processes(list(items or []))[: self._MAX_GROUPS] \
+                    if items is not None else []
             except Exception:
                 groups = []
             try:
@@ -202,7 +224,7 @@ class ProcessManagerDialog(ThemedModal):
                 # ThemedModal now owns a dispatcher per dialog, so there is one
                 # hop and it is always the safe one.
                 self._dispatch.post(
-                    lambda: self._apply_groups(groups, first))
+                    lambda: self._apply_groups(groups, first, err))
             except Exception:
                 self._sampling = False
 
@@ -250,9 +272,26 @@ class ProcessManagerDialog(ThemedModal):
         except Exception:
             pass
 
-    def _apply_groups(self, groups, first=False):
-        """Tk-thread half: everything here touches widgets."""
+    def _apply_groups(self, groups, first=False, err=None):
+        """Tk-thread half: everything here touches widgets.
+
+        `err` is set when the SAMPLER failed, which is different from the
+        sampler succeeding and returning nothing. The old code collapsed both
+        into `items = []`, so a machine where the process read kept failing
+        displayed "Nothing running right now." on every tick - a confident
+        false answer, repeated forever, for a running machine. Optional
+        because four verifiers call this directly with the 2-arg form.
+        """
         self._sampling = False
+        if err and not groups:
+            self._shown_groups = []
+            self._displayed_keys = []
+            try:
+                self._say("Couldn't read the process list \\u2014 try again.")
+            except Exception:
+                pass
+            self._paint_list_error(str(err))
+            return
         try:
             if self._dlg is None or not self._dlg.winfo_exists():
                 return
@@ -297,14 +336,64 @@ class ProcessManagerDialog(ThemedModal):
         try:
             if groups:
                 self._say(self._stats_text(groups))
-            elif not first:
+            elif not first and not err:
+                # Only when the sample genuinely SUCCEEDED and came back
+                # empty. With err set, _apply_groups already said why.
                 self._say("Nothing running right now.")
+        except Exception:
+            pass
+
+    def _paint_list_error(self, detail):
+        """The list body for a FAILED sample.
+
+        Deliberately not styled like the "Nothing running right now" empty
+        state, and deliberately showing the reason. A user who sees an empty
+        list concludes their machine is idle; a user who sees this concludes
+        the tool is broken. Only the second one is true here, and the two
+        look identical without this.
+        """
+        try:
+            holder = self.content
+        except Exception:
+            return
+        try:
+            for w in list(holder.winfo_children()):
+                w.destroy()
+        except Exception:
+            return
+        self._rows = {}
+        self._row_widgets = {}
+        self._icon_cache = {}
+        self._icon_missed = set()
+        self._icon_done = set()
+        short = (detail or "").strip().splitlines()[0][:120] or "unknown error"
+        try:
+            tk.Label(holder, text="Couldn't read the running programs.",
+                     font=(F, 10, "bold"), bg=COLORS["bg"],
+                     fg=COLORS["accent_yellow"],
+                     bd=0, highlightthickness=0).pack(pady=(22, 2))
+            tk.Label(holder, text=short, font=(F, 9), bg=COLORS["bg"],
+                     fg=COLORS["subtext"], wraplength=self.body_width(90),
+                     justify="center",
+                     bd=0, highlightthickness=0).pack(pady=(0, 4))
+            tk.Label(holder, text="This usually clears on its own.",
+                     font=(F, 9), bg=COLORS["bg"],
+                     fg=COLORS["subtext"],
+                     bd=0, highlightthickness=0).pack()
+            AnimatedButton(
+                holder, text="Try again", command=self._refresh_list,
+                bg=COLORS["surface"], fg=COLORS["text"],
+                font=(F, 9, "bold"), padx=16, pady=6).pack(pady=(12, 20))
+        except Exception:
+            pass
+        try:
+            self._panel.refresh_scroll()
         except Exception:
             pass
 
     def _rebuild_rows(self, groups):
         try:
-            holder = self._panel.inner
+            holder = self.content
         except Exception:
             return
         try:
@@ -324,7 +413,7 @@ class ProcessManagerDialog(ThemedModal):
         if not groups:
             try:
                 tk.Label(holder, text="Nothing running right now.",
-                         font=(F, 9), bg=COLORS["bg_alt"],
+                         font=(F, 9), bg=COLORS["bg"],
                          fg=COLORS["subtext"]).pack(pady=20)
                 self._panel.refresh_scroll()
             except Exception:
@@ -387,7 +476,7 @@ class ProcessManagerDialog(ThemedModal):
             pids = ()
         if not pids:
             return
-        row = tk.Frame(parent, bg=COLORS["bg_alt"])
+        row = tk.Frame(parent, bg=COLORS["bg"])
         row.pack(fill="x", padx=4, pady=3)
         # Icon placeholder. It is created EMPTY so the layout is identical
         # whether or not an icon ever arrives - a row that changes width when
@@ -406,18 +495,18 @@ class ProcessManagerDialog(ThemedModal):
         # popup rendered completely blank. A Frame's width/height are pixels,
         # so the slot is sized exactly ICON_ROW_PX and the Label fills it.
         icon_box = tk.Frame(row, width=ICON_ROW_PX, height=ICON_ROW_PX,
-                            bg=COLORS["bg_alt"])
+                            bg=COLORS["bg"])
         icon_box.pack_propagate(False)
         icon_box.pack(side="left", padx=(10, 0), pady=8)
-        icon_lbl = tk.Label(icon_box, bg=COLORS["bg_alt"])
+        icon_lbl = tk.Label(icon_box, bg=COLORS["bg"])
         icon_lbl.pack(fill="both", expand=True)
-        left = tk.Frame(row, bg=COLORS["bg_alt"])
+        left = tk.Frame(row, bg=COLORS["bg"])
         left.pack(side="left", fill="x", expand=True, padx=(10, 6), pady=8)
         name = tk.Label(left, text=disp, font=(F, 11, "bold"),
-                        bg=COLORS["bg_alt"], fg=COLORS["text"], anchor="w")
+                        bg=COLORS["bg"], fg=COLORS["text"], anchor="w")
         name.pack(fill="x")
         detail = tk.Label(left, text=self._detail_text(group), font=(F, 9),
-                          bg=COLORS["bg_alt"], fg=COLORS["subtext"],
+                          bg=COLORS["bg"], fg=COLORS["subtext"],
                           anchor="w")
         detail.pack(fill="x")
         btn = AnimatedButton(
@@ -507,7 +596,7 @@ class ProcessManagerDialog(ThemedModal):
                         from app.icon_extract import icon_ppm_bytes
                         from app.ui.theme import ICON_ROW_PX, icon_bg_rgb
                         ppm = icon_ppm_bytes(_path, size=ICON_ROW_PX,
-                                             bg_rgb=icon_bg_rgb(COLORS["bg_alt"]))
+                                             bg_rgb=icon_bg_rgb(COLORS["bg"]))
                     except Exception:
                         ppm = None
                     if ppm:
@@ -589,7 +678,7 @@ class ProcessManagerDialog(ThemedModal):
                         pass
             pids = tuple(p for p in pids if p not in protected)
         except Exception:
-            from app.process_manager import close_process
+            pass
         if not pids:
             return
         if len(pids) > 1:
@@ -608,11 +697,47 @@ class ProcessManagerDialog(ThemedModal):
                 self._dlg, title, msg, accent=TAB_ACCENTS["Tools"],
                 yes_text=yes, no_text="Keep running")
         except Exception:
-            ok = True
+            # B-008: fail SAFE. A dialog failure must not be read as consent
+            # to force-kill; the old `ok = True` terminated processes unasked.
+            ok = False
         if not ok:
             return
+        # B-008: revalidate before killing. PIDs were captured on the last
+        # ~3 s tick; while the confirm dialog was open a short-lived process
+        # may have exited and its PID been recycled, so kill only PIDs whose
+        # current image still matches the name we captured.
         try:
-            done = sum(1 for p in pids if close_process(p, force=True))
+            from app.process_manager import _process_image_path
+            want = {}
+            starts = {}
+            for _it in (self._last_items or []):
+                try:
+                    _p = int(_it.get("pid"))
+                    want[_p] = str(_it.get("name") or "").lower()
+                    starts[_p] = _it.get("start")
+                except Exception:
+                    pass
+            verified = []
+            for p in pids:
+                cur = os.path.basename(_process_image_path(p)).lower()
+                exp = want.get(p, "")
+                # Allow when either side is unknown: refusing to act on an
+                # unreadable image would break the normal case, and the
+                # protected-name guard in close_process still applies.
+                if not cur or not exp or cur == exp:
+                    verified.append(p)
+            pids = tuple(verified)
+        except Exception:
+            starts = {}
+            pass
+        if not pids:
+            self._say(f"{display} is no longer running.")
+            return
+        try:
+            # Pass the per-PID creation time captured at scan time: close_process
+            # refuses if the PID was recycled between the tick and now.
+            done = sum(1 for p in pids
+                       if close_process(p, force=True, expected_start=starts.get(p)))
         except Exception:
             done = 0
         if done:

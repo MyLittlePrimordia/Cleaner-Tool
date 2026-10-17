@@ -1,43 +1,22 @@
-"""Run-state FSM and cancellation token (STATE-001 remediation foundation).
+"""DEPRECATED shim — re-exports the real run-state types.
 
-Stdlib-only. The central run engine in app.gui can adopt these types
-incrementally; existing bool flags remain as deprecated aliases until
-the full migration is verified on Windows smoke tests.
+ARCH-006 / I-013: the run-state FSM and the cancellation token live in
+``app.runner.types``, the single source of truth used by both the GUI
+(``app.ui.app``) and the headless scheduler. This module originally defined a
+SECOND copy of ``RunState`` that was missing ``PREFLIGHT`` and the transition
+table, so ``from app.services import RunState`` silently handed back the wrong
+finite-state machine. It now re-exports the canonical types (and its own copy
+of ``CancellationToken``), so any lingering importer gets the correct ones.
+
+Import direction: ``app.runner.types`` depends on nothing in the app, so this
+shim cannot create an import cycle.
 """
 from __future__ import annotations
 
-from enum import Enum, auto
-from dataclasses import dataclass, field
-import threading
-from typing import Optional
+from app.runner.types import (  # noqa: F401
+    RunState, CancellationToken, OUTCOME_STATES, LIVE_STATES,
+    ALLOWED_TRANSITIONS,
+)
 
-
-class RunState(Enum):
-    IDLE = auto()
-    RUNNING = auto()
-    CANCELLING = auto()
-    DONE = auto()
-    ERROR = auto()
-
-
-@dataclass
-class CancellationToken:
-    """Single source of truth for cooperative cancel (replaces ad-hoc
-    _stop / _token / _scan_token bool lists). Thread-safe."""
-    _cancelled: bool = field(default=False, init=False)
-    _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
-
-    def cancel(self) -> None:
-        with self._lock:
-            self._cancelled = True
-
-    def is_cancelled(self) -> bool:
-        with self._lock:
-            return self._cancelled
-
-    def reset(self) -> None:
-        with self._lock:
-            self._cancelled = False
-
-    def __bool__(self) -> bool:  # allow `if token:`
-        return self.is_cancelled()
+__all__ = ["RunState", "CancellationToken", "OUTCOME_STATES", "LIVE_STATES",
+           "ALLOWED_TRANSITIONS"]

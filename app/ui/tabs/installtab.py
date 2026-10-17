@@ -11,16 +11,90 @@ import subprocess
 import threading
 
 import tkinter as tk
+
+from app.ui.widgets.checkbox import M3Checkbutton
 from tkinter import ttk, messagebox
-from app.ui.base import ThemedModal, Tooltip, _themed_showinfo
+from app.ui.base import ThemedModal, Tooltip, _themed_showinfo, _themed_showerror
 from app.ui.dialogs.install_profiles_dialog import InstallProfilesDialog
-from app.ui.theme import COLORS, F, ICON_ROW_PX, icon_bg_rgb, TAB_ACCENTS
+from app.ui.theme import (COLORS, F, ICON_ROW_PX, TAB_ACCENTS, ellipsize,
+                          icon_bg_rgb)
 from app.ui.widgets import AnimatedButton, ScrollableRoundedPanel
 
-# Catalog rows are COLORS["bg_alt"], so the icon plate must be that exact
+# Catalog rows are COLORS["bg"], so the icon plate must be that exact
 # colour; default_icon_ppm() fills the whole tile, and a mismatched fill
 # shows up as a square chip behind the icon (user-reported).
-_icon_bg = icon_bg_rgb(COLORS["bg_alt"])
+_icon_bg = icon_bg_rgb(COLORS["bg"])
+
+
+#: Essentials group header -> the sentence that used to be printed inline
+#: beside the title and is now the title's tooltip (redesign 2026-10).
+#: MODULE level, not a local: _build_ess_group is a method and cannot see
+#: __init__'s locals, so a first attempt at this failed the whole group
+#: build - silently, because the catalog slice builder swallows per-section
+#: errors - and the symptom was 26 install tasks registering 0 vars.
+_GROUP_HELP = {
+    "LTSC Missing Components":
+        "The Store, Xbox, Game Bar, codecs and everyday apps that LTSC "
+        "strips out.",
+    "Essentials":
+        "One-click runtime bundles. Check them all - no version guessing.",
+}
+
+#: Pixels an Essentials/catalog row spends on everything that is NOT the
+#: name: the checkbox, the 32px icon + its gap, the label's own padding, and
+#: the optional admin shield. Deliberately generous - ellipsize() returns a
+#: short name untouched, so over-reserving costs a little slack and never
+#: produces a wrong result.
+_ROW_CHROME_PX = 118
+
+
+def _fit_name_to_row(label, full_text, row):
+    """Ellipsize `label` to the name space left in `row`.
+
+    Why this needs three triggers, which is the whole lesson:
+
+      * `<Configure>` on the LABEL fires once, early, with whatever width the
+        idle-time catalog builder happened to hand it - and if that already
+        IS the final width, no second Configure ever comes, so the text is
+        never corrected.
+      * `<Configure>` on the ROW is more reliable (it is packed fill="x") but
+        has the same single-shot risk.
+      * `after_idle` runs before the panel has been laid out at all.
+
+    So: bind both Configures, AND re-check once on a short timer that is
+    certain to land after the geometry pass. Redundant triggers are free
+    (the work is one font measure, and it no-ops when the text already fits).
+
+    Correctness note: font measurement is DPI-sensitive. tk renders at
+    scaling 1.33 in a DPI-unaware process and 2.0 in a DPI-aware one, so the
+    SAME string measures 268px in one and 417px in the other. Anything that
+    measures text outside the app's own process - a throwaway Tk root, a
+    test harness - will disagree with what the user sees. Always measure
+    through the label's own toplevel.
+    """
+    def _fit():
+        try:
+            room = row.winfo_width() - _ROW_CHROME_PX
+            if room < 60:
+                return
+            txt = ellipsize(full_text, label.cget("font"), room)
+            if txt != label.cget("text"):
+                label.config(text=txt)
+        except Exception:
+            pass
+
+    for w in (label, row):
+        try:
+            w.bind("<Configure>", lambda _e: _fit(), add="+")
+        except Exception:
+            pass
+    try:
+        label.after_idle(_fit)
+        label.after(200, _fit)
+        label.after(700, _fit)
+    except Exception:
+        pass
+    return label
 
 
 class InstallTab(tk.Frame):
@@ -77,13 +151,15 @@ class InstallTab(tk.Frame):
         # it reads at a glance next to the green Install button.
         self.update_btn = AnimatedButton(
             _btns, text="Update Apps…", command=self._update_apps,
-            bg=COLORS["accent_yellow"], fg=COLORS["black"], font=(F, 12, "bold"), padx=24, pady=11,
+            bg=COLORS["accent_yellow"], fg=COLORS["black"], font=(F, 12, "bold"), padx=28, pady=14,
+            radius=16,
         )
         self.update_btn.pack(side="left", padx=6)
         self._update_count = None  # None = unknown/scanning, else int
         self.install_btn = AnimatedButton(
             _btns, text="Install", command=self._install_selected,
-            bg=accent, fg=COLORS["black"], font=(F, 12, "bold"), padx=24, pady=11,
+            bg=accent, fg=COLORS["black"], font=(F, 12, "bold"), padx=28, pady=14,
+            radius=16,
         )
         self.install_btn.pack(side="left", padx=6)
         self.install_btn.set_enabled(False)  # gray until something is picked
@@ -121,8 +197,16 @@ class InstallTab(tk.Frame):
             if _g not in _seen_groups:
                 _seen_groups.append(_g)
         _group_subs = {
-            "LTSC Missing Components": "— the Store, Xbox, Game Bar, codecs & everyday apps that LTSC strips out",
-            "Essentials": "— one-click runtime bundles: check them all, no version guessing",
+            # REDESIGN 2026-10: these were rendered INLINE after the group
+            # title at 8pt - a 71-character clause ("the Store, Xbox, Game
+            # Bar, codecs & everyday apps that LTSC strips out") competing
+            # with the title on one line, at the narrowest row width on the
+            # tab. The group titles are already self-describing
+            # ("LTSC Missing Components", "Essentials"), so the clause is now
+            # the header's tooltip. Passed as "" so _build_ess_group does not
+            # reserve a label for it.
+            "LTSC Missing Components": "",
+            "Essentials": "",
         }
 
         # F6(a): the catalog rows (~950 widgets) are NOT built on the
@@ -161,7 +245,7 @@ class InstallTab(tk.Frame):
         # construction before any slice runs.
         self._placeholder = tk.Label(
             panel.inner, text="Preparing catalog…", font=(F, 10),
-            bg=COLORS["bg_alt"], fg=COLORS["subtext"])
+            bg=COLORS["bg"], fg=COLORS["subtext"])
         self._placeholder.pack(pady=24)
         try:
             panel.refresh_scroll()
@@ -593,8 +677,8 @@ class InstallTab(tk.Frame):
             if app_id.lower() not in self._installed_ids:
                 continue
             n += 1
-            b = tk.Label(row, text="✓ Installed", font=(F, 7, "bold"),
-                         bg=COLORS["bg_alt"], fg=COLORS["accent_green"])
+            b = tk.Label(row, text="✓ Installed", font=(F, 8, "bold"),
+                         bg=COLORS["bg"], fg=COLORS["accent_green"])
             # beside the name cluster, not exiled to the row's right edge —
             # packed left it lands right after the last badge (FOSS / OEM /
             # 🔗), keeping the marker adjacent to the app it belongs to
@@ -661,23 +745,37 @@ class InstallTab(tk.Frame):
         Rows register into the shared self.ess_vars / self.vars pools so
         'Install Selected Apps' includes them naturally, in TASKS order.
         Header is arrow + titles only (user request: no All/None buttons)."""
-        ess = tk.Frame(parent, bg=COLORS["bg_alt"])
+        ess = tk.Frame(parent, bg=COLORS["bg"])
         ess.pack(fill="x", pady=(2, 6))
-        ess_head = tk.Frame(ess, bg=COLORS["surface"])
+        ess_head = tk.Frame(ess, bg=COLORS["bg"])
         ess_head.pack(fill="x")
         _ess_title = tk.Label(ess_head, text=title, font=(F, 10, "bold"),
-                              bg=COLORS["surface"], fg=accent)
+                              bg=COLORS["bg"], fg=accent)
         _ess_title.pack(side="left", padx=(8, 4), pady=5)
-        _ess_sub = tk.Label(ess_head, text=subtitle,
-                            font=(F, 8), bg=COLORS["surface"], fg=COLORS["subtext"])
-        _ess_sub.pack(side="left")
+        # REDESIGN 2026-10: the subtitle is a tooltip on the title now. It
+        # used to be a second, always-visible Label packed beside it, and an
+        # EMPTY one (every caller after the text purge passes "") still
+        # reserved a full line of height in the header - so the purge would
+        # have removed the words but left the gap. Not packing it at all is
+        # what actually reclaims the space.
+        _ess_sub = None
+        if subtitle:
+            _ess_sub = tk.Label(ess_head, text=subtitle, font=(F, 8),
+                                bg=COLORS["bg"], fg=COLORS["subtext"])
+            _ess_sub.pack(side="left")
+        _help = _GROUP_HELP.get(title)
+        if _help:
+            try:
+                Tooltip(_ess_title, _help)
+            except Exception:
+                pass
 
-        body = tk.Frame(ess, bg=COLORS["bg_alt"])
+        body = tk.Frame(ess, bg=COLORS["bg"])
         body.pack(fill="x")
         # arrow on the RIGHT like every other Install divider (user request)
         arrow = tk.Label(ess_head, text="▾", font=(F, 10, "bold"),
-                         bg=COLORS["surface"], fg=accent, width=2)
-        arrow.pack(side="right", padx=(0, 8), pady=6)
+                         bg=COLORS["bg"], fg=accent, width=2)
+        arrow.pack(side="right", padx=(0, 10), pady=9)
 
         def toggle_ess(b=body, a=arrow):
             if b.winfo_ismapped():
@@ -692,7 +790,7 @@ class InstallTab(tk.Frame):
         # hover recolors the bar AND its labels together (user bug: only the
         # bar changed, leaving boxed-looking text on mismatched backgrounds)
         def _ess_hover(on, _e=None):
-            _bg = COLORS["surface_hover"] if on else COLORS["surface"]
+            _bg = COLORS["surface_hover"] if on else COLORS["bg"]
             try:
                 ess_head.config(bg=_bg)
                 for _w in (_ess_title, _ess_sub, arrow):
@@ -713,7 +811,7 @@ class InstallTab(tk.Frame):
         cols = self._CAT_COLUMNS
         col_frames = []
         for c in range(cols):
-            cf = tk.Frame(body, bg=COLORS["bg_alt"])
+            cf = tk.Frame(body, bg=COLORS["bg"])
             cf.grid(row=0, column=c, sticky="nsew", padx=(6, 6))
             body.grid_columnconfigure(c, weight=1, uniform="catcols")
             col_frames.append(cf)
@@ -725,10 +823,10 @@ class InstallTab(tk.Frame):
             # Apps' includes Essentials naturally
             self.vars[f"task:{task.key}"] = var
             self._trace_install_var(var)
-            row = tk.Frame(col_frames[ci % cols], bg=COLORS["bg_alt"])
+            row = tk.Frame(col_frames[ci % cols], bg=COLORS["bg"])
             row.pack(fill="x", padx=10, pady=2)
-            cb = tk.Checkbutton(row, variable=var, bg=COLORS["bg_alt"],
-                                fg=COLORS["text"], activebackground=COLORS["bg_alt"],
+            cb = M3Checkbutton(row, variable=var, bg=COLORS["bg"],
+                                fg=COLORS["text"], activebackground=COLORS["bg"],
                                 selectcolor=COLORS["surface"], onvalue=True, offvalue=False)
             cb.pack(side="left")
             # task icons (user bug: Essentials/LTSC rows never called
@@ -736,13 +834,20 @@ class InstallTab(tk.Frame):
             # catalog/bundle rows, keyed off the task label).
             self._row_icon(row, task.label)
             name_lbl = tk.Label(row, text=task.label, font=(F, 9, "bold"),
-                                bg=COLORS["bg_alt"], fg=COLORS["text"])
+                                bg=COLORS["bg"], fg=COLORS["text"],
+                                anchor="w", bd=0)
             name_lbl.pack(side="left", padx=(6, 4))
+            # REDESIGN 2026-10: ellipsize, like the catalog rows above. The
+            # Essentials rows are a SEPARATE builder from _build_category, so
+            # fixing one does not fix the other - which is how "Install
+            # Windows Codecs (AV1, VP9 + Web Media)" ended up sheared
+            # mid-word while every neighbouring row was fine.
+            _fit_name_to_row(name_lbl, task.label, row)
             # admin shield only (user request: no "one-click" text — the
             # shield matches the Custom toggle rows)
             if getattr(task, "admin_required", False):
                 tg = tk.Label(row, text="🛡️", font=("Segoe UI Emoji", 9),
-                              bg=COLORS["bg_alt"], fg=COLORS["text"], cursor="hand2")
+                              bg=COLORS["bg"], fg=COLORS["text"], cursor="hand2")
                 tg.pack(side="left", padx=(6, 0))
                 Tooltip(tg, "Admin Required — needs Administrator rights (skipped in limited mode)")
             Tooltip(name_lbl, task.description)
@@ -911,8 +1016,7 @@ class InstallTab(tk.Frame):
         font's average character happens to be. That mistake blanked the
         Process Manager popup once already (5aba301) and must not be repeated
         here. Tk's photo-image `copy` preserves the source's alpha, so the
-        padding is genuinely transparent rather than a black plate - which is
-        asserted in tools/verify_install_row_alignment.py, because an opaque
+        padding is genuinely transparent rather than a black plate - an opaque
         padding would draw a black square around every logo.
 
         An image that is already exactly size x size is returned unchanged.
@@ -987,14 +1091,14 @@ class InstallTab(tk.Frame):
                 cache[app_name] = img
             img = cache.get(app_name)
             if img is not None:
-                lbl = tk.Label(row, image=img, bg=COLORS["bg_alt"],
+                lbl = tk.Label(row, image=img, bg=COLORS["bg"],
                                bd=0, highlightthickness=0)
                 lbl.pack(side="left", padx=(2, 0))
                 return lbl
         except Exception:
             pass
         try:
-            sp = tk.Frame(row, bg=COLORS["bg_alt"], width=size, height=size)
+            sp = tk.Frame(row, bg=COLORS["bg"], width=size, height=size)
             sp.pack(side="left", padx=(2, 0))
             sp.pack_propagate(False)
         except Exception:
@@ -1002,20 +1106,20 @@ class InstallTab(tk.Frame):
         return None
 
     def _build_category(self, parent, cat, apps, manuals, accent):
-        outer = tk.Frame(parent, bg=COLORS["bg_alt"])
+        outer = tk.Frame(parent, bg=COLORS["bg"])
         outer.pack(fill="x", pady=(6, 4))
 
-        header = tk.Frame(outer, bg=COLORS["surface"])
+        header = tk.Frame(outer, bg=COLORS["bg"])
         header.pack(fill="x")
         # arrow on the RIGHT on every Install divider (user request)
-        arrow = tk.Label(header, text="▾", font=(F, 10, "bold"), bg=COLORS["surface"],
+        arrow = tk.Label(header, text="▾", font=(F, 10, "bold"), bg=COLORS["bg"],
                          fg=accent, width=2)
-        arrow.pack(side="right", padx=(0, 8), pady=6)
-        _cat_title = tk.Label(header, text=cat, font=(F, 10, "bold"), bg=COLORS["surface"],
-                              fg=COLORS["text"])
-        _cat_title.pack(side="left", padx=6)
+        arrow.pack(side="right", padx=(0, 10), pady=9)
+        _cat_title = tk.Label(header, text=cat, font=(F, 11, "bold"), bg=COLORS["bg"],
+                              fg=accent)
+        _cat_title.pack(side="left", padx=(12, 6))
         n_lbl = tk.Label(header, text=f"{len(apps) + len(manuals)} apps", font=(F, 9),
-                         bg=COLORS["surface"], fg=COLORS["subtext"])
+                         bg=COLORS["bg"], fg=COLORS["subtext"])
         n_lbl.pack(side="left", padx=4)
         self._cat_count_lbls[cat] = n_lbl
 
@@ -1036,7 +1140,7 @@ class InstallTab(tk.Frame):
         # hover recolors the bar AND its labels together (user bug: only the
         # bar changed, leaving boxed-looking text on mismatched backgrounds)
         def _cat_hover(on, _e=None):
-            _bg = COLORS["surface_hover"] if on else COLORS["surface"]
+            _bg = COLORS["surface_hover"] if on else COLORS["bg"]
             try:
                 header.config(bg=_bg)
                 for _w in (_cat_title, n_lbl, arrow):
@@ -1048,13 +1152,13 @@ class InstallTab(tk.Frame):
             w.bind("<Enter>", lambda e: _cat_hover(True))
             w.bind("<Leave>", lambda e: _cat_hover(False))
 
-        body = tk.Frame(outer, bg=COLORS["bg_alt"])
+        body = tk.Frame(outer, bg=COLORS["bg"])
         body.pack(fill="x")
         cat_rows = []   # (app_id, row) — feeds the search filter
         cols = self._CAT_COLUMNS          # 2-column flow (user request)
         col_frames = []
         for c in range(cols):
-            cf = tk.Frame(body, bg=COLORS["bg_alt"])
+            cf = tk.Frame(body, bg=COLORS["bg"])
             cf.grid(row=0, column=c, sticky="nsew", padx=(6, 6))
             body.grid_columnconfigure(c, weight=1, uniform="catcols")
             col_frames.append(cf)
@@ -1066,7 +1170,7 @@ class InstallTab(tk.Frame):
             fg = base_fg or COLORS["text"]
             _font = (F, 9, "bold") if bold else (F, 9)
             lbl = tk.Label(parent, text=text, font=_font,
-                           bg=COLORS["bg_alt"], fg=fg, cursor="hand2")
+                           bg=COLORS["bg"], fg=fg, cursor="hand2")
 
             def _enter(_e):
                 lbl.config(font=(F, 9, "bold", "underline") if bold else (F, 9, "underline"),
@@ -1074,6 +1178,14 @@ class InstallTab(tk.Frame):
 
             def _leave(_e):
                 lbl.config(font=_font, fg=fg)
+
+            # REDESIGN 2026-10: long app names ellipsize instead of clipping.
+            # The catalog flows TWO columns per category and the longest names
+            # ("Install Microsoft Visual C++ All-in-One") are wider than half
+            # the window, so pack truncated the glyphs mid-word with no
+            # indication - which reads as a broken render rather than as a
+            # long name. The full name is already in this label's tooltip.
+            _fit_name_to_row(lbl, text, parent)
 
             # Tooltip FIRST, hover binds with add="+": plain bind() replaces
             # (this exact ordering bug is why name hover highlighting silently
@@ -1103,12 +1215,12 @@ class InstallTab(tk.Frame):
             subsequent manual row just reuses the cached width."""
             w = getattr(self, "_cb_spacer_width", None)
             if w is None:
-                cb_probe = tk.Checkbutton(parent, bg=COLORS["bg_alt"],
+                cb_probe = M3Checkbutton(parent, bg=COLORS["bg"],
                                            selectcolor=COLORS["surface"])
                 w = cb_probe.winfo_reqwidth()
                 cb_probe.destroy()
                 self._cb_spacer_width = w
-            sp = tk.Frame(parent, bg=COLORS["bg_alt"], width=w, height=1)
+            sp = tk.Frame(parent, bg=COLORS["bg"], width=w, height=1)
             sp.pack(side="left")
             sp.pack_propagate(False)   # hold the reserved width
             return sp
@@ -1117,10 +1229,10 @@ class InstallTab(tk.Frame):
             var = tk.BooleanVar(value=False)
             self.vars[app["id"]] = var
             self._trace_install_var(var)
-            row = tk.Frame(col_frames[ci % cols], bg=COLORS["bg_alt"])
+            row = tk.Frame(col_frames[ci % cols], bg=COLORS["bg"])
             row.pack(fill="x", padx=4, pady=4)
-            cb = tk.Checkbutton(row, variable=var, bg=COLORS["bg_alt"],
-                                fg=COLORS["text"], activebackground=COLORS["bg_alt"],
+            cb = M3Checkbutton(row, variable=var, bg=COLORS["bg"],
+                                fg=COLORS["text"], activebackground=COLORS["bg"],
                                 selectcolor=COLORS["surface"], onvalue=True, offvalue=False)
             cb.pack(side="left")
             self._row_icon(row, app["name"])
@@ -1139,12 +1251,12 @@ class InstallTab(tk.Frame):
                 # next to each other in the same green (user feedback
                 # 2026-09-06). accent_sky is the palette's designated Install
                 # alt so FOSS/Installed read as different signals at a glance.
-                foss = tk.Label(row, text="FOSS", font=(F, 7, "bold"),
-                                bg=COLORS["bg_alt"], fg=COLORS["accent_sky"])
+                foss = tk.Label(row, text="FOSS", font=(F, 8, "bold"),
+                                bg=COLORS["bg"], fg=COLORS["accent_sky"])
                 foss.pack(side="left", padx=(4, 0))
             if hw:
-                hw_lbl = tk.Label(row, text="⚠ OEM", font=(F, 7, "bold"),
-                                  bg=COLORS["bg_alt"], fg=COLORS["accent_yellow"])
+                hw_lbl = tk.Label(row, text="⚠ OEM", font=(F, 8, "bold"),
+                                  bg=COLORS["bg"], fg=COLORS["accent_yellow"])
                 Tooltip(hw_lbl, f"Hardware restricted — {hw}. Do not install this on other systems.")
                 hw_lbl.pack(side="left", padx=(4, 0))
             # mirror link (user design): 🔗 beside the name as the SECONDARY
@@ -1163,7 +1275,7 @@ class InstallTab(tk.Frame):
         # text color, name IS the link, FOSS badge when flagged, plus 🔗
         # when a mirror exists.
         for ci, app in enumerate(manuals):
-            row = tk.Frame(col_frames[(len(apps) + ci) % cols], bg=COLORS["bg_alt"])
+            row = tk.Frame(col_frames[(len(apps) + ci) % cols], bg=COLORS["bg"])
             row.pack(fill="x", padx=4, pady=4)
             _checkbox_width_spacer(row)
             self._row_icon(row, app["name"])
@@ -1179,8 +1291,8 @@ class InstallTab(tk.Frame):
             if app["foss"]:
                 # sky blue to match the winget-row FOSS chips (green belongs
                 # to the "✓ Installed" badge alone — see _paint_installed_badges)
-                foss = tk.Label(row, text="FOSS", font=(F, 7, "bold"),
-                                bg=COLORS["bg_alt"], fg=COLORS["accent_sky"])
+                foss = tk.Label(row, text="FOSS", font=(F, 8, "bold"),
+                                bg=COLORS["bg"], fg=COLORS["accent_sky"])
                 foss.pack(side="left", padx=(4, 0))
             if fallback:
                 self._make_mirror_link(row, fallback)
@@ -1199,19 +1311,19 @@ class InstallTab(tk.Frame):
             _bvar = tk.BooleanVar(value=False)
             self.bundle_vars[_bundle.key] = (_bvar, _bundle)
             self._trace_install_var(_bvar)
-            _brow = tk.Frame(outer, bg=COLORS["bg_alt"])
+            _brow = tk.Frame(outer, bg=COLORS["bg"])
             _brow.pack(fill="x", padx=10, pady=(2, 6))
-            _bcb = tk.Checkbutton(_brow, variable=_bvar, bg=COLORS["bg_alt"],
-                                   fg=COLORS["text"], activebackground=COLORS["bg_alt"],
+            _bcb = M3Checkbutton(_brow, variable=_bvar, bg=COLORS["bg"],
+                                   fg=COLORS["text"], activebackground=COLORS["bg"],
                                    selectcolor=COLORS["surface"], onvalue=True, offvalue=False)
             _bcb.pack(side="left")
             self._row_icon(_brow, _bundle.label)
             _blbl = tk.Label(_brow, text=_bundle.label, font=(F, 9, "bold"),
-                             bg=COLORS["bg_alt"], fg=COLORS["text"])
+                             bg=COLORS["bg"], fg=COLORS["text"])
             _blbl.pack(side="left", padx=(6, 4))
             if _bundle.admin_required:
                 _bsh = tk.Label(_brow, text="🛡️", font=("Segoe UI Emoji", 9),
-                                bg=COLORS["bg_alt"], fg=COLORS["text"], cursor="hand2")
+                                bg=COLORS["bg"], fg=COLORS["text"], cursor="hand2")
                 _bsh.pack(side="left", padx=(6, 0))
                 Tooltip(_bsh, "Admin Required — needs Administrator rights (skipped in limited mode)")
             Tooltip(_blbl, _bundle.description)
@@ -1232,7 +1344,7 @@ class InstallTab(tk.Frame):
         size as the 🛡️ badge; no underline, ever."""
         _font = ("Segoe UI Emoji", 9)
         mirror = tk.Label(row, text="🔗", font=_font,
-                          bg=COLORS["bg_alt"], fg=COLORS["subtext"],
+                          bg=COLORS["bg"], fg=COLORS["subtext"],
                           cursor="hand2")
         mirror.pack(side="left", padx=(4, 0))
 
@@ -1333,8 +1445,8 @@ class InstallTab(tk.Frame):
                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             return
         except Exception as exc:
-            messagebox.showerror("Could Not Open Link",
-                                 f"Couldn't open this page:\n{url}\n\n{exc}")
+            _themed_showerror(self, "Could Not Open Link",
+                              f"Couldn't open this page:\n{url}\n\n{exc}")
 
     def _set_category(self, cat, on: bool):
         from app.app_catalog import APP_CATALOG

@@ -9,17 +9,26 @@ import tkinter as tk
 from app.ui.theme import COLORS, _hex_lerp, F
 
 class AnimatedProgressBar(tk.Canvas):
-    """Segmented progress bar with a sliding glow. Real fraction fills green
-    segments; while a task is active an indeterminate shimmer runs on top."""
+    """Material 3 linear progress indicator.
 
-    def __init__(self, parent, accent=COLORS["accent_green"], height=14, **kw):
+    A rounded active indicator (the tab accent) over a tonal track. Real
+    fractions fill from the left; indeterminate mode slides a rounded segment
+    across the track. Same API as before (set_fraction / set_indeterminate)."""
+
+    THICK = 6
+
+    def __init__(self, parent, accent=COLORS["primary"], height=14, **kw):
+        try:
+            self._page = parent["bg"]
+        except Exception:
+            self._page = COLORS["bg"]
         super().__init__(parent, height=height, highlightthickness=0, bd=0,
-                         bg=COLORS["bg_widget"], **kw)
+                         bg=self._page, **kw)
         self._accent = accent
         self._fraction = 0.0
         self._indeterminate = False
         self._shimmer = 0.0
-        self._segs = 20
+        self._segs = 20          # kept for API compat
         self.bind("<Configure>", lambda e: self._draw())
 
     def set_fraction(self, fraction: float):
@@ -68,21 +77,25 @@ class AnimatedProgressBar(tk.Canvas):
         h = self.winfo_height()
         if w < 10:
             return
-        gap = 3
-        seg_w = (w - gap * (self._segs - 1)) / self._segs
-        lit = self._fraction * self._segs
-        for i in range(self._segs):
-            x = i * (seg_w + gap)
-            # partial segment alpha via color blend
-            seg_t = max(0.0, min(1.0, lit - i))
-            if self._indeterminate:
-                dist = abs(((i / self._segs) + 0.5) - self._shimmer) % 1.0
-                dist = min(dist, 1.0 - dist)
-                seg_t = max(seg_t, max(0.0, 0.65 - dist * 2.2))
-            color = _hex_lerp(COLORS["surface"], self._accent, seg_t)
-            self._round_rect(x, 2, x + seg_w, h - 2, 3, fill=color, outline="")
+        bh = self.THICK
+        y0 = (h - bh) / 2.0
+        y1 = y0 + bh
+        track = _hex_lerp(self._page, self._accent, 0.24)
+        self._round_rect(0, y0, w, y1, bh / 2.0, fill=track, outline="")
+        if self._indeterminate:
+            seg = w * 0.35
+            x = (self._shimmer / 1.3) * (w + seg) - seg
+            x0, x1 = max(0.0, x), min(float(w), x + seg)
+            if x1 - x0 > 1:
+                self._round_rect(x0, y0, x1, y1, bh / 2.0,
+                                 fill=self._accent, outline="")
+        elif self._fraction > 0:
+            x1 = max(float(bh), self._fraction * w)
+            self._round_rect(0, y0, x1, y1, bh / 2.0,
+                             fill=self._accent, outline="")
 
     def _round_rect(self, x0, y0, x1, y1, r, **kw):
+        r = max(0.0, min(r, (x1 - x0) / 2.0, (y1 - y0) / 2.0))
         points = [
             x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r,
             x1, y1 - r, x1, y1, x1 - r, y1, x0 + r, y1,

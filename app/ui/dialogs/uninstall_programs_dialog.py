@@ -10,8 +10,11 @@ from __future__ import annotations
 import os
 
 import tkinter as tk
+
+from app.ui.widgets.checkbox import M3Checkbutton
 from tkinter import ttk, messagebox
-from app.ui.base import ThemedModal, _themed_askyesno
+from app.ui.base import _themed_askyesno
+from app.ui.dialogs._tool_page import ToolPage
 from app.ui.theme import COLORS, F, TAB_ACCENTS, ICON_ROW_PX, icon_bg_rgb
 from app.ui.widgets import AnimatedButton, RoundedEntry, ScrollableRoundedPanel
 
@@ -22,7 +25,88 @@ from app.ui.widgets import AnimatedButton, RoundedEntry, ScrollableRoundedPanel
 _icon_bg = icon_bg_rgb(COLORS["bg"])
 
 
-class UninstallProgramsDialog(ThemedModal):
+#: Return codes Windows uses to say "it worked, but...".
+#: 3010 = ERROR_SUCCESS_REBOOT_REQUIRED, 1641 = ERROR_SUCCESS_REBOOT_INITIATED.
+#: Both mean the uninstall SUCCEEDED. Treating a bare non-zero rc as failure
+#: would mislabel these as broken, which is why this is an explicit table
+#: rather than `rc != 0`.
+_UNINSTALL_REBOOT_CODES = (3010, 1641)
+
+
+def classify_uninstall(rc, err):
+    """Did this program actually uninstall? -> ok / reboot / unclear / failed
+
+    BUGFIX 2026-10: the batch summary was computed as
+    ``started_ok = [p for p, rc, err in results if not err]`` and then read
+    "Finished N uninstall(s)", where N was len(results) - every ATTEMPT. A
+    non-zero return code was silently treated as success, so three programs
+    whose uninstallers all errored produced "Finished. 3 uninstall(s). No
+    high-confidence leftovers found." Nothing crashed and no leftover was
+    invented; the dialog simply asserted success it had not observed.
+
+    Four outcomes, because they mean different things to a user:
+
+      ok       - the uninstaller reported success
+      reboot   - reported success, needs a restart to finish
+      unclear  - ran, but returned a code we cannot interpret
+      failed   - never ran (could not launch, malformed command, cancelled)
+    """
+    if err:
+        return "failed"
+    if rc is None:
+        return "failed"
+    if rc == 0:
+        return "ok"
+    if rc in _UNINSTALL_REBOOT_CODES:
+        return "reboot"
+    return "unclear"
+
+
+def _tally_uninstall(results):
+    """{outcome: count} for a finished batch."""
+    out = {}
+    for _p, rc, err in results:
+        k = classify_uninstall(rc, err)
+        out[k] = out.get(k, 0) + 1
+    return out
+
+
+def describe_uninstall_batch(tally):
+    """One honest sentence for a finished batch.
+
+    Never says "N uninstalled" for N attempts. "Unclear" is called out
+    separately from "failed" on purpose: an unclear code usually means the
+    uninstaller did its work and reported oddly, whereas "failed" means
+    nothing happened - and collapsing them would either alarm people about
+    successful removals or hide genuine failures.
+    """
+    parts = []
+    ok = tally.get("ok", 0)
+    if ok:
+        parts.append("%d uninstalled" % ok)
+    if tally.get("reboot"):
+        parts.append("%d finished after a restart"
+                     % tally["reboot"])
+    if tally.get("unclear"):
+        parts.append("%d did not report success - check them in Settings"
+                     % tally["unclear"])
+    if tally.get("failed"):
+        parts.append("%d could not be started" % tally["failed"])
+    if not parts:
+        return "Nothing was uninstalled."
+    # NOT str.capitalize(): it lowercases the entire remainder, which turned
+    # "check them in Settings" into "check them in settings".
+    joined = " · ".join(parts) + "."
+    return joined[0].upper() + joined[1:]
+
+
+class _PillEntry(RoundedEntry):
+    """Search box as a full pill (M3 search bar), centred by its caller."""
+    RADIUS = 24
+    PAD_Y = 10
+
+
+class UninstallProgramsDialog(ToolPage):
     """Uninstall Programs (Tools tab card): list installed apps,
     run each program's official uninstaller, then optionally scan for
     leftover folders for the chosen name only.
@@ -34,6 +118,12 @@ class UninstallProgramsDialog(ThemedModal):
         heuristics as the Clean-tab orphan task).
       * User reviews leftover candidates with checkboxes before delete.
       * Elevation is requested only when the selected uninstall needs it.
+
+    REDESIGN 2026-10: on the shared ToolPage shell — a Header banner
+    instead of the bare "Pick a program to remove" line, the search +
+    Select all controls in the shell toolbar, the list in its own scroll
+    panel, and status + actions in the shared footer (Uninstall Selected
+    is the one primary action).
     """
 
     def __init__(self, parent, app):
@@ -45,9 +135,12 @@ class UninstallProgramsDialog(ThemedModal):
         self._icon_cache = {}     # DisplayIcon spec -> tk.PhotoImage (survives rebuilds)
         self._icon_waiters = {}   # DisplayIcon spec -> [Label, ...] awaiting extraction
         self._icon_default_img = None  # lazily built placeholder PhotoImage
-        super().__init__(parent, title="Uninstall Programs",
-                         accent=TAB_ACCENTS.get("Clean", COLORS["accent_green"]))
-        body = self.body
+        accent = TAB_ACCENTS.get("Clean", COLORS["accent_green"])
+        super().__init__(parent, title="Uninstall Programs", accent=accent,
+                         scope="Uses each program's own official "
+                               "uninstaller — never a force-delete.",
+                         with_toolbar=True, scroll=False)
+        body = self.content
 
         # One-way bridge onto the Tk thread.
         #
@@ -62,21 +155,33 @@ class UninstallProgramsDialog(ThemedModal):
         # owns one per dialog and stops it in close(), so the class body just
         # uses the inherited self._dispatch. See app/ui/tkdispatch.py.
 
-        tk.Label(body, text="Uninstall a program the official way, then "
-                            "optionally clean leftovers it left behind.",
-                 font=(F, 10, "bold"), bg=COLORS["bg"], fg=COLORS["text"],
-                 anchor="w").pack(fill="x", pady=(0, 2))
-        tk.Label(body, text="Only the program's own uninstaller runs. "
-                            "Leftover folders are shown for review — nothing "
-                            "is force-deleted without your say-so.",
-                 font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
-                 anchor="w", wraplength=720).pack(fill="x", pady=(0, 8))
+        self.banner.set_state("\U0001F5D1", accent)
+        self.banner.set_title("Free up space by removing apps")
+        self.banner.set_sub("Remove an app and, if you want, review what it "
+                            "left behind.")
 
-        # Search
+        # Search + Select all live in the shell toolbar.
+        #
+        # AUDIT FIX (2026-10): SELECT-ALL IS PACKED FIRST, and the order is the
+        # whole point. pack() hands the toolbar's width out in PACK ORDER, and
+        # the search pill asks for 50 characters - on the smallest window the
+        # app allows it ate the row and sheared the checkbox label off at
+        # "Select |all", cut mid-character at the 44px it was left with. The
+        # short, fixed-width control now claims its natural width first and
+        # the elastic one takes whatever is left.
+        self._select_all_var = tk.BooleanVar(value=False)
+        M3Checkbutton(
+            self.toolbar, text="Select all", variable=self._select_all_var,
+            command=self._on_select_all, font=(F, 9), bg=COLORS["bg"],
+            fg=COLORS["text"], selectcolor=COLORS["surface"],
+            activebackground=COLORS["bg"], activeforeground=COLORS["text"]
+        ).pack(side="right", pady=(0, 2))
+
         self._search_var = tk.StringVar()
         self._search_var.trace_add("write", lambda *_: self._apply_filter())
-        entry = RoundedEntry(body, textvariable=self._search_var)
-        entry.pack(fill="x", pady=(0, 6))
+        entry = _PillEntry(self.toolbar, textvariable=self._search_var, width=50,
+                           font=(F, 11))
+        entry.pack(side="left", pady=(0, 2))
         self._search_entry = entry.entry
         self._search_placeholder = "Type to filter…"
         self._search_entry.insert(0, self._search_placeholder)
@@ -84,44 +189,24 @@ class UninstallProgramsDialog(ThemedModal):
         self._search_entry.bind("<FocusIn>", self._filter_focus_in)
         self._search_entry.bind("<FocusOut>", self._filter_focus_out)
 
-        # Program list
+        # Program list (keeps its own scroll panel)
         self._list_panel = ScrollableRoundedPanel(body)
         self._list_panel.config(height=280)
         self._list_panel.pack(fill="both", expand=True, pady=(0, 6))
         self._list_body = self._list_panel.inner
 
-        # Status + actions
-        brow = tk.Frame(body, bg=COLORS["bg"])
-        brow.pack(fill="x", pady=(4, 0))
-        self._status = tk.Label(brow, text="Scanning…", font=(F, 9),
-                                bg=COLORS["bg"], fg=COLORS["subtext"],
-                                wraplength=420, justify="left", anchor="w")
-        self._status.pack(side="left", fill="x", expand=True)
-        self._uninstall_btn = AnimatedButton(
-            brow, text="Uninstall Selected", command=self._do_uninstall,
-            bg=TAB_ACCENTS.get("Clean", COLORS["accent_green"]),
-            fg=COLORS["black"], font=(F, 9, "bold"), padx=14, pady=6)
-        self._uninstall_btn.pack(side="right", padx=(6, 0))
-        self._uninstall_btn.set_enabled(False)
-        self._select_all_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(
-            brow, text="Select all", variable=self._select_all_var,
-            command=self._on_select_all, font=(F, 9), bg=COLORS["bg"],
-            fg=COLORS["text"], selectcolor=COLORS["surface"],
-            activebackground=COLORS["bg"], activeforeground=COLORS["text"]
-        ).pack(side="right", padx=(6, 0))
-        AnimatedButton(brow, text="Refresh", command=self._refresh,
-                       bg=COLORS["surface"], fg=COLORS["text"],
-                       font=(F, 9, "bold"), padx=12, pady=6).pack(
-                           side="right", padx=(6, 0))
-        AnimatedButton(brow, text="Close", command=self.close,
-                       bg=COLORS["surface"], fg=COLORS["text"],
-                       font=(F, 9, "bold"), padx=12, pady=6).pack(
-                           side="right")
-
         # Leftover review panel (hidden until after uninstall)
         self._leftover_frame = tk.Frame(body, bg=COLORS["bg"])
         # packed on demand
+
+        # REDESIGN 2026-10: shell footer — Uninstall Selected is the one
+        # primary action; status is the shared StatusLine.
+        self.status.stop("Scanning…")
+        self._uninstall_btn = self.add_button(
+            "Uninstall Selected", self._do_uninstall, kind="primary")
+        self._uninstall_btn.set_enabled(False)
+        self.add_button("Close", self.close, kind="secondary")
+        self.add_button("Refresh", self._refresh, kind="secondary")
 
         # Async enumerate so the dialog never freezes on open
         self._scan_token = [False]
@@ -164,30 +249,57 @@ class UninstallProgramsDialog(ThemedModal):
         self._rebuild_list()
 
     def _start_scan(self):
-        self._status.config(text="Scanning installed programs…")
+        self.status.stop("Scanning installed programs…")
         token = self._scan_token
         token[0] = False
 
         def work():
+            # BUGFIX 2026-10: the exception became `programs = []`, which is
+            # what a machine with nothing installed also produces. Both then
+            # rendered "0 program(s) found." - a failed read was reported to
+            # the user as a confident, specific fact about their PC, and
+            # there was no way to retry except Refresh (which re-ran the same
+            # failing call).
+            err = None
             try:
                 from app.game_catalog import list_installed_programs
                 programs = list_installed_programs()
-            except Exception:
-                programs = []
+            except Exception as exc:
+                programs, err = None, str(exc)
             if token[0]:
                 return
-            self._dispatch.post(lambda p=programs: self._on_scan_done(p))
+            self._dispatch.post(
+                lambda p=programs, e=err: self._on_scan_done(p, e))
 
         import threading
         threading.Thread(target=work, daemon=True).start()
 
-    def _on_scan_done(self, programs):
+    def _on_scan_done(self, programs, err=None):
         if self._scan_token[0]:
+            return
+        if err is not None:
+            self._programs = []
+            self._shown = []
+            self.status.stop(
+                "Couldn't read the list of installed programs. "
+                "Nothing was changed.", COLORS["accent_yellow"])
+            self._rebuild_list(error=str(err))
             return
         self._programs = programs or []
         self._shown = list(self._programs)
-        self._status.config(
-            text=f"{len(self._programs)} program(s) found. Select one to uninstall.")
+        # BUGFIX 2026-10 (E3): the list was shown in raw registry-enumeration
+        # order, which is roughly install order - so the 200th program on a
+        # typical machine sits under a text filter with nothing to sort by,
+        # while Startup Manager sorts the same kind of list. Two list dialogs
+        # in one app behaving differently is worse than either alone. Sorted
+        # case-insensitively by name, with unnamed entries last so a blank
+        # name cannot sort to the top of the list.
+        # .strip() so a name that is only whitespace is treated as unnamed
+        # rather than sorting to the very top of the list as "".
+        self._shown.sort(key=lambda p: ((str(p.get("name") or "").strip()
+                                         .lower()) or "\uffff"))
+        self.status.stop(
+            f"{len(self._programs)} program(s) found. Select one to uninstall.")
         self._rebuild_list()
 
     def _refresh(self):
@@ -244,12 +356,30 @@ class UninstallProgramsDialog(ThemedModal):
         var.set(not var.get())
         self._update_uninstall_btn()
 
-    def _rebuild_list(self):
+    def _rebuild_list(self, error=None):
         for child in self._list_body.winfo_children():
             try:
                 child.destroy()
             except Exception:
                 pass
+        if error:
+            # Never "No matching programs." after a failed read: that is a
+            # statement about a search, and no search has run.
+            short = error.strip().splitlines()[0][:140] or "unknown error"
+            tk.Label(self._list_body, text="Couldn't read your programs.",
+                     font=(F, 10, "bold"), bg=COLORS["bg"],
+                     fg=COLORS["accent_yellow"], anchor="w",
+                     bd=0, highlightthickness=0).pack(fill="x", padx=8,
+                                                       pady=(12, 2))
+            tk.Label(self._list_body, text=short, font=(F, 9),
+                     bg=COLORS["bg"], fg=COLORS["subtext"], anchor="w",
+                     justify="left", wraplength=self.body_width(28),
+                     bd=0, highlightthickness=0).pack(fill="x", padx=8)
+            try:
+                self._list_panel.refresh_scroll()
+            except Exception:
+                pass
+            return
         if not self._shown:
             tk.Label(self._list_body,
                      text="No matching programs.",
@@ -277,7 +407,7 @@ class UninstallProgramsDialog(ThemedModal):
         row = tk.Frame(self._list_body, bg=COLORS["bg"], cursor="hand2")
         row.pack(fill="x", padx=4, pady=1)
 
-        cb = tk.Checkbutton(
+        cb = M3Checkbutton(
             row, variable=var, command=lambda p=prog: self._update_uninstall_btn(),
             bg=COLORS["bg"], activebackground=COLORS["bg"],
             selectcolor=COLORS["surface"])
@@ -429,7 +559,7 @@ class UninstallProgramsDialog(ThemedModal):
         built-in once-per-~24h throttling, etc.), so this can't block or
         fail the uninstall itself; it only delays starting it by however
         long the checkpoint takes."""
-        self._status.config(text="Creating a System Restore point (safety net)…")
+        self.status.stop("Creating a System Restore point (safety net)…")
         token = self._scan_token
 
         def work():
@@ -457,8 +587,8 @@ class UninstallProgramsDialog(ThemedModal):
         threading.Thread(target=work, daemon=True).start()
 
     def _after_restore_point(self, ok):
-        self._status.config(
-            text="Restore point created." if ok
+        self.status.stop(
+            "Restore point created." if ok
             else "Restore point skipped (System Protection may be off) — continuing.")
         self._run_next_in_queue()
 
@@ -469,8 +599,8 @@ class UninstallProgramsDialog(ThemedModal):
         prog = self._queue.pop(0)
         name = prog.get("name") or "this program"
         step = self._queue_total - len(self._queue)
-        self._status.config(
-            text=f"Uninstalling {name}… ({step}/{self._queue_total})")
+        self.status.stop(
+            f"Uninstalling {name}… ({step}/{self._queue_total})")
         cmd = prog.get("quiet") or prog.get("uninstall") or ""
         if not cmd:
             self._queue_results.append((prog, None, "No uninstall command found"))
@@ -519,11 +649,17 @@ class UninstallProgramsDialog(ThemedModal):
     def _on_queue_done(self):
         results = self._queue_results
         n = len(results)
-        # Only programs whose uninstaller actually started get a leftover
-        # scan — one that failed to launch left nothing new behind.
-        started_ok = [p for p, rc, err in results if not err]
-        failed = n - len(started_ok)
-        self._status.config(text=f"Finished {n} uninstall(s). Scanning leftovers…")
+        # Only programs whose uninstaller actually STARTED get a leftover
+        # scan - one that never launched left nothing new behind. This
+        # deliberately includes "unclear": the uninstaller ran, so it may
+        # have removed files, and skipping its leftovers would hide debris.
+        started_ok = [p for p, rc, err in results
+                      if classify_uninstall(rc, err) != "failed"]
+        tally = {}
+        for _p, rc, err in results:
+            k = classify_uninstall(rc, err)
+            tally[k] = tally.get(k, 0) + 1
+        self.status.stop("Uninstallers finished. Scanning leftovers…")
 
         token = self._scan_token
 
@@ -568,22 +704,21 @@ class UninstallProgramsDialog(ThemedModal):
                 return
             try:
                 self._dispatch.post(
-                    lambda: self._on_leftover_scan_done(items, n, failed))
+                    lambda: self._on_leftover_scan_done(items, n, 0, tally))
             except Exception:
                 pass
 
         import threading
         threading.Thread(target=work, daemon=True).start()
 
-    def _on_leftover_scan_done(self, items, n, failed):
+    def _on_leftover_scan_done(self, items, n, failed=None, tally=None):
+        tally = tally or {}
+        summary = describe_uninstall_batch(tally)
         if not items:
-            msg = f"Finished {n} uninstall(s). No high-confidence leftovers found."
-            if failed:
-                msg += f" ({failed} failed to start.)"
-            self._status.config(text=msg)
+            msg = summary + " No high-confidence leftovers found."
+            self.status.stop(msg)
             self._refresh()
             return
-        summary = f"{n} uninstalled program(s)" if n != 1 else "1 program"
         self._show_leftover_review(summary, items)
 
     def _check_ghost_registry_key(self, prog):
@@ -806,12 +941,12 @@ class UninstallProgramsDialog(ThemedModal):
         for item in items:
             var = tk.BooleanVar(value=True)
             self._leftover_vars[item["path"]] = var
-            cb = tk.Checkbutton(
+            cb = M3Checkbutton(
                 self._leftover_frame, text=item["label"], variable=var,
-                font=(F, 8), bg=COLORS["bg"], fg=COLORS["text"],
+                font=(F, 9), bg=COLORS["bg"], fg=COLORS["text"],
                 selectcolor=COLORS["surface"], activebackground=COLORS["bg"],
                 activeforeground=COLORS["text"], anchor="w",
-                wraplength=700, justify="left")
+                wraplength=self.body_width(28), justify="left")
             cb.pack(fill="x", padx=4, pady=1)
         brow = tk.Frame(self._leftover_frame, bg=COLORS["bg"])
         brow.pack(fill="x", pady=(6, 0))
@@ -834,7 +969,7 @@ class UninstallProgramsDialog(ThemedModal):
     def _delete_leftovers(self, summary_name):
         paths = [p for p, v in self._leftover_vars.items() if v.get()]
         if not paths:
-            self._status.config(text="Nothing selected to delete.")
+            self.status.stop("Nothing selected to delete.")
             return
         if not _themed_askyesno(
                 self._dlg, "Confirm Delete",
@@ -890,12 +1025,12 @@ class UninstallProgramsDialog(ThemedModal):
 
         import threading
         threading.Thread(target=work, daemon=True).start()
-        self._status.config(text="Deleting selected leftovers…")
+        self.status.stop("Deleting selected leftovers…")
 
     def _after_leftover_delete(self, ok_count, freed):
         mb = freed / (1024 * 1024) if freed else 0
-        self._status.config(
-            text=f"Removed {ok_count} leftover item(s)"
+        self.status.stop(
+            f"Removed {ok_count} leftover item(s)"
                  + (f" (~{mb:.1f} MB freed)." if mb > 0 else "."))
         self._clear_leftover_panel()
         self._refresh()

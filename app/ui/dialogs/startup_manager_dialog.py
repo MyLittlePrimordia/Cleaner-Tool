@@ -9,16 +9,19 @@ from __future__ import annotations
 
 import tkinter as tk
 from tkinter import ttk, messagebox
-from app.ui.base import ThemedModal, Tooltip
+from app.ui.base import Tooltip
+from app.ui.dialogs._tool_page import ToolPage
 from app.ui.theme import COLORS, F, TAB_ACCENTS, ICON_ROW_PX, icon_bg_rgb
 from app.ui.widgets import AnimatedButton, ScrollableRoundedPanel, ToggleSwitch
 from app.ui.tkdispatch import TkDispatcher
 
-# Rows here are COLORS["bg_alt"]; the icon plate must match it exactly.
-_icon_bg = icon_bg_rgb(COLORS["bg_alt"])
+# Rows sit directly on the page now (no per-row card fill), so the icon
+# plate must match the PAGE colour exactly - otherwise every app icon shows
+# the opaque square the extractor composites onto.
+_icon_bg = icon_bg_rgb(COLORS["bg"])
 
 
-class StartupManagerDialog(ThemedModal):
+class StartupManagerDialog(ToolPage):
     """Startup Manager (Tools tab card): everything that launches at
     sign-in, with one toggle each.
 
@@ -33,19 +36,30 @@ class StartupManagerDialog(ThemedModal):
     rows show a small shield + are disabled outright when not running
     as Administrator, the same visual language Install/Custom already
     use for admin-gated rows.
+
+    REDESIGN 2026-10: on the shared ToolPage shell — the two intro
+    labels are one Header banner, and the footer is the shell's
+    StatusLine + button row (Close primary, Refresh secondary).
     """
 
     def __init__(self, parent, app):
         self.app = app
         self._rows = {}     # item_id -> {"toggle": ToggleSwitch, "var": BooleanVar}
+        self._wrap_bound = False
         # icon state: command -> PhotoImage, plus the labels still waiting on
         # an extraction, so a Refresh never re-extracts the same file.
         self._icon_cache = {}
         self._icon_waiters = {}
         self._icon_default_img = None
         super().__init__(parent, title="Startup Manager",
-                         accent=TAB_ACCENTS["Tools"])
-        body = self.body
+                         accent=TAB_ACCENTS["Tools"],
+                         scope="Nothing is deleted — every switch turns "
+                               "back on.",
+                         scroll=False)
+        body = self.content
+        self.banner.set_state("\U0001F680", TAB_ACCENTS["Tools"])
+        self.banner.set_title("What starts with Windows?")
+        self.banner.set_sub("Turn apps on or off at boot.")
         # One-way bridge onto the Tk thread. Icon extraction runs off-thread
         # (it is GDI work) and the swap has to happen on the Tk thread, so it
         # goes through a queue rather than calling .after() from the worker —
@@ -53,40 +67,21 @@ class StartupManagerDialog(ThemedModal):
         self._dispatch = TkDispatcher(self._dlg)
         self._dispatch.start()
 
-        tk.Label(body, text="Turn off apps that launch when Windows "
-                            "starts, without uninstalling anything.",
-                 font=(F, 10, "bold"), bg=COLORS["bg"], fg=COLORS["text"],
-                 anchor="w").pack(fill="x", pady=(0, 2))
-        tk.Label(body, text="Switch anything off here any time — nothing "
-                            "is deleted, and you can turn it back on with "
-                            "the same switch.",
-                 font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
-                 anchor="w", wraplength=700).pack(fill="x", pady=(0, 12))
-
         self._panel = ScrollableRoundedPanel(body)
         self._panel.config(height=340)
         self._panel.pack(fill="both", expand=True)
 
-        brow = tk.Frame(body, bg=COLORS["bg"])
-        brow.pack(fill="x", pady=(10, 0))
-        self._status = tk.Label(brow, text="", font=(F, 9), bg=COLORS["bg"],
-                                fg=COLORS["subtext"], wraplength=560,
-                                justify="left")
-        self._status.pack(side="left", fill="x", expand=True)
-        AnimatedButton(brow, text="Refresh", command=self._refresh,
-                       bg=COLORS["surface"], fg=COLORS["text"],
-                       font=(F, 9, "bold"), padx=16,
-                       pady=6).pack(side="right", padx=(8, 0))
-        AnimatedButton(brow, text="Close", command=self.close,
-                       bg=TAB_ACCENTS["Tools"], fg=COLORS["black"],
-                       font=(F, 9, "bold"), padx=20,
-                       pady=6).pack(side="right")
+        # REDESIGN 2026-10: shell footer — Close is the one primary action
+        # (it was the accent-filled button before), Refresh is secondary.
+        # _say() now writes to the shared StatusLine.
+        self.add_button("Close", self.close, kind="primary")
+        self.add_button("Refresh", self._refresh, kind="secondary")
 
         self._refresh()
 
     def _say(self, text):
         try:
-            self._status.config(text=text)
+            self.status.stop(text)
         except Exception:
             pass
 
@@ -98,14 +93,24 @@ class StartupManagerDialog(ThemedModal):
         except Exception:
             return
         self._rows = {}
+        # BUGFIX 2026-10: the exception was swallowed into `items = []`, which
+        # is the same value a genuinely-empty machine produces. Both rendered
+        # one string - "Nothing found - or this PC couldn't be checked." - so
+        # a user whose read failed was told, with equal confidence, that they
+        # might have nothing, and had no way to tell the two apart or to retry
+        # a read that had not actually happened.
+        err = None
         try:
             from app.startup_manager import list_startup_items
             items = list_startup_items()
-        except Exception:
-            items = []
+        except Exception as exc:
+            items, err = None, str(exc)
+        if err is not None:
+            self._paint_error(holder, err)
+            return
         if not items:
-            tk.Label(holder, text="Nothing found — or this PC couldn't be "
-                                  "checked.", font=(F, 9), bg=COLORS["bg_alt"],
+            tk.Label(holder, text="Nothing is set to start with Windows.",
+                     font=(F, 9), bg=COLORS["bg"],
                      fg=COLORS["subtext"]).pack(pady=20)
             try:
                 self._panel.refresh_scroll()
@@ -121,10 +126,49 @@ class StartupManagerDialog(ThemedModal):
         except Exception:
             pass
         n_on = sum(1 for i in items if i["enabled"])
-        self._say(f"{n_on} of {len(items)} start with Windows.")
+        self._say("%d of %d start with Windows." % (n_on, len(items)))
+        self._bind_wrap()
+
+    def _paint_error(self, holder, detail):
+        """A failed read, shown as a failed read.
+
+        Distinct from the empty state on purpose. "Nothing is set to start
+        with Windows" is a confident claim about the machine; a failed read is
+        a statement about this tool. Showing the former after the latter is
+        how users end up disabling things that were working.
+        """
+        short = (detail or "").strip().splitlines()[0][:140] or "unknown error"
+        try:
+            tk.Label(holder, text="Couldn't read your startup items.",
+                     font=(F, 10, "bold"), bg=COLORS["bg"],
+                     fg=COLORS["accent_yellow"],
+                     bd=0, highlightthickness=0).pack(pady=(22, 2))
+            tk.Label(holder, text=short, font=(F, 9), bg=COLORS["bg"],
+                     fg=COLORS["subtext"], wraplength=self.body_width(28),
+                     justify="center", bd=0, highlightthickness=0).pack(pady=(0, 4))
+            tk.Label(holder, text="Nothing was changed.",
+                     font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
+                     bd=0, highlightthickness=0).pack()
+            AnimatedButton(
+                holder, text="Try again", command=self._refresh,
+                bg=COLORS["surface"], fg=COLORS["text"],
+                font=(F, 9, "bold"), padx=16, pady=6).pack(pady=(12, 20))
+        except Exception:
+            pass
+        try:
+            self._panel.refresh_scroll()
+        except Exception:
+            pass
 
     def _build_row(self, parent, item, admin):
-        row = tk.Frame(parent, bg=COLORS["bg_alt"])
+        # AUDIT D2: this dialog predates ToolShell, so its rows never got
+        # ToolRow._fit_title's ellipsis. Both labels below packed a name and
+        # a source_label (often a full command line - "C:\Program Files\...\app.exe
+        # --background") with no wraplength and no truncation, so pack sheared
+        # them MID-CHARACTER. That reads as a rendering fault rather than as
+        # truncation. Widths come from the row's own column, re-measured on
+        # <Configure>, so they follow the window instead of a literal.
+        row = tk.Frame(parent, bg=COLORS["bg"])
         var = tk.BooleanVar(value=item["enabled"])
         needs_admin = item["admin_required"] and not admin
         toggle = ToggleSwitch(
@@ -140,27 +184,106 @@ class StartupManagerDialog(ThemedModal):
         # in two shapes and both resolve: a Run value that is a command line
         # pointing at an exe, and a Startup-folder .lnk shortcut (resolved by
         # parsing the shell link). There was no icon here at all before.
-        icon_lbl = tk.Label(row, bg=COLORS["bg_alt"])
+        icon_lbl = tk.Label(row, bg=COLORS["bg"])
         icon_lbl.pack(side="left", padx=(0, 10), pady=8)
         self._set_row_icon(icon_lbl, item)
-        text = tk.Frame(row, bg=COLORS["bg_alt"])
+        text = tk.Frame(row, bg=COLORS["bg"])
         text.pack(side="left", fill="x", expand=True)
-        name_row = tk.Frame(text, bg=COLORS["bg_alt"])
+        name_row = tk.Frame(text, bg=COLORS["bg"])
         name_row.pack(fill="x")
-        tk.Label(name_row, text=item["name"], font=(F, 9, "bold"),
-                 bg=COLORS["bg_alt"], fg=COLORS["text"],
-                 anchor="w").pack(side="left")
+        name_lbl = tk.Label(name_row, text=item["name"], font=(F, 9, "bold"),
+                            bg=COLORS["bg"], fg=COLORS["text"],
+                            anchor="w", justify="left", bd=0)
+        name_lbl.pack(side="left", fill="x", expand=True)
+        # The full text is never lost: it is the tooltip on both labels.
+        Tooltip(name_lbl, item["name"])
         if needs_admin:
-            shield = tk.Label(name_row, text="🛡️", font=(F, 8),
-                              bg=COLORS["bg_alt"])
-            shield.pack(side="left", padx=(6, 0))
+            shield = tk.Label(name_row, text="🛡️", font=(F, 9),
+                              bg=COLORS["bg"])
+            shield.pack(side="right", padx=(6, 0))
             Tooltip(shield, "Restart Cleaner Tool as Administrator to "
                            "change this one")
-        tk.Label(text, text=item["source_label"], font=(F, 8),
-                 bg=COLORS["bg_alt"], fg=COLORS["subtext"],
-                 anchor="w").pack(fill="x")
+        src_lbl = tk.Label(text, text=item["source_label"], font=(F, 9),
+                           bg=COLORS["bg"], fg=COLORS["subtext"],
+                           anchor="w", justify="left", bd=0)
+        src_lbl.pack(fill="x")
+        Tooltip(src_lbl, item["source_label"])
         row.pack(fill="x", pady=2)
         self._rows[item["id"]] = {"toggle": toggle, "var": var, "row": row}
+
+    def _bind_wrap(self):
+        """Bind the row-text wrapper to the panel's width, once.
+
+        On the PANEL rather than the dialog: the dialog's Configure fires
+        before the scroll panel has been given its width, so a handler bound
+        there measures 1px and bails, and the panel's Configure arrives too
+        late to be caught by anything bound later.
+        """
+        if self._wrap_bound:
+            return
+        try:
+            self._panel.inner.bind("<Configure>",
+                                   self._on_panel_resize, add="+")
+            self._wrap_bound = True
+        except Exception:
+            pass
+
+    def _on_panel_resize(self, _event=None):
+        self._wrap_rows()
+
+    def _wrap_rows(self, _event=None):
+        """Bound the row text to the panel's width, and let Tk do the work.
+
+        AUDIT D2: this dialog predates ToolShell, so its rows never got
+        ToolRow's ellipsis, and pack sheared a long name - or a full command
+        line in source_label - MID-CHARACTER, which reads as a rendering fault
+        rather than as truncation. The full text is on both tooltips.
+
+        WHY wraplength AND NOT theme.ellipsize(). Four mechanisms were tried
+        and measured before landing here, and every one of them failed:
+
+          * ellipsize on <Configure> of the ROW  - a row reaches its final
+            width one pass before the column inside it, so it always measured
+            1px and bailed. 10 attempts, nothing truncated.
+          * ellipsize on <Configure> of the COLUMN - the column is packed
+            fill/expand, so before the panel is laid out its width TRACKS its
+            contents: truncating shrank the column, which shrank the room,
+            which truncated further. Room fell 470 -> 346 -> 247 -> ... -> 56
+            then jumped to 428, looping indefinitely (6450 iterations in ten
+            seconds, measured).
+          * an after_idle retry loop, and then a re-entrancy flag - both hung
+            the dialog's CONSTRUCTOR outright; the test process had to be
+            killed both times.
+
+        wraplength breaks the loop because it is a HINT to Tk's own layout,
+        not a text rewrite driven by a measurement: Tk computes the wrap from
+        the width pack already gave the row, so there is no feedback path from
+        the text back into the width. Tk then wraps to a second line instead of
+        shearing, and the row grows to fit.
+        """
+        try:
+            wrap = self._panel.inner.winfo_width() - 130
+        except Exception:
+            return
+        if wrap < 60:
+            return                      # not laid out yet; Configure returns
+        for w in self._walk(self._panel.inner):
+            try:
+                if w.winfo_class() == "Label":
+                    w.config(wraplength=wrap)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _walk(widget):
+        stack = [widget]
+        while stack:
+            cur = stack.pop()
+            yield cur
+            try:
+                stack.extend(cur.winfo_children())
+            except Exception:
+                pass
 
     def _icon_default_photo(self):
         if self._icon_default_img is None:

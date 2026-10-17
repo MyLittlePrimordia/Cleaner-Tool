@@ -2,17 +2,20 @@ name: Build Windows Executable
 
 # Build a standalone .exe on every push to main / PR / manual run, and
 # continuously overwrite a rolling "latest" release with the raw .exe
-# (no zip). Version tags (e.g. v2.0.0) still create their own release too.
+# (no zip). Version tags (e.g. v2.1.0) still create their own release too.
+#
+# Asset name is pinned to Cleaner-Tool.exe on purpose: app/update_checker.py
+# only recognises a release asset named exactly "Cleaner-Tool.exe", so the
+# in-app "Update Available" flow reads this build.
 #
 # Defender / SmartScreen notes (DEF-001):
-#   - Every build now embeds a full VERSIONINFO resource (CompanyName,
-#     ProductName, FileVersion, etc.). This removes one of the heuristic
-#     signals that contributed to "Behavior:Win32/Persistence.A!ml".
+#   - Every build embeds a full VERSIONINFO resource (version_info.txt:
+#     CompanyName, ProductName, FileVersion, etc.), which removes one of the
+#     heuristic signals behind "Behavior:Win32/Persistence.A!ml".
 #   - Code signing is the single highest-leverage remaining fix. The
-#     "Sign the executable" step below is ready and only runs when you
-#     have uploaded the two secrets listed in the comments. Until then
-#     the build is unsigned (same as today) but already has proper
-#     version metadata.
+#     "Sign the executable" step below is ready and runs only when you
+#     upload the two secrets listed in its comments. Until then the build
+#     is unsigned, but already carries proper version metadata.
 on:
   push:
     branches: [ "main" ]
@@ -38,60 +41,31 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.13"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install pytest
 
-      - name: Run architecture guard
-        # check_architecture.py pins the 13 structural invariants the H4-H16
-        # splits established: layering, the app.gui contract, asset
-        # resolution, the RunState FSM, generation gating, the read-only
-        # tweak_state view, and [13] the harness itself.
-        #
-        # This never ran in CI until now. Every defect found in the last
-        # audit reached main because nothing here could see it.
-        run: python -X utf8 -u tools/check_architecture.py
+      - name: Run the regression suite
+        run: python -m pytest -q
 
-      - name: Run full verification suite
-        # 50 checks: the state machine, generation gating, undo/snapshot
-        # correctness, the two injection paths, resource limits, icon
-        # parity, layout and perf budgets, and the two smoke suites.
-        #
-        # The runner injects PYTHONPATH and pins cwd for every child, so a
-        # check cannot be silently disabled by its own import bootstrap --
-        # which is how 9 of these (326 assertions) came to never run at all.
-        # It also hashes the user's config.json before and after and fails
-        # the build if the suite mutated it.
-        run: python -X utf8 -u tools/run_all_checks.py
-
-      - name: Run smoke tests
-        # audit fix: the build never ran any test — regressions (like the
-        # ToggleSwitch duplicate-def bug) shipped silently. The harness
-        # checks run headless-safe; Tk is present on windows-latest runners.
-        # smoke_async is the mainloop-driven twin: worker-thread after()
-        # delivery (run engine -> scorecard, health check worker) only
-        # works under a real mainloop, never under a manual update() pump.
-        #
-        # run_all_checks above already runs both; this step keeps them as
-        # separate, individually-legible CI steps so a smoke failure points
-        # straight at its own log line.
-        run: |
-          python -X utf8 -m tools.smoke_gui
-          python -X utf8 -m tools.smoke_async
+      - name: SEC-001 allowlist drift guard
+        run: python tools/verify_sec001_task_allowlist.py
 
       - name: Build with PyInstaller
-        # --onefile  : single portable .exe
-        # --windowed : no console window behind the GUI
-        # --manifest : embed asInvoker manifest — the app starts unelevated
-        #              and uses its in-app Admin Gate / restart handshake to
-        #              elevate only when needed (cleanups work without admin)
-        # --icon / --add-data : bundle colored 🧼 icon from app/assets
-        # --version-file : embed Win32 VERSIONINFO (CompanyName, ProductName,
-        #                  FileVersion, LegalCopyright, …). Required for
-        #                  reducing Defender/SmartScreen heuristic score.
+        # --onefile    : single portable .exe
+        # --windowed   : no console window behind the GUI
+        # --name       : Cleaner-Tool -> dist\Cleaner-Tool.exe (matches the
+        #                asset name app/update_checker.py looks for)
+        # --manifest   : embed asInvoker manifest — the app starts unelevated
+        #                and uses its in-app Admin Gate / restart handshake to
+        #                elevate only when needed (cleanups work without admin)
+        # --add-data   : bundle app/assets -> <_MEIPASS>/app/assets, which is
+        #                the first layout app.utils.resolve_asset_path probes
+        # --icon/--version-file : colored 🧼 icon + Win32 VERSIONINFO
         run: >
           pyinstaller --onefile --windowed
           --name "Cleaner-Tool"
@@ -110,10 +84,9 @@ jobs:
       #
       # How to enable (one-time):
       #   1. Buy a code-signing certificate (OV or EV). EV is stronger
-      #      against SmartScreen but more expensive. Popular cheap options:
-      #      Certum, SSL.com, Sectigo, DigiCert.
+      #      against SmartScreen but more expensive.
       #   2. Export the cert as a .pfx (PKCS#12) protected by a password.
-      #   3. In the GitHub repo → Settings → Secrets and variables → Actions
+      #   3. In the GitHub repo -> Settings -> Secrets and variables -> Actions
       #      create two repository secrets:
       #        CODE_SIGNING_PFX_BASE64   = base64 of the entire .pfx file
       #                                   (PowerShell: [Convert]::ToBase64String(
@@ -122,13 +95,9 @@ jobs:
       #   4. Push any change. The next build will be signed.
       #
       # After the first signed build, also submit the .exe once to
-      # https://www.microsoft.com/wdsi/filesubmission so Microsoft’s
+      # https://www.microsoft.com/wdsi/filesubmission so Microsoft's
       # reputation system learns the new signature faster.
       - name: Sign the executable (Authenticode)
-        # This step is a no-op until you add the two secrets listed in the
-        # comments at the top of this file. Once the secrets exist, every
-        # future build is signed automatically — you never have to touch
-        # the workflow again.
         env:
           CODE_SIGNING_PFX_BASE64: ${{ secrets.CODE_SIGNING_PFX_BASE64 }}
           CODE_SIGNING_PASSWORD: ${{ secrets.CODE_SIGNING_PASSWORD }}
@@ -145,7 +114,6 @@ jobs:
 
           Write-Host "Signing Cleaner-Tool.exe …"
 
-          # Decode the PFX from the secret
           $pfxBytes = [Convert]::FromBase64String($env:CODE_SIGNING_PFX_BASE64)
           $pfxPath  = Join-Path $env:RUNNER_TEMP "codesign.pfx"
           [IO.File]::WriteAllBytes($pfxPath, $pfxBytes)
@@ -181,21 +149,32 @@ jobs:
           }
           Write-Host "Signing completed successfully."
 
-          # Clean up the temporary PFX
           Remove-Item $pfxPath -Force -ErrorAction SilentlyContinue
+
+      - name: Compute SHA-256 checksum
+        # Published next to the .exe so a downloader can verify it. The
+        # in-app update checker prefers a .sha256 asset (see update_checker.py,
+        # "prefer publishing a .sha256 asset long-term").
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Algorithm SHA256 "dist\Cleaner-Tool.exe").Hash.ToLower()
+          "$hash  Cleaner-Tool.exe" | Out-File -Encoding ascii "dist\Cleaner-Tool.exe.sha256"
+          Write-Host "SHA256: $hash"
 
       - name: Upload build artifact (raw .exe, no zip)
         uses: actions/upload-artifact@v4
         with:
           name: Cleaner-Tool-windows-exe
-          path: dist/Cleaner-Tool.exe
+          path: |
+            dist/Cleaner-Tool.exe
+            dist/Cleaner-Tool.exe.sha256
           if-no-files-found: error
 
       - name: Update rolling latest release (overwrite every build)
-        # Only on pushes to main — PRs from forks can't write releases,
-        # and we don't want feature branches clobbering "latest".
-        # This creates/overwrites the `latest` tag and replaces the
-        # attached Cleaner-Tool.exe with the freshly built one.
+        # Only on pushes to main — PRs from forks can't write releases, and we
+        # don't want feature branches clobbering "latest". Creates/overwrites
+        # the `latest` tag and replaces the attached Cleaner-Tool.exe with the
+        # freshly built one.
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
@@ -207,8 +186,12 @@ jobs:
             - Commit: ${{ github.sha }}
             - Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
-            Download `Cleaner-Tool.exe` below (raw .exe, not zipped). This asset is overwritten on every push to `main`.
-          files: dist/Cleaner-Tool.exe
+            Download `Cleaner-Tool.exe` below (raw .exe, not zipped). This
+            asset is overwritten on every push to `main`. Verify it against
+            `Cleaner-Tool.exe.sha256`.
+          files: |
+            dist/Cleaner-Tool.exe
+            dist/Cleaner-Tool.exe.sha256
           make_latest: "true"
           generate_release_notes: false
         env:
@@ -218,7 +201,9 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/Cleaner-Tool.exe
+          files: |
+            dist/Cleaner-Tool.exe
+            dist/Cleaner-Tool.exe.sha256
           generate_release_notes: true
           make_latest: "true"
         env:

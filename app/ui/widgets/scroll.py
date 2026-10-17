@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import tkinter as tk
 
-from app.ui.theme import COLORS, _hex_lerp, _round_pts, F
+from app.ui.theme import COLORS, _round_pts, F
 
 class ScrollableRoundedPanel(tk.Canvas):
     """Rounded-corner content panel with a custom-drawn scrollbar.
@@ -33,10 +33,10 @@ class ScrollableRoundedPanel(tk.Canvas):
     INSET_Y = 8
     SB_W = 16          # reserved right strip for the floating scrollbar
 
-    def __init__(self, parent, **kw):
+    def __init__(self, parent, fill_inner=False, hug=True, **kw):
         page_bg = parent["bg"] if isinstance(parent, (tk.Frame, tk.Canvas)) else COLORS["bg"]
         super().__init__(parent, bg=page_bg, highlightthickness=0, bd=0, height=10, **kw)
-        self._fill = COLORS["bg_alt"]
+        self._fill = COLORS["bg"]   # panel is page-coloured; rows are the cards
         self._offset = 0
         self._content_h = 0
         self._view_h = 0
@@ -51,16 +51,53 @@ class ScrollableRoundedPanel(tk.Canvas):
         self.resize_decide_cb = None     # set by TaskTab (column decision)
         self._resize_after = None
         # persistent scrollbar items (smooth-scroll fix): created once in
-        # _ensure_sb_items, only moved/recolor per tick — declared here so
+        # _ensure_sb_items, only moved/recolored per tick — declared here so
         # every method can safely getattr before first paint.
-        self._sb_track = None
         self._sb_thumb = None
+        # M3 overlay scrollbar: the thumb is a floating indicator that
+        # fades out shortly after scrolling stops (and back in on wheel,
+        # drag or hover). A permanent track+thumb read as a nested
+        # scrollbar "inside" the popup - the wrong look for the dialogs
+        # (user report). The track is gone entirely; only the thumb shows.
+        self._sb_hide_id = None
+        self._sb_vis = False
+        # Last painted card height, so _sync_card can skip a repaint that
+        # would be pixel-identical (see _sync_card).
+        self._card_drawn = None
+        # Whether the embedded frame is stretched to the VIEWPORT rather
+        # than left at its requested height.
+        #
+        # Tk quirk this exists for: a canvas window created with
+        # create_window(anchor="nw") and no explicit height keeps its
+        # REQUESTED height, so the inner frame is only as tall as its
+        # content - and every `expand=True` inside it then hands out
+        # leftover CONTENT height, not leftover VIEWPORT height. Measured
+        # with a two-pane tool: the whole body collapsed to 90px, because
+        # the panes' own panels report a 10px default request.
+        #
+        # The fix is to stretch the inner frame to the viewport, NOT to
+        # report the content's height upward: the canvas must still refuse
+        # to demand its content's height, or a long list pushes the dialog's
+        # footer and action bar out of view - which is the reason this
+        # widget exists rather than a plain Frame.
+        self._fill_inner = bool(fill_inner)
+        # hug=True (default): the drawn card ends just under short content, so
+        # a short list reads as a finished card rather than a half-empty box.
+        # Pass hug=False only where the body is a single centred EMPTY STATE -
+        # see _card_height() for why the two cases want opposite behaviour.
+        self._hug = bool(hug)
         self.inner = tk.Frame(self, bg=self._fill)
         self._win = self.create_window(0, 0, window=self.inner, anchor="nw")
         self.bind("<Configure>", self._on_configure)
         self.bind("<ButtonPress-1>", self._on_press)
         self.bind("<B1-Motion>", self._on_motion)
         self.bind("<ButtonRelease-1>", self._on_release)
+        # M3 overlay scrollbar: hovering the panel reveals the thumb so it
+        # can be grabbed before it fades.
+        self.bind("<Enter>", lambda _e: self._reveal_sb())
+        # Cancel pending timers on teardown, or an armed fade fires against a
+        # destroyed canvas and Tcl prints "invalid command name ...".
+        self.bind("<Destroy>", self._on_destroy, add="+")
 
     # ---- geometry ---------------------------------------------------- #
 
@@ -110,12 +147,85 @@ class ScrollableRoundedPanel(tk.Canvas):
         if self.resize_decide_cb is not None and self.winfo_exists():
             self.resize_decide_cb()
 
+    def _card_height(self):
+        """How tall the painted card should be.
+
+        DESIGN AUDIT (2026-10). This used to always be the full canvas
+        height, which made a short list look like a large empty box rather
+        than like a list: a 12-item preset drew a card 470px tall holding
+        130px of rows, and the leftover face read as "this panel failed to
+        load" rather than as breathing room.
+
+        The fix is one polygon, not a layout change. `self.inner` is a plain
+        Frame, so it has ALWAYS been only as tall as its content - the
+        stretch was purely this background rectangle. So the card can hug
+        its content without touching a single pack() call, which matters:
+        the obvious alternative (sizing the panel to its content) would have
+        meant the panel refusing expand=True, which is the one behaviour
+        this widget exists to guarantee - see the class docstring and
+        DetailPane's settle() notes on what propagate_height did to the
+        dialogs.
+
+        Consequence worth stating: the primary action row stays PINNED to
+        the bottom of the page, so it does not move when the user switches
+        between a 12-task preset and a 27-task one. That is deliberate. A
+        primary button that chases its content breaks Fitts's Law - the
+        muscle memory the user built on the first click is wrong on the
+        second - and macOS Mail's toolbar / Material's bottom bar both hold
+        their action in place regardless of list length.
+
+        When the content overflows, or fills the viewport, the card goes
+        full height: there is nothing to hug, and a full-bleed card is
+        correct for a scrolling region.
+
+        `hug` decides the rest, and it defaults to hugging. A card that ends
+        just under a short top-aligned list reads as a deliberate, finished
+        edge - the Repair preset is 20 tasks ending partway down, and a
+        full-height card there left ~210px of blank space INSIDE a bordered
+        box, which is worse than the seam it was meant to remove.
+
+        But the same shape is wrong for an empty state. A centred "Nothing
+        picked yet" in a short card, with more panel visible below it, reads
+        as two disconnected things and as "more is coming" when nothing is.
+        Those bodies pass hug=False, and that is the whole distinction:
+
+          A GROWS.  PC Health Report, File Lock and Duplicates all show a
+                    centred empty state first, and every one of them is
+                    replaced by a real list the moment the user acts -
+                    expand a section, pick a file, choose a folder. The space
+                    below is reserved headroom for content that is about to
+                    arrive, not waste, so filling reads correctly.
+
+          A IS FIXED. The Repair preset is 20 tasks that never change. Its
+                    body never grows, so a full-height card is ~210px of
+                    blank space inside a bordered box for good - which is
+                    worse than the seam hugging was avoiding.
+
+        Guessing this globally rather than per-body was tried and reverted:
+        filling fixed three first-run screens and broke every short preset.
+        """
+        if not self._hug:
+            return self.winfo_height()
+        h = self.winfo_height()
+        try:
+            need = self.inner.winfo_reqheight() + self.INSET_Y * 2
+        except Exception:
+            return h
+        # No hug when it would be a rounding error, or so short that the
+        # corner radius degenerates.
+        floor = self.RADIUS * 2
+        if need >= h - 1 or need <= floor:
+            return h
+        return need
+
     def _redraw_bg(self):
         self.delete("bg")
         w, h = self.winfo_width(), self.winfo_height()
         if w > 6 and h > 6:
-            self.create_polygon(_round_pts(0, 0, w, h, self.RADIUS), smooth=True,
-                                fill=self._fill, outline="", tags="bg")
+            self.create_polygon(_round_pts(0, 0, w, self._card_height(),
+                                           self.RADIUS),
+                                smooth=True, fill=self._fill, outline="",
+                                tags="bg")
             self.tag_lower("bg")
 
     # ---- scroll ------------------------------------------------------ #
@@ -136,9 +246,40 @@ class ScrollableRoundedPanel(tk.Canvas):
             self.inner.update_idletasks()
         self._content_h = self.inner.winfo_reqheight()
         self._view_h = self.view_height()
+        if self._fill_inner:
+            # Stretch the embedded frame to the viewport, so `expand=True`
+            # inside it hands out leftover VIEWPORT height.
+            #
+            # AUDIT FIX (2026-10): it is the LARGER of viewport and content,
+            # never the viewport alone. Forcing the bare viewport height made
+            # `fill_inner` panels CLIP any content taller than the panel - the
+            # content frame was squeezed to the viewport, its children were
+            # cut at the panel edge, and the scrollbar had nothing to scroll
+            # to. Taking the max keeps the stretch-to-viewport behaviour for
+            # short content and turns overflow into honest scrolling.
+            self.itemconfigure(
+                self._win,
+                height=max(1, max(self._view_h, self._content_h)))
         if self._content_h <= self._view_h:
             self._offset = 0
         self._apply()
+        self._sync_card()
+
+    def _sync_card(self):
+        """Repaint the card only when its height actually changed.
+
+        refresh_scroll runs once per catalog build slice (Install streams
+        ~950 widgets in idle chunks) and once per scroll settle. delete() +
+        create_polygon() on every one of those is exactly the churn this
+        module already removed from the scrollbar path (see _apply's note),
+        and the card only MOVES when the content crosses a row boundary.
+        One int compare is the whole cost when nothing changed.
+        """
+        want = self._card_height()
+        if want == self._card_drawn:
+            return
+        self._card_drawn = want
+        self._redraw_bg()
 
     def _max_offset(self):
         return max(0, self._content_h - self._view_h)
@@ -167,42 +308,95 @@ class ScrollableRoundedPanel(tk.Canvas):
         thumb_h = max(30, int(frac * (y1 - y0)))
         pos = (self._offset / max_off) if max_off else 0.0
         ty = y0 + pos * ((y1 - y0) - thumb_h)
-        track_c = _hex_lerp(self._fill, "#FFFFFF", 0.06)
-        self.itemconfigure(self._sb_track, fill=track_c)
-        self.coords(self._sb_track, cx, y0, cx, y1)
-        self.itemconfigure(self._sb_thumb, state="normal")
+        # M3 overlay scrollbar: a slim floating thumb on a 3.81:1 grey
+        # (muted, the same weight the app uses for de-emphasised
+        # foregrounds) - clearly visible while it is up, quiet enough to
+        # disappear. There is deliberately NO track: a permanent channel
+        # read as a scrollbar nested "inside" the popup, which is not the
+        # Material look. _reveal_sb shows it and schedules the fade.
+        self.itemconfigure(self._sb_thumb, fill=COLORS["muted"])
         self.coords(self._sb_thumb, *_round_pts(cx - 4, ty, cx + 4, ty + thumb_h, 4))
+        self._reveal_sb()
+
+    def _reveal_sb(self):
+        """Show the floating thumb and (re)arm the idle fade.
+
+        Called on every scroll tick, on the panel's <Enter>, and after a
+        geometry settle, so the indicator is up exactly while the user is
+        looking at it and fades ~1.2s after they stop."""
+        if not self.scroll_enabled:
+            return
+        try:
+            self.itemconfigure(self._sb_thumb, state="normal")
+        except Exception:
+            return
+        self._sb_vis = True
+        if self._sb_hide_id is not None:
+            try:
+                self.after_cancel(self._sb_hide_id)
+            except Exception:
+                pass
+        try:
+            self._sb_hide_id = self.after(1200, self._conceal_sb)
+        except Exception:
+            self._sb_hide_id = None
+
+    def _conceal_sb(self):
+        self._sb_hide_id = None
+        self._sb_vis = False
+        try:
+            self.itemconfigure(self._sb_thumb, state="hidden")
+        except Exception:
+            pass
+
+    def _on_destroy(self, e):
+        """Drop pending timers when the panel goes away.
+
+        An armed `after` that fires against a destroyed canvas makes Tcl
+        print `invalid command name "..._sb_conceal"` on teardown, so both
+        the scrollbar fade and the existing coalesced-scroll/resize timers
+        are cancelled here."""
+        if getattr(e, "widget", None) is not self:
+            return
+        for attr in ("_sb_hide_id", "_scroll_flush_id", "_resize_after"):
+            aid = getattr(self, attr, None)
+            if aid is None:
+                continue
+            try:
+                self.after_cancel(aid)
+            except Exception:
+                pass
+            setattr(self, attr, None)
 
     def _ensure_sb_items(self):
-        """Create the persistent scrollbar items on first use (or recreate
+        """Create the persistent scrollbar thumb on first use (or recreate
         if the canvas was cleared). find_withtag is the liveness check —
         an item id of a deleted item is falsy-safe here, but an int id
         that was valid at creation can be stale after a canvas-level
         delete, so verify it still resolves."""
-        track_ok = False
         thumb_ok = False
         try:
-            if self._sb_track is not None:
-                track_ok = bool(self.find_withtag(self._sb_track))
             if self._sb_thumb is not None:
                 thumb_ok = bool(self.find_withtag(self._sb_thumb))
         except Exception:
             pass
-        if not track_ok:
-            self._sb_track = self.create_line(0, 0, 0, 0, fill=self._fill, width=4,
-                                              capstyle="round", tags="sb")
         if not thumb_ok:
             self._sb_thumb = self.create_polygon(_round_pts(0, 0, 0, 0, 4), smooth=True,
-                                                  fill=COLORS["surface_hover"],
+                                                  fill=COLORS["muted"],
                                                   outline="", state="hidden", tags="sb")
-        # keep them above the content window & bg at all times
-        self.tag_raise(self._sb_track)
+        # keep it above the content window & bg at all times
         self.tag_raise(self._sb_thumb)
 
     def _hide_sb(self):
+        if self._sb_hide_id is not None:
+            try:
+                self.after_cancel(self._sb_hide_id)
+            except Exception:
+                pass
+            self._sb_hide_id = None
+        self._sb_vis = False
         try:
             self.itemconfigure(self._sb_thumb, state="hidden")
-            self.itemconfigure(self._sb_track, state="hidden")
         except Exception:
             pass
 

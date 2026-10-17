@@ -8,17 +8,21 @@ about any other dialog except where noted.
 from __future__ import annotations
 
 import tkinter as tk
+
+from app.ui.widgets.rounded_card import RoundedCard
 from tkinter import ttk, messagebox
-from app.ui.base import ThemedModal, Tooltip
+from app.ui.base import Tooltip
+from app.ui.dialogs._tool_page import ToolPage
 from app.ui.theme import COLORS, F, TAB_ACCENTS, _hex_lerp
-from app.ui.widgets import AnimatedButton, AnimatedProgressBar, GaugeDial
+from app.ui.widgets import AnimatedProgressBar, GaugeDial
 
 
-class SpeedTestDialog(ThemedModal):
+class SpeedTestDialog(ToolPage):
     """Speed Test popup (5th Tools card): Ookla-style staged flow.
 
     The popup NEVER auto-starts (user call) — it opens on a big GO
-    button sitting where the gauge will be. One click runs ping, then
+    button (the shared footer's primary action) where the gauge will
+    be. One click runs ping, then
     the FULL download leg (needle climbs, headline tracks it), then
     the gauge RESETS and climbs again through the FULL upload leg
     (Ookla behavior), with a horizontal phase bar under the headline
@@ -60,31 +64,42 @@ class SpeedTestDialog(ThemedModal):
         self._phase_span = None     # (base, end) for the phase bar
         # NOTE: no size= passed — exact same dimensions as DNS/Health/etc.
         super().__init__(parent, title="Speed Test",
-                         accent=TAB_ACCENTS["Tools"])
-        body = self.body
+                         accent=TAB_ACCENTS["Tools"],
+                         scope="Read-only: nothing on your PC is changed.",
+                         scroll=False, fit=True)
+        # REDESIGN 2026-10: on the shared ToolPage shell. The GO action is now
+        # the footer's primary button and the Header banner replaces the need
+        # for a descriptive headline.
+        body = self.content
+        self.banner.set_state("\u2191", TAB_ACCENTS["Tools"])
+        self.banner.set_title("How fast is your connection?")
+        self.banner.set_sub("Ping, download and upload, measured in one go.")
+
+        self._go_btn = self.add_button("GO", self._start_test, kind="primary")
+        # harness alias: the smoke suite drives hover/press + existence
+        # through _retest_btn (kept, now pointing at the footer button).
+        self._retest_btn = self._go_btn
+        # NOTE (user call): no Tooltip on the GO button on purpose —
+        # Tooltip binds <Enter>/<Leave> without add="+", which wipes
+        # AnimatedButton's own hover/press animation binds.
 
         # Stage (fixed height so GO <-> gauge swaps never move the rows
-        # below): the dial + headline + phase bar while running, the big
-        # GO button + headline when idle/done. No description label —
-        # the title says what this is and GO says what to do.
-        stage = self._stage = tk.Frame(body, bg=COLORS["bg"], height=270)
+        # below): the dial + headline + phase bar while running; the headline
+        # alone when idle/done. No description label — the banner says what
+        # this is and GO says what to do.
+        #
+        # HEIGHT 2026-10: 286 -> 236 with the dial 200 -> 156. The stage is the
+        # tallest fixed block in the popup, and at 286 the whole page came to
+        # 530px against a 517px content zone — one scrollbar, for a dial whose
+        # needle sits in the bottom third of its box anyway.
+        stage = self._stage = tk.Frame(body, bg=COLORS["bg"], height=236)
         stage.pack(fill="x", pady=(6, 0))
         try:
             stage.pack_propagate(False)
         except Exception:
             pass
         self._gauge = GaugeDial(stage, accent=TAB_ACCENTS["Tools"],
-                                width=340, height=200)
-        self._go_btn = AnimatedButton(
-            stage, text="GO", command=self._start_test,
-            bg=TAB_ACCENTS["Tools"], fg=COLORS["black"],
-            font=(F, 14, "bold"), padx=44, pady=14)
-        # harness alias: the smoke suite drives hover/press + existence
-        # through _retest_btn (kept, now pointing at the stage button).
-        self._retest_btn = self._go_btn
-        # NOTE (user call): no Tooltip on the GO button on purpose —
-        # Tooltip binds <Enter>/<Leave> without add="+", which wipes
-        # AnimatedButton's own hover/press animation binds.
+                                width=340, height=156)
         self._big_lbl = tk.Label(stage, text="—", font=(F, 18, "bold"),
                                  bg=COLORS["bg"], fg=COLORS["text"])
         self._phase_bar = AnimatedProgressBar(stage,
@@ -99,7 +114,7 @@ class SpeedTestDialog(ThemedModal):
         self._usage = {}
         self._usage_imgs = {}
         urow = tk.Frame(body, bg=COLORS["bg"])
-        urow.pack(fill="x", pady=(2, 0))
+        urow.pack(fill="x", pady=(12, 0))
         for ci in range(4):
             urow.grid_columnconfigure(ci, weight=1, uniform="usecols")
         try:
@@ -119,10 +134,10 @@ class SpeedTestDialog(ThemedModal):
                     _emo = _UFE.get(use, "•")
                 except Exception:
                     _emo = "•"
-                icon_lbl = tk.Label(cell, text=_emo, font=("Segoe UI Emoji", 20),
+                icon_lbl = tk.Label(cell, text=_emo, font=("Segoe UI Emoji", 16),
                                     bg=COLORS["bg"], fg=COLORS["text"])
             icon_lbl.pack(anchor="center")
-            dots = tk.Label(cell, text="☆☆☆☆☆", font=(F, 8, "bold"),
+            dots = tk.Label(cell, text="☆☆☆☆☆", font=(F, 9, "bold"),
                             bg=COLORS["bg"], fg=COLORS["subtext"])
             dots.pack(anchor="center")
             try:
@@ -151,7 +166,7 @@ class SpeedTestDialog(ThemedModal):
         # single stats bar, no divider lines (user call): plain cells
         # on the dialog bg, even columns only.
         self._rows_body = tk.Frame(body, bg=COLORS["bg"])
-        self._rows_body.pack(fill="x", pady=(4, 0))
+        self._rows_body.pack(fill="x", pady=(10, 0))
         self._build_rows()
 
         self.on_close(self._cancel_test)
@@ -285,25 +300,26 @@ class SpeedTestDialog(ThemedModal):
     # ---- stage (GO <-> gauge swap, Ookla-style) ------------------------- #
 
     def _show_go(self):
-        """Idle/done stage: dial + phase bar hide, GO returns to where
-        the gauge was, headline keeps the last verdict (or '—'). The
-        fixed-height stage means rows below never move. Tk thread only."""
+        """Idle/done stage: dial + phase bar hide; the headline keeps the last
+        verdict (or '—') and the footer GO button comes back. The fixed-height
+        stage means rows below never move. Tk thread only."""
         try:
-            for w in (self._gauge, self._phase_bar,
-                      self._go_btn, self._big_lbl):
+            for w in (self._gauge, self._phase_bar, self._big_lbl):
                 try:
                     w.pack_forget()
                 except Exception:
                     pass
-            self._go_btn.pack(anchor="center", pady=(64, 0))
-            self._big_lbl.pack(anchor="center", pady=(10, 0))
+            self._big_lbl.pack(anchor="center", pady=(70, 0))
+            self._go_btn.set_enabled(True)
+            if not self._go_btn.winfo_manager():
+                self._go_btn.pack(side="right", padx=(8, 0))
             self._stage_mode = "go"
         except Exception:
             pass
 
     def _show_gauge(self):
-        """Running stage: GO hides, the dial + headline + phase bar take
-        the stage. Tk thread only."""
+        """Running stage: the footer GO hides, the dial + headline + phase bar
+        take the stage. Tk thread only."""
         try:
             for w in (self._gauge, self._phase_bar,
                       self._go_btn, self._big_lbl):
@@ -313,7 +329,7 @@ class SpeedTestDialog(ThemedModal):
                     pass
             self._gauge.pack(anchor="center")
             self._big_lbl.pack(anchor="center")
-            self._phase_bar.pack(fill="x", padx=120, pady=(8, 0))
+            self._phase_bar.pack(fill="x", pady=(8, 0))
             self._stage_mode = "gauge"
         except Exception:
             pass
@@ -378,13 +394,14 @@ class SpeedTestDialog(ThemedModal):
         self._row_values = {}
         for ci, (leg, title) in enumerate(self.LEGS):
             self._rows_body.grid_columnconfigure(ci, weight=1, uniform="statcols")
-            cell = tk.Frame(self._rows_body, bg=COLORS["bg_alt"])
-            cell.grid(row=0, column=ci, sticky="nsew", padx=3)
-            tk.Label(cell, text=title, font=(F, 8),
-                     bg=COLORS["bg_alt"], fg=COLORS["subtext"]).pack(pady=(5, 0))
-            val = tk.Label(cell, text="…", font=(F, 10, "bold"),
+            cell = RoundedCard(self._rows_body, fill=COLORS["bg_alt"],
+                               bg=COLORS["bg"], radius=16, min_height=76)
+            cell.grid(row=0, column=ci, sticky="nsew", padx=5)
+            tk.Label(cell.body, text=title, font=(F, 10),
+                     bg=COLORS["bg_alt"], fg=COLORS["subtext"]).pack(pady=(8, 0))
+            val = tk.Label(cell.body, text="…", font=(F, 14, "bold"),
                            bg=COLORS["bg_alt"], fg=COLORS["subtext"])
-            val.pack(pady=(0, 5))
+            val.pack(pady=(2, 8))
             self._row_values[leg] = val
 
     def _start_test(self):

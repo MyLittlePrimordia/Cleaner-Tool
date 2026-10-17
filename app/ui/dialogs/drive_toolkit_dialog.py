@@ -8,13 +8,18 @@ about any other dialog except where noted.
 from __future__ import annotations
 
 import tkinter as tk
+
+from app.ui.widgets.dropdown import M3Dropdown
+
+from app.ui.widgets.status_icon import StatusIcon
 from tkinter import ttk, messagebox
-from app.ui.base import ThemedModal, _themed_askyesno
+from app.ui.base import _themed_askyesno
+from app.ui.dialogs._tool_page import ToolPage
 from app.ui.theme import COLORS, F, TAB_ACCENTS
 from app.ui.widgets import AnimatedButton, AnimatedProgressBar, ScrollableRoundedPanel, SegmentedTabs
 
 
-class DriveToolkitDialog(ThemedModal):
+class DriveToolkitDialog(ToolPage):
     """Drive Toolkit (Tools tab card): 3-in-1 — Health, Speed, Capacity.
     Same internal tab-switch pattern as MouseTesterDialog (Buttons/Aim):
     two or three AnimatedButton tabs swap self._content wholesale.
@@ -40,8 +45,16 @@ class DriveToolkitDialog(ThemedModal):
         self._stop_token = [False]
         self._view = "health"
         super().__init__(parent, title="Drive Toolkit",
-                         accent=TAB_ACCENTS["Clean"])
-        body = self.body
+                         accent=TAB_ACCENTS["Clean"],
+                         scope="Read-only checks; the speed test writes one "
+                               "temp file and removes it.",
+                         scroll=False, fit=True)
+        # REDESIGN 2026-10: on the shared ToolPage shell; the per-tab actions
+        # stay in the content zone and the Header banner opens the dialog.
+        body = self.content
+        self.banner.set_state("\u25A4", TAB_ACCENTS["Clean"])
+        self.banner.set_title("How healthy is this drive?")
+        self.banner.set_sub("Health, speed and a fake USB/SD card check.")
         # One centered pill (same language as the main Clean/Repair/Tweak
         # switcher) — replaces the old three separate left-packed buttons.
         tabs = tk.Frame(body, bg=COLORS["bg"])
@@ -98,7 +111,7 @@ class DriveToolkitDialog(ThemedModal):
         tk.Label(c, text="Checks each drive's health — the same signal "
                          "Windows uses to warn before it fails.",
                  font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
-                 wraplength=700, justify="left").pack(anchor="w", pady=(0, 8))
+                 wraplength=self.body_width(28), justify="left").pack(anchor="w", pady=(0, 8))
         self._health_panel = ScrollableRoundedPanel(c)
         self._health_panel.config(height=280)
         self._health_panel.pack(fill="both", expand=True)
@@ -160,8 +173,14 @@ class DriveToolkitDialog(ThemedModal):
                 worst = "Unhealthy"
             elif d["health"] == "Warning" and worst != "Unhealthy":
                 worst = "Warning"
-            tk.Label(row, text=glyph, font=("Segoe UI Emoji", 12),
-                     bg=COLORS["bg_alt"]).pack(side="left", padx=(10, 8), pady=8)
+            _kind = {"Healthy": "ok", "Warning": "warn",
+                     "Unhealthy": "bad"}.get(d["health"])
+            if _kind:
+                StatusIcon(row, _kind, bg=COLORS["bg_alt"], size=24).pack(
+                    side="left", padx=(12, 10), pady=10)
+            else:
+                tk.Label(row, text=glyph, font=(F, 12), bg=COLORS["bg_alt"],
+                         fg=color).pack(side="left", padx=(12, 10), pady=10)
             info = tk.Frame(row, bg=COLORS["bg_alt"])
             info.pack(side="left", fill="x", expand=True)
             size_gb = d["size_bytes"] / (1024 ** 3) if d["size_bytes"] else 0
@@ -176,7 +195,7 @@ class DriveToolkitDialog(ThemedModal):
                     "Warning": "Showing early warning signs — back up your files soon",
                     "Unhealthy": "Failing — back up your files now"}
             tk.Label(info, text=words.get(d["health"], d["health"]),
-                     font=(F, 8), bg=COLORS["bg_alt"], fg=color,
+                     font=(F, 9), bg=COLORS["bg_alt"], fg=color,
                      anchor="w").pack(fill="x")
             row.pack(fill="x", pady=2)
         self._health_status.config(
@@ -193,7 +212,7 @@ class DriveToolkitDialog(ThemedModal):
         # Health/Capacity's condensed style.
         tk.Label(c, text="Tests real-world read/write speed to spot a slowdown.",
                  font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
-                 wraplength=700, justify="left").pack(anchor="w", pady=(0, 10))
+                 wraplength=self.body_width(28), justify="left").pack(anchor="w", pady=(0, 10))
 
         row = tk.Frame(c, bg=COLORS["bg"])
         row.pack(fill="x")
@@ -207,7 +226,7 @@ class DriveToolkitDialog(ThemedModal):
         names = [f"{letter}:" for letter, *_ in drives] or ["C:"]
         self._speed_var = tk.StringVar(value=names[0])
         import tkinter.ttk as _ttk
-        combo = _ttk.Combobox(row, textvariable=self._speed_var, values=names,
+        combo = M3Dropdown(row, textvariable=self._speed_var, values=names,
                               state="readonly", width=8, font=(F, 9))
         combo.pack(side="left", padx=(6, 12))
         self._speed_btn = AnimatedButton(
@@ -224,14 +243,14 @@ class DriveToolkitDialog(ThemedModal):
         results.grid_columnconfigure(1, weight=1, uniform="s")
         w_cell = tk.Frame(results, bg=COLORS["bg_alt"])
         w_cell.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        tk.Label(w_cell, text="WRITE", font=(F, 8, "bold"), bg=COLORS["bg_alt"],
+        tk.Label(w_cell, text="WRITE", font=(F, 9, "bold"), bg=COLORS["bg_alt"],
                  fg=COLORS["subtext"]).pack(pady=(12, 0))
         self._write_lbl = tk.Label(w_cell, text="—", font=(F, 22, "bold"),
                                    bg=COLORS["bg_alt"], fg=COLORS["text"])
         self._write_lbl.pack(pady=(0, 12))
         r_cell = tk.Frame(results, bg=COLORS["bg_alt"])
         r_cell.grid(row=0, column=1, sticky="ew", padx=(6, 0))
-        tk.Label(r_cell, text="READ", font=(F, 8, "bold"), bg=COLORS["bg_alt"],
+        tk.Label(r_cell, text="READ", font=(F, 9, "bold"), bg=COLORS["bg_alt"],
                  fg=COLORS["subtext"]).pack(pady=(12, 0))
         self._read_lbl = tk.Label(r_cell, text="—", font=(F, 22, "bold"),
                                   bg=COLORS["bg_alt"], fg=COLORS["text"])
@@ -296,7 +315,7 @@ class DriveToolkitDialog(ThemedModal):
         tk.Label(c, text="Checks if a USB drive or SD card is fake — "
                          "your files are never touched.",
                   font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
-                  wraplength=700, justify="left").pack(anchor="w", pady=(0, 10))
+                  wraplength=self.body_width(28), justify="left").pack(anchor="w", pady=(0, 10))
 
         self._cap_drives = []
         row = tk.Frame(c, bg=COLORS["bg"])
@@ -305,7 +324,7 @@ class DriveToolkitDialog(ThemedModal):
                  fg=COLORS["subtext"]).pack(side="left")
         self._cap_var = tk.StringVar(value="")
         import tkinter.ttk as _ttk
-        self._cap_combo = _ttk.Combobox(row, textvariable=self._cap_var,
+        self._cap_combo = M3Dropdown(row, textvariable=self._cap_var,
                                         values=[], state="readonly",
                                         width=28, font=(F, 9))
         self._cap_combo.pack(side="left", padx=(6, 8))
@@ -317,14 +336,27 @@ class DriveToolkitDialog(ThemedModal):
         mrow = tk.Frame(c, bg=COLORS["bg"])
         mrow.pack(fill="x", pady=(10, 0))
         self._cap_mode = tk.StringVar(value="quick")
-        for val, label in (("quick", "Quick check (a minute or two)"),
-                          ("full", "Full check (can take hours — most thorough)")):
-            rb = tk.Radiobutton(
-                mrow, text=label, value=val, variable=self._cap_mode,
-                font=(F, 9), bg=COLORS["bg"], fg=COLORS["text"],
-                selectcolor=COLORS["bg_alt"], activebackground=COLORS["bg"],
-                anchor="w")
-            rb.pack(anchor="w")
+        self._cap_hint = tk.Label(c, text="", font=(F, 8), bg=COLORS["bg"],
+                                  fg=COLORS["subtext"],
+                                  wraplength=self.body_width(28), justify="left")
+
+        def _cap_mode_changed(mode):
+            self._cap_mode.set(mode)
+            self._cap_hint.config(text={
+                "quick": "Quick check — a handful of reads; usually a minute or two.",
+                "full": "Full check — the most thorough scan; can take hours on a large drive.",
+            }.get(mode, ""))
+
+        # Themed segmented control (same language as this dialog's own
+        # Health/Speed/Capacity pill) instead of a pair of native radios.
+        self._cap_tabs = SegmentedTabs(
+            mrow, labels=["Quick check", "Full check"],
+            keys=["quick", "full"], initial="quick",
+            accent=TAB_ACCENTS["Clean"], font=(F, 9),
+            command=_cap_mode_changed)
+        self._cap_tabs.pack(anchor="w")
+        self._cap_hint.pack(anchor="w", pady=(6, 0))
+        _cap_mode_changed("quick")
 
         self._cap_btn = AnimatedButton(
             c, text="Start Test", command=self._start_capacity,
@@ -335,7 +367,7 @@ class DriveToolkitDialog(ThemedModal):
         self._cap_bar = AnimatedProgressBar(c, accent=TAB_ACCENTS["Clean"])
         self._cap_bar.pack(fill="x", pady=(14, 0))
         self._cap_result = tk.Label(c, text="", font=(F, 9), bg=COLORS["bg"],
-                                    fg=COLORS["subtext"], wraplength=700,
+                                    fg=COLORS["subtext"], wraplength=self.body_width(28),
                                     justify="left")
         self._cap_result.pack(pady=(8, 0), anchor="w")
         self._refresh_cap_drives()

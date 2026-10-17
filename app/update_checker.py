@@ -1,9 +1,12 @@
 """
 Update checker - detects new Cleaner Tool releases from GitHub.
 
-Uses GitHub API to fetch the latest release information and compares
-SHA256 hashes to determine if an update is available. No third-party
-dependencies - uses stdlib urllib.request only.
+Uses the GitHub API to fetch the latest release information and compares
+the release's version tag (e.g. "v2.1.0" -> 2.1.0) against APP_VERSION to
+decide whether an update is available. No third-party dependencies - uses
+stdlib urllib.request only. get_current_exe_hash() is exposed so callers can
+verify the downloaded exe's integrity, but the update decision itself is
+version-based, not hash-based.
 """
 
 import hashlib
@@ -34,7 +37,9 @@ def get_current_exe_hash() -> str:
             for chunk in iter(lambda: f.read(8192), b''):
                 sha256.update(chunk)
         return sha256.hexdigest()
-    except Exception:
+    except Exception as exc:
+        from app.utils import log_or_swallow
+        log_or_swallow(None, "update.exe_hash", exc)
         return ""
 
 
@@ -80,7 +85,9 @@ def fetch_latest_release_info(repo: str = "owner/repo", timeout: int = 10) -> di
             # Repository or release not found
             return None
         return None
-    except Exception:
+    except Exception as exc:
+        from app.utils import log_or_swallow
+        log_or_swallow(None, "update.fetch", exc)
         return None
 
 
@@ -110,7 +117,9 @@ def _trusted_release_url(url: str, repo: str) -> str:
     try:
         from urllib.parse import urlparse
         parts = urlparse(url)
-    except Exception:
+    except Exception as exc:
+        from app.utils import log_or_swallow
+        log_or_swallow(None, "update.url_parse", exc)
         return ""
     if parts.scheme != "https":
         return ""
@@ -213,12 +222,14 @@ def check_for_updates(repo: str = "owner/repo", timeout: int = 10) -> dict:
                         result['update_available'] = True
                     elif not remote_hash:
                         result['error'] = "rolling build — manual check (hash unavailable or file too large)"
-            except Exception:
+            except Exception as exc:
                 # If hash comparison fails, assume no update
-                pass
-    except Exception:
+                from app.utils import log_or_swallow
+                log_or_swallow(None, "update.hash_compare", exc)
+    except Exception as exc:
         # If version parsing fails, assume no update
-        pass
+        from app.utils import log_or_swallow
+        log_or_swallow(None, "update.version_parse", exc)
     
     return result
 
@@ -253,7 +264,9 @@ def get_remote_exe_hash(url: str, timeout: int = 30) -> str:
                     return ""
                 sha256.update(chunk)
         return sha256.hexdigest()
-    except Exception:
+    except Exception as exc:
+        from app.utils import log_or_swallow
+        log_or_swallow(None, "update.remote_hash", exc)
         return ""
 
 

@@ -29,6 +29,17 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import tempfile
+
+
+def _si_log(msg):
+    """Write to log file for debugging single-instance issues"""
+    try:
+        log_path = os.path.join(tempfile.gettempdir(), "cleaner_tool_single_instance.log")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"[{os.getpid()}] {msg}\n")
+    except Exception:
+        pass
 
 _MUTEX_BASENAME = "CleanerTool_SingleInstance_Mutex"
 _EVENT_BASENAME = "CleanerTool_ShowWindow_Event"
@@ -388,8 +399,15 @@ def is_elevation_child(argv=None) -> bool:
     try:
         for a in (argv if argv is not None else sys.argv):
             if str(a).startswith("--elevation-token="):
+                try:
+                    import sys as _sys
+                    print(f"[single_instance] Detected elevation child: {a}", file=_sys.stderr)
+                    _si_log(f"Detected elevation child: {a}")
+                except Exception:
+                    pass
                 return True
-    except Exception:
+    except Exception as exc:
+        _si_log(f"is_elevation_child exception: {exc}")
         pass
     return False
 

@@ -8,13 +8,33 @@ about any other dialog except where noted.
 from __future__ import annotations
 
 import tkinter as tk
+
+from app.ui.widgets.rounded_card import RoundedCard
+from app.ui.widgets.entry import RoundedEntry
 from tkinter import ttk, messagebox
-from app.ui.base import ThemedModal, Tooltip
+from app.ui.base import Tooltip, _themed_askyesno
+from app.ui.dialogs._tool_page import ToolPage
 from app.ui.theme import COLORS, F, TAB_ACCENTS, _hex_lerp
 from app.ui.widgets import AnimatedButton, AnimatedProgressBar
 
 
-class DnsTesterDialog(ThemedModal):
+class _PickRow(RoundedCard):
+    """A RoundedCard that answers to the plain-Frame calls the DNS list makes
+    (config(bg=...) recolours the face; winfo_children() lists the labels)."""
+
+    def config(self, cnf=None, **kw):
+        if "bg" in kw:
+            self.set_fill(kw.pop("bg"))
+        if kw or cnf:
+            super().config(cnf, **kw)
+
+    configure = config
+
+    def winfo_children(self):
+        return self.body.winfo_children()
+
+
+class DnsTesterDialog(ToolPage):
     """Find My Fastest DNS (user-approved feature 5, 2026-09): one click
     tests the well-known gaming-friendly resolvers plus the machine's
     current DNS when publicly testable (router IPs are held back with an
@@ -48,36 +68,34 @@ class DnsTesterDialog(ThemedModal):
         self._watchdog_after = None
 
         super().__init__(parent, title="Find My Fastest DNS",
-                         accent=TAB_ACCENTS["Tweak"])
+                         accent=TAB_ACCENTS["Tweak"],
+                         scope="Tests each resolver over this connection, "
+                               "then lets you apply the fastest.",
+                         scroll=True)
+        # REDESIGN 2026-10: migrated onto the shared ToolPage shell — the
+        # descriptive intro label became the Header banner and the hand-built
+        # button row moved into the shared footer roles.
         dlg = self._dlg
-        body = self.body
+        body = self.content
 
-        # plain-language intro (title row carries the accent dot + name)
         # F09: honest methodology — TCP:53 handshake ranking (stdlib-only),
         # a good proxy for, but not a real UDP DNS query.
-        tk.Label(body, text="Tests which DNS server responds fastest for YOUR "
-                            "connection (TCP handshake to port 53 — a close "
-                            "proxy for real DNS speed) — then applies it.",
-                 font=(F, 9), bg=COLORS["bg"],
-                 fg=COLORS["subtext"], wraplength=680,
-                 justify="left").pack(anchor="w")
+        self.banner.set_state("\u26A1", TAB_ACCENTS["Tweak"])
+        self.banner.set_title("Pick the fastest DNS for your connection")
+        self.banner.set_sub("Tests each server over your connection, "
+                            "then ranks them.")
 
         # progress (indeterminate — probe count is known but per-probe
         # latency isn't; the honest signal is rows landing below)
         self._bar = AnimatedProgressBar(body, accent=TAB_ACCENTS["Tweak"])
-        self._bar.pack(fill="x", pady=(10, 0))
+        self._bar.pack(fill="x", pady=(14, 0))
         self._bar.set_indeterminate(True)
-        self._status_lbl = tk.Label(body, text="Starting…", font=(F, 9),
-                                    bg=COLORS["bg"], fg=COLORS["subtext"],
-                                    anchor="w")
-        self._status_lbl.pack(fill="x", pady=(2, 0))
+        self._status_lbl = tk.Label(body, text="Starting…", font=(F, 10),
+                                    bg=COLORS["bg"], fg=COLORS["subtext"])
+        self._status_lbl.pack(pady=(6, 10))
 
-        tk.Frame(body, bg=COLORS["hairline"], height=1).pack(
-            fill="x", pady=(10, 4))
         self._rows_body = tk.Frame(body, bg=COLORS["bg"])
         self._rows_body.pack(fill="x")
-        tk.Frame(body, bg=COLORS["hairline"], height=1).pack(
-            fill="x", pady=(4, 0))
 
         # Custom DNS (user-requested): test/apply a provider that isn't
         # in the built-in list — some players run a household/VPN
@@ -85,28 +103,21 @@ class DnsTesterDialog(ThemedModal):
         # is required; secondary is optional (falls back to primary-only
         # if left blank, same as any single-address custom host).
         custom_row = tk.Frame(body, bg=COLORS["bg"])
-        custom_row.pack(fill="x", pady=(6, 0))
-        tk.Label(custom_row, text="Custom:", font=(F, 9),
-                 bg=COLORS["bg"], fg=COLORS["subtext"]).pack(side="left")
-        self._custom_primary_entry = tk.Entry(
-            custom_row, bg=COLORS["surface"], fg=COLORS["text"],
-            insertbackground=COLORS["text"], font=(F, 9), bd=0,
-            highlightthickness=1, highlightbackground=COLORS["hairline"],
-            width=15)
-        self._custom_primary_entry.pack(side="left", padx=(6, 0))
+        custom_row.pack(pady=(14, 0))
+        _pf = RoundedEntry(custom_row, width=16, font=(F, 11))
+        _pf.pack(side="left", padx=4)
+        self._custom_primary_entry = _pf.entry
         Tooltip(self._custom_primary_entry, "Primary DNS IP (required)")
-        self._custom_secondary_entry = tk.Entry(
-            custom_row, bg=COLORS["surface"], fg=COLORS["text"],
-            insertbackground=COLORS["text"], font=(F, 9), bd=0,
-            highlightthickness=1, highlightbackground=COLORS["hairline"],
-            width=15)
-        self._custom_secondary_entry.pack(side="left", padx=(4, 0))
+        _sf = RoundedEntry(custom_row, width=16, font=(F, 11))
+        _sf.pack(side="left", padx=4)
+        self._custom_secondary_entry = _sf.entry
         Tooltip(self._custom_secondary_entry, "Secondary DNS IP (optional)")
         AnimatedButton(custom_row, text="Add & Test",
                        command=self._add_custom_dns,
-                       bg=COLORS["surface"], fg=COLORS["text"],
-                       font=(F, 9, "bold"), padx=12,
-                       pady=4).pack(side="left", padx=(6, 0))
+                       bg=COLORS["secondary_container"],
+                       fg=COLORS["on_secondary_container"],
+                       font=(F, 10, "bold"), padx=22,
+                       pady=9).pack(side="left", padx=(8, 0))
         for _e in (self._custom_primary_entry, self._custom_secondary_entry):
             try:
                 _e.bind("<Return>", lambda _ev: self._add_custom_dns())
@@ -119,24 +130,14 @@ class DnsTesterDialog(ThemedModal):
         # buttons (Apply stays a bare verb — the status line + the
         # highlighted row say WHAT it will apply; Restore reverts both
         # primary + secondary to the pre-apply snapshot via the real
-        # gaming_dns revert, same engine as Tweak-tab Undo)
-        brow = tk.Frame(body, bg=COLORS["bg"])
-        brow.pack(fill="x", pady=(12, 6))
-        self._apply_btn = AnimatedButton(
-            brow, text="Apply", command=self._apply_selected,
-            bg=TAB_ACCENTS["Tweak"], fg=COLORS["black"],
-            font=(F, 9, "bold"), padx=18, pady=7)
-        self._apply_btn.pack(side="right")
+        # gaming_dns revert, same engine as Tweak-tab Undo).
+        # REDESIGN 2026-10: the hand-built button row is now the shared
+        # ToolPage footer; the first add_button call is the rightmost.
+        self._apply_btn = self.add_button("Apply", self._apply_selected,
+                                          kind="primary")
         self._apply_btn.set_enabled(False)
-        AnimatedButton(brow, text="Re-test", command=self._start_test,
-                       bg=COLORS["surface"], fg=COLORS["text"],
-                       font=(F, 9, "bold"), padx=18,
-                       pady=7).pack(side="right", padx=(0, 8))
-        self._restore_btn = AnimatedButton(
-            brow, text="Restore", command=self._restore_default,
-            bg=COLORS["surface"], fg=COLORS["text"],
-            font=(F, 9, "bold"), padx=18, pady=7)
-        self._restore_btn.pack(side="left")
+        self.add_button("Re-test", self._start_test)
+        self._restore_btn = self.add_button("Restore", self._restore_default)
         Tooltip(self._restore_btn, "Restores your DNS to default")
 
         # closing cancels probes + the watchdog (base close hook)
@@ -307,38 +308,43 @@ class DnsTesterDialog(ThemedModal):
     def _add_row(self, name, ip, is_current):
         """Build one server row (shared by the built-in list and a
         user-added Custom entry) and register it in self._row_widgets."""
-        row = tk.Frame(self._rows_body, bg=COLORS["bg_alt"])
+        row = _PickRow(self._rows_body, fill=COLORS["bg_alt"],
+                       bg=COLORS["bg"], radius=16, min_height=44)
+        rb = row.body
         try:
             _pri, _sec = self._pair_for(ip)
             _pair_txt = f"{_pri} / {_sec}" if _sec != _pri else _pri
         except Exception:
             _pair_txt = ip
-        title = f"{name}  {_pair_txt}" + ("  (current)" if is_current else "")
-        name_lbl = tk.Label(row, text=title, font=(F, 9, "bold"),
+        title = name + ("  (current)" if is_current else "")
+        name_lbl = tk.Label(rb, text=title, font=(F, 11, "bold"),
                             bg=COLORS["bg_alt"], fg=COLORS["text"],
                             anchor="w")
-        name_lbl.pack(side="left", padx=(8, 0), pady=6)
-        badge = tk.Label(row, text="", font=(F, 8, "bold"),
+        name_lbl.pack(side="left", padx=(12, 0), pady=9)
+        ip_lbl = tk.Label(rb, text=_pair_txt, font=(F, 9),
+                          bg=COLORS["bg_alt"], fg=COLORS["muted"])
+        ip_lbl.pack(side="left", padx=(10, 0))
+        badge = tk.Label(rb, text="", font=(F, 9, "bold"),
                          bg=COLORS["bg_alt"], fg=COLORS["accent_green"])
-        badge.pack(side="left", padx=(6, 0))
-        pick = tk.Label(row, text="", font=(F, 10, "bold"),
+        badge.pack(side="left", padx=(8, 0))
+        pick = tk.Label(rb, text="", font=(F, 10, "bold"),
                         bg=COLORS["bg_alt"], fg=TAB_ACCENTS["Tweak"])
         pick.pack(side="left", padx=(6, 0))
-        ms = tk.Label(row, text="…", font=(F, 9, "bold"),
+        ms = tk.Label(rb, text="…", font=(F, 11, "bold"),
                       bg=COLORS["bg_alt"], fg=COLORS["subtext"])
-        ms.pack(side="right", padx=(0, 8))
+        ms.pack(side="right", padx=(0, 14))
         self._row_widgets[ip] = {"row": row, "ms": ms, "badge": badge,
                                  "pick": pick, "name": name,
                                  "current": is_current}
         # rows become clickable once they answer (unanswered rows
         # ignore clicks — picking a dead server can only fail Apply)
-        for w in (row, name_lbl, badge, pick, ms):
+        for w in (row, rb, name_lbl, ip_lbl, badge, pick, ms):
             try:
                 w.bind("<Button-1>",
                        lambda e, _ip=ip: self._select_ip(_ip), add="+")
             except Exception:
                 pass
-        row.pack(fill="x", pady=2)
+        row.pack(fill="x", pady=3)
         return row
 
     def _build_rows(self, targets, skipped_current=None, _gen=None):
@@ -597,6 +603,36 @@ class DnsTesterDialog(ThemedModal):
             from app.tab_presets import TABS as _TABS
             task = next(t for t in _TABS.get("Tweak", []) if t.key == "gaming_dns")
         except Exception:
+            return
+        # REDESIGN 2026-10: this had no confirmation, and the comment above
+        # argued one was unnecessary because "the status line + the highlighted
+        # row say WHAT it will apply". They do not. apply_gaming_dns runs
+        #   Get-NetAdapter | Where-Object Status -eq 'Up' | ...
+        # so it rewrites the DNS on EVERY connected adapter - Wi-Fi, Ethernet
+        # and any active VPN - while the row the user picked describes ONE
+        # resolver. A machine with Wi-Fi and Ethernet both up would have both
+        # changed from a click that looked like a single-server choice. All
+        # five sibling tools in this set (File Lock, Duplicates, Services,
+        # Restore Points, PC Health) confirm before a system-wide change; this
+        # was the only one that did not.
+        #
+        # Undo exists (the real gaming_dns revert, plus Restore in this
+        # dialog), so this is a scope warning, not a permission gate.
+        try:
+            ok = _themed_askyesno(
+                self._dlg, "Apply DNS to every adapter?",
+                "%s will be set as DNS on EVERY connected network adapter"
+                " (Wi-Fi, Ethernet, VPN).\n\n"
+                "Only %s appears selected here, but the change is not"
+                " limited to it.\n\nYou can undo this from the Tweak tab, or"
+                " with Restore here."
+                % (primary, winner), accent=TAB_ACCENTS["Tweak"],
+                yes_text="Apply to all", no_text="Go Back")
+        except Exception:
+            # A prompt that cannot build must not become a dead button; this
+            # action is reversible and the user asked for it explicitly.
+            ok = True
+        if not ok:
             return
         try:
             import dataclasses as _dc

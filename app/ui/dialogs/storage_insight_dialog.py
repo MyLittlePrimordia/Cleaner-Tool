@@ -10,16 +10,19 @@ from __future__ import annotations
 import os
 
 import tkinter as tk
+
+from app.ui.widgets.rounded_card import RoundedCard
 import tkinter.font as tkfont
 from tkinter import ttk, messagebox
-from app.ui.base import ThemedModal, Tooltip
+from app.ui.base import Tooltip
+from app.ui.dialogs._tool_page import ToolPage, fit_label
 from app.ui.hardware.drives import _system_drive_root
-from app.ui.theme import COLORS, F, TAB_ACCENTS
+from app.ui.theme import COLORS, F, TAB_ACCENTS, _measure_font
 from app.ui.widgets import AnimatedButton, ScrollableRoundedPanel, ToggleSwitch
 from app.utils import format_bytes
 
 
-class StorageInsightDialog(ThemedModal):
+class StorageInsightDialog(ToolPage):
     """Storage Insight (user-approved feature 3, 2026-09): 'what's eating
     my drives?' — machine-wide reclaimable-junk estimates beside a
     biggest-games list, in one screen with no scrolling.
@@ -42,8 +45,14 @@ class StorageInsightDialog(ThemedModal):
     allowlist (see app/storage_scan.py) and the dialog footnotes what it
     does NOT estimate; a cancelled scan labels its numbers partial.
 
-    Chrome: ThemedModal (borderless rounded card, scrim, X, fixed size).
-    The scan worker never touches widgets — every paint hops via after().
+    Chrome: ToolPage (borderless rounded card, scrim, X, proportional
+    size). The scan worker never touches widgets — every paint hops via
+    the shared dispatcher.
+
+    REDESIGN 2026-10: on the shared ToolPage shell — the 30pt hero
+    number and its "can be freed up" caption are the Header banner
+    (headline = the live total), and status + Rescan/Benchmark/Clean
+    Selected are the shared footer.
     """
 
     # Five games, not eight (user call 2026-09: no scrollbar — the columns
@@ -58,74 +67,46 @@ class StorageInsightDialog(ThemedModal):
         self._cat_vars = {}         # title -> BooleanVar
         self._cat_sizes = {}        # title -> measured bytes (None = pending)
         self._cat_size_lbls = {}    # title -> size Label
+        self._cat_refits = {}       # title -> callable: re-fit the title
         self._cat_keys = {}         # title -> member task keys
         self._games = []            # measured game dicts
 
-        super().__init__(parent, title="Storage Insight",
-                         accent=TAB_ACCENTS["Clean"])
+        accent = TAB_ACCENTS["Clean"]
+        super().__init__(parent, title="Storage Insight", accent=accent,
+                         scope="Estimates only what it can measure — a "
+                               "cancelled scan says so.",
+                         scroll=False)
         dlg = self._dlg
-        body = self.body
+        body = self.content
 
-        # intro line (title row carries the accent dot + name)
-        tk.Label(body, text="See what's eating your drives.",
-                 font=(F, 9), bg=COLORS["bg"],
-                 fg=COLORS["subtext"], wraplength=680,
-                 justify="left").pack(anchor="w")
+        # hero: live reclaimable total, now the banner headline
+        self.banner.set_state("\U0001F4BE", accent)
+        self.banner.set_title("Scanning…", COLORS["subtext"])
+        self.banner.set_sub("can be freed up")
 
-        # hero: live reclaimable total
-        hero = tk.Frame(body, bg=COLORS["bg"])
-        hero.pack(fill="x", pady=(8, 0))
-        self._hero_lbl = tk.Label(hero, text="Scanning…", font=(F, 20, "bold"),
-                                  bg=COLORS["bg"], fg=COLORS["subtext"])
-        self._hero_lbl.pack()
-        tk.Label(hero, text="estimated reclaimable junk", font=(F, 9),
-                 bg=COLORS["bg"], fg=COLORS["subtext"]).pack()
-
-        # footer FIRST (packed side=bottom): the action buttons are
-        # guaranteed visible no matter how tall the columns grow (user
-        # bug report: long game names wrapped rows and squeezed Rescan /
-        # Clean Selected out of the fixed 600px dialog). The columns
-        # live in a scroll panel taking exactly the remaining space.
-        foot = tk.Frame(body, bg=COLORS["bg"])
-        foot.pack(side="bottom", fill="x", pady=(10, 6))
-        # UI fix (Rescan clipping): status_lbl had no width limit, so a
-        # long status line could eat into the room the three buttons
-        # needed and push Rescan (packed closest to the label) partly
-        # off the edge of the fixed-width card. Capping it to wrap onto
-        # a second line instead guarantees the buttons always have their
-        # full width available.
-        self._status_lbl = tk.Label(foot, text="Starting scan…", font=(F, 9),
-                                    bg=COLORS["bg"], fg=COLORS["subtext"],
-                                    anchor="w", justify="left", wraplength=340)
-        self._status_lbl.pack(side="left")
-        self._clean_btn = AnimatedButton(
-            foot, text="Clean Selected", command=self._clean_selected,
-            bg=TAB_ACCENTS["Clean"], fg=COLORS["black"],
-            font=(F, 9, "bold"), padx=16, pady=7)
-        self._clean_btn.pack(side="right")
+        # REDESIGN 2026-10: shell footer — Clean Selected is the one primary
+        # action; Rescan and Benchmark are secondary. The scan status lives
+        # in the shared StatusLine.
+        self.status.stop("Starting scan…")
+        self._clean_btn = self.add_button(
+            "Clean Selected", self._clean_selected, kind="primary")
         self._clean_btn.set_enabled(False)
-        self._bench_btn = AnimatedButton(foot, text="Benchmark", command=self._start_benchmark,
-                                         bg=COLORS["surface"], fg=COLORS["text"],
-                                         font=(F, 9, "bold"), padx=16,
-                                         pady=7)
-        self._bench_btn.pack(side="right", padx=(0, 8))
+        self._bench_btn = self.add_button(
+            "Benchmark", self._start_benchmark, kind="secondary")
         Tooltip(self._bench_btn, "Measures this drive's real write/read speed (32MB temp file, removed afterwards)")
-        AnimatedButton(foot, text="Rescan", command=self._start_scan,
-                       bg=COLORS["surface"], fg=COLORS["text"],
-                       font=(F, 9, "bold"), padx=16,
-                       pady=7).pack(side="right", padx=(0, 8))
+        self.add_button("Rescan", self._start_scan, kind="secondary")
 
-        # honest footnote: what the estimates do NOT cover (above footer)
+        # honest footnote: what the estimates do NOT cover
         try:
             from app.storage_scan import SCAN_EXCLUDED_NOTE as _note
         except Exception:
             _note = ""
         if _note:
-            tk.Label(body, text="Note: " + _note, font=(F, 8),
-                     bg=COLORS["bg"], fg=COLORS["subtext"],
-                     wraplength=self._modal_w - 36, justify="left").pack(
-                         side="bottom", anchor="w", pady=(8, 0))
-        self._bench_lbl = tk.Label(body, text="", font=(F, 8),
+            try:
+                Tooltip(self.status.caption, _note)
+            except Exception:
+                pass
+        self._bench_lbl = tk.Label(body, text="", font=(F, 9),
                                    bg=COLORS["bg"], fg=COLORS["subtext"],
                                    anchor="w", justify="left")
         self._bench_lbl.pack(side="bottom", anchor="w")
@@ -253,12 +234,12 @@ class StorageInsightDialog(ThemedModal):
             var.trace_add("write", lambda *_: self._refresh_estimate())
             self._cat_vars[title] = var
             self._cat_sizes[title] = None
-            outer = tk.Frame(self._junk_body, bg=COLORS["bg_alt"])
-            inner = tk.Frame(outer, bg=COLORS["bg_alt"])
-            inner.pack(fill="both", expand=True)
+            outer = RoundedCard(self._junk_body, fill=COLORS["bg_alt"],
+                                bg=COLORS["bg"], radius=16, min_height=54)
+            inner = outer.body
             ToggleSwitch(inner, var).pack(side="left", anchor="center",
-                                          padx=(8, 2), pady=6)
-            lbl = tk.Label(inner, text=title, font=(F, 9, "bold"),
+                                          padx=(12, 6), pady=7)
+            lbl = tk.Label(inner, text=title, font=(F, 11, "bold"),
                            bg=COLORS["bg_alt"], fg=COLORS["text"],
                            anchor="w", justify="left")
             lbl.pack(side="left", anchor="center")
@@ -270,11 +251,36 @@ class StorageInsightDialog(ThemedModal):
                                     if _names else ""))
             except Exception:
                 pass
-            size = tk.Label(inner, text="…", font=(F, 9, "bold"),
-                            bg=COLORS["bg_alt"], fg=COLORS["subtext"])
-            size.pack(side="right", anchor="center", padx=(6, 8))
+            size = tk.Label(inner, text="…", font=(F, 11, "bold"),
+                            bg=COLORS["bg_alt"], fg=COLORS["subtext"],
+                            anchor="e")
+            size.pack(side="right", anchor="center", padx=(6, 14))
             self._cat_size_lbls[title] = size
-            outer.pack(fill="x", pady=2)
+            # Width-fit pass 2026-10: the title is packed before the size pill
+            # on the right, so at the minimum window a long title (237px of a
+            # 241px budget) left the pill 4px and its text — the "…"
+            # placeholder, later a real "12.4 GB" or "✓ clean" — was sheared
+            # off. Fit the title to the room the switch and the pill need,
+            # measured from the FONT and the pill's own text: a widget's
+            # reqwidth lags a layout pass behind, and trusting it here left
+            # the pill 8px short. The pill re-runs the fit whenever its text
+            # grows (see _paint_category).
+            _fm11 = _measure_font(inner.winfo_toplevel(), (F, 11, "bold"))
+
+            def _pill_room(_fm=_fm11, _lbl=size):
+                try:
+                    need = _fm.measure(str(_lbl.cget("text"))) + 2 + 20
+                except Exception:
+                    need = 120
+                return 70 + need          # switch column + pill
+
+            refit = fit_label(inner, lbl, title, reserve=_pill_room)
+            self._cat_refits[title] = refit
+            try:
+                size.bind("<Configure>", refit, add="+")
+            except Exception:
+                pass
+            outer.pack(fill="x", pady=3)
 
     def _build_games_placeholder(self):
         self._games_ph = tk.Label(self._games_body, text="Scanning libraries…",
@@ -320,7 +326,7 @@ class StorageInsightDialog(ThemedModal):
             except Exception:
                 pass
         try:
-            self._hero_lbl.config(text="Scanning…", fg=COLORS["subtext"])
+            self.banner.set_title("Scanning…", COLORS["subtext"])
             self._set_scan_status("Starting scan…")
         except Exception:
             pass
@@ -423,8 +429,7 @@ class StorageInsightDialog(ThemedModal):
 
     def _set_scan_status(self, text):
         try:
-            if self._status_lbl.winfo_exists():
-                self._status_lbl.config(text=text)
+            self.status.stop(text)
         except Exception:
             pass
 
@@ -444,6 +449,13 @@ class StorageInsightDialog(ThemedModal):
                                fg=COLORS["accent_green"])
                 else:
                     lbl.config(text="✓ clean", fg=COLORS["accent_green"])
+                # the pill's text is a different width now, and a config() that
+                # keeps the widget's geometry identical sends no <Configure>:
+                # re-fit the title once this layout pass has settled, so the
+                # pill is never the thing that gets shaved
+                refit = self._cat_refits.get(title)
+                if refit is not None:
+                    lbl.after_idle(refit)
         except Exception:
             pass
         self._refresh_estimate()
@@ -494,43 +506,86 @@ class StorageInsightDialog(ThemedModal):
             tk.Label(self._games_body,
                      text="Custom or portable installs outside a launcher's "
                           "library folder won't show up here.",
-                     font=(F, 8), bg=COLORS["bg"], fg=COLORS["subtext"],
+                     font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
                      wraplength=320, justify="left").pack(anchor="w")
             return
         shown = self._games[:self._MAX_GAMES]
         for g in shown:
-            outer = tk.Frame(self._games_body, bg=COLORS["bg_alt"])
-            inner = tk.Frame(outer, bg=COLORS["bg_alt"])
-            inner.pack(fill="both", expand=True)
-            tk.Label(inner, text=g.get("drive", ""), font=(F, 8, "bold"),
-                     bg=COLORS["bg_alt"], fg=COLORS["subtext"],
-                     width=3, anchor="w").pack(side="left", anchor="center",
-                                              padx=(8, 2), pady=6)
-            lbl = tk.Label(inner, text=self._short_game_name(g.get("name", "?")),
-                           font=(F, 9, "bold"),
+            outer = RoundedCard(self._games_body, fill=COLORS["bg_alt"],
+                                bg=COLORS["bg"], radius=16, min_height=54)
+            inner = outer.body
+            drive_lbl = tk.Label(inner, text=g.get("drive", ""),
+                                 font=(F, 9, "bold"),
+                                 bg=COLORS["bg_alt"], fg=COLORS["subtext"],
+                                 anchor="w")
+            drive_lbl.pack(side="left", anchor="center", padx=(8, 2),
+                           pady=6)
+            _gname = self._short_game_name(g.get("name", "?"))
+            lbl = tk.Label(inner, text=_gname,
+                           font=(F, 11, "bold"),
                            bg=COLORS["bg_alt"], fg=COLORS["text"],
-                           anchor="w", justify="left", wraplength=175)
+                           anchor="w", justify="left")
             lbl.pack(side="left", anchor="center")
             try:
                 Tooltip(lbl, f"{g.get('name', '?')}\n{g.get('launcher', '')} — {g.get('path', '')}\n"
                              "Read-only: uninstall from its launcher.")
             except Exception:
                 pass
-            AnimatedButton(inner, text="Open",
-                           command=lambda p=g.get("path", ""): self._open_game_folder(p),
-                           bg=COLORS["surface"], fg=COLORS["text"],
-                           font=(F, 8), padx=10, pady=3).pack(
-                               side="right", anchor="center", padx=(0, 8))
-            tk.Label(inner, text=format_bytes(g.get("bytes", 0)),
-                     font=(F, 9), bg=COLORS["bg_alt"],
-                     fg=COLORS["text"]).pack(side="right", anchor="center",
-                                             padx=(0, 6))
-            outer.pack(fill="x", pady=2)
+            open_btn = AnimatedButton(
+                inner, text="Open",
+                command=lambda p=g.get("path", ""): self._open_game_folder(p),
+                bg=COLORS["bg_alt"], fg=COLORS["primary"],
+                variant="outlined",
+                font=(F, 9, "bold"), padx=14, pady=5)
+            open_btn.pack(side="right", anchor="center", padx=(0, 12))
+            size_lbl = tk.Label(inner, text=format_bytes(g.get("bytes", 0)),
+                                font=(F, 10), bg=COLORS["bg_alt"],
+                                fg=COLORS["text"], anchor="e")
+            size_lbl.pack(side="right", anchor="center", padx=(0, 8))
+            # Width-fit pass 2026-10: same shape as the junk rows above — the
+            # name is packed before the drive chip, the size and the Open
+            # button, so at the minimum window those were handed the leftovers
+            # (the size was cut to a couple of pixels). The name now fits the
+            # room that is left, so at every width the name is the one thing
+            # that shortens (with an ellipsis) and the chips keep their pixels.
+            #
+            # All three are computed from the FONT and the text rather than
+            # read back from the widgets: a widget's request is only
+            # recomputed on a layout pass, and a reserve taken from a
+            # half-updated one is exactly how a chip ends up clipped. Each
+            # term carries 6px of slack, because a Label renders its text a
+            # few pixels wider than tkfont.Font.measure() reports it
+            # (measured: 93 vs 89 for "114.98 GB"), and a Label's
+            # `width=<chars>` box uses Tk's own average character width, which
+            # is not any single glyph's width — one more reason to size from
+            # the text here.
+            # drive = text + padding + pack (8,2) + 6; Open = text + the
+            # button's 6px lead-in + 14px padx each side + pack (0,12) + 6;
+            # size = text + padding + pack (0,8) + 6.
+            _fm9 = _measure_font(inner.winfo_toplevel(), (F, 9, "bold"))
+            _fm10 = _measure_font(inner.winfo_toplevel(), (F, 10))
+            _w_drive = _fm9.measure(g.get("drive", "")) + 2 + 8 + 2 + 6
+            _w_open = _fm9.measure("Open") + 6 + 28 + 12 + 6
+            _w_size = _fm10.measure(format_bytes(g.get("bytes", 0))) + 2 + 8 + 6
+
+            def _fixed_room():
+                return _w_drive + _w_open + _w_size
+
+            _fit_name = fit_label(inner, lbl, _gname, reserve=_fixed_room)
+            try:
+                inner.bind("<Configure>", _fit_name, add="+")
+                # one deferred pass: the first Configure can land while the
+                # row is still being sized, and this row's exactness is the
+                # difference between a clipped chip and a whole one
+                inner.after_idle(_fit_name)
+            except Exception:
+                pass
+            outer.pack(fill="x", pady=3)
         rest = self._games[self._MAX_GAMES:]
         if rest:
             tk.Label(self._games_body,
                      text=f"+{len(rest)} more games ({format_bytes(sum(g.get('bytes', 0) for g in rest))} total)",
-                     font=(F, 8), bg=COLORS["bg"],
+                     font=(F, 9), bg=COLORS["bg"],
                      fg=COLORS["subtext"]).pack(anchor="w", pady=(4, 0))
         self._refresh_cols_scroll()
 
@@ -551,12 +606,12 @@ class StorageInsightDialog(ThemedModal):
             total = sum(self._cat_sizes.get(t, 0) or 0
                         for t, v in self._cat_vars.items() if v.get())
             if any(s is None for s in self._cat_sizes.values()):
-                self._hero_lbl.config(text="Scanning…", fg=COLORS["subtext"])
+                self.banner.set_title("Scanning…", COLORS["subtext"])
             elif total > 0:
-                self._hero_lbl.config(text=format_bytes(total),
-                                      fg=COLORS["accent_green"])
+                self.banner.set_title(format_bytes(total),
+                                      COLORS["accent_green"])
             else:
-                self._hero_lbl.config(text="All clean", fg=COLORS["accent_green"])
+                self.banner.set_title("All clean", COLORS["accent_green"])
             try:
                 self._clean_btn.config_text(
                     f"Clean Selected ({format_bytes(total)})" if total > 0

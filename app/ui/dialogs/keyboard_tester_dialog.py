@@ -9,15 +9,21 @@ from __future__ import annotations
 
 import tkinter as tk
 from tkinter import ttk, messagebox
-from app.ui.base import ThemedModal
-from app.ui.theme import COLORS, F, TAB_ACCENTS, _hex_lerp
-from app.ui.widgets import AnimatedButton
+from app.ui.dialogs._tool_page import ToolPage
+from app.ui.theme import (COLORS, F, TAB_ACCENTS, _hex_lerp,
+                          _round_rect_points)
 
 
-class KeyboardTesterDialog(ThemedModal):
+class KeyboardTesterDialog(ToolPage):
     """Keyboard Tester: QWERTY canvas that flashes each key while held and
     keeps a dim mark after release so gaps show at a glance. Simultaneous
-    count gives a rough ghosting check. Pure Tk key events, zero Win32."""
+    count gives a rough ghosting check. Pure Tk key events, zero Win32.
+
+    REDESIGN 2026-10: on the shared ToolPage shell — the font-18 headline is
+    now the Header banner, the stuck-key warning moved to the shared
+    StatusLine, and Reset is a footer action. scroll=False: the key canvas is
+    a fixed interactive surface that must never scroll (the click/key zones
+    are absolute canvas coordinates)."""
 
     _ROWS = [
         [("Esc", "Escape", 1), ("F1", "F1", 1), ("F2", "F2", 1), ("F3", "F3", 1),
@@ -42,6 +48,9 @@ class KeyboardTesterDialog(ThemedModal):
     _KEY_H = 46
     _KEY_GAP = 4
     _UNIT_W = 48
+    #: Widest row is 15 key units; 15.2 leaves the board a little air on the
+    #: right. The canvas width is expressed in these units everywhere.
+    _ROWS_UNITS = 15.2
 
     def __init__(self, parent, app):
         self.app = app
@@ -51,33 +60,44 @@ class KeyboardTesterDialog(ThemedModal):
         self._press_time = {}
         self._stuck_after = None
         self._STUCK_S = 10.0
-        super().__init__(parent, title="Keyboard Tester", accent=TAB_ACCENTS["Clean"])
-        body = self.body
-        self._status_lbl = tk.Label(body, text="Press any key.",
-                                    font=(F, 10, "bold"), bg=COLORS["bg"],
-                                    fg=COLORS["subtext"], anchor="w")
-        self._status_lbl.pack(fill="x", pady=(0, 6))
-        cv_w = int(15 * self._UNIT_W)
-        cv_h = len(self._ROWS) * (self._KEY_H + self._KEY_GAP) + self._KEY_GAP
-        self._cv = tk.Canvas(body, width=cv_w, height=cv_h, bg=COLORS["bg"],
-                             bd=0, highlightthickness=0)
-        self._cv.pack(pady=(0, 6))
+        super().__init__(parent, title="Keyboard Tester",
+                         accent=TAB_ACCENTS["Clean"],
+                         scope="Escape is a test key here too — close with "
+                               "the ✕ or Alt+F4.",
+                         scroll=False, fit=True)
+        self.banner.set_state("\u2328", TAB_ACCENTS["Clean"])
+        self.banner.set_title("Does every key work?")
+        self.banner.set_sub("Hold any key to light it up; keys you have "
+                            "tested stay dimly marked.")
+        body = self.content
+        # Size the keys to the CONTENT ZONE, and keep them there.
+        #
+        # USER FIX 2026-10 (keyboard clipped on the right): this used to be
+        # sized from body_width(0) -- the popup WINDOW width -- and the canvas
+        # was packed WITHOUT fill. At the normal 998px popup that asked for a
+        # 976px canvas inside a 932px content zone, so the packer clamped the
+        # canvas and every row wider than 932px lost its right end: Bksp,
+        # Enter and the right-hand Shift were visibly sheared off. The canvas
+        # now fills the zone and rebuilds the board for the width it is
+        # actually given, so no row can be cut at any window size.
+        self._cv_size = (0, 0)
+        _guess = self._zone_width_guess()
+        self._UNIT_W = max(24.0, (_guess - self._KEY_GAP) / self._ROWS_UNITS)
+        self._KEY_H = self._UNIT_W - self._KEY_GAP
+        self._cv = tk.Canvas(body, width=int(_guess), height=self._cv_height(),
+                             bg=COLORS["bg"], bd=0, highlightthickness=0)
+        self._cv.pack(fill="x", pady=(0, 10))
+        self._cv.bind("<Configure>", self._on_canvas_resize)
         self._draw_layout()
         stats = tk.Frame(body, bg=COLORS["bg"])
         stats.pack(fill="x", pady=(4, 0))
-        for c in range(3):
+        for c in range(2):
             stats.grid_columnconfigure(c, weight=1, uniform="kbstats")
         self._stat_held, _ = self._stat_block(stats, 0, "KEYS HELD")
         self._stat_tested, _ = self._stat_block(stats, 1, "TESTED")
-        reset_cell = self._stat_cell(stats, 2)
-        _reset = AnimatedButton(reset_cell, text="Reset",
-                                command=self._reset_tested,
-                                bg=COLORS["surface"], fg=COLORS["text"],
-                                font=(F, 8, "bold"), padx=10, pady=3)
-        _reset.pack()
-        tk.Label(body, text="Windows grabs Win/PrintScreen/media keys before we see them.",
-                 font=(F, 8), bg=COLORS["bg"], fg=COLORS["subtext"],
-                 wraplength=640, justify="left").pack(fill="x", pady=(8, 0))
+        # REDESIGN 2026-10: Reset is the dialog's one action, so it lives in
+        # the shared footer instead of a third stat cell.
+        self.add_button("Reset", self._reset_tested)
         try:
             # Escape carve-out: ThemedModal binds Escape to close, but Escape
             # is itself a test target — unbind close so it lights up instead.
@@ -96,7 +116,7 @@ class KeyboardTesterDialog(ThemedModal):
             cell = tk.Frame(parent, bg=COLORS["bg"])
             cell.grid(row=0, column=col, sticky="nsew", padx=12)
             if title:
-                tk.Label(cell, text=title, font=(F, 8), bg=COLORS["bg"],
+                tk.Label(cell, text=title, font=(F, 9), bg=COLORS["bg"],
                          fg=COLORS["subtext"]).pack()
             val = tk.Label(cell, text="0", font=(F, 11, "bold"),
                            bg=COLORS["bg"], fg=COLORS["text"])
@@ -107,7 +127,11 @@ class KeyboardTesterDialog(ThemedModal):
 
     def _stat_cell(self, parent, col):
         """Button-only cell (no value label — the old empty-title block
-        still created its '0' label, floating a stray 0 over Reset)."""
+        still created its '0' label, floating a stray 0 over Reset).
+
+        Retained (unused) from the pre-redesign layout: Reset moved to the
+        shared footer, but the helper stays so nothing that referenced it
+        breaks."""
         try:
             cell = tk.Frame(parent, bg=COLORS["bg"])
             cell.grid(row=0, column=col, sticky="nsew", padx=12)
@@ -115,24 +139,70 @@ class KeyboardTesterDialog(ThemedModal):
         except Exception:
             return parent
 
+    def _zone_width_guess(self):
+        """First guess at the canvas width, before the packer has run.
+
+        The window width less the modal chrome (card inset + content
+        padding). Only a starting value: <Configure> replaces it with the
+        width the canvas is actually given, so a drifting chrome constant
+        can never bring the clipping back."""
+        try:
+            return max(320, int(self.body_width(0)) - 66)
+        except Exception:
+            return 720
+
+    def _cv_height(self):
+        return int(len(self._ROWS) * self._UNIT_W) + self._KEY_GAP
+
+    def _on_canvas_resize(self, event):
+        """Rebuild the board for the width the canvas actually got.
+
+        Guarded on width: setting the height below fires another <Configure>
+        with the same width, which must not re-enter this."""
+        w = int(getattr(event, "width", 0) or 0)
+        if w <= 20 or w == self._cv_size[0]:
+            return
+        self._cv_size = (w, int(getattr(event, "height", 0) or 0))
+        self._UNIT_W = max(24.0, (w - self._KEY_GAP) / self._ROWS_UNITS)
+        self._KEY_H = self._UNIT_W - self._KEY_GAP
+        try:
+            self._cv.configure(height=self._cv_height())
+        except Exception:
+            pass
+        self._draw_layout()
+
+    def _repaint_states(self):
+        """Re-apply held/tested colours after the board is redrawn."""
+        for ks in list(self._tested):
+            self._paint_key(ks, "held" if ks in self._held else "tested")
+        for ks in list(self._held):
+            self._paint_key(ks, "held")
+
     def _draw_layout(self):
+        try:
+            self._cv.delete("all")
+        except Exception:
+            pass
+        self._key_shapes = {}
         y = self._KEY_GAP
         for row in self._ROWS:
             x = self._KEY_GAP
             for label, keysym, units in row:
                 w = units * self._UNIT_W - self._KEY_GAP
                 try:
-                    rect = self._cv.create_rectangle(
-                        x, y, x + w, y + self._KEY_H,
-                        fill=COLORS["surface"], outline=COLORS["hairline"])
+                    rect = self._cv.create_polygon(
+                        _round_rect_points(x, y, x + w, y + self._KEY_H, 10),
+                        smooth=True, fill=COLORS["surface"], outline="")
                     text = self._cv.create_text(
                         x + w / 2, y + self._KEY_H / 2, text=label,
-                        font=(F, 9, "bold"), fill=COLORS["subtext"])
+                        font=(F, 11 if self._UNIT_W >= 56 else 9, "bold"),
+                        fill=COLORS["subtext"])
                     self._key_shapes[keysym] = (rect, text)
                 except Exception:
                     pass
                 x += w + self._KEY_GAP
             y += self._KEY_H + self._KEY_GAP
+        self._repaint_states()
 
     def _paint_key(self, keysym, state):
         shapes = self._key_shapes.get(keysym)
@@ -186,15 +256,14 @@ class KeyboardTesterDialog(ThemedModal):
                 if len(stuck) > 4:
                     names += f" +{len(stuck) - 4} more"
                 try:
-                    self._status_lbl.config(
-                        text=f"Stuck key? {names} — lift your finger or tap it again.",
-                        fg=COLORS["accent_red"])
+                    self.status.stop(
+                        f"Stuck key? {names} — lift your finger or tap it again.",
+                        COLORS["accent_red"])
                 except Exception:
                     pass
             else:
                 try:
-                    self._status_lbl.config(text="Press any key.",
-                                            fg=COLORS["subtext"])
+                    self.status.stop("Press any key.")
                 except Exception:
                     pass
         except Exception:

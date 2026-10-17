@@ -8,13 +8,26 @@ about any other dialog except where noted.
 from __future__ import annotations
 
 import tkinter as tk
+
+from app.ui.widgets.rounded_card import RoundedCard
+from app.ui.widgets.entry import RoundedEntry
+
+from app.ui.widgets.dropdown import M3Dropdown
 from tkinter import ttk, messagebox
-from app.ui.base import ThemedModal
+from app.ui.dialogs._tool_page import ToolPage
 from app.ui.theme import COLORS, F, TAB_ACCENTS
 from app.ui.widgets import AnimatedButton
 
 
-class GameServerPingDialog(ThemedModal):
+class _Row(RoundedCard):
+    """RoundedCard whose winfo_children() lists the labels inside it, so the
+    result-marking code that walks a plain row Frame keeps working."""
+
+    def winfo_children(self):
+        return self.body.winfo_children()
+
+
+class GameServerPingDialog(ToolPage):
     """Game Server Ping (user-approved Tools feature): ping before you
     queue. Fortnite regions go to Epic's official per-region endpoints
     (ICMP echo); company rows measure the TCP path to each publisher's
@@ -48,24 +61,28 @@ class GameServerPingDialog(ThemedModal):
             _games = ("Fortnite",)
         self._game_var = tk.StringVar(value=_games[0])
         super().__init__(parent, title="Game Server Ping",
-                         accent=TAB_ACCENTS["Clean"])
-        body = self.body
-        tk.Label(body, text="Test before you queue — lower is better. "
-                            "In-game ping usually reads a bit lower.",
-                 font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
-                 anchor="w").pack(fill="x")
-        top = tk.Frame(body, bg=COLORS["bg"])
-        top.pack(fill="x", pady=(8, 2))
+                         accent=TAB_ACCENTS["Clean"],
+                         scope="Ping is a measurement only — nothing is "
+                               "changed on your PC.",
+                         with_toolbar=True, scroll=True)
+        # REDESIGN 2026-10: on the shared ToolPage shell. The descriptive
+        # headline became the Header banner, the game picker moved to the
+        # shared toolbar and Test became the footer's primary action.
+        body = self.content
+        self.banner.set_state("\u25CE", TAB_ACCENTS["Clean"])
+        self.banner.set_title("Check your ping before you queue")
+        self.banner.set_sub("Lower is better.")
+
         try:
             # Option A (user-approved): the flat OptionMenu spread all 50
             # games into one menu taller than most screens — it spilled past
             # the bottom edge. A readonly Combobox scrolls its popdown and
             # gives typeahead (type "for" → Fortnite), so it always fits and
             # is far easier to navigate. Mirrors the preset picker above.
-            self._game_combo = ttk.Combobox(
-                top, textvariable=self._game_var, values=_games,
+            self._game_combo = M3Dropdown(
+                self.toolbar, textvariable=self._game_var, values=_games,
                 state="readonly", width=42 if tk.TkVersion >= 8.6 else 38,
-                font=(F, 9))
+                font=(F, 11))
             self._game_combo.pack(side="left")
         except Exception:
             pass
@@ -73,20 +90,16 @@ class GameServerPingDialog(ThemedModal):
             self._game_var.trace_add("write", lambda *_a: self._start_test())
         except Exception:
             pass
-        AnimatedButton(top, text="Test", command=self._start_test,
-                       bg=COLORS["accent_green"], fg=COLORS["black"],
-                       font=(F, 9, "bold"), padx=18, pady=6).pack(side="right")
-        self._method_lbl = tk.Label(body, text="", font=(F, 8),
-                                    bg=COLORS["bg"], fg=COLORS["subtext"],
-                                    anchor="w")
-        self._method_lbl.pack(fill="x")
+        self._test_btn = self.add_button("Test", self._start_test,
+                                         kind="primary")
+        # kept (unpacked): the update code still writes the method note here
+        self._method_lbl = tk.Label(body, text="")
         self._custom_row = tk.Frame(body, bg=COLORS["bg"])
         self._rows_body = tk.Frame(body, bg=COLORS["bg"])
         self._rows_body.pack(fill="x", pady=(4, 0))
-        self._verdict_lbl = tk.Label(body, text="", font=(F, 11, "bold"),
-                                     bg=COLORS["bg"], fg=COLORS["text"],
-                                     anchor="w")
-        self._verdict_lbl.pack(fill="x", pady=(8, 0))
+        self._verdict_lbl = tk.Label(body, text="", font=(F, 13, "bold"),
+                                     bg=COLORS["bg"], fg=COLORS["text"])
+        self._verdict_lbl.pack(pady=(16, 0))
         self.on_close(self._cancel)
         self._start_test()
 
@@ -110,7 +123,7 @@ class GameServerPingDialog(ThemedModal):
             from app.config_persist import load_config as _load
             key = self._tab_key()
             try:
-                self._method_lbl.config(text=_gp.GAME_METHODS.get(key, ""))
+                self._method_lbl.config(text=_gp.method_note(key))
             except Exception:
                 pass
             if key == "custom":
@@ -132,18 +145,16 @@ class GameServerPingDialog(ThemedModal):
                 pass
             if not show:
                 return
-            self._custom_row.pack(fill="x", pady=(4, 0))
-            self._custom_entry = tk.Entry(
-                self._custom_row, bg=COLORS["surface"], fg=COLORS["text"],
-                insertbackground=COLORS["text"], font=(F, 9), bd=0,
-                highlightthickness=1, highlightbackground=COLORS["hairline"],
-                width=34)
-            self._custom_entry.pack(side="left")
+            self._custom_row.pack(pady=(8, 0))
+            _ce = RoundedEntry(self._custom_row, width=34, font=(F, 11))
+            _ce.pack(side="left")
+            self._custom_entry = _ce.entry
             AnimatedButton(self._custom_row, text="Add",
                            command=self._add_custom,
-                           bg=COLORS["surface"], fg=COLORS["text"],
-                           font=(F, 9, "bold"), padx=14,
-                           pady=4).pack(side="left", padx=(8, 0))
+                           bg=COLORS["secondary_container"],
+                           fg=COLORS["on_secondary_container"],
+                           font=(F, 10, "bold"), padx=22,
+                           pady=9).pack(side="left", padx=(8, 0))
         except Exception:
             pass
 
@@ -237,23 +248,25 @@ class GameServerPingDialog(ThemedModal):
         self._results = {}
         for key, title, _kind, _host, _port in targets:
             try:
-                row = tk.Frame(self._rows_body, bg=COLORS["bg"])
-                row.pack(fill="x", pady=1)
-                tk.Label(row, text=title, font=(F, 9, "bold"),
-                         bg=COLORS["bg"], fg=COLORS["text"],
-                         anchor="w").pack(side="left")
+                row = _Row(self._rows_body, fill=COLORS["bg_alt"],
+                           bg=COLORS["bg"], radius=16, min_height=48)
+                row.pack(fill="x", pady=3)
+                rb = row.body
+                tk.Label(rb, text=title, font=(F, 11, "bold"),
+                         bg=COLORS["bg_alt"], fg=COLORS["text"],
+                         anchor="w").pack(side="left", padx=(14, 0), pady=10)
                 if custom:
-                    _rm = tk.Label(row, text="✕", font=(F, 9),
-                                   bg=COLORS["bg"], fg=COLORS["subtext"],
+                    _rm = tk.Label(rb, text="\u2715", font=(F, 10),
+                                   bg=COLORS["bg_alt"], fg=COLORS["subtext"],
                                    cursor="hand2")
-                    _rm.pack(side="left", padx=(6, 0))
+                    _rm.pack(side="left", padx=(8, 0))
                     _rm.bind("<Button-1>",
                              lambda _e, raw=key: self._remove_custom(raw),
                              add="+")
-                ms = tk.Label(row, text="…", font=(F, 9),
-                              bg=COLORS["bg"], fg=COLORS["subtext"],
+                ms = tk.Label(rb, text="\u2026", font=(F, 11),
+                              bg=COLORS["bg_alt"], fg=COLORS["subtext"],
                               anchor="e")
-                ms.pack(side="right")
+                ms.pack(side="right", padx=(0, 14))
                 self._rows[key] = {"ms": ms, "row": row}
             except Exception:
                 pass
@@ -321,8 +334,8 @@ class GameServerPingDialog(ThemedModal):
         silently won, so the first was dead code. The verdict is benign rather
         than a bug, but it is a maintainability trap: a future fix applied to
         the wrong copy does nothing at all, with no error to hint at it. The
-        duplicate is removed; tools/verify_low001_dupes.py now fails if any
-        class in app/ defines the same method twice.
+        duplicate is removed. The lesson stands: a method defined twice in a
+        class silently keeps only the last body.
         """
         self._poll_after = None
         try:

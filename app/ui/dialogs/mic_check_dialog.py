@@ -8,19 +8,28 @@ about any other dialog except where noted.
 from __future__ import annotations
 
 import tkinter as tk
+
+from app.ui.widgets.dropdown import M3Dropdown
 from tkinter import ttk, messagebox
-from app.ui.base import ThemedModal, Tooltip
+from app.ui.base import Tooltip
+from app.ui.dialogs._tool_page import ToolPage
 from app.ui.hardware.capture import _capture_inputs, _default_capture_id
 from app.ui.hardware.mmdev import _InputMeter, _MM_STATE_NAMES, _mm_vfn
 from app.ui.theme import COLORS, F, TAB_ACCENTS
-from app.ui.widgets import AnimatedButton
+from app.ui.widgets.level_meter import LevelMeter
 
 
-class MicCheckDialog(ThemedModal):
+class MicCheckDialog(ToolPage):
     """Mic Check (user-requested Tools feature): one-glance
     verdict, the working microphones, the mic permission, and a live
     input-level bar. Strictly read-only — the fix path is the
-    'Allow Microphone For Apps' tweak, linked below, never applied here."""
+    'Allow Microphone For Apps' tweak, linked below, never applied here.
+
+    REDESIGN 2026-10: on the shared ToolPage shell — the banner takes the
+    headline, the live verdict / level meter / dB read-out stay in
+    self.content (they are numbers, not chrome), and the four actions are
+    footer buttons. The capture and meter engine is untouched.
+    """
 
     _TICK_MS = 120
 
@@ -36,130 +45,49 @@ class MicCheckDialog(ThemedModal):
             self._pick_var.trace_add("write", self._pick_input)
         except Exception:
             pass
-        super().__init__(parent, title="Mic Check",
-                         accent=TAB_ACCENTS["Tweak"])
-        body = self.body
-        tk.Label(body, text="Pick a mic, speak, watch the dial.",
-                 font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
-                 anchor="w").pack(fill="x")
-        self._verdict_lbl = tk.Label(body, text="", font=(F, 12, "bold"),
-                                     bg=COLORS["bg"], fg=COLORS["text"],
-                                     anchor="w")
-        self._verdict_lbl.pack(fill="x", pady=(8, 2))
-        drow = tk.Frame(body, bg=COLORS["bg"])
-        drow.pack(fill="x", pady=(2, 0))
-        tk.Label(drow, text="Microphone:", font=(F, 9, "bold"),
-                 bg=COLORS["bg"], fg=COLORS["text"],
-                 anchor="w").pack(side="left")
-        self._pick_box = tk.Frame(drow, bg=COLORS["bg"])
-        self._pick_box.pack(side="left", padx=(8, 0))
-        self._other_note = tk.Label(body, text="", font=(F, 8),
-                                    bg=COLORS["bg"], fg=COLORS["subtext"],
-                                    anchor="w")
-        self._other_note.pack(fill="x")
-        self._listen_lbl = tk.Label(body, text="", font=(F, 9, "bold"),
-                                    bg=COLORS["bg"], fg=COLORS["text"],
-                                    anchor="w")
-        self._listen_lbl.pack(fill="x", pady=(4, 0))
-        grow = tk.Frame(body, bg=COLORS["bg"])
-        grow.pack(pady=(4, 0))
-        self._gauge_cv = tk.Canvas(grow, width=220, height=132,
-                                   bg=COLORS["bg"], bd=0,
-                                   highlightthickness=0)
-        self._gauge_cv.pack()
-        self._draw_gauge()
-        # level bar
-        tk.Label(body, text="Input level — speak into your mic:",
-                 font=(F, 9, "bold"), bg=COLORS["bg"], fg=COLORS["text"],
-                 anchor="w").pack(fill="x", pady=(10, 2))
-        self._level_cv = tk.Canvas(body, height=14, bg=COLORS["surface"],
-                                   bd=0, highlightthickness=0)
-        self._level_cv.pack(fill="x")
-        self._level_item = self._level_cv.create_rectangle(
-            0, 0, 0, 14, fill=COLORS["accent_green"], outline="")
-        self._level_note = tk.Label(body, text="", font=(F, 9),
-                                    bg=COLORS["bg"], fg=COLORS["subtext"],
-                                    anchor="w")
-        self._level_note.pack(fill="x")
-        # actions row
-        brow = tk.Frame(body, bg=COLORS["bg"])
-        brow.pack(fill="x", pady=(12, 6))
-        AnimatedButton(brow, text="Open Sound settings",
-                       command=self._open_sound,
-                       bg=COLORS["surface"], fg=COLORS["text"],
-                       font=(F, 9, "bold"), padx=18, pady=7).pack(side="left")
-        self._rec_btn = AnimatedButton(brow, text="Record 3s",
-                                       command=self._record_take,
-                                       bg=COLORS["surface"], fg=COLORS["text"],
-                                       font=(F, 9, "bold"), padx=18, pady=7)
-        self._rec_btn.pack(side="left", padx=(8, 0))
+        super().__init__(
+            parent, title="Mic Check", accent=TAB_ACCENTS["Tweak"],
+            scope="Read-only: it shows the working microphones and the live "
+                  "level, it never changes a setting.",
+            scroll=False)
+        self.banner.set_state("\u25CF", TAB_ACCENTS["Tweak"])
+        self.banner.set_title("Is your microphone working?")
+        self.banner.set_sub("Speak and watch the level move.")
+        body = self.content
+        # Simplified, centred: status, picker, meter, readout, footer actions.
+        wrap = tk.Frame(body, bg=COLORS["bg"])
+        wrap.pack(expand=True, fill="x", padx=36)
+        self._verdict_lbl = tk.Label(wrap, text="", font=(F, 15),
+                                     bg=COLORS["bg"], fg=COLORS["text"])
+        self._verdict_lbl.pack(pady=(0, 14))
+        self._pick_box = tk.Frame(wrap, bg=COLORS["bg"])
+        self._pick_box.pack(pady=(0, 20))
+        # kept (unpacked) because the update code still writes to them
+        self._other_note = tk.Label(wrap, text="")
+        self._listen_lbl = tk.Label(wrap, text="")
+        self._meter_w = LevelMeter(wrap)
+        self._meter_w.pack(fill="x")
+        self._readout = tk.Label(wrap, text="-inf dB", font=(F, 34),
+                                 bg=COLORS["bg"], fg=COLORS["subtext"])
+        self._readout.pack(pady=(14, 0))
+        self._level_note = tk.Label(wrap, text="", font=(F, 10),
+                                    bg=COLORS["bg"], fg=COLORS["subtext"])
+        self._level_note.pack()
+        # REDESIGN 2026-10: the four actions moved from a hand-built body
+        # row onto the shared ToolPage footer, by role.
+        self._rec_btn = self.add_button("Record 3s", self._record_take,
+                                        kind="primary")
         Tooltip(self._rec_btn, "Records 3 seconds from the Windows default mic, then play it back to hear yourself")
-        self._play_btn = AnimatedButton(brow, text="Play back",
-                                        command=self._play_take,
-                                        bg=COLORS["surface"], fg=COLORS["text"],
-                                        font=(F, 9, "bold"), padx=18, pady=7)
-        self._play_btn.pack(side="left", padx=(8, 0))
+        self._play_btn = self.add_button("Play back", self._play_take)
         self._play_btn.set_enabled(False)
-        AnimatedButton(brow, text="Refresh",
-                       command=self._refresh,
-                       bg=COLORS["surface"], fg=COLORS["text"],
-                       font=(F, 9, "bold"), padx=18, pady=7).pack(side="right")
+        self.add_button("Refresh", self._refresh)
+        self.add_button("Sound settings", self._open_sound)
         self._take = None
         self._recorder = None
         self._rec_busy = False
-        tk.Label(body, text="Mic blocked? Tweak tab → Custom → "
-                            "Allow Microphone For Apps (reversible).",
-                 font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
-                 wraplength=680, justify="left").pack(anchor="w")
         self._rebuild_inputs()
         self.on_close(self._stop_tick)
         self._tick()
-
-    def _draw_gauge(self):
-        """Static dial furniture (Tk thread, once): zone arcs, ticks,
-        labels. The needle (_needle item) moves in _tick."""
-        try:
-            cv = self._gauge_cv
-            cx, cy, r = 110, 115, 85
-            cv.create_arc(cx - r, cy - r, cx + r, cy + r, start=80,
-                          extent=100, style="arc", outline=COLORS["accent_green"],
-                          width=7)
-            cv.create_arc(cx - r, cy - r, cx + r, cy + r, start=38,
-                          extent=42, style="arc", outline=COLORS["accent_yellow"],
-                          width=7)
-            cv.create_arc(cx - r, cy - r, cx + r, cy + r, start=0,
-                          extent=38, style="arc", outline=COLORS["accent_red"],
-                          width=7)
-            import math as _math
-            for frac, label in ((0.0, "0"), (0.5, "50"), (1.0, "100")):
-                deg = 180.0 - frac * 180.0
-                rad = _math.radians(deg)
-                x1, y1 = cx + 72 * _math.cos(rad), cy - 72 * _math.sin(rad)
-                x2, y2 = cx + 85 * _math.cos(rad), cy - 85 * _math.sin(rad)
-                cv.create_line(x1, y1, x2, y2, fill=COLORS["subtext"], width=2)
-                cv.create_text(cx + 58 * _math.cos(rad), cy - 58 * _math.sin(rad),
-                               text=label, font=(F, 8), fill=COLORS["subtext"])
-            self._needle = cv.create_line(cx, cy, cx - 68, cy,
-                                          fill=COLORS["accent_green"], width=3)
-            cv.create_oval(cx - 6, cy - 6, cx + 6, cy + 6,
-                           fill=COLORS["text"], outline="")
-        except Exception:
-            self._needle = None
-
-    def _paint_needle(self, peak):
-        try:
-            import math as _math
-            cx, cy = 110, 115
-            deg = 180.0 - max(0.0, min(1.0, peak)) * 180.0
-            rad = _math.radians(deg)
-            self._gauge_cv.coords(self._needle, cx, cy,
-                                  cx + 68 * _math.cos(rad),
-                                  cy - 68 * _math.sin(rad))
-            color = COLORS["accent_green"] if peak < 0.7 else (
-                COLORS["accent_yellow"] if peak < 0.9 else COLORS["accent_red"])
-            self._gauge_cv.itemconfig(self._needle, fill=color)
-        except Exception:
-            pass
 
     def _drop_inputs(self):
         """Release enumerated COM refs not owned by the live meter."""
@@ -226,7 +154,7 @@ class MicCheckDialog(ThemedModal):
                     continue
         try:
             self._pick_var.set(_defname or (names[0] if names else ""))
-            _om = ttk.Combobox(
+            _om = M3Dropdown(
                 self._pick_box, textvariable=self._pick_var,
                 values=names, state="readonly",
                 width=42 if tk.TkVersion >= 8.6 else 38, font=(F, 9))
@@ -236,14 +164,14 @@ class MicCheckDialog(ThemedModal):
         try:
             if _consent is not None and _consent != "Allow":
                 self._verdict_lbl.config(
-                    text="🔇 Mic is blocked — turn permission on below.",
+                    text="Microphone is blocked in Windows",
                     fg=COLORS["accent_red"])
             elif not actives:
                 self._verdict_lbl.config(
-                    text="⚠️ No working mic found — check the cable.",
+                    text="No working microphone found",
                     fg=COLORS["accent_yellow"])
             else:
-                self._verdict_lbl.config(text="🎙️ Mic ready — pick one and speak.",
+                self._verdict_lbl.config(text="Ready \u2014 say something",
                                          fg=COLORS["accent_green"])
             _notes = []
             for e in others:
@@ -435,25 +363,18 @@ class MicCheckDialog(ThemedModal):
                     level = self._meter.read()
             except Exception:
                 level = None
-            try:
-                self._needle_val = getattr(self, "_needle_val", 0.0)
-                target = level if level is not None else 0.0
-                self._needle_val += (target - self._needle_val) * 0.45
-                self._paint_needle(self._needle_val)
-            except Exception:
-                pass
             if level is None:
                 self._level_note.config(text="Level meter unavailable on this PC.")
                 try:
-                    self._level_cv.coords(self._level_item, 0, 0, 0, 14)
+                    self._meter_w.set_level(-60.0, -60.0, False)
+                    self._readout.config(text="n/a", fg=COLORS["subtext"])
                 except Exception:
                     pass
             else:
                 try:
                     import math as _math
-                    # dBFS scale: real gain language — 0dB is digital
-                    # full-scale (clip); aim peaks -12..-6dB for
-                    # Discord/OBS. Linear % hid clipping completely.
+                    # dBFS: 0 dB is digital full-scale (clip); aim peaks
+                    # -12..-6 dB for Discord/OBS. Linear % hid clipping.
                     peak = max(0.0, min(1.0, float(level)))
                     db = 20.0 * _math.log10(peak) if peak > 0 else -60.0
                     db = max(-60.0, db)
@@ -461,29 +382,32 @@ class MicCheckDialog(ThemedModal):
                     hold = float(getattr(self, "_peak_hold_db", -60.0))
                     hold = db if db > hold else max(-60.0, hold - 1.5)
                     self._peak_hold_db = hold
-                    w = max(1, int(self._level_cv.winfo_width() or 400))
-                    frac = max(0.0, min(1.0, (db + 60.0) / 60.0))
-                    self._level_cv.coords(self._level_item, 0, 0, w * frac, 14)
-                    try:
-                        fill = COLORS["accent_green"] if db < -12 else (
-                            COLORS["accent_yellow"] if db < -3 else COLORS["accent_red"])
-                        self._level_cv.itemconfig(self._level_item, fill=fill)
-                    except Exception:
-                        pass
-                    if peak >= 0.99 or hold >= -1.0:
+                    clip = peak >= 0.99 or hold >= -1.0
+                    self._meter_w.set_level(db, hold, clip)
+                    col = (COLORS["accent_green"] if db < -12 else
+                           COLORS["accent_yellow"] if db < -3 else
+                           COLORS["accent_red"])
+                    self._readout.config(
+                        text=("-inf dB" if db <= -59.0 else "%.0f dB" % db),
+                        fg=col if db > -59.0 else COLORS["subtext"])
+                    if clip:
                         self._level_note.config(
-                            text=f"CLIPPING at {hold:.0f}dB peak — turn the mic gain down.")
+                            text="CLIPPING at %.0f dB peak - turn the mic "
+                                 "gain down." % hold)
                     elif db <= -59.0:
-                        self._level_note.config(text="-inf dB — Listening…")
+                        self._level_note.config(text="Listening...")
                     elif hold < -24.0:
                         self._level_note.config(
-                            text=f"{db:.0f}dB (peak {hold:.0f}dB) — very quiet, raise gain.")
+                            text="Peak %.0f dB - very quiet, raise the gain."
+                                 % hold)
                     elif hold <= -6.0:
                         self._level_note.config(
-                            text=f"{db:.0f}dB (peak {hold:.0f}dB) — Signal OK, aim -12 to -6dB peaks.")
+                            text="Peak %.0f dB - signal OK. Aim for -12 to "
+                                 "-6 dB peaks." % hold)
                     else:
                         self._level_note.config(
-                            text=f"{db:.0f}dB (peak {hold:.0f}dB) — hot, back off a little.")
+                            text="Peak %.0f dB - hot, back off a little."
+                                 % hold)
                 except Exception:
                     pass
         except Exception:

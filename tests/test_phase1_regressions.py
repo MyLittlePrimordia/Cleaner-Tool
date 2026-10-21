@@ -94,6 +94,7 @@ def test_get_installed_ids_badges_store_apps(monkeypatch):
 
     class _R:
         stdout = fake_out
+        returncode = 0     # _run_winget treats a non-zero exit as failure
 
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: _R())
     monkeypatch.setattr(it, "resolve_exe", lambda name: name)

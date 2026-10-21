@@ -34,6 +34,7 @@ from app.downloader import (
 )
 from app import capabilities as cap
 import os
+import threading
 
 
 def _ensure_winget(ctx: TaskContext) -> None:
@@ -1587,21 +1588,35 @@ def _installed_package_names() -> "set[str] | None":
     return {line.strip().lower() for line in out.splitlines() if line.strip()}
 
 
+# winget serializes its own operations with an internal mutex; concurrent
+# invocations (the badge scan and the upgrade count used to start together at
+# launch) can block or fail with "another instance is running". One process-
+# wide lock makes our calls queue instead.
+_WINGET_LOCK = threading.Lock()
+
+
 def _run_winget(args, timeout: int = 120) -> "str | None":
     """Run winget and return its stdout as text, or None on failure.
 
     3.2: force a UTF-8 decode. winget emits UTF-8; under a non-English console
     codepage the default locale decoding can raise UnicodeDecodeError or mojibake
     the package ids. errors='replace' keeps a stray byte from aborting the parse.
+
+    2026-10: a non-zero exit is a failure (None), not data. The old version
+    returned stdout regardless, so an error banner could be parsed as a
+    package list. Callers all handle None.
     """
     import subprocess as _sp
     try:
-        out = _sp.run(
-            [resolve_exe("winget"), *args],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=timeout,
-            creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
-        )
+        with _WINGET_LOCK:
+            out = _sp.run(
+                [resolve_exe("winget"), *args],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=timeout,
+                creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
+            )
+        if out.returncode != 0:
+            return None
         return out.stdout or ""
     except Exception:
         return None
@@ -1624,8 +1639,12 @@ def _installed_ids_from_export() -> "set[str] | None":
     try:
         fd, path = tempfile.mkstemp(suffix=".json", prefix="ct_winget_export_")
         _os.close(fd)
+        # --include-versions was dropped: only PackageIdentifier is read, and
+        # --disable-interactivity keeps a source-agreement prompt from waiting
+        # on a GUI process with no console.
         text = _run_winget(
-            ["export", "--include-versions", "--accept-source-agreements", "-o", path])
+            ["export", "--accept-source-agreements",
+             "--disable-interactivity", "-o", path])
         if text is None:
             return None
         with open(path, "r", encoding="utf-8") as fh:
@@ -1681,31 +1700,38 @@ def get_installed_ids(refresh: bool = False) -> "set[str] | None":
     exported = _installed_ids_from_export()
     found = set(exported) if exported is not None else set()
 
-    listing = _run_winget(
-        ["list", "--accept-source-agreements", "--disable-interactivity"])
-    if listing is not None:
-        if exported is None:
-            for line in listing.splitlines():
-                for tok in line.split():
-                    t = tok.strip().strip(",;").lower()
-                    if t and t in known:
-                        found.add(t)
-        # M-2 fix: badge Store apps by name (their product id is absent from
-        # the listing AND from the export — see _MSSTORE_NAME_HINTS).
-        low_out = listing.lower()
-        for sid, hints in _MSSTORE_NAME_HINTS.items():
-            if any(h in low_out for h in hints):
-                found.add(sid.lower())
+    # `winget list` is only needed when the exact sources could not answer:
+    # either the export failed (fallback IDs) or Get-AppxPackage failed (so
+    # Store badges have no exact identity and must fall back to name hints).
+    # On a normal machine both work, and this skips ~600 ms of subprocess
+    # work at launch. Hints are additive only.
+    pkg_names = _installed_package_names()
+    listing = None
+    if exported is None or pkg_names is None:
+        listing = _run_winget(
+            ["list", "--accept-source-agreements", "--disable-interactivity"])
+        if listing is not None:
+            if exported is None:
+                for line in listing.splitlines():
+                    for tok in line.split():
+                        t = tok.strip().strip(",;").lower()
+                        if t and t in known:
+                            found.add(t)
+            # M-2 fix: badge Store apps by name (their product id is absent
+            # from the listing AND from the export — see _MSSTORE_NAME_HINTS).
+            low_out = listing.lower()
+            for sid, hints in _MSSTORE_NAME_HINTS.items():
+                if any(h in low_out for h in hints):
+                    found.add(sid.lower())
 
-    if exported is None and listing is None:
-        return None  # nothing worked — keep the honest "unknown" contract
+        if exported is None and listing is None:
+            return None  # nothing worked — keep the honest "unknown" contract
 
     # 1.3: exact Store-app detection. Get-AppxPackage reports the package
     # identity Name of every Store/MSIX app, so a store id is badged only when
     # its real package is installed — no locale or display-name guessing. This
     # unions with the name hints above: an app the hints miss is now caught
     # exactly, and a hint's false positive is only ever additive.
-    pkg_names = _installed_package_names()
     if pkg_names is not None:
         for sid, identities in _MSSTORE_IDENTITY.items():
             if any(i in pkg_names for i in identities):
@@ -1759,7 +1785,6 @@ def get_upgradable_count(refresh: bool = False) -> "int | None":
     Header/footer wording is locale-dependent, so detection is structural
     (header = line containing Name+Id+Version+Available; dashes; footer =
     empty or starts with a digit+'upgrade' or 'no '), not exact-match."""
-    import subprocess as _sp
     import time as _time
     now = _time.monotonic()
     cached, stamp = _UPGRADE_CACHE
@@ -1769,16 +1794,9 @@ def get_upgradable_count(refresh: bool = False) -> "int | None":
         return None
     if not cap.has_winget():
         return None
-    try:
-        out = _sp.run(
-            [resolve_exe("winget"), "upgrade", "--accept-source-agreements", "--disable-interactivity"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=120,
-            creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
-        )
-    except Exception:
-        return None
-    text = (out.stdout or "").strip()
+    text = (_run_winget(
+        ["upgrade", "--accept-source-agreements", "--disable-interactivity"],
+        timeout=120) or "").strip()
     if not text:
         return None
     lines = [ln.rstrip() for ln in text.splitlines()]

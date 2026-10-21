@@ -15,7 +15,7 @@ from app.compat import (task_min_build, task_supported, unsupported_reason,
 from app.tasks import Task
 from app.tab_presets import TABS
 
-_VALID_RISK = {"SAFE", "ADVANCED", "REBOOT REQUIRED"}
+_VALID_RISK = {"SAFE", "ADVANCED", "REBOOT REQUIRED", "DATA LOSS"}
 
 
 class _Stub:
@@ -40,6 +40,26 @@ def test_every_shipped_task_has_a_valid_risk_and_min_build():
            if getattr(t, "risk", "SAFE") not in _VALID_RISK
            or task_min_build(t) < 0]
     assert not bad, f"tasks with an invalid risk/min_build: {bad}"
+
+
+def test_irreversible_tasks_are_not_silently_safe():
+    """Data-loss tasks must say so, and must not be in Quick Clean.
+
+    2026-10: these were all risk="SAFE" and three of them were in the
+    everyday preset, which taught users to ignore the badge.
+    """
+    from app.tab_presets import PRESETS
+    by_key = {t.key: t for t in _all_tasks()}
+    for key in ("recycle_bin", "game_captures", "remove_bloat"):
+        assert by_key[key].risk == "DATA LOSS", key
+    for key in ("driver_junk", "old_logs"):
+        assert by_key[key].risk == "ADVANCED", key
+
+    quick = set(PRESETS["Clean"]["Quick Clean"])
+    assert not quick & {"recycle_bin", "driver_junk", "old_logs"}, (
+        "Quick Clean must not empty the Recycle Bin or delete driver "
+        "packages / diagnostic logs by default"
+    )
 
 
 def test_no_shipped_task_declares_a_min_build_yet():

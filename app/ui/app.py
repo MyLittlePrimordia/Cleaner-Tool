@@ -90,8 +90,7 @@ GAP_X = 12
 #: Emoji fallbacks for the status-row shortcut glyphs (redesign 2026-10).
 #: Used ONLY when the PNG is missing or will not decode, so a packaging
 #: mistake degrades to the previous look instead of a blank button.
-_CORNER_FALLBACK = {"automaint": "🛠️", "quicktools": "🧰",
-                     "exports": "📋"}
+_CORNER_FALLBACK = {"automaint": "🛠️", "exports": "📋"}
 
 #: Displayed size of a status-row glyph. The preset cards use 24; these are a
 #: little smaller because they sit in a dense strip beside the privilege
@@ -117,6 +116,13 @@ class Application:
         self.root.configure(bg=COLORS["shell"])
         _set_window_icon(self.root)
         _enable_dark_titlebar(self.root)
+        # Local crash log: Tk swallows callback exceptions before they reach
+        # sys.excepthook, so the root needs its own hook. Best-effort.
+        try:
+            from app.diagnostics import install_hooks as _install_crash_hooks
+            _install_crash_hooks(self.root)
+        except Exception:
+            pass
         # custom borderless chrome (engages lazily on first <Map> so the
         # headless harness never flashes; falls back to native on failure)
         self._chrome = BorderlessChrome(root, self)
@@ -849,6 +855,13 @@ class Application:
         self.page_container.pack(fill="both", expand=True, padx=(0, 0),
                                  pady=(0, 4))
         self.tabs = {}
+        # PERF (2026-10): Settings is built on FIRST VISIT, not at startup.
+        # It is not the default tab and its constructor is the most expensive
+        # page (~180 ms incl. three schtasks probes), so building it up front
+        # cost every launch for a screen most users open rarely. _ensure_tab
+        # materializes a lazy page exactly once; everything else keeps using
+        # self.tabs as before.
+        self._tab_factories = {}
         for name in TAB_NAMES:
             if name == "Install":
                 self.tabs[name] = InstallTab(self.page_container, self)
@@ -859,7 +872,9 @@ class Application:
                 self.tabs[name] = DriversTab(self.page_container, self)
             elif name == "Settings":
                 from app.ui.tabs.settingstab import SettingsTab
-                self.tabs[name] = SettingsTab(self.page_container, self)
+                self._tab_factories[name] = (
+                    lambda _cls=SettingsTab:
+                    _cls(self.page_container, self))
             else:
                 self.tabs[name] = TaskTab(self.page_container, self, name)
         self._show_tab("Clean")
@@ -977,7 +992,7 @@ class Application:
         )
         self.cancel_btn.set_enabled(False)
 
-        # Bottom-corner shortcuts: Auto Maintenance, Quick Tools, Export
+        # Bottom-corner shortcuts: Auto Maintenance and Export
         # Logs. Startup Manager and Uninstall Programs moved to Tools tab
         # cards (user request, 2026-09) — the Tools grid had exactly two
         # empty slots on its last row, and both dialogs already existed
@@ -1006,6 +1021,11 @@ class Application:
         # to themed assets from the same generated set the preset cards use
         # (app/assets/preset_icons/, drawn in `subtext` because a global
         # control must not wear whichever tab's accent happens to be open).
+        #
+        # 2026-10: Quick Tools (the third of them) is gone - its card was
+        # dropped from the Tools tab and this icon had never been packed, so
+        # the widget went with the feature instead of lingering as a hook
+        # nothing could reach.
         #
         # Still a tk.Label, not an AnimatedButton: tools/smoke/tools.py
         # asserts on `_corner_logs.cget("text")` and drives these through
@@ -1038,24 +1058,15 @@ class Application:
                 pass
             return lbl
 
-        # Built in reading order, packed in REVERSE (see below).
+        # Built in reading order.
         self._corner_maint = _corner_icon(
             "automaint", "Auto Maintenance",
             lambda: self._show_schedule_dialog())
-        self._corner_quick = _corner_icon(
-            "quicktools", "Quick Tools", lambda: self._open_quick_tools())
         self._corner_logs = _corner_icon(
             "exports", "Export Logs", lambda: self.export_logs())
-        # Tk's pack(side="right") fills from the right edge inward, so the
-        # FIRST label packed is the RIGHTMOST one. Packing these in reading
-        # order would lay them out reversed - so reverse the PACK, not the
-        # declaration order, and the three still read left-to-right as Auto
-        # Maintenance, Quick Tools, Export Logs exactly as they did in the
-        # old uniform grid.
-        # DECLUTTER 2026-10 (second pass): these three corner actions now live
-        # in the Settings tab (Auto Maintenance, Export Logs) and the Tools tab
-        # (Quick Tools), so the strip carries no menu at all. The widgets are
-        # still BUILT - never packed - only because tools/smoke/tools.py
+        # DECLUTTER 2026-10 (second pass): both of these actions now live in
+        # the Settings tab, so the strip carries no menu at all. The widgets
+        # are still BUILT - never packed - only because tools/smoke/tools.py
         # drives their click handlers; they are not a user-facing control.
 
         self._build_log(bottom)
@@ -1101,6 +1112,10 @@ class Application:
         # happy path; it is kept as an explicit initializer for the rebuild
         # path (where _show_tab is not called) rather than left to chance.
         self.set_status(_TAB_STATUS.get(self.active_tab, ""))
+
+        # Read the real scheduler state back into config in the background.
+        # Settings used to do this synchronously in its constructor.
+        self._resync_scheduler_flags_async()
 
         # Check for updates in the background (non-blocking)
         self._schedule_update_check()
@@ -1264,6 +1279,46 @@ class Application:
         so the choice lives in a real dialog. See app/ui/dialogs/registry.py.
         """
         open_dialog(self, "app_update")
+
+    # ---------------- scheduler flag resync (off the UI thread) ---------- #
+
+    def _resync_scheduler_flags_async(self):
+        """Read the real Task Scheduler state back into config, off-thread.
+
+        This used to run inside SettingsTab.__init__ on the Tk thread: three
+        `schtasks /Query` calls (85-244 ms measured) before the page could
+        paint. It is a status probe, so it belongs on a worker; the Settings
+        page refreshes its toggle vars when the result lands (if it is built).
+        """
+        if getattr(self, "_flags_resync_started", False):
+            return
+        self._flags_resync_started = True
+
+        def _work():
+            try:
+                from app.settings_apply import resync_flags
+                resync_flags()
+            except Exception:
+                pass
+            try:
+                self._dispatch.post(self._apply_resynced_flags)
+            except Exception:
+                pass
+
+        try:
+            threading.Thread(target=_work, daemon=True,
+                             name="SchedulerFlagResync").start()
+        except Exception:
+            pass
+
+    def _apply_resynced_flags(self):
+        """Tk-thread hop: refresh Settings toggles if that page exists."""
+        try:
+            page = self.tabs.get("Settings")
+            if page is not None and hasattr(page, "refresh_scheduler_flags"):
+                page.refresh_scheduler_flags()
+        except Exception:
+            pass
 
     # ---------------- F6: idle pre-warm chain ---------------- #
 
@@ -1593,7 +1648,13 @@ class Application:
             self._hover_t = 0.0
         self._style_switch_labels()
         self._show_tab(name)
-        self.root.update_idletasks()
+        # PERF (2026-10): no synchronous layout flush here. Pages are stacked
+        # with place() and switched with tkraise(), which needs no layout at
+        # all; the old update_idletasks() made every click pay a full layout
+        # pass over every hidden page (measured 42-89 ms per switch, 96-100%
+        # of the click, vs 3-7 ms without it). Tk lays the page out on the
+        # next idle turn, so the visible result is unchanged and the rail
+        # animation gets its full frame budget instead of starting late.
         self._tick_switch()
 
     def _tick_switch(self):
@@ -1693,6 +1754,30 @@ class Application:
         except Exception:
             pass
 
+    def _ensure_tab(self, name):
+        """Return the page for `name`, building a lazy one on first use.
+
+        Only Settings is lazy today (see _build_main_ui). Construction runs on
+        the Tk thread because it creates widgets; a failure is logged and
+        returns None so the shell can report it rather than crash.
+        """
+        page = self.tabs.get(name)
+        if page is not None:
+            return page
+        factory = getattr(self, "_tab_factories", {}).pop(name, None)
+        if factory is None:
+            return None
+        try:
+            page = factory()
+        except Exception as exc:
+            try:
+                self.log("  ! could not build the %s page: %r" % (name, exc))
+            except Exception:
+                pass
+            return None
+        self.tabs[name] = page
+        return page
+
     def _show_tab(self, name):
         # -------------------------------------------------------------
         # PROTO (user-approved experiment, 2026-09): always-mapped STACKED
@@ -1725,11 +1810,25 @@ class Application:
         # the "Preparing catalog…" placeholder; the queued slices keep
         # building in idle and _catalog_finish drops the placeholder and
         # applies pending badge/search/count state when they drain.
+        target = self._ensure_tab(name)
+        if target is None:
+            # A lazy page failed to construct. Say so instead of leaving the
+            # previous page up with the wrong title, and keep the app alive.
+            self.set_status("Could not open the %s page." % name)
+            return
         if name == "Install":
-            _start = getattr(self.tabs[name], "_start_catalog_build", None)
+            # Defer BOTH the first catalog slice and the (slow) winget scans
+            # to the next event-loop turn: building a slice synchronously here
+            # was measured at 433 ms on a cold catalog, and the scans are
+            # read-only work that must not sit between the click and the paint.
+            try:
+                target.warm_scans()
+            except Exception:
+                pass
+            _start = getattr(target, "_start_catalog_build", None)
             if _start is not None:
                 try:
-                    _start()   # guarded: no-op when ready / already in flight
+                    self.root.after(0, _start)
                 except Exception:
                     pass
         try:
@@ -1737,7 +1836,6 @@ class Application:
             self._appbar_sub.config(text=self._TAB_SUBTITLES.get(name, ""))
         except Exception:
             pass
-        target = self.tabs[name]
         # TIMING (diagnostic): what the switch itself costs, and whether this
         # was a FIRST map of the page (large tree) or a plain re-raise.
         _t_show = time.perf_counter()
@@ -1745,13 +1843,11 @@ class Application:
         if _first_map:
             target.place(relx=0, rely=0, relwidth=1, relheight=1)
         target.tkraise()
-        try:
-            # B-0xx: this used to call self.update_idletasks() — Application has
-            # no such method, so it raised AttributeError every first map and
-            # the layout flush never happened. Call it on the real widget.
-            self.root.update_idletasks()
-        except Exception:
-            pass
+        # PERF (2026-10): the first-map layout flush that used to live here
+        # is gone. It ran on the user's click (a full geometry pass over the
+        # whole stacked page set) and was the dominant cost of a tab switch;
+        # tkraise() itself needs no layout, and Tk's idle handler lays the
+        # page out before it is next painted.
         if name == "Install":
             try:
                 self.log("Install show: %.0f ms (%s), catalog_ready=%s"
@@ -1973,10 +2069,6 @@ class Application:
             # the comment above this block claims to have fixed.
             self._dispatch.post(_on_done)
         threading.Thread(target=_wait_thread, daemon=True).start()
-
-    def _open_quick_tools(self):
-        """Opens the quick_tools dialog. See app/ui/dialogs/registry.py."""
-        open_dialog(self, "quick_tools")
 
     def _open_gamepad_tester(self):
         """Opens the gamepad_tester dialog. See app/ui/dialogs/registry.py."""
@@ -2230,9 +2322,13 @@ class Application:
         """Opens the safety_center dialog. See app/ui/dialogs/registry.py."""
         open_dialog(self, "safety_center")
 
-    def _open_run_history(self):
-        """Opens the run_history dialog. See app/ui/dialogs/registry.py."""
-        open_dialog(self, "run_history")
+    def _open_game_saves(self):
+        """Opens the game_saves dialog. See app/ui/dialogs/registry.py."""
+        open_dialog(self, "game_saves")
+
+    def _open_game_readiness(self):
+        """Opens the game_readiness dialog. See app/ui/dialogs/registry.py."""
+        open_dialog(self, "game_readiness")
 
     def _pilot_preset_tasks(self):
         """Task objects for the configured session preset (tolerant:
@@ -3665,7 +3761,7 @@ class Application:
 
     # ---------------- log (in-memory only, #16 simplified per user) ------- #
     # No log window in the UI anymore — the log accumulates in memory and
-    # "Export Logs" (Quick Tools menu) saves it to a .txt for debugging.
+    # "Export Logs" (Settings → Data & logs) saves it to a .txt for debugging.
 
     def _build_log(self, parent):
         self._log_lines = []
@@ -3710,6 +3806,14 @@ class Application:
                 f"Edition: {self._windows_edition_str()}\n"
                 f"{'=' * 60}\n"
             )
+            # Audit 2026-10: a support bundle must include the environment
+            # and recent unhandled exceptions, not only the in-memory run
+            # log (which is empty after a crash).
+            try:
+                from app.diagnostics import diagnostics_text
+                header += "\n" + diagnostics_text() + "\n"
+            except Exception:
+                pass
             with open(path, "w", encoding="utf-8") as f:
                 f.write(header + "\n".join(self._log_lines) + "\n")
                 # U-001: the app writes a diagnostics trail to events.log the
@@ -4239,13 +4343,13 @@ class Application:
         # _abort_unstarted_run. Nothing after thread.start() can raise, so
         # this handler can never pull the slot out from under a live worker.
         try:
-            self._start_claimed_run(gen, tab_name, tasks, mode, quiet,
-                                    toast_kind, toast_extra)
+            self._start_claimed_run(gen, tab_name, tasks, all_selected, mode,
+                                    quiet, toast_kind, toast_extra)
         except Exception as exc:                       # noqa: BLE001
             self._abort_unstarted_run(exc)
 
-    def _start_claimed_run(self, gen, tab_name, tasks, mode, quiet,
-                           toast_kind, toast_extra):
+    def _start_claimed_run(self, gen, tab_name, tasks, all_selected, mode,
+                           quiet, toast_kind, toast_extra):
         """The claimed-but-not-yet-started half of run_tasks.
 
         Split out so the try/except that guarantees the run slot is released

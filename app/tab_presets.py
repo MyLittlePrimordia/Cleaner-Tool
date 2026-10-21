@@ -110,9 +110,15 @@ PRESETS = {
             # audit fix: ram_purge moved out (anti-performance in the everyday
             # preset — trimming working sets causes immediate page-in stalls;
             # it stays available in Custom and Deep Clean).
-            "shader_cache", "launcher_cache", "engine_cache", "driver_junk",
-            "user_temp_files", "inet_cache", "recycle_bin", "error_reports",
-            "old_logs", "dns_flush", "game_files",
+            # SAFETY (2026-10): driver_junk, recycle_bin and old_logs moved
+            # out of this preset. All three are better-than-nothing targets
+            # that are NOT zero-risk: driver packages are what let a user
+            # reinstall offline, the Recycle Bin is the user's only undo for
+            # a mistaken delete, and CBS/DISM logs are the evidence needed to
+            # diagnose a failed update. They remain available in Custom.
+            "shader_cache", "launcher_cache", "engine_cache",
+            "user_temp_files", "inet_cache", "error_reports",
+            "dns_flush", "game_files",
         ],
         "Deep Clean": [
             # Everything Quick plus the heavier / admin / rarely-needed passes.

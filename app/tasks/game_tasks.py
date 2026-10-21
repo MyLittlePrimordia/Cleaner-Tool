@@ -13,6 +13,7 @@ Tasks:
 import os
 
 from app.utils import TaskContext, TaskCancelled, clean_folder_contents, known_folder
+from app import game_saves as _gs
 from app.tasks import launcher_paths as _lp
 from app.tasks.launcher_paths import (
     GAMER_LAUNCHER_ALL,
@@ -38,16 +39,11 @@ def _game_saves_backup_dir() -> str:
     pile up there forever (acknowledged but never addressed — see the
     pruning note below). Documents\\CleanerTool Backups\\Game Saves keeps
     the Desktop clean and OneDrive-sync-light; the exact path is still
-    logged on every backup so it stays easy to find."""
-    docs = known_folder("Personal",
-                        os.path.join(os.environ.get("USERPROFILE", ""), "Documents"))
-    dest = os.path.join(docs or os.path.join(os.environ.get("USERPROFILE", ""), "Documents"),
-                        "CleanerTool Backups", "Game Saves")
-    try:
-        os.makedirs(dest, exist_ok=True)
-    except Exception:
-        pass
-    return dest
+    logged on every backup so it stays easy to find.
+
+    The folder now lives in app.game_saves.backup_folder so the restore
+    dialog lists exactly where the backup writes."""
+    return _gs.backup_folder()
 
 
 def _prune_game_saves_backups(folder: str, keep: int = 5) -> None:
@@ -67,14 +63,6 @@ def _prune_game_saves_backups(folder: str, keep: int = 5) -> None:
         pass
 
 
-def _shell_dir(name: str, fallback: str) -> str:
-    """Known-folder path with OneDrive redirection (F-4): Documents is
-    OneDrive-redirected by default on new Win11 profiles, so a saves backup
-    built from USERPROFILE\\Documents would silently miss My Games. F3-1:
-    shared resolver; `fallback` is a full path to return when unreadable."""
-    return known_folder(name, fallback)
-
-
 def backup_game_saves(ctx: TaskContext):
     """Zip known save locations to Documents\\CleanerTool Backups\\Game
     Saves (UX-001: moved off the Desktop, and pruned to the 5 most
@@ -89,22 +77,9 @@ def backup_game_saves(ctx: TaskContext):
     import shutil
     from datetime import datetime
 
-    sources = [
-        # F-4: resolve the real known-folder paths — OneDrive-redirected
-        # profiles keep Saved Games / Documents under OneDrive, and a
-        # USERPROFILE-relative path would silently miss the saves this
-        # backup exists to protect.
-        (_shell_dir("{4C5C32FF-BB9D-43B0-B5B4-2D72E54EAAA4}",
-                    os.path.join(os.environ.get("USERPROFILE", ""), "Saved Games")), "Saved Games"),
-        (os.path.join(_shell_dir("Personal",
-                                 os.path.join(os.environ.get("USERPROFILE", ""), "Documents")),
-                      "My Games"), "My Games"),
-        (os.path.join(os.environ.get("APPDATA", ""), ".minecraft", "saves"), "Minecraft"),
-        # extend with verified per-game roots only, per launcher_paths.py's
-        # 'verified live' policy: a wrong folder just bloats the zip, but a
-        # missing folder means silently unprotected saves.
-    ]
-    sources = [(p, tag) for p, tag in sources if p and os.path.isdir(p)]
+    # F-4: the root table now lives in app.game_saves so the RESTORE path
+    # validates destinations against exactly the list the backup wrote from.
+    sources = _gs.save_roots()
     if not sources:
         raise RuntimeError("No save folders found — nothing to back up.")
 
@@ -126,7 +101,11 @@ def backup_game_saves(ctx: TaskContext):
                     total += os.path.getsize(fp)
                 except OSError:
                     continue
-                files_to_zip.append((fp, os.path.join(tag, os.path.relpath(fp, path))))
+                # POSIX separators inside the zip: the manifest lists the
+                # same names, and a backslash entry is unreadable as a tree
+                # to every non-Windows unzip tool.
+                files_to_zip.append((fp, os.path.join(
+                    tag, os.path.relpath(fp, path)).replace("\\", "/")))
     desktop = _game_saves_backup_dir()
     try:
         free = shutil.disk_usage(desktop).free
@@ -155,11 +134,72 @@ def backup_game_saves(ctx: TaskContext):
                 count += 1
             except OSError:
                 skipped += 1
+        # Manifest LAST: it is what makes this archive restorable, and a
+        # cancelled archive therefore has none (restore refuses it instead
+        # of scattering a partial set of saves).
+        if count:
+            _gs.write_manifest(zf, files_to_zip, sources)
     if skipped:
         ctx.log(f"  (skipped {skipped} locked/inaccessible files — close running games for a full backup)")
     ctx.log(f"Backup complete: {count} files -> {dest}")
     _prune_game_saves_backups(desktop, keep=5)
     return None
+
+
+# 2026-10 audit: deleting a shader/engine cache under a LIVE game is the one
+# realistic way this app can crash a session. Launchers are included because
+# their web/profile caches are the other thing these tasks delete, and a
+# running launcher may be mid-update. Games themselves cannot be enumerated
+# by name (any exe can be a game), so the watch set is the stable headline
+# titles from session_pilot plus every launcher we clean.
+_SESSION_PROCS = frozenset({
+    "steam.exe", "steamwebhelper.exe", "epicgameslauncher.exe",
+    "battle.net.exe", "riotclientservices.exe", "eadesktop.exe",
+    "origin.exe", "ubisoftconnect.exe", "upc.exe", "galaxyclient.exe",
+    "goggalaxy.exe", "amazon games services.exe", "itch.exe",
+    "rockstar games launcher.exe",
+})
+
+
+def _session_processes() -> "tuple[list[str], list[str]] | None":
+    """(running_games, running_launchers) lowercased; None when the probe
+    itself failed. Same honesty rule as MED-005 in this module: an
+    unanswerable question is never answered "nothing is running"."""
+    try:
+        from app.session_pilot import KNOWN_GAME_EXES, default_get_processes
+    except Exception:
+        return None
+    wanted = set(KNOWN_GAME_EXES) | _SESSION_PROCS
+    procs = default_get_processes(wanted=wanted, timeout=10)
+    if procs is None:
+        return None
+    names = {name for name, _path in procs}
+    return (sorted(names & set(KNOWN_GAME_EXES)),
+            sorted(names & _SESSION_PROCS))
+
+
+def _skip_if_session_running(ctx: TaskContext, what: str) -> None:
+    """Raise TaskSkipped when a game or launcher is running.
+
+    Called before every cache-wiping task in this module. Skip (rather than
+    prompt) because tasks run on a worker thread with no dialog channel, and
+    because an honest SKIP is better than a run that a live game turns into
+    a crash. A failed probe also skips, with its own log line."""
+    from app.utils import TaskSkipped
+    if getattr(ctx, "dry_run", False):
+        return   # measure-only: nothing is deleted, nothing can be corrupted
+    hit = _session_processes()
+    if hit is None:
+        ctx.log(f"  ! Could not list running processes — skipping {what} "
+                "(cannot rule out a live game).")
+        raise TaskSkipped("could not check for running games")
+    games, launchers = hit
+    if not games and not launchers:
+        return
+    names = ", ".join(games + launchers)
+    ctx.log(f"  ! Running now: {names} — skipping {what} so a live session "
+            "is not disturbed.")
+    raise TaskSkipped(f"a game or launcher is running ({names})")
 
 
 def _clean_many(ctx: TaskContext, folders, label):
@@ -212,6 +252,7 @@ def _clean_files(ctx: TaskContext, files, label):
 def clean_gamer_launchers(ctx: TaskContext):
     # M5 fix: log line now matches GAMER_LAUNCHER_ALL's real contents
     # (Slack/Teams/Spotify are actually included now, see launcher_paths.py).
+    _skip_if_session_running(ctx, "launcher caches")
     # M12: refresh glob/listdir discoveries at clean time (lists mutate in
     # place, so the imported names below observe the refresh).
     _lp.refresh_dynamic_paths()
@@ -226,6 +267,7 @@ def clean_game_files(ctx: TaskContext):
 
     Only touches logs, crash dumps, web caches and shader caches — never saves.
     """
+    _skip_if_session_running(ctx, "game caches")
     # M12: fresh Unity/LocalLow + Minecraft discoveries (in-place refresh).
     _lp.refresh_dynamic_paths()
     ctx.log("Cleaning game files (verified top titles, Minecraft, CurseForge, OBS,")
@@ -256,12 +298,14 @@ def clean_gpu_shader_caches(ctx: TaskContext):
     different path list, so the two "shader cache" tasks can no longer
     silently drift apart.
     """
+    _skip_if_session_running(ctx, "shader caches")
     ctx.log("Cleaning shader caches (DirectX, NVIDIA, AMD, Intel, Steam per-game)")
     return _clean_many(ctx, GPU_SHADER_CACHE_ALL, "shader cache")
 
 
 def clean_game_captures(ctx: TaskContext):
     """Game DVR / Xbox Game Bar recorded clips."""
+    _skip_if_session_running(ctx, "game captures")
     ctx.log("Cleaning game captures (Videos\\Captures)")
     return _clean_many(ctx, GAME_CAPTURES_PATHS, "game captures")
 
@@ -724,12 +768,12 @@ TASKS = [
     Task("game_files", "Clean Game Files", "Removes logs, crashes and junk from top games like Fortnite, PUBG, BG3 plus a Unity log sweep for indies; keeps saves", clean_game_files, default=True, admin_required=False),
     Task("steam_stuck", "Clear Stuck Steam Downloads", "Removes huge leftover files from failed Steam updates; frees lots of space", clean_steam_stuck_downloads, default=False, admin_required=False),
     Task("gpu_shader_caches", "Clean Shader Caches", "Rebuilds DirectX/NVIDIA/AMD/Intel shader caches to fix game stutter", clean_gpu_shader_caches, default=False, admin_required=False),
-    Task("game_captures", "Clean Game Captures", "Deletes ALL Xbox Game Bar clips in Videos\\Captures (no age filter, not backed up) — opt-in only", clean_game_captures, default=False, admin_required=False),
+    Task("game_captures", "Clean Game Captures", "Deletes ALL Xbox Game Bar clips in Videos\\Captures (no age filter, not backed up) — opt-in only", clean_game_captures, default=False, admin_required=False, risk="DATA LOSS"),
     # default=False ON PURPOSE: an always-on backup in the weekly scheduler
     # still shouldn't run unattended by default — but the zip pile-up this
     # comment used to warn about is now capped (keeps the 5 most recent,
     # see _prune_game_saves_backups) and no longer lands on the Desktop.
-    Task("backup_saves", "Back Up Game Saves", "Zips your save folders (Saved Games, My Games, Minecraft) to Documents\\CleanerTool Backups\\Game Saves (keeps the last 5)", backup_game_saves, default=False, admin_required=False),
+    Task("backup_saves", "Back Up Game Saves", "Zips your save folders (Saved Games, My Games, Minecraft) to Documents\\CleanerTool Backups\\Game Saves (keeps the last 5); restore any of them from Tools > Game Saves", backup_game_saves, default=False, admin_required=False),
     # Per-game mega-caches (user request 2026-09-12): separate opt-in rows so
     # a layman sees WHAT will redownload. All default=False (redownload cost
     # or game-specific), all skip honestly when the game isn't installed.

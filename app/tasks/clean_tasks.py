@@ -12,7 +12,7 @@ import time
 
 from app.utils import (
     TaskCancelled, TaskContext, clean_folder_contents, create_restore_point,
-    run_cmd, restart_explorer, resolve_exe,
+    run_cmd, resolve_exe,
 )
 from app.tasks.launcher_paths import (
     ALL_LAUNCHER_CACHE_PATHS, GPU_SHADER_CACHE_ALL, refresh_dynamic_paths,
@@ -438,36 +438,34 @@ def clean_chk_fragments(ctx: TaskContext):
 
 
 def clean_thumbnail_icon_cache(ctx: TaskContext):
-    """Clear thumbcache/iconcache .db files. They are locked while Explorer
-    runs, so Explorer is restarted around the clean.
+    """Clear thumbcache/iconcache .db files that the running shell releases.
 
-    C3 fix: this used to kill Explorer, clean, then call
-    run_cmd(ctx, "explorer.exe", timeout=10) to bring it back. run_cmd waits
-    for the process to exit — but explorer.exe is meant to stay running as
-    the shell, so it never exits, the call blocks for the full 10s, times
-    out, and run_cmd's timeout-cleanup kills the process tree — which kills
-    the Explorer we just relaunched. Net effect: this default-on task could
-    leave the user with no taskbar/desktop about 10 seconds after "fixing"
-    their icons. Fix: use the shared restart_explorer() helper, which
-    launches Explorer detached and never waits on it.
+    History: C3 fixed a version that killed Explorer, then relaunched it with
+    run_cmd (which waits for it to exit, timed out, and killed the tree —
+    leaving no taskbar). It then restarted Explorer around the clean. The
+    2026-10 audit (B9) removed the kill entirely: this task is default-on in
+    Deep Clean and silently removing the user's taskbar and every Explorer
+    window for a cosmetic rebuild is not a fair trade. Locked files are
+    skipped and reported; Windows rebuilds the rest on its own.
     """
-    # M13: never kill the shell after the user pressed Stop, and never
-    # report success when the shell failed to come back.
-    if ctx.cancelled():
-        ctx.log("  ! cancelled — leaving Explorer running.")
-        return 0
     explorer_dir = os.path.join(_LOCALAPPDATA, "Microsoft\\Windows\\Explorer")
-    if _dry(ctx):
-        # H-001 / H-005: never force-kill the shell during a read-only pass.
-        ctx.log("[dry-run] would restart Explorer to release the thumbnail cache.")
-        return clean_folder_contents(ctx, explorer_dir, extensions=[".db"])
-    run_cmd(ctx, "taskkill /f /im explorer.exe", timeout=10)
+    # 2026-10 audit (B9): the shell is NO LONGER killed here. This task is
+    # default-on in Deep Clean, and force-killing Explorer makes the taskbar
+    # and every open File Explorer window vanish mid-run with no warning —
+    # for a cosmetic icon rebuild. Locked .db files are simply skipped by the
+    # clean funnel (they are counted, not forced), so the shell stays up.
+    # The user can still release them deliberately via Tools > Restart
+    # Explorer, which is an explicit, named action.
     total = clean_folder_contents(ctx, explorer_dir, extensions=[".db"])
-    # Always bring Explorer back — detached, non-blocking (see docstring above)
-    if not restart_explorer(ctx):
-        raise RuntimeError(
-            "Explorer did not come back after the thumbnail clean — press "
-            "Ctrl+Shift+Esc, File > Run new task, type explorer.exe.")
+    try:
+        left = (globmod.glob(os.path.join(explorer_dir, "iconcache_*.db"))
+                + globmod.glob(os.path.join(explorer_dir, "thumbcache_*.db")))
+    except Exception:
+        left = []
+    if left:
+        ctx.log(f"  {len(left)} cache file(s) are locked by the running shell "
+                "and were left in place. Windows rebuilds them on its own; "
+                "to force it, run Tools > Restart Explorer first.")
     return total
 
 
@@ -1989,18 +1987,18 @@ TASKS = [
     Task("shader_cache", "Clear Shader Cache", "Removes temp graphics files that help fix stutter", clean_shader_cache, default=True, admin_required=False),
     Task("launcher_cache", "Clean Launchers & Chat", "Clears every game store plus Discord, Slack, Teams, Spotify junk", clean_launcher_cache, default=True, admin_required=False),
     Task("engine_cache", "Clean Engine Cache", "Removes leftover Unreal/Unity build files", clean_engine_cache, default=True, admin_required=False),
-    Task("driver_junk", "Remove Old Drivers", "Deletes old NVIDIA/AMD installer leftovers", clean_driver_junk, default=True, admin_required=True),
+    Task("driver_junk", "Driver Installer Leftovers", "Deletes extracted NVIDIA/AMD/Intel installer folders — keep them if you may reinstall a driver offline", clean_driver_junk, default=False, admin_required=True, risk="ADVANCED"),
     Task("user_temp_files", "Empty User Temp Files", "Deletes leftover temp files Windows left behind", clean_user_temp_files, default=True, admin_required=False),
     Task("system_temp_files", "Empty System Temp Files", "Cleans system temp files no longer needed", clean_system_temp_files, default=True, admin_required=True),
     Task("win_update_cache", "Fix Update Cache", "Fixes Windows Update when downloads get stuck", clean_windows_update_cache, default=True, admin_required=True),
     Task("delivery_optimization", "Clear Update Share Cache", "Removes update copies kept to share with other PCs", clean_delivery_optimization, default=True, admin_required=True),
     Task("inet_cache", "Clear Internet Cache", "Clears old internet temp files", clean_inet_cache, default=True, admin_required=False),
-    Task("recycle_bin", "Empty Bin & Crash Reports", "Empties trash and removes old crash dumps", clean_recycle_bin_and_dumps, default=True, admin_required=True),
+    Task("recycle_bin", "Empty Bin & Crash Reports", "Empties the Recycle Bin (deleted files can no longer be restored) and removes old crash dumps", clean_recycle_bin_and_dumps, default=False, admin_required=True, risk="DATA LOSS"),
     Task("error_reports", "Clear Error Reports", "Deletes old Windows error reports", clean_error_reports, default=True, admin_required=False),
     Task("gpu_watchdog_dumps", "Clean GPU Watchdog Dumps", "Removes multi-GB driver-hang dumps that pile up after black-screen flashes", clean_gpu_watchdog_dumps, default=False, admin_required=True),
     Task("thumbnail_cache", "Fix Blurry Icons", "Rebuilds icons, fixes missing thumbnails", clean_thumbnail_icon_cache, default=True, admin_required=False),
     Task("chk_fragments", "Remove Disk Fragments", "Deletes leftover files from disk checks", clean_chk_fragments, default=True, admin_required=True),
-    Task("old_logs", "Clear System Logs", "Removes old Windows logs", clean_old_logs, default=True, admin_required=True),
+    Task("old_logs", "Clear System Logs", "Removes Windows CBS/DISM/Update logs — these are the evidence needed to diagnose a failed update", clean_old_logs, default=False, admin_required=True, risk="ADVANCED"),
     Task("dns_flush", "Fix Internet (DNS)", "Clears internet cache to fix sites not loading", flush_dns, default=True, admin_required=False),
     Task("ram_purge", "Free Up RAM", "Asks Windows to free unused memory", purge_ram_working_sets, default=False, admin_required=False),
     Task("update_leftovers", "Clear Update Leftovers", "Run this only once your PC has been running fine for a few days after a big Windows update", clean_windows_update_leftovers, default=False, admin_required=True, risk="ADVANCED"),
@@ -2013,7 +2011,7 @@ TASKS = [
     Task("font_cache", "Fix Broken Fonts", "Rebuilds fonts to fix garbled text", clean_font_cache, default=False, admin_required=True),
     Task("store_cache", "Fix Store", "Resets Store if apps won't download", clean_store_cache, default=False, admin_required=False),
     Task("temp_deep_clean", "Deep Temp Clean", "Deep cleans temp files with PowerShell", remove_temp_files_deep, default=False, admin_required=True),
-    Task("remove_bloat", "Remove Windows Bloat", "Removes Clipchamp, MSN apps, TikTok and other preinstalled junk", remove_windows_bloat, default=False, admin_required=True),
+    Task("remove_bloat", "Remove Windows Bloat", "Uninstalls Clipchamp, MSN apps, TikTok and other preinstalled apps — they can be reinstalled from the Store", remove_windows_bloat, default=False, admin_required=True, risk="DATA LOSS"),
     Task("winget_cache", "Clear WinGet Cache", "Removes leftover installer files and logs from Windows' app downloader", clean_winget_cache, default=False, admin_required=False),
     Task("event_logs", "Clear Event Viewer Logs", "Wipes old Windows diagnostic logs so they start fresh (Security log always kept)", clean_event_logs, default=False, admin_required=True, risk="ADVANCED"),
     Task("defender_history", "Clear Defender History", "Removes stale protection-history entries that haunt the Security app", clean_defender_history, default=False, admin_required=True),

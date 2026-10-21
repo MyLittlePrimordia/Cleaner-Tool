@@ -47,10 +47,18 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pytest
+          pip install pytest ruff
 
       - name: Run the regression suite
         run: python -m pytest -q
+
+      # Undefined-name check. F821 is deliberately the only selector: the
+      # codebase has many intentional best-effort imports/locals that other
+      # pyflakes rules flag, but an undefined name is always a runtime bug.
+      # Three shipped in v1 (all_priority/all_selected class errors) and were
+      # invisible because the handlers around them swallow exceptions.
+      - name: Static check (undefined names)
+        run: python -m ruff check app --select F821
 
       - name: SEC-001 allowlist drift guard
         run: python tools/verify_sec001_task_allowlist.py

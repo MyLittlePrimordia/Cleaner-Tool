@@ -316,9 +316,9 @@ class ToolPage(ThemedModal):
             # REDESIGN 2026-10: opt-in scrolling content zone. ToolPage's
             # content normally does NOT scroll, because the six dialogs it was
             # built for put a DataTable there and the table scrolls itself.
-            # A dialog whose content is a plain list/menu (Quick Tools) does
-            # need to scroll, or the header + footer squeeze it past the card
-            # edge and the last rows are unreachable. Same shared panel the
+            # A dialog whose content is a plain list or menu does need to
+            # scroll, or the header + footer squeeze it past the card edge and
+            # the last rows are unreachable. Same shared panel the
             # Settings pane and Tools tab use, so the scrollbar matches.
             panel = ScrollableRoundedPanel(body)
             panel._fill = COLORS["bg"]

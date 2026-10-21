@@ -195,3 +195,6 @@ MONO_FONT_FAMILY = "Consolas"
 RISK_SAFE = "SAFE"
 RISK_ADVANCED = "ADVANCED"
 RISK_REBOOT = "REBOOT REQUIRED"
+# Irreversible removal of data the user may still want (Recycle Bin, captures,
+# uninstalled apps). Distinct from ADVANCED, which is reversible.
+RISK_DATA_LOSS = "DATA LOSS"

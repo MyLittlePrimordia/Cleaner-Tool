@@ -74,7 +74,6 @@ from app.toast import (  # noqa: F401
 from app.warnings import check_dangerous_combos, check_info_notices  # noqa: F401
 from app.runner import CancellationToken  # noqa: F401
 from app.runner.task_runner import invoke_task  # noqa: F401
-from app.tools_shortcuts import TOOLS_SHORTCUTS  # noqa: F401
 
 
 def launch():
@@ -116,5 +115,5 @@ __all__ = [
     "mark_tweak_reverted", "is_admin", "relaunch_as_admin", "show_toast",
     "notify_clean_complete", "notify_low_space", "check_dangerous_combos",
     "check_info_notices", "CancellationToken", "invoke_task",
-    "TOOLS_SHORTCUTS", "_TAB_STATUS",
+    "_TAB_STATUS",
 ]

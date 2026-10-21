@@ -5,8 +5,8 @@ Why this exists
 ---------------
 Before this, the app had two shape languages. Pills, buttons, the tab
 switcher, StatTile and ScrollableRoundedPanel were all smoothly-rounded
-polygons; but every actual CARD - the preset cards on the task tabs, the 24
-Tools cards, every ToolRow in every popup - was a square `tk.Frame` with a
+polygons; but every actual CARD - the preset cards on the task tabs, every
+Tools card, every ToolRow in every popup - was a square `tk.Frame` with a
 1px `hairline` parent simulating a border. Put a Tools popup and a task tab
 side by side and the difference is obvious: rounded numbers floating over
 squares.

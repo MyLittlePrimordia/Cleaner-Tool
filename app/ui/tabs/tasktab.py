@@ -56,7 +56,14 @@ class TaskTab(tk.Frame):
         self.presets = PRESETS[tab_name]
         self.mode = "preset"          # preset | custom | undo
         self.vars = {}
-        self._selected_preset = None
+        # UX (2026-10): Clean starts with Quick Clean selected, so the app's
+        # "1-click" promise is literally true on first paint: Run is enabled
+        # and the summary is already on screen. Previously nothing was
+        # selected, Run was disabled, and every launch cost two clicks.
+        self._selected_preset = (
+            "Quick Clean"
+            if tab_name == "Clean" and "Quick Clean" in self.presets
+            else None)
         self._anim_jobs = []          # active after() ids owned by this page
         # grid engine state: cells built once, only re-gridded afterwards
         self._cells = None            # list[(widget, task)] in stable order
@@ -403,7 +410,7 @@ class TaskTab(tk.Frame):
         self._rr_session = AnimatedButton(
             btns,
             text="Game Session" if _gs_img is not None
-            else _ICON_FALLBACK["gamesession"] + " Game Session",
+            else self._ICON_FALLBACK["gamesession"] + " Game Session",
             command=lambda: self._select_preset("Game Session"),
             image=_gs_img,
             bg=COLORS["surface"], fg=COLORS["text"],
@@ -764,6 +771,11 @@ class TaskTab(tk.Frame):
                             COLORS["alert_amber_bg"],
                             "Reboot Required — Windows needs a restart after "
                             "this one.", pady=2)
+            elif getattr(t, "risk", "SAFE") == "DATA LOSS":
+                self._badge(cell.body, "Data loss", COLORS["accent_red"],
+                            COLORS["alert_red_bg"],
+                            "Deletes data that cannot be recovered. Review "
+                            "before selecting.", pady=2)
             cells.append((cell, t))
         self._cells = cells
         self._cell_blocks = [(None, cells)]   # summary has no group headers
@@ -1075,6 +1087,12 @@ class TaskTab(tk.Frame):
                     txt, "Reboot", COLORS["accent_orange"],
                     COLORS["alert_amber_bg"],
                     "Reboot Required — Windows needs a restart after this one."))
+            elif risk == "DATA LOSS":
+                extra.append(self._badge(
+                    txt, "Data loss", COLORS["accent_red"],
+                    COLORS["alert_red_bg"],
+                    "Deletes data that cannot be recovered (Recycle Bin, "
+                    "captures, uninstalled apps). Review before selecting."))
         # F3: undo rows get a '✓ Active' badge label at build time, PACKED
         # only while the tweak is actually applied (state from the last
         # _build_toggle_grid call). The handle lives on the row so

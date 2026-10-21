@@ -32,7 +32,7 @@ from _tkhelpers import make_root
 #: Every dialog reachable from the Tools tab (27 cards). If a Tools dialog is
 #: added or removed, this list — and the assertion below — must move with it.
 TOOLS_DIALOGS = (
-    "QuickToolsDialog", "SpecsDialog", "StartupManagerDialog",
+    "SpecsDialog", "StartupManagerDialog",
     "UninstallProgramsDialog", "StorageInsightDialog", "DnsTesterDialog",
     "SpeedTestDialog", "GameServerPingDialog", "DriveToolkitDialog",
     "HardwareMonitorDialog", "PilotDialog", "ProcessManagerDialog",
@@ -40,7 +40,7 @@ TOOLS_DIALOGS = (
     "MonitorTestDialog", "WebcamDialog", "MicCheckDialog",
     "SpeakerTestDialog", "HealthReportDialog", "NetworkConnectionsDialog",
     "ServicesDialog", "FileLockDialog", "DuplicatesDialog",
-    "RestorePointDialog", "SafetyCenterDialog", "RunHistoryDialog",
+    "RestorePointDialog", "SafetyCenterDialog",
 )
 
 

@@ -1,13 +1,12 @@
 """Regression tests for the 2026-10 "make these popups fit" pass.
 
-Second sweep, from six screenshots the user sent: Quick Tools, Mouse Tester,
-Gamepad Tester, Auto-Pilot, Speed Test and Hardware Monitor still showed a
-scrollbar at the window size the app runs at. The audit that followed measured
-each popup's content zone against its content at `tk scaling 2.0` (150% DPI,
-the worst case the app's default window allows) and found every one of them
-between 13px and 235px too tall for the zone the popup had:
+Second sweep, from screenshots the user sent: Mouse Tester, Gamepad Tester,
+Auto-Pilot, Speed Test and Hardware Monitor still showed a scrollbar at the
+window size the app runs at. The audit that followed measured each popup's
+content zone against its content at `tk scaling 2.0` (150% DPI, the worst case
+the app's default window allows) and found every one of them between 13px and
+235px too tall for the zone the popup had:
 
-    Quick Tools        770 vs a 535 zone   (10 two-line tiles per column)
     Hardware Monitor   672 vs a 535 zone   (2x3 grid of tall cards)
     Gamepad Tester     660 vs a 535 zone   (a 400px artwork + 6 stacked rows)
     Auto-Pilot         616 vs a 517 zone   (3 cards stacked in ONE column)
@@ -45,24 +44,6 @@ def _src(module_name):
     import importlib
 
     return inspect.getsource(importlib.import_module(module_name))
-
-
-# --------------------------------------------------------------- Quick Tools
-def test_quick_tools_tiles_stay_one_line_short():
-    """10 tiles must fit a 535px zone: the tile pitch is what decides it.
-
-    Was: 46px minimum + a 12pt label with 10px of vertical padding = a 72px
-    pitch, so the 10-item "Windows Settings" column alone asked for 720px.
-    """
-    src = _src("app.ui.dialogs.quick_tools_dialog")
-    assert "min_height=32" in src, (
-        "Quick Tools tiles must keep the compact minimum height")
-    assert "text=label, font=(F, 10)" in src, (
-        "tiles must keep the one-line label size")
-    assert "text=label, font=(F, 12)" not in src, (
-        "a 12pt tile label re-inflates the row pitch past the content zone")
-    assert "pady=10" not in src, (
-        "10px of label padding per side is what made a 72px row pitch")
 
 
 # ------------------------------------------------------------ Mouse Tester

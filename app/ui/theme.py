@@ -209,7 +209,7 @@ def ellipsize(text, font, room):
     """`text` cut to fit `room` px in `font`, with a trailing ellipsis.
 
     One implementation, because this problem has three call sites and they
-    must agree: ToolRow row titles, the 24 Tools card titles, and the preset
+    must agree: ToolRow row titles, every Tools card title, and the preset
     card titles. Before this existed, a too-long label was handled by nothing
     - pack simply gave the Label less width than it asked for and Tk clipped
     the glyphs. Because a Label's default anchor is CENTER, that clipped the

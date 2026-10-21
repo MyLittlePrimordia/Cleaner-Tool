@@ -288,7 +288,14 @@ class BorderlessChrome:
         close.bind("<Leave>", lambda _e: close.config(
             fg=COLORS["subtext"], bg=COLORS["shell"]))
         close.bind("<Button-1>", lambda _e: self.app._on_close())
-        close.pack(side="right", padx=(0, 8), pady=6)
+        # CORNER-SAFE INSET (2026-10): the rounded-corner masks are lifted
+        # ABOVE this bar and paint a shell-coloured fillet inside the top-right
+        # RADIUS x RADIUS square. The close button used to sit 8 px from the
+        # edge, so its top-right 8x10 px was painted over by that fillet (the
+        # 'square over the exit button' artifact) and clicks there hit the
+        # mask instead of the button. Keeping every window control outside the
+        # corner arc fixes both, and stays correct if RADIUS grows.
+        close.pack(side="right", padx=(0, self.RADIUS + 4), pady=6)
         maxb = _mkbtn("❐", "Maximize")
         maxb.bind("<Button-1>", lambda _e: self.toggle_maximize())
         maxb.pack(side="right", padx=4, pady=6)

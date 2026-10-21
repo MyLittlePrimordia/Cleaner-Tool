@@ -252,12 +252,20 @@ class InstallTab(tk.Frame):
         except Exception:
             pass
 
-        # installed badges + update count: kick off the (slow) winget calls
-        # in worker threads, then paint on the Tk thread when they land.
-        # Both paints are pre-build-safe (badges defer until rows exist).
+        # PERF (2026-10): the installed-badge and upgrade-count scans are
+        # deferred to the FIRST VISIT (warm_scans). They cost 2-5 s of winget
+        # + PowerShell work, and they used to start at app launch for a tab
+        # the user might never open. Both paints are pre-build-safe.
+        self._scans_started = False
+        self._refresh_install_count()
+
+    def warm_scans(self):
+        """Start the Install tab's slow read-only scans, once per session."""
+        if getattr(self, "_scans_started", False):
+            return
+        self._scans_started = True
         self._start_installed_badge_scan()
         self._start_update_count_scan()
-        self._refresh_install_count()
 
     # ---------------- F6(a): chunked catalog build ---------------- #
 
@@ -1409,8 +1417,7 @@ class InstallTab(tk.Frame):
         except Exception:
             return None
 
-    @classmethod
-    def _open_url(cls, url: str):
+    def _open_url(self, url: str):
         """Open a URL in the user's browser AND bring the browser window to
         the foreground.
 
@@ -1425,7 +1432,7 @@ class InstallTab(tk.Frame):
         import os
         import subprocess
         # Route 1: direct browser launch (raises window if already running)
-        browser_cmd = cls._resolve_default_browser_cmd()
+        browser_cmd = self._resolve_default_browser_cmd()
         if browser_cmd:
             try:
                 subprocess.Popen([*browser_cmd, url],

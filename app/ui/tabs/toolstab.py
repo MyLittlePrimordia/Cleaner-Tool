@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import tkinter as tk
 from tkinter import ttk, messagebox
-from app.tools_shortcuts import TOOLS_SHORTCUTS
 from app.ui.base import Tooltip
 from app.ui.theme import COLORS, F, TAB_ACCENTS, ellipsize, _hex_lerp
 from app.ui.widgets import RoundedCard, ScrollableRoundedPanel
@@ -20,9 +19,8 @@ class ToolsTab(tk.Frame):
 
     Feature cards in a 3-wide grid — the exact same card size,
     gaps and grid as the Tweak tab's 6 preset cards (PER_ROW=3,
-    same pack/grid/pad). The old inline shortcuts box now lives in
-    the 6th card's Quick Tools popup, so the tab itself is cards
-    only, like Tweak's top."""
+    same pack/grid/pad), so the tab itself is cards only, like
+    Tweak's top."""
 
     # Logical groups (left→right, top→bottom):
     #   1) Storage / disk
@@ -76,7 +74,7 @@ class ToolsTab(tk.Frame):
 
     #: Cards added by Phases 2 and 7-11. Same 5-tuple shape as _CARDS, and
 #: rendered into the SAME 3-wide grid (see _build) with no separate section
-#: band, so all 24 cards look identical. Kept as its own tuple so each phase's
+#: band, so all cards look identical. Kept as its own tuple so each phase's
 #: verifier can still assert what that phase contributed.
     #: so _build_card serves both. Deliberately a SEPARATE table from
     #: _CARDS: tools/smoke/tools.py derives its grid-position assertions from
@@ -101,25 +99,18 @@ class ToolsTab(tk.Frame):
         ("restore_points", "\U0001F570\ufe0f", "Restore Point Manager",
          "Your safety net: see it, and add to it",
          TAB_ACCENTS["Tools"]),
-        # Quick Tools used to be reachable only from a corner icon in the
-        # status row; that row was decluttered, so it is a card now.
-        ("quick_tools", "\u26A1", "Quick Tools",
-         "Windows tools and settings, one click away",
-         TAB_ACCENTS["Tools"]),
         # U-002: one place to see and use every safety net.
         ("safety_center", "\U0001F6E1\ufe0f", "Safety & Undo",
          "Every safety net in one place \u2014 restore points, undo, backups",
          TAB_ACCENTS["Tools"]),
-        # N-006: what cleaning has actually reclaimed over time.
-        ("run_history", "\U0001F4C8", "Run History",
-         "What you've reclaimed over time, and the trend",
+        # 2026-10 audit: the restore half of the Clean tab's save backup.
+        ("game_saves", "\U0001F4BE", "Game Saves",
+         "Back up and restore your save files, safely",
+         TAB_ACCENTS["Tools"]),
+        ("game_readiness", "\U0001F3AE", "Game Readiness",
+         "Seven checks between your PC and a smooth game",
          TAB_ACCENTS["Tools"]),
     )
-
-    # H12: the table itself now lives in app.tools_shortcuts so QuickToolsDialog
-    # can read it without importing this tab. Kept as a class attribute so
-    # `ToolsTab._SHORTCUTS` still resolves, to the same object.
-    _SHORTCUTS = TOOLS_SHORTCUTS
 
     def __init__(self, parent, app):
         super().__init__(parent, bg=COLORS["bg"])
@@ -137,27 +128,35 @@ class ToolsTab(tk.Frame):
         # same card grid pads (padx=5, pady=4) and uniform columns, so
         # every card lands at the exact same size + position. The old
         # top helper label is gone (Tweak has none above its cards) and
-        # the shortcuts box now lives in the Quick Tools popup — the
-        # tab itself is cards only.
+        # nothing above the cards: the shortcuts box that used to live here
+        # is gone, so the tab itself is cards only, like Tweak's top.
         # (Why no topbar: keeping it would push every card down vs
         # Tweak; exact position match requires the same top offset.)
         PER_ROW = 3
-        # DESIGN AUDIT (2026-10) — the grid scrolls.
+        # DESIGN AUDIT (2026-10) — the grid fits with no scrolling.
         #
         # It used to pack straight into the page with no scroll container, on
-        # the reasoning that 24 cards in 8 rows "fits". Measured, it does not
-        # fit: the cards need ~418px and the page has ~422px at the 980x700
-        # window floor - about 4px of headroom. That is not a design margin,
-        # that is a coin flip, and it fails outright the moment tk font
-        # scaling rises (the frozen build runs DPI-aware at scaling 2.0 while
-        # a source run is DPI-unaware at ~1.33 - the same split
-        # app/config.py warns about). Clipped cards with no way to reach them
-        # is the worst failure mode a grid can have.
+        # the reasoning that N cards in rows "fits". Measured at the 980x700
+        # window floor that was false, so the grid was wrapped in the shared
+        # ScrollableRoundedPanel: clipped cards with no way to reach them is
+        # the worst failure mode a grid can have.
         #
-        # Wrapping in the shared ScrollableRoundedPanel costs nothing when the
-        # content does fit: the scrollbar only draws when the content
-        # overflows, and the panel is the same widget every Tools popup
-        # already uses, so the family stays one family.
+        # USER CALL (2026-10): rather than scroll, drop the two weakest cards
+        # (Quick Tools, Run History). Measured in the real main window at the
+        # 1280x900 default: 29 cards (10 rows) needed 680px in a 661px panel
+        # and DID draw the thumb; 27 cards (9 rows) need 612px, so the grid
+        # now fits with ~49px to spare and the thumb stays hidden. One row of
+        # three cards costs ~68px, so the next full row would bring the
+        # scrollbar back - re-measure before adding cards, and remember the
+        # 980x700 window floor still scrolls (461px panel) by design.
+        #
+        # The panel is still the shared ScrollableRoundedPanel (the same
+        # widget every Tools popup uses, so the family stays one family). It
+        # costs nothing now that the content fits: its thumb only draws when
+        # the content overflows, which is also the safety valve for a raised
+        # tk font scaling (the frozen build runs DPI-aware at scaling 2.0 while
+        # a source run is DPI-unaware at ~1.33 - the split app/config.py warns
+        # about).
         # OLED redesign: no outer grey tray. Panel and inner canvas are pure
         # black so cards float on the true-black canvas.
         panel = ScrollableRoundedPanel(self)
@@ -197,50 +196,11 @@ class ToolsTab(tk.Frame):
                              card_accent)
         for c in range(PER_ROW):
             card_area.grid_columnconfigure(c, weight=1, uniform="cards")
-        # Kept for the smoke harness (it scans this for shortcut rows);
-        # now points at the card grid — the rows themselves live in the
-        # Quick Tools popup, which the harness opens separately.
+        # Kept for the smoke harness; now points at the card grid.
         self._card_area_ref = card_area
         # One grid now, so the old second-area handle points at the same
         # frame. Anything still reading it gets the grid rather than None.
         self._fix_card_area_ref = card_area
-
-    def _build_shortcut_column(self, parent, col, title, items):
-        """One bullet column: left-aligned header + hairline divider +
-        bullet rows (pink dot + bold name, Install-row language)."""
-        cell = tk.Frame(parent, bg=COLORS["bg_alt"])
-        cell.grid(row=0, column=col, sticky="new", padx=8)
-        tk.Label(cell, text=title, font=(F, 10, "bold"),
-                 bg=COLORS["bg_alt"], fg=COLORS["text"],
-                 anchor="w").pack(fill="x")
-        tk.Frame(cell, bg=COLORS["hairline"], height=1).pack(
-            fill="x", pady=(4, 6))
-        for label, target in items:
-            self._make_bullet(cell, label, target)
-
-    def _make_bullet(self, parent, label, target):
-        """One bullet row: pink dot + clickable name (hand cursor, pink
-        hover). True list rows — no card chrome, no cell padding beyond
-        a single pixel separator (the 10-row Settings column must fit
-        the page with zero scrolling; 31px rows stay roomy)."""
-        row = tk.Frame(parent, bg=COLORS["bg_alt"])
-        row.pack(fill="x", pady=0)
-        dot = tk.Label(row, text="•", font=(F, 9, "bold"),
-                       bg=COLORS["bg_alt"], fg=TAB_ACCENTS["Tools"],
-                       bd=0, highlightthickness=0)
-        dot.pack(side="left", padx=(2, 4))
-        lbl = tk.Label(row, text=label, font=(F, 9, "bold"),
-                       bg=COLORS["bg_alt"], fg=COLORS["text"],
-                       cursor="hand2", anchor="w",
-                       bd=0, highlightthickness=0)
-        lbl.pack(side="left", fill="x", expand=True)
-        for w in (row, dot, lbl):
-            w.bind("<Enter>", lambda e, l=lbl: l.config(
-                fg=TAB_ACCENTS["Tools"]), add="+")
-            w.bind("<Leave>", lambda e, l=lbl: l.config(
-                fg=COLORS["text"]), add="+")
-            w.bind("<Button-1>",
-                   lambda e, t=target: self._open_target(t), add="+")
 
     def _build_card(self, parent, rr, cc, key, icon, title, blurb,
                       card_accent):
@@ -298,7 +258,7 @@ class ToolsTab(tk.Frame):
         self._card_frames[key] = (outer, inner)
 
         # REDESIGN 2026-10: long titles truncate with an ellipsis instead of
-        # being clipped. Three of the 24 ("Duplicate & Large Files",
+        # being clipped. Three of the cards ("Duplicate & Large Files",
         # "Restore Point Manager", "Network Connections") are wider than a
         # third of the window at 12pt, and pack's answer was to shrink the
         # Label below its requested width - which, with the default CENTER
@@ -389,15 +349,6 @@ class ToolsTab(tk.Frame):
                 except Exception:
                     pass
 
-    def _open_target(self, target):
-        try:
-            if target.startswith("ms-settings:"):
-                self.app._launch_settings(target)
-            else:
-                self.app._launch(target)
-        except Exception:
-            pass
-
     # ---------------- feature launch ---------------- #
 
     def _mount(self, key):
@@ -436,8 +387,6 @@ class ToolsTab(tk.Frame):
                 self.app._open_mouse_tester()
             elif key == "specs":
                 self.app._open_pc_specs()
-            elif key == "quick_tools":
-                self.app._open_quick_tools()
             elif key == "health":
                 self.app._open_health_report()
             elif key == "network_connections":
@@ -452,8 +401,10 @@ class ToolsTab(tk.Frame):
                 self.app._open_restore_points()
             elif key == "safety_center":
                 self.app._open_safety_center()
-            elif key == "run_history":
-                self.app._open_run_history()
+            elif key == "game_saves":
+                self.app._open_game_saves()
+            elif key == "game_readiness":
+                self.app._open_game_readiness()
             elif key == "hwmonitor":
                 self.app._open_hw_monitor()
             elif key == "startup":

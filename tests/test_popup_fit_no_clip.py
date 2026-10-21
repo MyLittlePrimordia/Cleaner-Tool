@@ -55,7 +55,7 @@ SELF_SCROLLING_DIALOGS = (
     "ServicesDialog", "NetworkConnectionsDialog", "HealthReportDialog",
     "DuplicatesDialog", "RestorePointDialog", "UninstallProgramsDialog",
     "FileLockDialog", "StorageInsightDialog", "ProcessManagerDialog",
-    "StartupManagerDialog", "QuickToolsDialog",
+    "StartupManagerDialog",
 )
 
 

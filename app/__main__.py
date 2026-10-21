@@ -39,6 +39,16 @@ _early_log(f"Starting __main__.py, argv={sys.argv}")
 if __package__ in (None, ""):
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
+# Crash log FIRST: an exception during the rest of startup must leave a
+# trace, since the windowed build has no stderr. install_hooks() is
+# idempotent and never raises; the Tk hook is added again once the root
+# exists (Application.__init__).
+try:
+    from app.diagnostics import install_hooks as _install_crash_hooks
+    _install_crash_hooks()
+except Exception:
+    pass
+
 from app.dpi import enable_dpi_awareness as _enable_dpi_awareness  # noqa: E402
 _early_log("About to enable DPI awareness")
 

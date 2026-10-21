@@ -1,7 +1,7 @@
-"""One declarative table for the 20 feature dialogs, plus one generic opener.
+"""One declarative table for the feature dialogs, plus one generic opener.
 
 Why this exists. `Application` grew twenty `_open_*` methods that were, with
-two exceptions, the same three lines of code:
+an exception, the same three lines of code:
 
     def _open_dns_tester(self):
         '''...a docstring explaining the busy-guard decision...'''
@@ -14,16 +14,12 @@ Twenty copies of that is 168 lines whose only real information is the pair
 (dialog class, does this one need a busy-guard). The information belongs in a
 table; the repetition belonged nowhere.
 
-The two exceptions are the reason this is a table and not a loop over bare
-class names:
-
-  * `storage_insight` refuses to open while a run owns the progress UI, and
-    says so in the status bar instead of silently doing nothing;
-  * `quick_tools` takes a third constructor argument resolved from the Tools
-    tab, and must NOT open at all when that target is missing.
-
-Both are data (`guard_busy`, `extra_arg`) rather than control flow, which is
-what keeps the opener generic.
+The exception is the reason this is a table and not a loop over bare class
+names: `storage_insight` refuses to open while a run owns the progress UI, and
+says so in the status bar instead of silently doing nothing. That is data
+(`guard_busy`) rather than control flow, which is what keeps the opener
+generic. (`extra_arg` remains in the spec for resolvers that need a
+constructor argument; no dialog currently uses one.)
 
 Layering: this module lives INSIDE app/ui/dialogs/ so the architecture guard
 still applies to it — it may import its own layer and anything below, and
@@ -44,6 +40,8 @@ from app.ui.dialogs.dns_tester_dialog import DnsTesterDialog
 from app.ui.dialogs.file_lock_dialog import FileLockDialog
 from app.ui.dialogs.drive_toolkit_dialog import DriveToolkitDialog
 from app.ui.dialogs.duplicates_dialog import DuplicatesDialog
+from app.ui.dialogs.game_readiness_dialog import GameReadinessDialog
+from app.ui.dialogs.game_saves_dialog import GameSavesDialog
 from app.ui.dialogs.game_server_ping_dialog import GameServerPingDialog
 from app.ui.dialogs.gamepad_dialog import GamepadDialog
 from app.ui.dialogs.hardware_monitor_dialog import HardwareMonitorDialog
@@ -55,9 +53,7 @@ from app.ui.dialogs.mouse_tester_dialog import MouseTesterDialog
 from app.ui.dialogs.network_connections_dialog import NetworkConnectionsDialog
 from app.ui.dialogs.pilot_dialog import PilotDialog
 from app.ui.dialogs.process_manager_dialog import ProcessManagerDialog
-from app.ui.dialogs.quick_tools_dialog import QuickToolsDialog
 from app.ui.dialogs.restore_point_dialog import RestorePointDialog
-from app.ui.dialogs.run_history_dialog import RunHistoryDialog
 from app.ui.dialogs.safety_center_dialog import SafetyCenterDialog
 from app.ui.dialogs.update_picker_dialog import UpdatePickerDialog
 from app.ui.dialogs.services_dialog import ServicesDialog
@@ -76,21 +72,10 @@ DialogSpec = namedtuple("DialogSpec", "cls guard_busy extra_arg")
 DialogSpec.__new__.__defaults__ = (False, None)
 
 
-def _quick_tools_target(app):
-    """Quick Tools needs the Tools tab's launch target, and opens nothing
-    without one (the tab may not be built yet)."""
-    tools_tab = app.tabs.get("Tools")
-    target = getattr(tools_tab, "_open_target", None)
-    return ABORT if target is None else target
-
-
 #: key -> spec. The key is what Application's forwarders pass through.
 DIALOGS = {
     # --- guarded: refuses to open while a run owns the progress UI -------
     "storage_insight": DialogSpec(StorageInsightDialog, guard_busy=True),
-
-    # --- needs a third ctor arg from the Tools tab ------------------------
-    "quick_tools": DialogSpec(QuickToolsDialog, extra_arg=_quick_tools_target),
 
     # --- plain -----------------------------------------------------------
     "dns_tester": DialogSpec(DnsTesterDialog),
@@ -143,8 +128,15 @@ DIALOGS = {
     # one heavy action (Undo all) hands off to a real run, which has its own
     # busy gate. Opening it mid-run just shows stale-but-honest counts.
     "safety_center": DialogSpec(SafetyCenterDialog),
-    # N-006: read-only history/trends; cheap to build and never writes.
-    "run_history": DialogSpec(RunHistoryDialog),
+    # N-006: the reclaimed-over-time sentence lives in the scorecard now;
+    # the rolling run_history data it reads is still written by every run.
+    # 2026-10: restore path for the save backups the Clean tab already made.
+    # Not guard_busy: listing archives is a folder read, and the restore
+    # itself refuses to run while a game holds the files open (skipped and
+    # reported) rather than competing with a task for the progress UI.
+    "game_saves": DialogSpec(GameSavesDialog),
+    # Read-only checks; fixes route to real tweak tasks (own snapshots/undo).
+    "game_readiness": DialogSpec(GameReadinessDialog),
     # Opened from PC Health: choose exactly which Windows updates to install.
     "update_picker": DialogSpec(UpdatePickerDialog),
     # U-006: opened from the "Update available" banner; fetch+verify in place

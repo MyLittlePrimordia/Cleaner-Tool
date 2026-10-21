@@ -7,9 +7,6 @@ called out in the modules themselves:
   * PilotDialog opens _CatalogPickerDialog
   * InstallTab opens InstallProfilesDialog
 
-The Quick Tools table lives in app/tools_shortcuts.py rather than on ToolsTab,
-because QuickToolsDialog needs it and a dialog must not import a tab.
-
 Adding a new dialog means adding a module here and re-exporting it from
 app/gui.py, which stays the compatibility facade for the smoke suite.
 """
@@ -31,9 +28,7 @@ from app.ui.dialogs.mouse_tester_dialog import MouseTesterDialog
 from app.ui.dialogs.network_connections_dialog import NetworkConnectionsDialog
 from app.ui.dialogs.pilot_dialog import PilotDialog
 from app.ui.dialogs.process_manager_dialog import ProcessManagerDialog
-from app.ui.dialogs.quick_tools_dialog import QuickToolsDialog
 from app.ui.dialogs.restore_point_dialog import RestorePointDialog
-from app.ui.dialogs.run_history_dialog import RunHistoryDialog
 from app.ui.dialogs.safety_center_dialog import SafetyCenterDialog
 from app.ui.dialogs.update_picker_dialog import UpdatePickerDialog
 from app.ui.dialogs.scorecard_dialog import ScorecardDialog
@@ -53,7 +48,7 @@ __all__ = [
     "InstallProfilesDialog", "KeyboardTesterDialog", "MicCheckDialog",
     "MonitorTestDialog", "MouseTesterDialog", "NetworkConnectionsDialog",
     "PilotDialog",
-    "ProcessManagerDialog", "QuickToolsDialog", "RestorePointDialog", "RunHistoryDialog", "SafetyCenterDialog", "UpdatePickerDialog", "ScorecardDialog",
+    "ProcessManagerDialog", "RestorePointDialog", "SafetyCenterDialog", "UpdatePickerDialog", "ScorecardDialog",
     "ServicesDialog", "SpeakerTestDialog", "SpecsDialog", "SpeedTestDialog",
     "StartupManagerDialog", "StorageInsightDialog",
     "UninstallProgramsDialog", "WebcamDialog", "_CatalogPickerDialog",

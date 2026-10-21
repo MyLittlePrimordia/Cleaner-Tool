@@ -167,11 +167,10 @@ class SettingsTab(tk.Frame):
         self._active_cat = None
 
         from app.config_persist import load_config
-        try:
-            from app.settings_apply import resync_flags
-            resync_flags()
-        except Exception:
-            pass
+        # PERF (2026-10): resync_flags() (three schtasks probes) used to run
+        # here on the Tk thread. Application now runs it on a worker at
+        # startup and calls refresh_scheduler_flags() when it lands; the page
+        # also re-checks shortly after first build as a safety net.
         cfg = load_config()
 
         pad = tk.Frame(self, bg=COLORS["bg"])
@@ -237,6 +236,46 @@ class SettingsTab(tk.Frame):
         # About section intentionally removed (user request).
 
         self._show_cat("general")
+        # Safety net for an instant Settings visit: the async resync may not
+        # have posted yet. Cheap (config read) and skipped once the user edits.
+        try:
+            self.after(700, self.refresh_scheduler_flags)
+        except Exception:
+            pass
+
+    def refresh_scheduler_flags(self):
+        """Apply a completed scheduler resync to the maintenance toggles.
+
+        Only touches untouched controls: a user mid-edit must not have their
+        choice overwritten by a background probe that started before it.
+        """
+        if getattr(self, "_dirty", False):
+            return
+        try:
+            from app.config_persist import load_config
+            cfg = load_config()
+        except Exception:
+            return
+        for key, cfg_key in (("clean_schedule", "schedule_enabled"),
+                             ("update_apps", "schedule_update_enabled")):
+            var = self._vars.get(key)
+            if var is not None:
+                try:
+                    var.set(bool(cfg.get(cfg_key, False)))
+                except Exception:
+                    pass
+        var = self._vars.get("frequency")
+        if var is not None:
+            try:
+                var.set(str(cfg.get("schedule_frequency", "weekly")))
+            except Exception:
+                pass
+        var = self._vars.get("time")
+        if var is not None:
+            try:
+                var.set(str(cfg.get("schedule_time", "03:00")))
+            except Exception:
+                pass
 
     def _rail_width(self):
         """Width of the category rail, measured for the current font/DPI.

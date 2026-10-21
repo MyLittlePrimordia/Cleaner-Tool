@@ -58,6 +58,29 @@ def test_tools_dialogs_are_all_exported():
     assert not missing, "not exported from app.ui.dialogs: %s" % missing
 
 
+def test_quick_tools_stays_removed():
+    """Quick Tools went with Run History in 2026-10 (the grid's scroll fix).
+
+    Nothing should reach it: no package export, no registry key, no Tools
+    card, no Application launcher. A half-revert that restores only one of
+    those used to be invisible to this suite - see the Run History guard in
+    tests/test_run_history_dialog.py for the same contract.
+    """
+    from app.ui.dialogs.registry import DIALOGS
+    from app.ui.tabs.toolstab import ToolsTab
+
+    assert not hasattr(D, "QuickToolsDialog")
+    assert "QuickToolsDialog" not in D.__all__
+    assert "quick_tools" not in DIALOGS
+
+    keys = [card[0] for card in ToolsTab._CARDS + ToolsTab._FIX_CARDS]
+    assert "quick_tools" not in keys
+
+    from app.ui.app import Application
+
+    assert not hasattr(Application, "_open_quick_tools")
+
+
 def test_toolpage_scroll_routes_content_through_the_shared_panel():
     from app.ui.widgets import ScrollableRoundedPanel
 

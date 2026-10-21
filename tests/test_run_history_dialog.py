@@ -1,62 +1,59 @@
-"""N-006 GUI: the Run History dialog renders the honest empty and populated
-states. The config read is patched, so nothing touches the real config file.
+"""The Run History dialog is GONE - this file keeps it gone.
+
+Historical name: this module used to render the dialog's empty and populated
+states. In 2026-10 the Run History card was dropped from the Tools tab (it was
+one of the two weakest there, and dropping two cards is what stopped the grid
+from scrolling), and the dialog itself went with it.
+
+It is a guard rather than a deletion on purpose. The 2026-10 removal shipped
+in a commit that carried the edits but not the file deletions, so the stale
+import in the old version of this file was the only thing that broke CI; a
+guard cannot rot that way. It pins the parts a half-revert would bring back
+one at a time: a resurrected export, a registry key nothing opens, a launcher
+calling a dialog that no longer exists, or the card reappearing in the grid.
+
+What is deliberately NOT asserted here: that the dialog module is
+unimportable. A deletion only reaches the remote once a commit carries it, so
+that assertion would be true locally and false on a runner. The contract that
+matters is that nothing can reach the feature.
 """
 from __future__ import annotations
 
-import datetime as dt
-
-import pytest
-
-tk = pytest.importorskip("tkinter")
-
-from app.ui.dialogs import RunHistoryDialog
-from app.ui.dialogs._tool_page import ToolPage
+import app.ui.dialogs as dialogs
 from app.ui.dialogs.registry import DIALOGS
 
-from _tkhelpers import make_root
+
+def test_dialog_is_not_exported_from_the_package():
+    assert not hasattr(dialogs, "RunHistoryDialog")
+    assert "RunHistoryDialog" not in dialogs.__all__
 
 
-class _StubApp:
-    def __getattr__(self, name):
-        return lambda *a, **k: None
+def test_registry_has_no_run_history_key():
+    assert "run_history" not in DIALOGS
 
 
-def _build(monkeypatch, entries):
-    import app.config_persist as cp
-    monkeypatch.setattr(cp, "load_config", lambda: {"run_history": entries})
-    root = make_root()
-    root.withdraw()
-    dlg = RunHistoryDialog(root, _StubApp())
-    return root, dlg
+def test_application_has_no_run_history_launcher():
+    from app.ui.app import Application
+
+    assert not hasattr(Application, "_open_run_history")
 
 
-def test_registered_and_on_the_shared_shell():
-    assert issubclass(RunHistoryDialog, ToolPage)
-    assert "run_history" in DIALOGS
-    assert DIALOGS["run_history"].cls is RunHistoryDialog
+def test_tools_tab_has_no_run_history_card():
+    from app.ui.tabs.toolstab import ToolsTab
+
+    keys = [card[0] for card in ToolsTab._CARDS + ToolsTab._FIX_CARDS]
+    assert "run_history" not in keys
 
 
-def test_empty_history_says_so_plainly(monkeypatch):
-    root, dlg = _build(monkeypatch, [])
-    try:
-        assert "No runs recorded yet" in dlg.banner._title_full
-        assert dlg._spark_lbl is None
-        assert dlg._list_rows == []
-    finally:
-        dlg.close()
-        root.destroy()
+def test_the_reclaimed_over_time_data_survives_the_dialog():
+    """The rolling history is still written and still read elsewhere.
 
+    The scorecard's "reclaimed over 30 days" line reads it through
+    config_persist.freed_since(); deleting the dialog must not take the data
+    plumbing with it.
+    """
+    from app.config_persist import freed_since
 
-def test_populated_history_shows_a_trend_and_rows(monkeypatch):
-    now = dt.datetime.now().timestamp()
-    entries = [{"t": now - i * 3600, "b": (i + 1) * 1000} for i in range(5)]
-    root, dlg = _build(monkeypatch, entries)
-    try:
-        assert "reclaimed across 5 cleans" in dlg.banner._title_full
-        assert dlg._spark_lbl is not None
-        assert len(dlg._list_rows) == 5
-        # newest first
-        assert dlg._list_rows[0] is not None
-    finally:
-        dlg.close()
-        root.destroy()
+    total, runs = freed_since(30)
+    assert isinstance(total, int) and total >= 0
+    assert isinstance(runs, int) and runs >= 0

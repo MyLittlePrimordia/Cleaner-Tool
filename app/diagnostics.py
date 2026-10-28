@@ -27,7 +27,6 @@ import platform
 import sys
 import threading
 import traceback
-from typing import Optional
 
 from app.config import APP_NAME, APP_VERSION
 

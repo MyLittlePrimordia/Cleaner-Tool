@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import datetime
 import os
-from typing import Callable, Dict, List, Optional
+from typing import Callable, List, Optional
 
 from app.drivers import catalog, download as dl, folder, install as ins
 from app.drivers import inventory, scan as scanmod

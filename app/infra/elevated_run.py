@@ -96,9 +96,16 @@ def run_elevated(script: str, timeout: int = 120):
             fh.write("%s *> '%s'" % (script, out_path))
         params = ('-NoProfile -NonInteractive -ExecutionPolicy Bypass '
                   '-File "%s"' % script_path)
+        # R-008: the exe comes from the shared resolver - a BARE "powershell.exe"
+        # here meant an ELEVATED launch picked whatever PATH offered first,
+        # which is the exact shadowing the System32-first rule exists to stop.
+        # This one is a ShellExecute argument, not an argv, so the run helpers
+        # do not apply; only the path does. The -ExecutionPolicy Bypass flag IS
+        # meaningful here (it runs a saved .ps1 with -File), so it stays.
+        from app.exe_paths import resolve_exe
         rc = ctypes.windll.shell32.ShellExecuteW(None, "runas",
-                                                 "powershell.exe", params,
-                                                 None, 0)
+                                                 resolve_exe("powershell"),
+                                                 params, None, 0)
         if rc is None or rc <= _MIN_OK:
             return False, ""
         deadline = time.time() + timeout

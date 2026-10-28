@@ -8,7 +8,7 @@ edit power plans and schedule tasks.
 So this module parses the task source with `ast` and re-derives, per task, the
 registry values it snapshots or writes, then reads each value's CURRENT setting
 (read-only) so the preview can say `1 -> 0`. The AST half is shared with
-`tools/verify_sec001_task_allowlist.py` (the SEC-001 drift guard) so the guard
+`dev/tools/verify_sec001_task_allowlist.py` (the SEC-001 drift guard) so the guard
 and the preview can never disagree about what a task touches.
 
 Nothing here ever writes: every registry call is a read. Honest limits, which the
@@ -27,7 +27,6 @@ preview reports rather than hides:
 from __future__ import annotations
 
 import ast
-import os
 from typing import Optional
 
 from app.utils import _REG_DENIED, reg_get_value_typed
@@ -308,7 +307,7 @@ def _apply_fn_keys(tree, consts, nodes):
     return out
 
 
-def _scan_tree(tree):
+def _scan_tree(tree, consts=None, nodes=None, fn_to_key=None):
     """Return (by_id, by_id_targets, by_fn, fn_to_key).
 
     by_id        : task/snapshot id -> set of (hive, path, name) from
@@ -319,9 +318,18 @@ def _scan_tree(tree):
     by_fn        : apply-function name -> {"regs": {triple: target},
                    "deletes": set(triple), "system": bool}
     fn_to_key    : apply-function name -> task key
+
+    `consts`/`nodes` may be supplied from a cross-module index: since the
+    per-domain split (R-002) a function often references a spec constant that
+    lives in tweak_common, and a per-file index cannot resolve that name.
     """
-    consts, nodes = const_index(tree)
-    fn_to_key = _apply_fn_keys(tree, consts, nodes)
+    own_consts, own_nodes = const_index(tree)
+    if consts is None:
+        consts = own_consts
+    if nodes is None:
+        nodes = own_nodes
+    if fn_to_key is None:
+        fn_to_key = _apply_fn_keys(tree, consts, nodes)
     by_id = {}
     by_id_targets = {}
     by_fn = {}
@@ -383,10 +391,44 @@ def _scan_tree(tree):
     return by_id, by_id_targets, by_fn, fn_to_key
 
 
+def merged_index(trees) -> "tuple[dict, dict]":
+    """Constants and assignment nodes from every tree, merged.
+
+    A split module imports its spec tables from tweak_common; resolving a name
+    against only the file that uses it would silently drop every such spec.
+    Names are unique across the tweak modules, so first-one-wins is exact.
+    """
+    consts, nodes = {}, {}
+    for tree in trees:
+        c, n = const_index(tree)
+        for name, value in c.items():
+            consts.setdefault(name, value)
+        for name, node in n.items():
+            nodes.setdefault(name, node)
+    return consts, nodes
+
+
 def scan_reg_specs(path) -> dict:
     """id -> set of (hive, path, name); the exact shape the SEC-001 guard uses."""
     by_id, _targets, _by_fn, _fn_to_key = _scan_tree(_parse(path))
     return by_id
+
+
+def scan_all_reg_specs(paths) -> dict:
+    """`scan_reg_specs` merged across every module, with one const index.
+
+    This is what the SEC-001 guard calls: after the R-002 split the literal
+    specs, the constants they name, and the `Task(...)` entries that tie a
+    function to a key all live in different files of the same package.
+    """
+    trees = [_parse(p) for p in paths]
+    consts, nodes = merged_index(trees)
+    merged = {}
+    for tree in trees:
+        by_id, _targets, _by_fn, _fn_to_key = _scan_tree(tree, consts, nodes)
+        for tid, specs in by_id.items():
+            merged.setdefault(tid, set()).update(specs)
+    return merged
 
 
 def _parse(path):
@@ -394,9 +436,30 @@ def _parse(path):
         return ast.parse(fh.read(), filename=path)
 
 
+def tweak_source_modules():
+    """Every module whose source the scanner must read.
+
+    The tweak implementations used to live in one file; they are now split by
+    domain (audit 2026-10, R-002), so a literal registry spec can be in any of
+    them. `tweak_tasks` itself holds only the registry, but it is included so a
+    task declared inline there is still seen.
+    """
+    from app.tasks import (
+        advanced_tasks, tweak_common, tweak_explorer, tweak_gaming,
+        tweak_network, tweak_power, tweak_privacy, tweak_system, tweak_tasks,
+    )
+    return [tweak_tasks, tweak_common, tweak_power, tweak_gaming,
+            tweak_network, tweak_privacy, tweak_explorer, tweak_system,
+            advanced_tasks]
+
+
+def tweak_source_paths() -> "list[str]":
+    """`tweak_source_modules()` as file paths, for the SEC-001 guard."""
+    return [m.__file__ for m in tweak_source_modules()]
+
+
 def _task_modules():
-    from app.tasks import tweak_tasks, advanced_tasks
-    return [tweak_tasks, advanced_tasks]
+    return tweak_source_modules()
 
 
 def prefix_specs() -> dict:
@@ -406,7 +469,7 @@ def prefix_specs() -> dict:
     (one subkey per network adapter), so — unlike `_TASK_REG_ALLOWLIST` — no
     exact triple can be derived from the source. The rule is the authoritative
     list of what the task may touch beneath that path, and
-    `tools/verify_sec001_task_allowlist.py` checks it against the source, so
+    `dev/tools/verify_sec001_task_allowlist.py` checks it against the source, so
     the preview and the security control read the same declaration.
 
     Imported lazily: this module must stay importable, and parseable, without
@@ -430,24 +493,33 @@ def scan_tasks() -> dict:
     fn_to_key = {}
     by_id_all = {}
     by_id_targets_all = {}
+    trees = []
     for mod in _task_modules():
         try:
-            tree = _parse(mod.__file__)
+            trees.append(_parse(mod.__file__))
         except Exception:
             continue
-        by_id, by_id_targets, by_fn, f2k = _scan_tree(tree)
-        fn_to_key.update(f2k)
+    consts, nodes = merged_index(trees)
+    # The Task(...) entries live in ONE module (the registry); the functions
+    # they name live in the domain modules. Build the function->key map from
+    # every tree first, then scan each tree with it.
+    for tree in trees:
+        fn_to_key.update(_apply_fn_keys(tree, consts, nodes))
+    for tree in trees:
+        by_id, by_id_targets, by_fn, _f2k = _scan_tree(
+            tree, consts, nodes, fn_to_key)
         by_id_all.update(by_id)
         for key, targets in by_id_targets.items():
             by_id_targets_all.setdefault(key, {}).update(targets)
-        for t in getattr(mod, "TASKS", []) or []:
-            titles[t.key] = getattr(t, "label", None) or t.key
         for key, fninfo in by_fn.items():
             merged = info.setdefault(
                 key, {"regs": {}, "deletes": set(), "system": False})
             merged["regs"].update(fninfo["regs"])
             merged["deletes"].update(fninfo["deletes"])
             merged["system"] = merged["system"] or fninfo["system"]
+    for mod in _task_modules():
+        for t in getattr(mod, "TASKS", []) or []:
+            titles[t.key] = getattr(t, "label", None) or t.key
 
     # fold in the id-bearing snapshot specs (a snapshot touches a value even if
     # the matching write lives in a helper we named differently). The literal
@@ -481,12 +553,6 @@ def scan_tasks() -> dict:
 
 
 _CACHE = None
-
-
-def reset_cache() -> None:
-    """Drop the parsed cache (tests, or after the source is edited)."""
-    global _CACHE
-    _CACHE = None
 
 
 # --------------------------------------------------------------------------- #

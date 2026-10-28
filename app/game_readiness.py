@@ -127,12 +127,12 @@ def _gpu_driver() -> dict:
     """Driver date via WMI, formatted invariantly (see repair_gpu_driver_age,
     which learned the culture lesson the hard way)."""
     try:
+        from app.tasks.ps import ps_argv
         out = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "Get-CimInstance Win32_VideoController | Where-Object DriverDate | "
-             "Sort-Object DriverDate -Descending | Select-Object -First 1 | "
-             "ForEach-Object { $_.DriverDate.ToString('yyyy-MM-dd', "
-             "[System.Globalization.CultureInfo]::InvariantCulture) }"],
+            ps_argv("Get-CimInstance Win32_VideoController | Where-Object DriverDate | "
+                    "Sort-Object DriverDate -Descending | Select-Object -First 1 | "
+                    "ForEach-Object { $_.DriverDate.ToString('yyyy-MM-dd', "
+                    "[System.Globalization.CultureInfo]::InvariantCulture) }"),
             capture_output=True, text=True, timeout=45,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         ).stdout or ""
@@ -319,3 +319,48 @@ def check() -> list[dict]:
 def summary(rows: list[dict]) -> tuple[int, int]:
     """(warnings, checked) — what the header says."""
     return (sum(1 for r in rows if r.get("state") == WARN), len(rows))
+
+
+#: Warnings this tool owns that Health does not already grade. The graphics
+#: driver and free-space checks are deliberately absent: Health has a card and
+#: an action for both, and publishing the same fact twice would make the
+#: Health tab's "found by your tools" band repeat its own findings.
+_BUS_KEYS = ("game_mode", "game_dvr", "power_plan", "refresh", "reboot")
+
+
+def publish_findings(rows) -> list:
+    """Publish this read's gaming-specific warnings (AUDIT TX-002).
+
+    Only WARN: INFO is "could not read" or "this is a custom plan", which is
+    not a problem to act on. The read is authoritative for the ids it owns, so
+    fixing Game Mode or switching power plans clears the old row on the next
+    check.
+    """
+    try:
+        from app import insights
+        from app.insights import Finding, slug
+        import time as _time
+    except Exception:
+        return []
+
+    now = _time.time()
+    findings = []
+    for row in rows or []:
+        key = str(row.get("key") or "")
+        if key not in _BUS_KEYS or row.get("state") != WARN:
+            continue
+        findings.append(Finding(
+            id="readiness." + slug(key),
+            domain="gaming",
+            severity="warn",
+            title=str(row.get("label") or "A gaming setting"),
+            detail=str(row.get("detail") or ""),
+            evidence={"check": key},
+            action={"kind": "route", "target": "readiness",
+                    "label": "Open Game Readiness"},
+            observed_at=now,
+        ))
+    try:
+        return insights.replace("readiness.", *findings)
+    except Exception:
+        return []

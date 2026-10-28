@@ -54,10 +54,47 @@ def default_folder() -> str:
     return os.path.join(_exe_dir(), "Drivers")
 
 
+def _custom_usable(path: str) -> bool:
+    """Is a user-chosen drivers folder safe to create three subfolders in?
+
+    The value comes from the config file, which anything can edit. Pointed at
+    `C:\\Windows`, a drive root, the profile root or any other protected
+    root, this app would scatter `downloads\\`, `extracted\\` and `backup\\`
+    (and run pnputil against them) inside a system directory. Such a value is
+    IGNORED - the next candidate wins - rather than repaired.
+    """
+    text = str(path or "").strip()
+    if not text or not os.path.isabs(text):
+        return False
+    if "\x00" in text:
+        return False
+    try:
+        import os as _os
+        norm = _os.path.normcase(_os.path.abspath(text))
+        if norm != _os.path.normcase(text):
+            # `..` and friends: resolve() would already have done it, so a
+            # value that only makes sense after normalisation is a red flag.
+            if ".." in text.replace("/", "\\").split("\\"):
+                return False
+        from app.utils import _is_protected_root
+        if _is_protected_root(norm):
+            return False
+        windir = _os.environ.get("SystemRoot") or r"C:\Windows"
+        w = _os.path.normcase(_os.path.abspath(windir))
+        if norm == w or norm.startswith(w + _os.sep):
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def resolve(custom: Optional[str] = None) -> str:
-    """The folder to use right now: custom (if writable) -> next to the exe
-    (if writable) -> the fallback. Always returns something usable."""
-    for cand in (str(custom or "").strip(), default_folder()):
+    """The folder to use right now: custom (if valid and writable) -> next to
+    the exe (if writable) -> the fallback. Always returns something usable."""
+    custom_text = str(custom or "").strip()
+    if custom_text and not _custom_usable(custom_text):
+        custom_text = ""
+    for cand in (custom_text, default_folder()):
         if cand and writable(cand):
             return os.path.abspath(cand)
     fb = fallback_folder()

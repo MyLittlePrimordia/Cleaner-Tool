@@ -98,8 +98,6 @@ CLOSEABLE_APPS = (
       "creative cloud helper.exe")),
 )
 
-APP_KEYS = tuple(a[0] for a in CLOSEABLE_APPS)
-
 
 # --------------------------------------------------------------------------- #
 # User-picked apps
@@ -117,6 +115,12 @@ CUSTOM_PREFIX = "custom:"
 #: separators would turn a name into a location, the rest are shell quirks.
 _UNSAFE_IN_EXE = '\\/:*?"<>|'
 
+#: Longest exe name accepted. config_schema enforces the same number when the
+#: close list is loaded (GAME_NIGHT_APP_NAME_MAX) — duplicated rather than
+#: imported because this module keeps its zero-dependency rule, and pinned by
+#: dev/tests/test_config_schema.py so the two cannot drift apart.
+CUSTOM_APP_NAME_MAX = 96
+
 
 def custom_exe_name(value):
     """Validate one custom app: 'custom:steam.exe' or 'Steam.exe' -> the exe
@@ -128,7 +132,7 @@ def custom_exe_name(value):
     s = str(value or "").strip()
     if s.lower().startswith(CUSTOM_PREFIX):
         s = s[len(CUSTOM_PREFIX):].strip()
-    if not s or len(s) > 96 or not s.lower().endswith(".exe"):
+    if not s or len(s) > CUSTOM_APP_NAME_MAX or not s.lower().endswith(".exe"):
         return None
     if s[0] in "-." or any(ch in _UNSAFE_IN_EXE or ord(ch) < 32 for ch in s):
         return None
@@ -163,31 +167,6 @@ def custom_label(name):
         s = s[:-4]
     s = s.strip() or str(name or "").strip()
     return (s[:1].upper() + s[1:]) if s else "?"
-
-
-def exe_names_for(keys):
-    """Flat tuple of exe names for the ticked app keys. Unknown keys are
-    ignored — a stale config can never ask us to close something that is
-    not on the reviewed list above — and a `custom:` key only contributes a
-    name that passes custom_exe_name (a plain exe basename, picked by the
-    user in the Auto-Pilot dialog)."""
-    wanted = set(str(k) for k in (keys or []))
-    names, seen = [], set()
-
-    def _add(n):
-        if n.lower() not in seen:
-            seen.add(n.lower())
-            names.append(n)
-
-    for key, _label, _note, exes in CLOSEABLE_APPS:
-        if key in wanted:
-            for exe in exes:
-                _add(exe)
-    for key in sorted(wanted):
-        exe = custom_exe_name(key)
-        if exe:
-            _add(exe)
-    return tuple(names)
 
 
 def close_apps(keys, log=None):

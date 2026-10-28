@@ -31,7 +31,8 @@ _EVENTS_LOCK = threading.Lock()
 #: what this app writes) never trimmed AND re-read the whole file on every
 #: single append, because the size condition stayed true forever.
 _EVENTS_MAX_BYTES = 512_000
-_EVENTS_MAX_LINES = 2000
+#: The line cap is applied by app.logsafe once the size trigger fires
+#: (logsafe._TRAIL_KEEP_LINES = 2000); only the size gates the work here.
 
 
 def log_security_event(category: str, message: str) -> None:
@@ -39,8 +40,9 @@ def log_security_event(category: str, message: str) -> None:
 
     Best-effort and never raises — this is observability, not a control
     path, so a failure here must never affect the caller's actual
-    operation. The lock keeps concurrent appends (GUI thread, scheduler
-    process, elevated twin) from interleaving partial lines.
+    operation. The threading lock below serializes this process; the append
+    itself takes an inter-process lock, so the GUI, its elevated twin and a
+    scheduled run cannot interleave half a line or lose one to the trim.
     """
     try:
         from datetime import datetime
@@ -51,52 +53,19 @@ def log_security_event(category: str, message: str) -> None:
                 os.makedirs(CONFIG_DIR, exist_ok=True)
             except Exception:
                 pass
-            with open(EVENTS_LOG_FILE, "a", encoding="utf-8") as f:
-                f.write(line)
-            # cheap cap check — only actually trims once in a long while,
-            # so no need to count lines on every single append
-            #
-            # LOW-009, two defects in the trim:
-            #  1. The trim was gated on BOTH size > 512 KB AND len(lines) >
-            #     2000. A log over 512 KB with 2000 or fewer lines - entirely
-            #     possible with long messages, which is what the app writes -
-            #     never trimmed at all, and worse, the full re-read happened on
-            #     EVERY append, forever, because the size condition stayed
-            #     true. Now the size condition alone triggers the work, and the
-            #     line cap is applied as the result rather than as a gate.
-            #  2. The rewrite was non-atomic: `open(..., "w")` truncates the
-            #     file before anything is written, so a crash or a concurrent
-            #     reader during the rewrite loses the whole log. It now goes
-            #     through utils.atomic_write_text, which writes a sibling temp
-            #     and os.replace()s it into place.
-            try:
-                if os.path.getsize(EVENTS_LOG_FILE) > _EVENTS_MAX_BYTES:
-                    with open(EVENTS_LOG_FILE, "r", encoding="utf-8",
-                              errors="ignore") as f:
-                        lines = f.readlines()
-                    keep = lines[-_EVENTS_MAX_LINES:]
-                    if len(keep) < len(lines):
-                        # Atomic replace, done LOCALLY on purpose. The first
-                        # version called app.utils.atomic_write_text, which
-                        # made config_events import utils - and config_persist
-                        # imports config_events, so that closed the cycle
-                        # utils -> config_persist -> config_events -> utils.
-                        # The architecture guard caught it. config_events is a
-                        # leaf as far as the import graph is concerned and must
-                        # stay that way, so the three lines it needs are
-                        # inlined: temp in the SAME directory (a cross-volume
-                        # temp would break os.replace atomicity), then replace.
-                        tmp = str(EVENTS_LOG_FILE) + ".trim.tmp"
-                        with open(tmp, "w", encoding="utf-8") as tf:
-                            tf.write("".join(keep))
-                            try:
-                                tf.flush()
-                                os.fsync(tf.fileno())
-                            except Exception:
-                                pass
-                        os.replace(tmp, EVENTS_LOG_FILE)
-            except Exception:
-                pass
+            # H-002: one append path, shared with the debug trails.
+            # `append_text_no_follow` takes an inter-PROCESS lock (the
+            # threading.Lock above only serializes this process: the GUI and
+            # its elevated twin, plus a scheduled run, all write this file),
+            # refuses a link planted at the path, and performs the LOW-009 size
+            # trim atomically - temp sibling in the same directory, then
+            # os.replace, so a crash mid-trim cannot lose the whole log.
+            # `app.logsafe` imports nothing from the app, so this does not
+            # reopen the utils -> config_persist -> config_events cycle that
+            # the module split closed.
+            from app.logsafe import append_text_no_follow
+            append_text_no_follow(str(EVENTS_LOG_FILE), line,
+                                  max_bytes=_EVENTS_MAX_BYTES)
     except Exception:
         pass
 

@@ -31,6 +31,7 @@ this; nothing here imports config_persist.
 """
 from __future__ import annotations
 
+import math
 import re
 
 # --------------------------------------------------------------------------- #
@@ -41,6 +42,45 @@ import re
 
 #: Rolling run history. A friendly summary, not an audit trail.
 RUN_HISTORY_MAX = 120
+#: R-005: typed changes are far more detailed than a byte count, so only the
+#: newest runs keep theirs. Older entries stay the reclaim summary they always
+#: were - the viewer lists the latest runs anyway.
+RUN_HISTORY_CHANGE_RUNS = 30
+#: One run's change list. The card names 8 and Copy lists all of them; history
+#: is a rolling answer to "what did that run do?", not a ledger dump.
+RUN_CHANGE_MAX = 24
+#: Field caps for one stored change. A hand-edited config must not be able to
+#: stuff a paragraph (or a whole registry hive) into one row.
+RUN_CHANGE_TARGET_MAX = 240
+RUN_CHANGE_DETAIL_MAX = 120
+RUN_KIND_MAX = 24
+#: PC Health score history. One point per completed checkup, so the Health
+#: tab can show a trend instead of a single grade. Same order of magnitude as
+#: the run ledger: a season of checkups, not a lifetime telemetry archive.
+HEALTH_HISTORY_MAX = 120
+#: Quiet watch (N-006). Bounds rather than choices: any whole percent inside
+#: the range is a setting a user can hold, and the dropdown in Settings offers
+#: a few of them. app/watch.py imports these so the default and the clamp can
+#: never disagree, and a hand-edited 1000 cannot mean "every drive is full".
+WATCH_FREE_RANGE = (2, 50)
+WATCH_SCORE_RANGE = (3, 30)
+#: Which checks a checkup measured, so the trend can say WHY the score moved
+#: ("Drive health dropped to C") instead of only the drop. One entry per
+#: measured sensor: key -> grade. The count is the sensor list's order of
+#: magnitude, not a quota; bounded so 120 points cannot become a dump.
+HEALTH_FINDINGS_MAX = 24
+HEALTH_FINDING_KEY_MAX = 32
+#: Findings bus (AUDIT TX-002). One row is a conclusion a tool reached, so
+#: the board is bounded like the health ledger: a handful of live problems,
+#: not a lifetime telemetry archive. The text caps exist because these rows
+#: are rendered inside fixed-height rows and quoted in tooltips.
+INSIGHTS_MAX = 24
+INSIGHT_ID_MAX = 96
+INSIGHT_TITLE_MAX = 120
+INSIGHT_DETAIL_MAX = 280
+INSIGHT_EVIDENCE_MAX = 12
+INSIGHT_TARGET_MAX = 40
+INSIGHT_LABEL_MAX = 40
 #: Bounds so a hand-edited config can never balloon the file.
 PROFILE_MAX = 20
 PROFILE_ITEMS_MAX = 400
@@ -53,10 +93,60 @@ STARTUP_COMMAND_MAX = 4096
 GAMEPING_MAX = 64
 #: Game Night / Session Pilot key lists.
 SESSION_KEYS_MAX = 200
+#: Tools hub recency (AUDIT TV-001). Card keys only, newest first; the page
+#: shows at most a handful, the file may keep a few more so a single detour
+#: does not erase the user's real habits.
+TOOLS_RECENT_MAX = 8
+#: Game Night / Session Pilot "close these apps" list. Named rather than left
+#: inside the coercer so the schema tests import it instead of repeating 25.
+GAME_NIGHT_APPS_MAX = 25
+#: One exe name in that list: long enough for any real process name, short
+#: enough that the taskkill call can never be handed a paragraph. The limit is
+#: enforced TWICE on purpose — here on load, and again in
+#: game_night.custom_exe_name just before the taskkill — and the two copies are
+#: deliberately independent (that module keeps its zero-dependency import
+#: rule). The schema test asserts both accept exactly the same boundary, so
+#: they cannot drift without it failing.
+GAME_NIGHT_APP_NAME_MAX = 96
+#: Drivers tab download folder. A picked folder is normally well inside
+#: MAX_PATH; the bound is what stops a hand-edited config carrying a
+#: megabyte-long string into the tab and into every scheduled run.
+DRIVERS_FOLDER_MAX = 500
+#: Duplicates dialog's never-delete list. Bounded so a hand-edited config
+#: cannot grow the file, and validated because this list is what stops the
+#: app deleting something the user explicitly protected.
+PROTECTED_PATHS_MAX = 500
+#: SEC-004: the Defender exclusions this app added, so it can remove exactly
+#: those. A real record is one absolute path to this app's binary (a portable
+#: copy run from another folder adds another), so 8 is far past any real use.
+#: The bound is not cosmetic: elevation.remove_defender_exclusions() turns
+#: every entry into a Remove-MpPreference and joins them into ONE -Command
+#: argument, so a hand-edited list decides whether that command line can even
+#: be executed. 8 entries of at most DEFENDER_EXCLUSION_PATH_MAX plus the
+#: per-entry command text stays under 9 KB, inside the 32 KB CreateProcess
+#: limit (a measured 8 x 914-char sample came to 7 KB).
+DEFENDER_EXCLUSIONS_MAX = 8
+#: Longer than MAX_PATH (260) four times over, shorter than an extended-length
+#: path can be. An entry past this is dropped, not truncated: a cut-off path is
+#: not a path, and forgetting one only leaves an exclusion behind.
+DEFENDER_EXCLUSION_PATH_MAX = 1024
 
 #: Tabs the pre-merge UI persisted. Preserved (and normalised) by the
 #: selected_tasks coercer so _migrate_selected_tasks can still fold them.
 LEGACY_TABS = ("Games", "Game", "Advanced", "Install")
+
+#: U-006: how long the Quarantine bin keeps a file before a launch clears it.
+#: 0 = keep until the user empties the bin. The set is closed because Settings
+#: renders exactly these as a dropdown: an unseen number would show as the
+#: first option and quietly mean something else.
+QUARANTINE_DAYS = (0, 7, 30, 90)
+
+#: Interface density. "system" follows the display's own scale with the 125%
+#: floor app/dpi.py documents; a percentage forces that Tk scale exactly. Kept
+#: here (stdlib-only) so config validation and app/dpi.py cannot drift, and
+#: closed because Settings renders exactly these as a dropdown - a hand-edited
+#: "137" would otherwise mean a density nobody can see a name for.
+UI_SCALES = ("system", "100", "125", "150", "175", "200")
 
 SCHEDULE_FREQUENCIES = ("daily", "weekly", "monthly")
 _TIME_RE = re.compile(r"([01]\d|2[0-3]):[0-5]\d")
@@ -71,6 +161,34 @@ def _bool(value, default):
     """Exact bool check. `isinstance(1, bool)` is False but `isinstance(True,
     int)` is True, so int/float must not be accepted as flags."""
     return value if isinstance(value, bool) else default
+
+
+def _days(value, default):
+    """One of QUARANTINE_DAYS, as a real int. bool is rejected on purpose:
+    `isinstance(True, int)` is True, and a `true` here would read as 1 day."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return default
+    return value if value in QUARANTINE_DAYS else default
+
+
+def _watch_int(value, default, bounds):
+    """A whole number inside `bounds`, else the default.
+
+    Quiet watch's thresholds are continuous within a range (a user may want
+    7%), unlike the dropdown-only keys that must land on a listed option. So
+    this clamps by range instead of by membership, and still rejects bool and
+    float: `True` would read as 1, and a 7.5 is not a percentage anybody chose.
+    """
+    lo, hi = bounds
+    if isinstance(value, bool) or not isinstance(value, int):
+        return default
+    return value if lo <= value <= hi else default
+
+
+def _gameping_last(value, default):
+    """A picker title, capped: it is only ever shown in a 42px dropdown, and a
+    hand-edited paragraph there would be measured on every open."""
+    return _str(value, default)[:80]
 
 
 def _str(value, default, choices=None, lower=False):
@@ -358,11 +476,68 @@ def _schedule_time(value, default):
     return out if _TIME_RE.fullmatch(out) else default
 
 
+def _health_last_check(value, default):
+    """Epoch seconds of the last PC Health check; anything else is the default.
+
+    The check is not decorative. This was a one-line lambda that guarded the
+    TYPE and the sign but called float() outside any handler, and json.load()
+    produces ints of unbounded size: a 400-digit literal in a hand-edited
+    config raised OverflowError straight out of apply_schema. That is not a bad
+    field, it is a quarantined config — the loader's broad except treats any
+    exception as corruption and resets to defaults, taking every profile and
+    tweak snapshot with it.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    if value < 0:
+        return default
+    try:
+        return float(value)
+    except (OverflowError, ValueError):
+        return default
+
+
+def _one_run_change(item):
+    """One stored change record, or None when it is not one.
+
+    Values are stored DISPLAY-READY ("1 \u2192 0", "\u2192 disabled") rather
+    than raw registry objects: history is read-only, never replayed, and this
+    keeps config.json free of bytes/typed-object envelopes.
+    """
+    if not isinstance(item, dict):
+        return None
+    kind = item.get("k")
+    label = item.get("l")
+    detail = item.get("d")
+    if not isinstance(kind, str) or not kind.strip():
+        return None
+    if not isinstance(label, str) or not label.strip():
+        return None
+    if not isinstance(detail, str):
+        return None
+    out = {"k": kind.strip()[:RUN_KIND_MAX],
+           "l": label.strip()[:RUN_CHANGE_TARGET_MAX],
+           "d": detail.strip()[:RUN_CHANGE_DETAIL_MAX]}
+    target = item.get("p")
+    if isinstance(target, str) and target.strip():
+        out["p"] = target.strip()[:RUN_CHANGE_TARGET_MAX]
+    return out
+
+
 def _run_history(value, default):
-    """[{t: unix_seconds, b: bytes_freed}], newest last, capped.
+    """[{t: unix_seconds, b: bytes_freed, k?: kind, c?: changes}], newest
+    last, capped.
 
     Accepts numeric strings for t/b, matching the previous behaviour, so an
-    older hand-edited file still loads.
+    older hand-edited file still loads. `k` and `c` are optional: entries
+    written before R-005 have neither, and they remain exactly `{t, b}` so an
+    old history reads the same as it always did.
+
+    N-010: `b` is the run's CREDITED figure - what its tasks removed, capped
+    at what the drive measurably gained - rather than a bare sum of file
+    sizes. Entries written before N-010 stored the removed total; the two are
+    the same number whenever free space could not be read around the run, so
+    old and new entries stay comparable.
     """
     if not isinstance(value, list):
         return []
@@ -373,11 +548,174 @@ def _run_history(value, default):
         try:
             t = float(entry.get("t", 0))
             b = int(entry.get("b", 0))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError is not hypothetical: json.load() parses ints of any
+            # length, so a 400-digit "t" (or `b: Infinity`, where int() raises
+            # the same way) arrives here as a perfectly valid Python int/float
+            # that float()/int() refuse to convert. It was uncaught, which made this
+            # one history entry raise out of apply_schema — and an exception
+            # there is a CORRUPT FILE: the whole config is quarantined over a
+            # single hand-edited number.
             continue
         if t > 0 and b >= 0:
-            clean.append({"t": t, "b": b})
-    return clean[-RUN_HISTORY_MAX:]
+            kept = {"t": t, "b": b}
+            kind = entry.get("k")
+            if isinstance(kind, str) and kind.strip():
+                kept["k"] = kind.strip()[:RUN_KIND_MAX]
+            changes = entry.get("c")
+            if isinstance(changes, list):
+                records = [rec for rec in
+                           (_one_run_change(i) for i in changes[:RUN_CHANGE_MAX])
+                           if rec is not None]
+                if records:
+                    kept["c"] = records
+            clean.append(kept)
+    clean = clean[-RUN_HISTORY_MAX:]
+    # Only the newest runs keep their change detail (see RUN_HISTORY_CHANGE_RUNS).
+    for old in clean[:-RUN_HISTORY_CHANGE_RUNS]:
+        old.pop("c", None)
+    return clean
+
+
+def _health_history(value, default):
+    """[{t: unix_seconds, s: score 0-100, g: grade, f?: findings}], capped.
+
+    A point exists only when a checkup produced a real score: a run that
+    measured nothing is not a 0, and is not stored (the trend must not read
+    "your PC got worse" because a scan could not look). Malformed entries are
+    dropped, never repaired into a number they did not have - same rule as
+    the run ledger.
+
+    ``f`` is the optional map of sensor key -> grade that checkup measured.
+    It is an ANNOTATION, so a malformed map loses the annotation, not the
+    score: dropping a real point because one key was odd would erase a
+    checkup that genuinely ran. Entries written before ``f`` existed stay
+    valid and simply carry no causes.
+    """
+    if not isinstance(value, list):
+        return []
+    clean = []
+    for entry in value:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            t = float(entry.get("t", 0))
+            s = int(entry.get("s", -1))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        grade = entry.get("g")
+        grade = grade.strip().upper() if isinstance(grade, str) else ""
+        if t <= 0 or not 0 <= s <= 100 or grade not in ("A", "B", "C", "D", "F"):
+            continue
+        point = {"t": t, "s": s, "g": grade}
+        findings = entry.get("f")
+        if isinstance(findings, dict):
+            kept = {}
+            for key, g in list(findings.items())[:HEALTH_FINDINGS_MAX]:
+                if not isinstance(key, str) or not key.strip():
+                    continue
+                if not isinstance(g, str):
+                    continue
+                g = g.strip().upper()
+                if g not in ("A", "B", "C", "D", "F"):
+                    continue
+                kept[key.strip()[:HEALTH_FINDING_KEY_MAX]] = g
+            if kept:
+                point["f"] = kept
+        clean.append(point)
+    clean.sort(key=lambda e: e["t"])
+    return clean[-HEALTH_HISTORY_MAX:]
+
+
+def _insights(value, default):
+    """[{id, domain, severity, title, detail, evidence, action, at}], bounded.
+
+    Structural junk (no id, unknown severity, empty title, no timestamp) is
+    dropped rather than repaired into a conclusion the tool did not reach.
+    Optional fields lose only themselves: a malformed action or evidence map
+    does not erase a real finding, and a stale observation is pruned here by
+    keeping the newest INSIGHTS_MAX rows. Semantic rules (id namespace, TTL,
+    one row per id) live in app.insights, which reads the same shape.
+    """
+    if not isinstance(value, list):
+        return []
+    rows = {}
+    for entry in value:
+        if not isinstance(entry, dict):
+            continue
+        fid = entry.get("id")
+        title = entry.get("title")
+        domain = entry.get("domain")
+        severity = entry.get("severity")
+        if not (isinstance(fid, str) and isinstance(title, str)
+                and isinstance(domain, str) and isinstance(severity, str)):
+            continue
+        fid = fid.strip()[:INSIGHT_ID_MAX]
+        title = " ".join(title.split())[:INSIGHT_TITLE_MAX]
+        domain = domain.strip().lower()
+        severity = severity.strip().lower()
+        if (not fid or not re.match(r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$", fid)
+                or not title
+                or domain not in ("storage", "system", "network", "gaming",
+                                  "security")
+                or severity not in ("info", "warn", "critical")):
+            continue
+        try:
+            at = float(entry.get("at", 0))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not math.isfinite(at) or at <= 0:
+            continue
+        detail = entry.get("detail")
+        detail = " ".join(detail.split())[:INSIGHT_DETAIL_MAX] \
+            if isinstance(detail, str) else ""
+
+        evidence = {}
+        raw_ev = entry.get("evidence")
+        if isinstance(raw_ev, dict):
+            for key, val in list(raw_ev.items())[:INSIGHT_EVIDENCE_MAX]:
+                if not isinstance(key, str) or not key.strip():
+                    continue
+                key = key.strip()[:32]
+                if isinstance(val, bool):
+                    evidence[key] = val
+                elif isinstance(val, int):
+                    evidence[key] = val
+                elif isinstance(val, float) and math.isfinite(val):
+                    evidence[key] = val
+                elif isinstance(val, str):
+                    evidence[key] = " ".join(val.split())[:120]
+
+        action = {}
+        raw_action = entry.get("action")
+        if (isinstance(raw_action, dict)
+                and raw_action.get("kind") in ("route", "care")
+                and isinstance(raw_action.get("target"), str)
+                and raw_action["target"].strip()):
+            action = {
+                "kind": raw_action["kind"],
+                "target": raw_action["target"].strip()[:INSIGHT_TARGET_MAX],
+                "label": str(raw_action.get("label") or "").strip()
+                         [:INSIGHT_LABEL_MAX],
+            }
+
+        confidence = entry.get("confidence")
+        confidence = (confidence.strip().lower()
+                      if isinstance(confidence, str) else "measured")
+        if confidence not in ("measured", "partial", "unknown"):
+            confidence = "measured"
+
+        row = {
+            "id": fid, "domain": domain, "severity": severity,
+            "title": title, "detail": detail, "evidence": evidence,
+            "action": action, "at": at, "confidence": confidence,
+        }
+        # A duplicate id keeps the newest observation, not whichever row the
+        # file happened to list last; the bus enforces the same rule on read.
+        if fid not in rows or at >= rows[fid]["at"]:
+            rows[fid] = row
+    ordered = sorted(rows.values(), key=lambda row: row["at"])
+    return ordered[-INSIGHTS_MAX:]
 
 
 def _install_profiles(value, default):
@@ -430,6 +768,48 @@ def _gameping_hosts(value, default):
     return _str_list(value, default, cap=GAMEPING_MAX)
 
 
+def _protected_paths(value, default):
+    """Never-delete list: absolute-ish strings only, de-duplicated, bounded.
+
+    Entries that are blank or contain a NUL are dropped. `..` is kept (a user
+    may legitimately protect a relative-shaped path) because matching is done
+    on `abspath` + normcase downstream.
+    """
+    vals = _str_list(value, default, cap=PROTECTED_PATHS_MAX)
+    out, seen = [], set()
+    for v in vals:
+        s = str(v).strip()
+        if not s or "\x00" in s:
+            continue
+        key = s.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(s)
+    return out
+
+
+def _defender_exclusions(value, default):
+    """SEC-004: exclusions this app recorded, bounded in count and in length.
+
+    `_str_list` alone would bound neither: this list is joined into a single
+    PowerShell `-Command` string elsewhere, so a hand-edited config could make
+    the removal path unrunnable just by being long. A recorded value is always
+    an absolute path this app produced, so blank, NUL-bearing and absurdly long
+    entries are dropped rather than repaired — dropping one can only leave an
+    exclusion behind (harmless, and the path SEC-004 already tolerates), where
+    truncating would invent a path nobody chose.
+    """
+    out = []
+    for path in _str_list(value, default):
+        s = path.strip()
+        if not s or "\x00" in s or len(s) > DEFENDER_EXCLUSION_PATH_MAX:
+            continue
+        if s not in out:
+            out.append(s)
+    return out[:DEFENDER_EXCLUSIONS_MAX]
+
+
 def _game_night_keys(value, default):
     """Tweaks Game Night itself turned on, so End puts back exactly those."""
     return _str_list(value, default, cap=SESSION_KEYS_MAX)
@@ -443,11 +823,11 @@ def _game_night_custom_apps(value, default):
     this copy only has to be no MORE permissive than the one that gates
     the taskkill call. Anything carrying a path separator, a drive colon,
     a quote or a control character is dropped rather than repaired."""
-    vals = _str_list(value, default, cap=25)
+    vals = _str_list(value, default, cap=GAME_NIGHT_APPS_MAX)
     out, seen = [], set()
     for v in vals:
         s = str(v).strip().lower()
-        if (not s or len(s) > 96 or not s.endswith(".exe")
+        if (not s or len(s) > GAME_NIGHT_APP_NAME_MAX or not s.endswith(".exe")
                 or s[0] in "-." or any(
                     c in '\\/:*?"<>|' or ord(c) < 32 for c in s)):
             continue
@@ -513,10 +893,28 @@ SCHEMA = {
                           "off | startup | daily | weekly - when the PC Health badge re-checks"),
     "health_last_grade": (lambda v, d: _str(v, d, choices=("A", "B", "C", "D", "F")) if v else d,
                           "overall grade of the last PC Health check, '' if never"),
-    "drivers_folder": (lambda v, d: v.strip()[:500] if isinstance(v, str) else d,
+    "drivers_folder": (lambda v, d: v.strip()[:DRIVERS_FOLDER_MAX]
+                       if isinstance(v, str) else d,
                        "custom Drivers download folder, '' = default"),
-    "health_last_check": (lambda v, d: float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0 else d,
+    "health_last_check": (_health_last_check,
                           "epoch seconds of the last PC Health check"),
+    "health_history": (_health_history,
+                       "[{t, s, g}] score per completed PC Health checkup; "
+                       "the Health tab's trend"),
+    # A missing key means ON for all four: quiet watch is the default
+    # experience, and these are the switches that turn OFF parts of it.
+    "watch_enabled": (_bool,
+                      "N-006: quiet watch may notify at all"),
+    "watch_free_percent": (lambda v, d: _watch_int(v, d, WATCH_FREE_RANGE),
+                           "N-006: percent free that marks a drive; also ends "
+                           "above this plus 2 points (hysteresis)"),
+    "watch_score_drop": (lambda v, d: _watch_int(v, d, WATCH_SCORE_RANGE),
+                         "N-006: points a checkup may fall and still be quiet"),
+    "watch_missed_run": (_bool,
+                         "N-006: mention a schedule that stopped or failed"),
+    "insights": (_insights,
+                 "[{id, domain, severity, title, at}] findings tools published; "
+                 "the Health/hub shared board (AUDIT TX-002)"),
 
     # --- task selection ------------------------------------------------- #
     "selected_tasks": (_selected_tasks, "per-tab list of task keys; folded "
@@ -545,23 +943,51 @@ SCHEMA = {
                                "apps you added to the close list (exe names only; "
                                "Auto-Pilot closes them by process name, never by path)"),
     "startup_disabled": (_startup_disabled, "records to restore disabled items"),
+    "duplicate_protected_paths": (_protected_paths,
+                                  "Duplicates dialog never-delete list"),
 
     # --- admin gate / tray ---------------------------------------------- #
     "auto_elevate": (_bool, "'stop asking me': relaunch elevated unattended"),
     "remember_limited": (_bool, "never show the Admin Gate again"),
     "add_defender_exclusion": (_bool, "SEC-004: opt-in (default off); excludes only this app's exact executable, never its folder"),
-   "defender_exclusions_applied": (_str_list, "SEC-004: exclusions this app added, so it can remove exactly those when the preference is turned off"),
+    "defender_exclusions_applied": (_defender_exclusions,
+                                    "SEC-004: exclusions this app added, so it "
+                                    "can remove exactly those when the "
+                                    "preference is turned off"),
     "defender_migration_notice_shown": (_bool, "SEC-004: the one-time notice about a folder-wide exclusion left by an older build has been shown"),
     "startup_tray_enabled": (_bool, "boot hidden with --tray"),
     "close_to_tray_enabled": (_bool, "window X hides to the tray"),
+    "window_animations": (lambda v, d: _str(v, d, choices=("system", "on", "off"),
+                                            lower=True),
+                          "system | on | off - overrides the OS animation "
+                          "setting for the window chrome"),
+    "ui_scale": (lambda v, d: _str(v, d, choices=UI_SCALES, lower=True),
+                 "system | 100 | 125 | 150 | 175 | 200 - interface density "
+                 "as the Windows percentage; 'system' keeps the 125% floor"),
+
+    # --- cleaner safety net --------------------------------------------- #
+    # This key was in DEFAULT_CONFIG from the start with no coercer, so it was
+    # the one piece of drift left for validate_schema() to report: a
+    # hand-edited "yes" read as ON although every other stored flag has to be
+    # a real bool. Declared now (2026-10) so the file's contract holds for
+    # every key.
+    "quarantine_enabled": (_bool,
+                           "keep cleaned files in the Quarantine bin instead "
+                           "of deleting them"),
+    "gameping_last_game": (_gameping_last,
+                            "U-008: the game last picked in Server Ping, so "
+                            "the dialog opens on it instead of the top row"),
+    "quarantine_days": (_days,
+                        "U-006: days the bin keeps a file before a launch "
+                        "clears it; 0 = until you empty the bin"),
+
+    # --- tools hub ------------------------------------------------------ #
+    "tools_recent": (lambda v, d: _str_list(v, d, cap=TOOLS_RECENT_MAX),
+                     "tools hub: opened card keys, newest first (AUDIT TV-001)"),
 
     # --- one-shot tips -------------------------------------------------- #
     "seen_tips": (_tip_flags, "tip_id -> True; bounded bool map, read by has_seen_tip"),
 }
-
-
-def schema_keys():
-    return set(SCHEMA)
 
 
 def apply_schema(data, defaults, extra=()):

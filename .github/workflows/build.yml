@@ -12,10 +12,23 @@ name: Build Windows Executable
 #   - Every build embeds a full VERSIONINFO resource (version_info.txt:
 #     CompanyName, ProductName, FileVersion, etc.), which removes one of the
 #     heuristic signals behind "Behavior:Win32/Persistence.A!ml".
-#   - Code signing is the single highest-leverage remaining fix. The
-#     "Sign the executable" step below is ready and runs only when you
-#     upload the two secrets listed in its comments. Until then the build
-#     is unsigned, but already carries proper version metadata.
+#   - Code signing is the single highest-leverage remaining fix, and it is
+#     wired to SSL.com eSigner (cloud HSM) below. It runs only when the four
+#     secrets listed in that step exist; until then the build is unsigned but
+#     already carries proper version metadata.
+#
+#     Why a cloud service and not a .pfx: since the CA/Browser Forum baseline
+#     requirements took effect on 2023-06-01, a publicly trusted OV/EV code
+#     signing private key must be generated, stored and used inside qualifying
+#     hardware. A .pfx pasted into a GitHub secret is no longer how a newly
+#     purchased certificate is delivered, so that flow was retired here rather
+#     than left as a trap. Signing also does not buy instant SmartScreen
+#     trust: publisher reputation still builds over weeks of clean installs.
+#     See the README's "Code signing" section.
+#
+#   - The signing step is gated on push/workflow_dispatch, never on
+#     pull_request: a fork PR gets no secrets anyway, and a same-repo PR should
+#     not spend a signature or hand signing credentials to reviewable code.
 on:
   push:
     branches: [ "main" ]
@@ -37,6 +50,11 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          # The token is not needed after checkout; keeping it in the git
+          # config hands every later step (and any dependency's build hook)
+          # a credential that can write to the repo.
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -47,21 +65,51 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pytest ruff
+          pip install -r requirements-dev.txt
 
       - name: Run the regression suite
         run: python -m pytest -q
 
-      # Undefined-name check. F821 is deliberately the only selector: the
-      # codebase has many intentional best-effort imports/locals that other
-      # pyflakes rules flag, but an undefined name is always a runtime bug.
-      # Three shipped in v1 (all_priority/all_selected class errors) and were
-      # invisible because the handlers around them swallow exceptions.
-      - name: Static check (undefined names)
-        run: python -m ruff check app --select F821
+      # Static check: the whole `F` (pyflakes) set, not just F821. Every
+      # finding here is a real defect class - an undefined or unused name, a
+      # redefinition, a wildcard import, a `return` outside a function - and
+      # three undefined names shipped in v1 (all_priority/all_selected) because
+      # the handlers around them swallow exceptions. app/ is at zero now, so
+      # any new finding fails the build. Widen to E9 (syntax errors) and I
+      # (import order) only when the codebase is clean for those too.
+      - name: Static check (pyflakes defects)
+        run: python -m ruff check app dev --select F
+
+      # The design-literal gate (dev/tools/design_literals.py). It also runs inside
+      # the suite, but as its own step its report is a line in the CI log rather
+      # than a truncated test failure: a new widget that writes `padx=9`,
+      # `radius=16`, an icon size or a hand-written font tuple gets told which
+      # token to reach for, for every finding at once.
+      - name: Design-literal gate
+        run: python dev/tools/design_literals.py
 
       - name: SEC-001 allowlist drift guard
-        run: python tools/verify_sec001_task_allowlist.py
+        run: python dev/tools/verify_sec001_task_allowlist.py
+
+      # R-008: every PowerShell call site goes through app/powershell.py, where
+      # the exe is resolved (System32\WindowsPowerShell\v1.0 first, never a PATH
+      # lookup) and the flags are decided once. Twenty hand-built copies had
+      # drifted before that - most said a bare "powershell", which does not
+      # exist on PATH on every machine, and three pasted the script into a shell
+      # string. The guard walks the AST, so a new list, a new shell string or a
+      # bare exe handed to ShellExecuteW all fail the build.
+      - name: PowerShell single call-site guard
+        run: python dev/tools/verify_powershell_single_call_site.py
+
+      # The dry-run promise. Storage Insight, the Health junk sensor and the
+      # Low-Space nudge estimate sizes by CALLING the real Clean-tab tasks with
+      # dry_run=True (app/storage_scan.SCAN_ALLOWLIST says which). A task that
+      # forgets its `if _dry(ctx)` check then deletes during a read-only scan -
+      # H-001 shipped exactly that. The guard walks what each allowlisted task
+      # can reach and fails on a mutation no dry check dominates, and it
+      # re-proves the dry-aware primitives the allowlist relies on.
+      - name: Dry-run scope guard
+        run: python dev/tools/verify_dryrun_scope.py
 
       - name: Build with PyInstaller
         # --onefile    : single portable .exe
@@ -84,80 +132,91 @@ jobs:
           app/__main__.py
 
       # ------------------------------------------------------------------
-      # Optional Authenticode signing (DEF-001 highest-leverage fix)
+      # Authenticode signing via SSL.com eSigner (cloud HSM)
       # ------------------------------------------------------------------
-      # This step is SKIPPED automatically until you add the two secrets
-      # below. Once the secrets exist, every future build is signed with
-      # no further action from you.
+      # The private key never leaves SSL.com's FIPS-validated cloud HSM, which
+      # is what the 2023 CA/Browser Forum hardware rule requires and what a
+      # .pfx in a secret cannot satisfy for a newly issued certificate. To
+      # enable, create these four repository secrets (Settings -> Secrets and
+      # variables -> Actions):
       #
-      # How to enable (one-time):
-      #   1. Buy a code-signing certificate (OV or EV). EV is stronger
-      #      against SmartScreen but more expensive.
-      #   2. Export the cert as a .pfx (PKCS#12) protected by a password.
-      #   3. In the GitHub repo -> Settings -> Secrets and variables -> Actions
-      #      create two repository secrets:
-      #        CODE_SIGNING_PFX_BASE64   = base64 of the entire .pfx file
-      #                                   (PowerShell: [Convert]::ToBase64String(
-      #                                      [IO.File]::ReadAllBytes("cert.pfx")))
-      #        CODE_SIGNING_PASSWORD     = the password you set on the .pfx
-      #   4. Push any change. The next build will be signed.
+      #   ES_USERNAME      SSL.com account username
+      #   ES_PASSWORD      SSL.com account password
+      #   ES_CREDENTIAL_ID eSigner credential id
+      #                    (CodeSignTool's get_credential_ids prints it)
+      #   ES_TOTP_SECRET   the base32 seed behind the eSigner OTP, which is
+      #                    what makes unattended signing possible
       #
-      # After the first signed build, also submit the .exe once to
-      # https://www.microsoft.com/wdsi/filesubmission so Microsoft's
-      # reputation system learns the new signature faster.
-      - name: Sign the executable (Authenticode)
+      # Nothing is exported or downloaded: the action sends the file's hash,
+      # SSL.com signs it inside the HSM and the signed binary comes back. The
+      # action is pinned to a commit rather than `@develop`, because this step
+      # holds credentials that could sign malware in the project's name.
+      - name: Check for signing credentials
+        id: creds
+        shell: pwsh
         env:
-          CODE_SIGNING_PFX_BASE64: ${{ secrets.CODE_SIGNING_PFX_BASE64 }}
-          CODE_SIGNING_PASSWORD: ${{ secrets.CODE_SIGNING_PASSWORD }}
+          ES_USERNAME: ${{ secrets.ES_USERNAME }}
+        run: |
+          # Secrets cannot be read from an `if:` expression directly, so the
+          # presence test happens here and the result travels as an output.
+          $present = -not [string]::IsNullOrEmpty($env:ES_USERNAME)
+          "available=$($present.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+          if ($present) { Write-Host "Signing credentials found." }
+          else { Write-Host "No signing credentials: the artifact will be unsigned." }
+
+      - name: Sign the executable (SSL.com eSigner)
+        if: >-
+          steps.creds.outputs.available == 'true' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        uses: sslcom/esigner-codesign@b7f8ff36fc0de8690fbbab8e5b4421d29802f747
+        with:
+          command: sign
+          username: ${{ secrets.ES_USERNAME }}
+          password: ${{ secrets.ES_PASSWORD }}
+          credential_id: ${{ secrets.ES_CREDENTIAL_ID }}
+          totp_secret: ${{ secrets.ES_TOTP_SECRET }}
+          file_path: ${{ github.workspace }}/dist/Cleaner-Tool.exe
+          # Replace dist/Cleaner-Tool.exe in place, so the checksum, the
+          # artifact upload and the release all pick up the SIGNED bytes
+          # without any of them being told the path changed.
+          override: true
+
+      # Nothing used to verify the result: the old step could report success
+      # and still leave an unsigned file, for a signature-tooling reason
+      # nobody surfaced. This makes the point of the step checkable and fails
+      # the build rather than publishing bytes it cannot vouch for.
+      - name: Verify the signature
+        # Tied to the sign step, not to the credentials: with secrets set, a
+        # same-repo PR skips signing (see the condition above) and must not be
+        # failed by a verifier looking at an intentionally unsigned file.
+        if: steps.sign.outcome == 'success'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-
-          if ([string]::IsNullOrEmpty($env:CODE_SIGNING_PFX_BASE64) -or
-              [string]::IsNullOrEmpty($env:CODE_SIGNING_PASSWORD)) {
-            Write-Host "No code-signing secrets found — skipping Authenticode signing."
-            Write-Host "(Add CODE_SIGNING_PFX_BASE64 + CODE_SIGNING_PASSWORD to enable.)"
-            exit 0
+          $sig = Get-AuthenticodeSignature "dist\Cleaner-Tool.exe"
+          Write-Host ("Status      : " + $sig.Status)
+          Write-Host ("StatusText  : " + $sig.StatusMessage)
+          if ($sig.SignerCertificate) {
+            Write-Host ("Signed by   : " + $sig.SignerCertificate.Subject)
+            Write-Host ("Thumbprint  : " + $sig.SignerCertificate.Thumbprint)
           }
-
-          Write-Host "Signing Cleaner-Tool.exe …"
-
-          $pfxBytes = [Convert]::FromBase64String($env:CODE_SIGNING_PFX_BASE64)
-          $pfxPath  = Join-Path $env:RUNNER_TEMP "codesign.pfx"
-          [IO.File]::WriteAllBytes($pfxPath, $pfxBytes)
-
-          # Prefer the modern Windows SDK signtool if present, otherwise fall
-          # back to the one that ships with the Visual Studio build tools.
-          $signtool = Get-Command signtool.exe -ErrorAction SilentlyContinue
-          if (-not $signtool) {
-            $candidates = @(
-              "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe",
-              "${env:ProgramFiles}\Windows Kits\10\bin\*\x64\signtool.exe"
-            )
-            $found = Get-ChildItem -Path $candidates -ErrorAction SilentlyContinue |
-                     Sort-Object FullName -Descending |
-                     Select-Object -First 1
-            if ($found) { $signtool = $found.FullName }
+          if (-not $sig.TimeStamperCertificate) {
+            # An untimestamped signature stops verifying the day the
+            # certificate expires, for copies already downloaded as well.
+            throw "Signature is not timestamped; it must stay verifiable after the certificate expires."
           }
-          if (-not $signtool) {
-            throw "signtool.exe not found on the runner. Cannot sign."
+          if ($sig.Status -ne 'Valid') {
+            throw "Signature status is '$($sig.Status)' - refusing to publish an unverified binary."
           }
+          Write-Host "Signature verified against a trusted root."
 
-          & $signtool sign `
-            /f $pfxPath `
-            /p $env:CODE_SIGNING_PASSWORD `
-            /fd sha256 `
-            /tr http://timestamp.digicert.com `
-            /td sha256 `
-            /v `
-            "dist\Cleaner-Tool.exe"
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "signtool failed with exit code $LASTEXITCODE"
-          }
-          Write-Host "Signing completed successfully."
-
-          Remove-Item $pfxPath -Force -ErrorAction SilentlyContinue
+      - name: Note an unsigned build
+        # "Anything but signed" - no credentials, or a PR that is deliberately
+        # not signed - so the log never implies this artifact is verifiable.
+        if: steps.sign.outcome != 'success'
+        shell: pwsh
+        run: |
+          Write-Host "::warning title=Unsigned build::This artifact is unsigned: either no SSL.com eSigner secrets are configured, or this event is a pull request (which is never signed). SmartScreen will warn about it."
 
       - name: Compute SHA-256 checksum
         # Published next to the .exe so a downloader can verify it. The

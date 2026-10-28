@@ -41,7 +41,6 @@ import ctypes
 import ctypes.wintypes as wt
 import hashlib
 import os
-import subprocess
 import sys
 
 from app.infra.fs_safe import is_safe_to_delete, safe_walk
@@ -202,28 +201,6 @@ SIZE_STEPS = (
     ("10 MB and up", 10 * 1024 * 1024),
     ("100 MB and up", 100 * 1024 * 1024),
 )
-
-#: Type filters. `None` means "everything". These are the groups people
-#: actually want to clear - screenshots, installers, archives - not a
-#: taxonomy of every extension Windows knows.
-TYPE_FILTERS = (
-    ("all", "Everything", None),
-    ("images", "Pictures", (".jpg", ".jpeg", ".png", ".gif", ".bmp",
-                            ".webp", ".heic", ".tif", ".tiff")),
-    ("video", "Video", (".mp4", ".mkv", ".avi", ".mov", ".wmv", ".webm",
-                        ".m4v")),
-    ("audio", "Music", (".mp3", ".flac", ".wav", ".m4a", ".aac", ".ogg")),
-    ("docs", "Documents", (".pdf", ".doc", ".docx", ".xls", ".xlsx",
-                           ".ppt", ".pptx", ".txt", ".rtf", ".epub")),
-    ("zip", "Archives", (".zip", ".7z", ".rar", ".tar", ".gz", ".bz2",
-                         ".xz", ".iso")),
-)
-
-
-def _files_under(root: str, min_size: int, max_files: int):
-    """Kept for callers that just want the paths. Hardlinks already collapsed."""
-    reps, truncated = _collect(root, min_size, max_files)
-    return [r["path"] for r in reps], truncated
 
 
 def keep_candidate(copies):
@@ -449,45 +426,17 @@ def load_protected() -> list:
     return [str(x).strip() for x in raw if str(x).strip()]
 
 
-def save_protected(paths) -> bool:
-    """Persist the never-delete list. Returns False if it could not be saved."""
-    clean = []
-    seen = set()
-    for p in paths or []:
-        p = str(p or "").strip()
-        if not p:
-            continue
-        key = os.path.normcase(p)
-        if key in seen:
-            continue
-        seen.add(key)
-        clean.append(p)
-    try:
-        from app.config_persist import load_config, save_config
-        cfg = load_config()
-        cfg[_CONFIG_KEY] = clean
-        save_config(cfg)
-        return True
-    except Exception:
-        return False
-
-
-def add_protected(path: str) -> bool:
-    if not (path or "").strip():
-        return False
-    cur = load_protected()
-    if any(os.path.normcase(p) == os.path.normcase(path.strip())
-           for p in cur):
-        return True
-    cur.append(path.strip())
-    return save_protected(cur)
-
-
-def remove_protected(path: str) -> bool:
-    target = os.path.normcase((path or "").strip())
-    cur = [p for p in load_protected()
-           if os.path.normcase(p) != target]
-    return save_protected(cur)
+# I-006: there used to be save_protected()/add_protected()/remove_protected()
+# here, and nothing called any of them - the 2026-10 UI pass removed the
+# affordance that would have (see duplicates_dialog's module docstring: "it
+# just has no button here") but left the writers behind. Deleting them makes
+# the truth explicit: this list is CONFIG-ONLY, maintained by hand in
+# config.json, and the app only ever reads it. `load_protected`
+# + `normalise_protected` + `is_protected` are the whole live surface, and
+# `recycle()` re-checks it itself so a filter bug upstream cannot become a
+# deletion. If the affordance ever comes back, its writer belongs here again -
+# capped by `config_schema.PROTECTED_PATHS_MAX` on the way out, not only on
+# load.
 
 
 def normalise_protected(protected) -> tuple:
@@ -542,19 +491,6 @@ def is_protected(path: str, protected=None) -> bool:
         if fnmatch.fnmatch(low, pat):
             return True
     return False
-
-
-def aliases_of(group: dict):
-    """Every hardlink name in a group, flattened.
-
-    Shown as information only. These are NOT removable: unlinking one of
-    several names for the same inode frees no space, so offering it would be
-    the false success BUG-038 is about.
-    """
-    out = []
-    for c in group.get("copies", []):
-        out.extend(c.get("aliases") or [])
-    return out
 
 
 def recycle(paths, timeout: int = 60, protected=None, should_stop=None,
@@ -673,12 +609,58 @@ def _recycle_one(path: str) -> bool:
         return False
 
 
-def recycle_bytes(paths) -> int:
-    """How much a proposed action would free, without touching anything."""
-    total = 0
-    for p in paths or []:
+#: Below this the scan is not a conclusion worth carrying to another screen.
+DUPLICATE_FINDING_BYTES = 2 * (1024 ** 3)
+
+
+def publish_reclaim_finding(stats) -> list:
+    """Publish what a completed duplicate scan found (AUDIT TX-002).
+
+    The scan is authoritative for its namespace: a later scan with nothing
+    over the threshold clears the old row, and so does cleaning the copies
+    down. Only a caller that actually completed a scan may invoke this - an
+    error or a cancelled walk has no standing to claim "nothing left".
+    """
+    try:
+        from app import insights
+        from app.insights import Finding
+        from app.utils import format_bytes
+        import time as _time
+    except Exception:
+        return []
+    try:
+        wasted = int((stats or {}).get("wasted") or 0)
+    except (TypeError, ValueError, OverflowError):
+        wasted = 0
+    if wasted < DUPLICATE_FINDING_BYTES:
         try:
-            total += os.path.getsize(p)
-        except OSError:
-            continue
-    return total
+            return insights.replace("duplicates.")
+        except Exception:
+            return []
+    try:
+        groups = int((stats or {}).get("groups") or 0)
+    except (TypeError, ValueError, OverflowError):
+        groups = 0
+    partial = bool((stats or {}).get("truncated")
+                   or (stats or {}).get("hash_capped"))
+    detail = ("%d set%s of copies. One copy of each is always kept, and "
+              "every removal goes to the Recycle Bin."
+              % (groups, "" if groups == 1 else "s"))
+    if partial:
+        detail += " The folder is huge, so this scan is partial."
+    finding = Finding(
+        id="duplicates.files",
+        domain="storage",
+        severity="warn",
+        title="%s of duplicate files" % format_bytes(wasted, compact=True),
+        detail=detail,
+        evidence={"bytes": wasted, "groups": groups, "partial": partial},
+        action={"kind": "route", "target": "duplicates",
+                "label": "Open Duplicates"},
+        observed_at=_time.time(),
+        confidence="partial" if partial else "measured",
+    )
+    try:
+        return insights.replace("duplicates.", finding)
+    except Exception:
+        return []

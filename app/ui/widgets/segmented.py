@@ -7,8 +7,9 @@ from __future__ import annotations
 import time
 import tkinter as tk
 
-from app.ui.theme import (COLORS, _measure_font, _hex_lerp,
-                                _round_rect_points, F)
+from app.ui.theme import (
+    COLORS, TYPE, _hex_lerp, _measure_font, _round_rect_points
+)
 
 class SegmentedTabs(tk.Canvas):
     """One-pill tab switcher for dialogs (Drive Toolkit + Process Manager).
@@ -41,9 +42,9 @@ class SegmentedTabs(tk.Canvas):
             range(n))
         self._accent = accent or COLORS["accent_blue"]
         self._command = command
-        self._font = font or (F, 9, "bold")
+        self._font = font or TYPE["label_medium"]
         self._font_off = (self._font[0], self._font[1]) \
-            if len(self._font) >= 2 else (F, 9)
+            if len(self._font) >= 2 else TYPE["caption"]
         # Segment width: caller override, else measured max label + padding.
         # Measured with the shared cached font (no throwaway widgets).
         if seg_w is not None:

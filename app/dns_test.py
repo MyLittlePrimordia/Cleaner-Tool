@@ -99,11 +99,13 @@ def get_current_dns(timeout: int = 15) -> list:
     row instead of guessing."""
     try:
         import subprocess as _sp
+        # R-008: argv from the shared runner, imported inside the call because
+        # this module keeps no app-level imports at module scope.
+        from app.tasks.ps import ps_argv
         out = _sp.run(
-            ["powershell", "-NoProfile", "-Command",
-             "Get-DnsClientServerAddress -AddressFamily IPv4 "
-             "-ErrorAction SilentlyContinue | "
-             "ForEach-Object { $_.ServerAddresses }"],
+            ps_argv("Get-DnsClientServerAddress -AddressFamily IPv4 "
+                    "-ErrorAction SilentlyContinue | "
+                    "ForEach-Object { $_.ServerAddresses }"),
             capture_output=True, text=True, timeout=timeout,
             creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
         )

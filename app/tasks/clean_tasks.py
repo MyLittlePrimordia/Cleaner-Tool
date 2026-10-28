@@ -12,11 +12,12 @@ import time
 
 from app.utils import (
     TaskCancelled, TaskContext, clean_folder_contents, create_restore_point,
-    run_cmd, resolve_exe,
+    mark_unmeasured, run_cmd, resolve_exe,
 )
 from app.tasks.launcher_paths import (
     ALL_LAUNCHER_CACHE_PATHS, GPU_SHADER_CACHE_ALL, refresh_dynamic_paths,
 )
+from app.tasks.ps import run_ps
 
 _USERPROFILE = os.environ.get("USERPROFILE", "")
 _LOCALAPPDATA = os.environ.get("LOCALAPPDATA", "")
@@ -44,6 +45,31 @@ def _dry(ctx: TaskContext) -> bool:
     that is meant to change nothing.
     """
     return bool(getattr(ctx, "dry_run", False))
+
+
+def _empty_recycle_bin_native() -> bool:
+    """Empty the Recycle Bin through the Shell API. Never raises.
+
+    `Clear-RecycleBin` is a PowerShell cmdlet: on a machine where Explorer
+    holds a single deleted file it can sit until the caller's timeout, which
+    is exactly the 120-second stall in the 2026-10 user log. SHEmptyRecycleBinW
+    is the same operation Windows' own "Empty Recycle Bin" uses; it returns an
+    HRESULT instead of hanging a subprocess, and the flags suppress the
+    confirmation, progress UI and sound (SHERB_NOCONFIRMATION = 0x1,
+    SHERB_NOPROGRESSUI = 0x2, SHERB_NOSOUND = 0x4).
+
+    Returns False on any failure so the caller can fall back to the cmdlet.
+    """
+    try:
+        if os.name != "nt":
+            return False
+        import ctypes
+        flags = 0x1 | 0x2 | 0x4
+        hr = ctypes.windll.shell32.SHEmptyRecycleBinW(None, None, flags)
+        # S_OK (0) and S_FALSE (1, already empty) both mean the bin is clear.
+        return hr in (0, 1)
+    except Exception:
+        return False
 
 
 def _clean_many(ctx: TaskContext, folders, label):
@@ -303,9 +329,23 @@ def clean_recycle_bin_and_dumps(ctx: TaskContext):
         ctx.log("[dry-run] would empty the Recycle Bin.")
     else:
         ctx.log("Emptying Recycle Bin (silent)...")
-        rc = run_cmd(ctx, 'powershell -NoProfile -Command "Clear-RecycleBin -Force -ErrorAction SilentlyContinue"')
-        if rc != 0:
-            ctx.log("  (Recycle Bin could not be emptied — some items may be in use.)")
+        # 2026-10 (user log): Clear-RecycleBin launched a whole PowerShell
+        # process and then sat until its timeout on a machine where Explorer
+        # held one file. The Shell API is the same operation without the
+        # process launch, and it is the call Windows' own UI uses. It returns
+        # a real HRESULT, so a failure can be reported instead of waiting out
+        # a timeout.
+        if _empty_recycle_bin_native():
+            ctx.log("Recycle Bin emptied.")
+        else:
+            # Fallback for a shell that refuses the API (rare). The bound is
+            # deliberately short: a bin that cannot be emptied in 15s is
+            # stuck, and the run should say so rather than appear frozen.
+            rc = run_ps(ctx, "Clear-RecycleBin -Force -Confirm:$false "
+                            "-ErrorAction SilentlyContinue", timeout=15)
+            if rc != 0:
+                ctx.log("  (Recycle Bin could not be emptied — some items "
+                        "may be in use. Empty it from Explorer if needed.)")
     return total
 
 
@@ -361,7 +401,7 @@ def _office_running():
     images = ("winword.exe", "excel.exe", "powerpnt.exe", "outlook.exe",
               "onenote.exe", "msaccess.exe", "mspub.exe")
     try:
-        out = _sp.check_output(
+        out = _sp.check_output(  # dry-ok: read-only `tasklist` probe
             ["tasklist", "/fo", "csv", "/nh"], text=True, stderr=_sp.DEVNULL,
             timeout=10, creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0))
     except Exception:
@@ -373,8 +413,13 @@ def _office_running():
 def clean_office_cache(ctx: TaskContext):
     # B-029: never delete the Office Document Cache while Office is running.
     if _office_running() is not False:
+        reason = ("Office may be running, so the Office cache was not looked "
+                  "at — close Office and run again")
         ctx.log("  ! Office may be running — skipping the Office cache so "
                 "unsynced offline edits are not lost. Close Office and run again.")
+        # A skip is not an empty folder: a measuring pass must report this
+        # size as unknown rather than 0 (see app.storage_scan).
+        mark_unmeasured(ctx, reason)
         return 0
     folders = [
         os.path.join(_LOCALAPPDATA, "Microsoft\\Office\\16.0\\OfficeFileCache"),
@@ -486,7 +531,9 @@ def _check_browser_running(ctx: TaskContext) -> list[str]:
     try:
         # Use timeout to avoid indefinite hang if tasklist/WMI stalls; not routed via run_cmd deliberately
         # but we add timeout and handle TimeoutExpired gracefully.
-        output = subprocess.check_output(
+        # A read-only probe: it lists processes and changes nothing, and the
+        # dry-run scan needs it to warn about open browsers.
+        output = subprocess.check_output(  # dry-ok: read-only `tasklist` probe
             ["tasklist", "/fo", "csv", "/nh"], text=True, stderr=subprocess.DEVNULL, timeout=10
         )
         for line in output.splitlines():
@@ -687,12 +734,7 @@ def purge_ram_working_sets(ctx: TaskContext):
     if _dry(ctx):
         ctx.log("[dry-run] would trim process working sets.")
         return 0
-    rc = run_cmd(
-        ctx,
-        ["powershell", "-NoProfile", "-Command", ps_script],
-        shell=False,
-        timeout=120,
-    )
+    rc = run_ps(ctx, ps_script, timeout=120)
     if rc == 0:
         ctx.log("Memory trim complete — Windows will reclaim pages as needed.")
         return 0
@@ -1099,8 +1141,7 @@ def remove_windows_bloat(ctx: TaskContext):
             "Write-Output \"CLEANER_TOOL_BAD=$bad\""
         )
         out: list = []
-        rc = run_cmd(ctx, ["powershell", "-NoProfile", "-Command", script],
-                     shell=False, timeout=60, collect=out)
+        rc = run_ps(ctx, script, timeout=60, collect=out)
         qf = ok = bad = 0
         for line in out:
             s = str(line).strip()
@@ -1252,7 +1293,7 @@ def _steam_running():
     must not be answered "safe to proceed", so callers now skip on None."""
     try:
         import subprocess as _sp
-        out = _sp.check_output(
+        out = _sp.check_output(  # dry-ok: read-only `tasklist` probe
             ['tasklist', '/fi', 'imagename eq steam.exe', '/fo', 'csv', '/nh'],
             text=True, timeout=10, stderr=_sp.DEVNULL,
             creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
@@ -1271,9 +1312,13 @@ def clean_steam_download_cache(ctx: TaskContext):
         # folders below are written during an active download.
         ctx.log("  ! could not determine whether Steam is running - skipping "
                 "to avoid touching active downloads.")
+        mark_unmeasured(ctx, "could not tell whether Steam is running, so the "
+                             "depot cache was not looked at")
         return 0
     if _steam:
         ctx.log("Steam is running — skipping to avoid touching active downloads.")
+        mark_unmeasured(ctx, "Steam is running, so the depot cache was not "
+                             "looked at — close Steam and scan again")
         return 0
     root = _steam_root()
     total = _clean_many(ctx, [os.path.join(root, "depotcache")], "Steam depot cache")
@@ -1634,7 +1679,6 @@ def _looks_like_residual_folder(folder_path: str) -> bool:
     # have proof there is data, and no evidence about what it is. That is
     # "unknown", and unknown must never be scored as "confidently deletable".
     if reparse_pruned:
-        ctx_free_note = ""      # no ctx here; the caller logs the skip
         return False
 
     if total_files == 0:
@@ -1664,6 +1708,8 @@ def clean_orphan_program_leftovers(ctx: TaskContext):
         installed = installed_display_names()
     except Exception as exc:
         ctx.log(f"  ! could not read installed programs list: {exc}")
+        mark_unmeasured(ctx, "the installed-programs list could not be read, so "
+                             "orphan leftovers were not looked at")
         return 0
 
     # H-4 (HIGH) fix: fail CLOSED. The orphan test is "the folder name matches
@@ -1677,6 +1723,8 @@ def clean_orphan_program_leftovers(ctx: TaskContext):
     if len(installed) < 25:
         ctx.log(f"  ! only {len(installed)} registered program names were readable "
                 "— refusing the orphan scan (needs a trustworthy installed list).")
+        mark_unmeasured(ctx, "only %d installed program names were readable, so "
+                             "the orphan scan was refused" % len(installed))
         return 0
 
     ctx.log(f"Orphan scan: {len(installed)} registered program names on this PC")
@@ -1862,7 +1910,6 @@ def audit_downloads_folder(ctx: TaskContext):
         if len(old) > 15:
             ctx.log(f"  ...and {len(old) - 15} more")
 
-    total = biggest if False else 0
     ctx.log("Nothing was deleted. Open the folder and remove what you don't "
             "need:")
     ctx.log(f"  {dl}")
@@ -1933,7 +1980,7 @@ def audit_docker_wsl_usage(ctx: TaskContext):
     safe commands involve pruning images or compacting a VHDX, and both need
     the user to choose what goes.
     """
-    from app.utils import format_bytes as _fb, resolve_exe as _rx
+    from app.utils import resolve_exe as _rx
     rows = []
 
     # WSL virtual disks live in the AppData package store.
@@ -2000,7 +2047,17 @@ TASKS = [
     Task("chk_fragments", "Remove Disk Fragments", "Deletes leftover files from disk checks", clean_chk_fragments, default=True, admin_required=True),
     Task("old_logs", "Clear System Logs", "Removes Windows CBS/DISM/Update logs — these are the evidence needed to diagnose a failed update", clean_old_logs, default=False, admin_required=True, risk="ADVANCED"),
     Task("dns_flush", "Fix Internet (DNS)", "Clears internet cache to fix sites not loading", flush_dns, default=True, admin_required=False),
-    Task("ram_purge", "Free Up RAM", "Asks Windows to free unused memory", purge_ram_working_sets, default=False, admin_required=False),
+    # A-002: this used to be "Free Up RAM / Asks Windows to free unused
+    # memory" - the exact "Boost RAM" pitch this app does not ship (it calls
+    # EmptyWorkingSet on every process, which pages everything out and makes
+    # the next click slower). The task stays - it is opt-in, sometimes wanted
+    # for diagnostics, and never selected by a preset - but the copy can no
+    # longer claim it speeds the PC up. `dev/tests/test_ram_trim_honesty.py`
+    # fails the build if a preset starts picking it or the copy drifts back.
+    Task("ram_purge", "Force Memory Trim",
+         "Pages out unused memory - Windows already reclaims it under "
+         "pressure, so this rarely helps and can slow the next click",
+         purge_ram_working_sets, default=False, admin_required=False),
     Task("update_leftovers", "Clear Update Leftovers", "Run this only once your PC has been running fine for a few days after a big Windows update", clean_windows_update_leftovers, default=False, admin_required=True, risk="ADVANCED"),
     Task("activity_traces", "Clear Activity Traces", "Clears recent-files and jump-list history for privacy", clean_activity_traces, default=False, admin_required=False),
     Task("prefetch", "Clear Prefetch Files", "Clears prefetch data, usually not needed", clean_prefetch, default=False, admin_required=True, risk="ADVANCED"),

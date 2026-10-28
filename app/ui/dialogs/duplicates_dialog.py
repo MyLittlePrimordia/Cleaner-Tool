@@ -31,14 +31,14 @@ from __future__ import annotations
 
 import os
 import threading
-import tkinter as tk
 from tkinter import filedialog as _fd
 
 from app.dupes import (SIZE_STEPS, is_protected, load_protected,
                        normalise_protected, promote_keeper)
 from app.ui.base import _themed_askyesno
 from app.ui.dialogs._tool_page import TOOL_ACCENT, ToolPage
-from app.ui.theme import COLORS, F
+from app.ui.theme import COLORS, SPACE_2
+from app.ui.metrics import GROUP_GAP
 from app.ui.widgets import AnimatedButton
 from app.ui.widgets.chips import ChipBar
 from app.ui.widgets.datatable import DataTable
@@ -113,8 +113,7 @@ class DuplicatesDialog(ToolPage):
                                            self._pick)
         self._stop_btn = AnimatedButton(
             self.foot_btns, text="Stop", command=self._stop_scan,
-            bg=COLORS["surface"], fg=COLORS["accent_yellow"], font=(F, 9),
-            padx=14, pady=6)
+            role="warn", size="sm")
 
         self.on_close(self._stop)
         self._idle()
@@ -127,7 +126,7 @@ class DuplicatesDialog(ToolPage):
         self._scanning = bool(busy)
         try:
             if busy and not self._stop_btn.winfo_manager():
-                self._stop_btn.pack(side="right", padx=(8, 0))
+                self._stop_btn.pack(side="right", padx=(SPACE_2, 0))
             elif not busy and self._stop_btn.winfo_manager():
                 self._stop_btn.pack_forget()
             self._folder_btn.set_enabled(not busy)
@@ -150,10 +149,10 @@ class DuplicatesDialog(ToolPage):
 
     def _show_main(self):
         if not self.toolbar.winfo_manager():
-            self.toolbar.pack(fill="x", pady=(10, 0), before=self.content)
+            self.toolbar.pack(fill="x", pady=(GROUP_GAP, 0), before=self.content)
         for b in (self.primary_btn, self._folder_btn):
             if not b.winfo_manager():
-                b.pack(side="right", padx=(8, 0))
+                b.pack(side="right", padx=(SPACE_2, 0))
 
     def _on_view(self, key):
         self._view = key
@@ -202,8 +201,14 @@ class DuplicatesDialog(ToolPage):
         def report(phase, done, total):
             if token[0]:
                 return
-            self._ui(self.status.set_text, "%s: %s files..." % (
-                _PHASE_TEXT.get(phase, "Working"), format(done, ",")))
+            label = _PHASE_TEXT.get(phase, "Working")
+            if total and total > 0:
+                # AUDIT TV-006: hashing is the long phase and it already knows
+                # how many files it has to do - show that, not a loop.
+                self._ui(self.status.progress, done, total, label, "files")
+            else:
+                self._ui(self.status.set_text,
+                         "%s: %s files..." % (label, format(done, ",")))
 
         def worker():
             try:
@@ -225,9 +230,25 @@ class DuplicatesDialog(ToolPage):
         self._data = data if isinstance(data, dict) else {}
         self.set_busy(False)
         self.status.stop("")
+        self._publish_finding()
         self._paint_banner()
         self._render()
         self._sync_primary()
+
+    def _publish_finding(self):
+        """Carry this scan's result to Health and the Tools hub (AUDIT TX-002).
+
+        An errored scan must not clear a real warning from another day, so it
+        is the one path that does not publish. Everything else is a completed
+        read and owns the `duplicates.` namespace.
+        """
+        if self._data.get("error"):
+            return
+        try:
+            from app.dupes import publish_reclaim_finding
+            publish_reclaim_finding(self._data.get("stats") or {})
+        except Exception:
+            pass
 
     def _paint_banner(self):
         from app.dupes import verdict_for
@@ -341,6 +362,9 @@ class DuplicatesDialog(ToolPage):
         self._freed += int(res.get("freed") or 0)
         self.set_busy(False)
         self._drop_groups(keep)
+        # Cleaning can take the total below the threshold; the bus should stop
+        # recommending a tool whose problem was just solved.
+        self._publish_finding()
         if res.get("cancelled"):
             self.status.stop("Stopped. %s freed so far." % _fmt(self._freed),
                              COLORS["accent_yellow"])
@@ -482,6 +506,3 @@ class DuplicatesDialog(ToolPage):
                     "size": {"text": _fmt(f.get("size") or 0), "bold": True},
                 }})
         return rows
-
-    def _resize(self):
-        pass

@@ -1,5 +1,21 @@
 """
 Config persistence for scheduled runs and user preferences.
+
+This module owns the CONFIG FILE itself: the atomic writer, the loader and its
+cache, corruption recovery from the .bak, the quarantine notice, and the lock
+that every read-modify-write goes through. Nothing else.
+
+The writers for individual config regions live next door (R-006) and are
+re-exported below, so `from app.config_persist import <writer>` still works:
+
+    app/config_history.py    the rolling run ledger
+    app/config_tweaks.py     tweak snapshots, applied registry, undo bundles
+    app/config_profiles.py   install profiles ("My Setups")
+    app/config_startup.py    Startup Manager undo records
+
+Game Night and the one-time tip flags are small enough to stay here. The
+Defender exclusion record is written by app/elevation.py, next to the code that
+adds and removes the exclusions, not here.
 """
 
 import contextlib
@@ -8,8 +24,6 @@ import json
 import os
 import sys
 import threading
-import time
-from pathlib import Path
 
 # H2/H3: path resolution and the event log now live in leaf modules, and are
 # re-exported here so every existing importer
@@ -35,6 +49,57 @@ _MAX_CONFIG_BYTES = 32 * 1024 * 1024
 # quarantine path's history; keep it importable so nothing external breaks.
 _get_config_dir = get_config_dir
 
+
+class ConfigUnavailable(RuntimeError):
+    """The on-disk config could not be read, so writing it would destroy it.
+
+    B-012: `load_config()` is allowed to serve DEFAULTS for a file it could not
+    read (a lock, an AV scan, a transient I/O error) - that keeps the app
+    usable. What it must never do is let the next write persist those defaults
+    over the user's intact file, taking every tweak snapshot and the whole
+    applied registry with it. Reads degrade; writes refuse.
+    """
+
+
+#: True while the last read of config.json failed for an I/O reason. While it
+#: is set, `load_config()` retries the disk instead of trusting the cache, and
+#: `save_config()`/`update_config()` refuse to write.
+_config_degraded = False
+_config_degraded_reason = ""
+
+
+def _mark_degraded(exc: BaseException) -> None:
+    """Enter the degraded state, logging only on the rising edge.
+
+    The retry loop in `load_config()` calls the loader on every read while
+    degraded; logging each attempt would fill the security event log with one
+    line per widget that reads a preference.
+    """
+    global _config_degraded, _config_degraded_reason
+    first = not _config_degraded
+    _config_degraded = True
+    _config_degraded_reason = "%s: %s" % (type(exc).__name__, exc)
+    if first:
+        log_security_event(
+            "config_unreadable",
+            "config.json could not be read (%s); it was left in place and "
+            "defaults are in use for this session. It is NOT corrupt and was "
+            "not reset. Writes are refused while it stays unreadable."
+            % _config_degraded_reason,
+        )
+
+
+def _clear_degraded() -> None:
+    global _config_degraded, _config_degraded_reason
+    _config_degraded = False
+    _config_degraded_reason = ""
+
+
+def _degraded_message() -> str:
+    return ("Settings could not be read (%s), so nothing was written - the "
+            "saved file is untouched."
+            % (_config_degraded_reason or "an I/O error"))
+
 DEFAULT_CONFIG = {
     "schedule_enabled": False,
     # H7: this key was written by app/scheduler.py and read by the Auto
@@ -50,6 +115,25 @@ DEFAULT_CONFIG = {
     "health_check_mode": "startup",
     "health_last_grade": "",
     "health_last_check": 0.0,
+    # One point per completed checkup ({t, s, g}), so the Health tab can show
+    # a trend. Capped by config_schema.HEALTH_HISTORY_MAX; a checkup with no
+    # measurable score adds nothing rather than a fake zero.
+    "health_history": [],
+    # Quiet watch (N-006): the app notices things while the window is closed
+    # and says so ONCE, in one notification. These are its thresholds, not
+    # its feature flags: a missing key reads as ON in app/watch.py, so an old
+    # config gets the default experience without a migration. 10% free is
+    # higher than the old hardcoded 5% chip because that is the point at which
+    # a drive is worth mentioning, not the point at which it is an emergency.
+    "watch_enabled": True,
+    "watch_free_percent": 10,
+    "watch_score_drop": 8,
+    "watch_missed_run": True,
+    # The findings bus (AUDIT TX-002): what a tool measured that still needs
+    # acting on, so the Health tab and the Tools hub can quote it without
+    # re-measuring. Bounded by config_schema.INSIGHTS_MAX and filtered by age
+    # in app.insights; a tool's own re-scan replaces its namespace.
+    "insights": [],
     # Drivers tab download folder. '' = the default: a "Drivers" folder next
     # to the .exe (or %LOCALAPPDATA%\CleanerTool\Drivers when that is not
     # writable). See app/drivers/folder.py.
@@ -57,6 +141,12 @@ DEFAULT_CONFIG = {
     # 2.5: move cleaned files into a Quarantine bin instead of deleting them,
     # so a mistaken clean can be undone from Settings. OFF by default.
     "quarantine_enabled": False,
+    # U-006: and how long the bin keeps them (0 = until emptied by hand).
+    # Enforced at launch, never mid-session: a shorter window must not delete
+    # files the instant it is chosen in Settings.
+    "quarantine_days": 0,
+    # U-008: the game last picked in Server Ping (bare title, no ● marker).
+    "gameping_last_game": "",
     # Phase 2 (#12): 5 tabs merged to 3 — Games folded into Clean, Advanced
     # into Tweak. Kept as an explicit dict so load_config can migrate old
     # saved configs (see _migrate_selected_tasks).
@@ -128,6 +218,10 @@ DEFAULT_CONFIG = {
     # name, command} where command is the held file's path under this
     # app's own config directory (never the user's Startup folder).
     "startup_disabled": [],
+    # Duplicates dialog: paths the user said "never delete". Declared here (and
+    # in config_schema.SCHEMA) because this list is the only guard between a
+    # batch remove and files the user explicitly protected.
+    "duplicate_protected_paths": [],
     # Auto-elevate ("stop asking me"): opt-in once on the Admin Gate, then
     # an on-demand elevated scheduled task relaunches the app without UAC.
     # remember_limited is the opposite crowd (never show the Gate). Both
@@ -154,6 +248,24 @@ DEFAULT_CONFIG = {
     # Close to tray: window X hides to the tray instead of quitting.
     # Default True preserves the existing behavior for upgrades.
     "close_to_tray_enabled": True,
+    # Window animations (2026-10): "system" follows Windows' own
+    # Settings > Accessibility > Visual effects > Animation effects, which is
+    # the default because that is the user's standing decision. "on"/"off"
+    # override it for THIS app's chrome only — the edge-band reveal and the
+    # drag-to-snap preview — which is why this is a three-way value and not a
+    # checkbox: a checkbox could not express "follow Windows".
+    "window_animations": "system",
+    # Interface density (2026-10): "system" follows the display's own scale
+    # with the 125% floor app/dpi.py documents; "100".."200" force that
+    # density exactly, so the floor can be stepped under as well as over. The
+    # choice is read once at startup, before the first widget exists - changing
+    # Tk's scale afterwards would move every existing widget mid-frame, which
+    # is why the Settings page asks for a restart instead of live-applying.
+    "ui_scale": "system",
+    # AUDIT TV-001: the Tools hub's "recently opened" memory. Card KEYS only
+    # ("storage", "dns"), newest first, bounded by config_schema. An empty
+    # list means the block is simply not drawn.
+    "tools_recent": [],
     # H7: also undeclared. has_seen_tip/mark_tip_seen read and write it with
     # a local default, so a non-dict value here made every tip reappear
     # forever instead of being ignored.
@@ -161,15 +273,45 @@ DEFAULT_CONFIG = {
 }
 
 # H7: the caps are schema constraints, so they live in app/config_schema.py
-# with the rules that apply them. Re-exported here because the writers below
-# still enforce them on the way OUT, and both ends must agree on the number.
+# with the rules that apply them. The per-region writers that used to enforce
+# those caps here now own their own modules (R-006) and import their bound
+# straight from config_schema; what stays here is the schema application the
+# loader itself performs.
 from app.config_schema import (  # noqa: E402
-    PROFILE_ITEMS_MAX as _PROFILE_ITEMS_MAX,
-    PROFILE_MAX as _PROFILE_MAX,
-    RUN_HISTORY_MAX as _RUN_HISTORY_MAX,
-    STARTUP_MAX as _STARTUP_MAX,
     apply_schema,
-    validate_schema,
+)
+
+# R-006: the run-history ledger lives in its own module; re-exported here so
+# every existing `from app.config_persist import record_run` keeps working.
+from app.config_history import (  # noqa: E402,F401
+    clear_run_history,
+    freed_since,
+    record_run,
+)
+
+# R-006: one module per config region. The writers below were copied out
+# verbatim with their rules and comments; these imports are the binding every
+# existing `from app.config_persist import ...` still resolves through.
+from app.config_tweaks import (  # noqa: E402,F401
+    clear_tweak_snapshot,
+    export_tweak_snapshots,
+    get_tweak_snapshot,
+    get_tweak_state,
+    import_tweak_snapshots,
+    mark_tweak_applied,
+    mark_tweak_reverted,
+    merge_tweak_snapshot,
+    save_tweak_snapshot,
+)
+from app.config_profiles import (  # noqa: E402,F401
+    delete_install_profile,
+    get_install_profiles,
+    save_install_profile,
+)
+from app.config_startup import (  # noqa: E402,F401
+    add_startup_disabled,
+    get_startup_disabled,
+    remove_startup_disabled,
 )
 
 # Phase 2 (#12): mapping used to migrate configs saved by the old 5-tab UI.
@@ -303,6 +445,25 @@ def _restore_from_bak() -> "dict | None":
         return None
 
 
+def _move_corrupt_aside() -> "str | None":
+    """Rename an unreadable/corrupt primary config.json out of the way.
+
+    Returns the archive path, or None when the move failed (the original is
+    then still in place). Split out of `_quarantine_corrupt_config` for B-013:
+    the RECOVERY path must use it too, or `save_config`'s next backup copy
+    would overwrite the known-good `.bak` with the bytes we just failed to
+    read - destroying the backup that had only seconds earlier saved the user.
+    """
+    try:
+        from datetime import datetime
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        target = CONFIG_FILE.with_name(f"config.json.corrupt-{stamp}")
+        os.replace(CONFIG_FILE, target)
+        return str(target)
+    except Exception:
+        return None
+
+
 def _quarantine_corrupt_config(exc: Exception) -> None:
     """Move an unreadable/corrupt config.json aside so its contents are
     not lost and the next save doesn't silently overwrite the only copy.
@@ -317,14 +478,7 @@ def _quarantine_corrupt_config(exc: Exception) -> None:
     explanation. A small sibling marker file is now also written; GUI
     startup calls consume_quarantine_notice() once to surface the same
     message in the visible run log, then deletes the marker."""
-    target = None
-    try:
-        from datetime import datetime
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        target = CONFIG_FILE.with_name(f"config.json.corrupt-{stamp}")
-        os.replace(CONFIG_FILE, target)
-    except Exception:
-        target = None
+    target = _move_corrupt_aside()
     where = f"quarantined to {target}" if target else "could NOT be moved aside (keeping it in place)"
     message = (f"Settings were reset to defaults because the saved file was "
                f"corrupt ({type(exc).__name__}: {exc}) — the original was "
@@ -406,6 +560,8 @@ def _load_config_from_disk() -> dict:
             # here, immediately after selected_tasks has been coerced to have
             # all three tabs, rather than inside the schema.
             _migrate_selected_tasks(data)
+            # B-012: the file is readable again - writes are allowed once more.
+            _clear_degraded()
             return data
         except FileNotFoundError:
             pass  # file vanished between exists() and open() — treat as missing
@@ -420,11 +576,18 @@ def _load_config_from_disk() -> dict:
             # sitting right next to it.
             recovered = _restore_from_bak()
             if recovered is not None:
+                # B-013: archive the unreadable primary FIRST. Leaving it in
+                # place let save_config's backup step copy those bytes over the
+                # `.bak` that had just rescued the session.
+                where = _move_corrupt_aside()
                 log_security_event(
                     "config_recovered",
                     f"config.json was unreadable ({type(exc).__name__}); "
                     "restored the last known-good backup instead of resetting "
-                    "to defaults.")
+                    "to defaults."
+                    + (f" The unreadable copy was kept at {where}." if where
+                       else " The unreadable copy could not be moved aside."))
+                _clear_degraded()
                 return recovered
             _quarantine_corrupt_config(exc)
         except OSError as exc:
@@ -439,26 +602,29 @@ def _load_config_from_disk() -> dict:
             # defaults - destroying the tweak_snapshots undo registry.
             #
             # Serve the cached copy if we have one and leave the file alone.
+            # B-012: mark the session degraded so a later write cannot persist
+            # defaults (or a stale cache) over a file we never managed to read.
+            _mark_degraded(exc)
             cached = _config_cache
             if isinstance(cached, dict) and cached:
                 return copy.deepcopy(cached)
-            log_security_event(
-                "config_unreadable",
-                f"config.json could not be read ({type(exc).__name__}: {exc}); "
-                "it was left in place and defaults are in use for this "
-                "session. It is NOT corrupt and was not reset.")
             return copy.deepcopy(DEFAULT_CONFIG)
         except Exception as exc:
             # Anything else (a schema bug, a migration failure) is treated as
             # corrupt, but we still prefer the backup.
             recovered = _restore_from_bak()
             if recovered is not None:
+                where = _move_corrupt_aside()
                 log_security_event(
                     "config_recovered",
                     f"config.json failed to load ({type(exc).__name__}: {exc}); "
-                    "restored the last known-good backup.")
+                    "restored the last known-good backup."
+                    + (f" The unreadable copy was kept at {where}." if where
+                       else " The unreadable copy could not be moved aside."))
+                _clear_degraded()
                 return recovered
             _quarantine_corrupt_config(exc)
+            _clear_degraded()
     return copy.deepcopy(DEFAULT_CONFIG)
 
 
@@ -466,6 +632,16 @@ def load_config() -> dict:
     """Load config, using cached version if available. Returns a fresh copy so caller mutations never touch the cache without save_config. Thread-safe."""
     global _config_cache, _config_mtime
     with _config_lock:
+        if _config_degraded:
+            # B-012: a degraded read is not a cache. Retry the disk on every
+            # read so the session heals the moment the file is readable again
+            # (an AV scan ends, the other writer closes the handle), and never
+            # present the defaults as the file's content in the meantime.
+            fresh = _load_config_from_disk()
+            if not _config_degraded:
+                _config_cache = fresh
+                _config_mtime = _disk_mtime()
+            return copy.deepcopy(fresh)
         # F08: re-stat the file — a long-lived GUI session must see
         # external changes (scheduler, elevated twin process, hand edits)
         # instead of serving a stale cache forever.
@@ -585,9 +761,17 @@ def _config_file_lock():
                     pass
 
 
+#: I-009: the temp sweep is a directory enumeration, and it used to run on
+#: EVERY save - which means on every tweak badge, selection, history entry and
+#: geometry write. Once per process is enough to clear what a previous crash
+#: left behind; on a roaming profile that is a directory round-trip saved per
+#: write.
+_temp_sweep_done = False
+
+
 def save_config(config: dict) -> None:
     """Save config to disk atomically (write to temp then replace). Thread-safe. Raises on failure."""
-    global _config_cache, _config_mtime
+    global _config_cache, _config_mtime, _temp_sweep_done
     # (audit fix: the old `global` statement also named _config_dirty, a
     # variable that never existed anywhere else — removed.)
     #
@@ -598,6 +782,11 @@ def save_config(config: dict) -> None:
     # file on disk and the in-memory cache despite the docstring's promise.
     import secrets
     with _config_lock, _config_file_lock():
+        if _config_degraded:
+            # B-012: `config` was built from defaults or a stale cache because
+            # the real file could not be read. Persisting it would replace the
+            # user's file with something they never chose.
+            raise ConfigUnavailable(_degraded_message())
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         # audit fix (H9): a fixed name (config.json.tmp) let the GUI process
         # and a concurrent --auto-clean/--auto-update process interleave —
@@ -611,9 +800,11 @@ def save_config(config: dict) -> None:
         # LOW-008: json.dump() raising (a TypeError from a non-serializable
         # value) used to leave the temp file on disk forever, and nothing ever
         # pruned config.json.*.tmp. The dump is wrapped so a failure removes
-        # its own temp file, and a cheap sweep clears any left by a previous
-        # crash.
-        _prune_stale_config_temps()
+        # its own temp file, and one sweep per process clears any left by a
+        # previous crash (I-009: it ran on every save before).
+        if not _temp_sweep_done:
+            _temp_sweep_done = True
+            _prune_stale_config_temps()
         try:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(config, f, indent=2)
@@ -689,7 +880,13 @@ def update_config(mutate) -> dict:
     # --auto-clean/--auto-update process cannot interleave its own
     # load-mutate-save with ours and lose a whole mutation.
     with _config_lock, _config_file_lock():
-        cfg = load_config()
+        cfg = load_config()          # retries the disk while degraded
+        if _config_degraded:
+            # B-012: refuse to write a config we could not read. Every writer
+            # in the app treats a failed update_config as best-effort, so this
+            # is a skipped save, never a crash - but it is no longer a silent
+            # overwrite of the whole file with defaults.
+            raise ConfigUnavailable(_degraded_message())
         result = mutate(cfg)
         if result is not None:
             cfg = result
@@ -698,232 +895,11 @@ def update_config(mutate) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# Tweak snapshot helpers — real pre-tweak values for accurate revert
-# --------------------------------------------------------------------------- #
-
-def get_tweak_snapshot(task_id: str) -> dict:
-    """Return the saved pre-apply values for a tweak task, or {} if none."""
-    cfg = load_config()
-    return cfg.get("tweak_snapshots", {}).get(task_id, {})
-
-
-def save_tweak_snapshot(task_id: str, values: dict) -> None:
-    """Save pre-apply values for a tweak task, but only if none exist yet —
-    if the tweak is applied again while an unreverted snapshot is already
-    on file, keep the ORIGINAL pre-tweak value, not the value from the last
-    apply (which would just re-snapshot the tweak's own output)."""
-    if not values:
-        return
-
-    def _mutate(cfg):
-        snapshots = cfg.setdefault("tweak_snapshots", {})
-        if task_id in snapshots and snapshots[task_id]:
-            return None
-        snapshots[task_id] = values
-
-    update_config(_mutate)
-
-
-def merge_tweak_snapshot(task_id: str, values: dict) -> None:
-    """Merge `values` into an existing snapshot under a SINGLE lock hold.
-
-    Some applies record their snapshot in two stages: the service start type
-    first, then the per-scheduled-task priors a moment later. The second write
-    must not erase the first, which is why `save_tweak_snapshot` refuses to
-    overwrite — but a read-then-clear-then-save sequence does that by hand,
-    and it is NOT atomic:
-
-        existing = get_tweak_snapshot(task_id)   # lock acquired + released
-        clear_tweak_snapshot(task_id)            # lock acquired + released
-        save_tweak_snapshot(task_id, existing)    # lock acquired + released
-
-    Between the clear and the save the snapshot does not exist. A crash, a
-    concurrent --auto-clean process, or a second writer in that window
-    destroys the task's ENTIRE undo history — the one thing the user cannot
-    get back. update_config holds _config_lock across load-mutate-save
-    precisely to close that class of hole, so this is one call.
-
-    Fails closed: if the mutation cannot be applied the existing snapshot is
-    left exactly as it was.
-    """
-    if not values:
-        return
-
-    def _mutate(cfg):
-        snapshots = cfg.setdefault("tweak_snapshots", {})
-        existing = snapshots.get(task_id)
-        merged = dict(existing) if isinstance(existing, dict) else {}
-        merged.update(values)
-        snapshots[task_id] = merged
-
-    update_config(_mutate)
-
-
-def clear_tweak_snapshot(task_id: str) -> None:
-    """Drop a tweak's saved snapshot after a successful revert, so the next
-    apply starts capturing fresh again."""
-    def _mutate(cfg):
-        snapshots = cfg.get("tweak_snapshots", {})
-        if task_id in snapshots:
-            del snapshots[task_id]
-
-    update_config(_mutate)
-
-
-# --------------------------------------------------------------------------- #
-# Applied-tweak registry — Phase 2 (#14)
-# --------------------------------------------------------------------------- #
-# The "Applied" badge must show what is ACTUALLY ACTIVE on this PC, not the
-# toggle's on/off state. Two sources imply "applied":
-#   * tweak_snapshots — powercfg tweaks snapshot their prior value on apply
-#     (only max_performance_gpu / max_cpu_power use this today), and the
-#     snapshot is cleared on successful revert;
-#   * applied_tweaks — the explicit registry the GUI marks after a tweak
-#     run succeeds and clears after its revert succeeds.
-# get_tweak_state() merges both in a single config load.
-
-def mark_tweak_applied(task_id: str) -> None:
-    def _mutate(cfg):
-        applied = cfg.setdefault("applied_tweaks", [])
-        if task_id not in applied:
-            applied.append(task_id)
-
-    update_config(_mutate)
-
-
-def mark_tweak_reverted(task_id: str) -> None:
-    def _mutate(cfg):
-        applied = cfg.get("applied_tweaks", [])
-        if task_id in applied:
-            applied.remove(task_id)
-
-    update_config(_mutate)
-
-
-def get_tweak_state() -> dict:
-    """One-shot read of which tweak ids are currently applied. Returns
-    {task_id: True}. Kept as a plain dict (not a set) so callers can cheaply
-    re-read after a run; loads config once, not per tweak."""
-    cfg = load_config()
-    state = {tid: True for tid in cfg.get("tweak_snapshots", {})}
-    state.update({tid: True for tid in cfg.get("applied_tweaks", [])})
-    return state
-
-
-# --------------------------------------------------------------------------- #
-# Phase 2 — portable tweak snapshot export/import (backup & move to a new PC)
-# --------------------------------------------------------------------------- #
-# The undo history — tweak_snapshots + applied_tweaks — is the one thing a user
-# cannot get back once it is gone. These two calls make it a file the user can
-# keep: on a USB stick, in cloud backup, or carried to a new machine before an
-# in-place Windows upgrade wipes the profile.
+# One-time tips
 #
-# Import is additive and fail-closed by design:
-#   * it NEVER replaces a snapshot already on file for a task id (merge=True,
-#     the default) — the value that was true before the tweak is the one Undo
-#     needs, and a stale backup must not overwrite a fresher record;
-#   * it validates the JSON shape before touching the config, so a truncated or
-#     hand-edited file raises ValueError instead of corrupting the registry.
-
-_SNAPSHOT_BUNDLE_VERSION = 1
-
-
-def export_tweak_snapshots(path: str) -> int:
-    """Write {applied_tweaks, tweak_snapshots} to a portable JSON file.
-
-    Reads the config under the lock so a concurrent apply cannot be captured
-    half-written. Returns the number of tweaks (snapshot entries) written.
-    Propagates OSError (unwritable path) and TypeError (non-serialisable data)
-    to the caller — a backup that silently failed is worse than none.
-    """
-    with _config_lock:
-        cfg = load_config()  # private copy, read under the lock
-        bundle = {
-            "version": _SNAPSHOT_BUNDLE_VERSION,
-            "exported_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "applied_tweaks": list(cfg.get("applied_tweaks", []) or []),
-            "tweak_snapshots": copy.deepcopy(cfg.get("tweak_snapshots", {}) or {}),
-        }
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(bundle, fh, indent=2, ensure_ascii=False)
-    return len(bundle["tweak_snapshots"])
-
-
-def import_tweak_snapshots(path: str, merge: bool = True) -> int:
-    """Merge a bundle written by export_tweak_snapshots() into this config.
-
-    Returns the number of NEW task ids added. Raises ValueError on a malformed
-    or oversized file (nothing is written in that case).
-    """
-    with open(path, "r", encoding="utf-8") as fh:
-        raw = fh.read(_MAX_CONFIG_BYTES + 1)
-    if len(raw) > _MAX_CONFIG_BYTES:
-        raise ValueError("Snapshot file is too large to import.")
-    try:
-        data = json.loads(raw)
-    except Exception as exc:
-        raise ValueError(f"Not a valid JSON snapshot file: {exc}") from exc
-    if not isinstance(data, dict):
-        raise ValueError("Snapshot file must contain a JSON object.")
-    snaps = data.get("tweak_snapshots", {})
-    applied = data.get("applied_tweaks", [])
-    if not isinstance(snaps, dict) or not isinstance(applied, list):
-        raise ValueError(
-            "Snapshot file is missing 'tweak_snapshots' or 'applied_tweaks'.")
-
-    added = 0
-
-    def _mutate(cfg):
-        nonlocal added
-        cur = cfg.setdefault("tweak_snapshots", {})
-        for tid, val in snaps.items():
-            if not isinstance(tid, str) or not isinstance(val, dict):
-                continue
-            if merge and cur.get(tid):
-                continue  # keep the fresher local record
-            cur[tid] = copy.deepcopy(val)
-            added += 1
-        app = cfg.setdefault("applied_tweaks", [])
-        for tid in applied:
-            if isinstance(tid, str) and tid not in app:
-                app.append(tid)
-
-    update_config(_mutate)
-    return added
-
-
-
+# The run-history ledger that used to sit above these lives in
+# `app/config_history.py` now (R-006) and is re-exported at the top of this file.
 # --------------------------------------------------------------------------- #
-# Feature 10 — "How is my PC doing?" run history
-# --------------------------------------------------------------------------- #
-
-def record_run(bytes_freed: int) -> None:
-    """Append one finished Clean run to the rolling history.
-
-    Called on the Tk thread right after a run lands. Best-effort: a
-    failure here must never disturb the run's own outcome, so every
-    error is swallowed (same contract as mark_tweak_applied)."""
-    try:
-        n = int(bytes_freed or 0)
-    except (TypeError, ValueError):
-        return
-    if n <= 0:
-        return          # nothing freed = nothing worth remembering
-    try:
-        import time as _time
-        stamp = _time.time()
-
-        def _mut(cfg):
-            hist = cfg.get("run_history")
-            if not isinstance(hist, list):
-                hist = []
-            hist.append({"t": stamp, "b": n})
-            cfg["run_history"] = hist[-_RUN_HISTORY_MAX:]
-
-        update_config(_mut)
-    except Exception:
-        pass
-
 
 def has_seen_tip(tip_id: str) -> bool:
     """One-time-tip flags (audit fix: Auto-Maintenance discoverability —
@@ -948,89 +924,6 @@ def mark_tip_seen(tip_id: str) -> None:
         update_config(_mut)
     except Exception:
         pass
-
-
-def freed_since(days: int = 30) -> "tuple[int, int]":
-    """(total_bytes_freed, run_count) over the last `days` days.
-
-    Returns (0, 0) when there is no history yet — the caller then shows
-    no sentence at all rather than a zero."""
-    try:
-        import time as _time
-        cutoff = _time.time() - (max(1, int(days)) * 86400)
-        total, runs = 0, 0
-        for entry in load_config().get("run_history", []) or []:
-            try:
-                if float(entry.get("t", 0)) >= cutoff:
-                    total += int(entry.get("b", 0))
-                    runs += 1
-            except (TypeError, ValueError):
-                continue
-        return total, runs
-    except Exception:
-        return 0, 0
-
-
-# --------------------------------------------------------------------------- #
-# Feature 7 — Install profiles ("My Setups")
-# --------------------------------------------------------------------------- #
-
-def get_install_profiles() -> dict:
-    """{name: [package ids]} — always a plain dict, never None."""
-    try:
-        profiles = load_config().get("install_profiles")
-        return dict(profiles) if isinstance(profiles, dict) else {}
-    except Exception:
-        return {}
-
-
-def save_install_profile(name: str, ids: "list[str]") -> bool:
-    """Create or overwrite one profile. True when it was stored.
-
-    Single-lock read-modify-write (H9 contract) so a save from the dialog
-    can't clobber a concurrent one."""
-    try:
-        name = str(name or "").strip()[:60]
-        if not name:
-            return False
-        clean = [str(i) for i in (ids or []) if str(i).strip()][:_PROFILE_ITEMS_MAX]
-
-        def _mut(cfg):
-            profiles = cfg.get("install_profiles")
-            if not isinstance(profiles, dict):
-                profiles = {}
-            if name not in profiles and len(profiles) >= _PROFILE_MAX:
-                # full: drop nothing silently — refuse instead (the dialog
-                # tells the user to delete one first)
-                raise ValueError("profile limit reached")
-            profiles[name] = clean
-            cfg["install_profiles"] = profiles
-
-        update_config(_mut)
-        return True
-    except Exception:
-        return False
-
-
-def delete_install_profile(name: str) -> bool:
-    """Remove one profile. True when something was removed."""
-    try:
-        name = str(name or "").strip()
-        if not name:
-            return False
-        removed = {"hit": False}
-
-        def _mut(cfg):
-            profiles = cfg.get("install_profiles")
-            if isinstance(profiles, dict) and name in profiles:
-                profiles.pop(name, None)
-                cfg["install_profiles"] = profiles
-                removed["hit"] = True
-
-        update_config(_mut)
-        return removed["hit"]
-    except Exception:
-        return False
 
 
 # --------------------------------------------------------------------------- #
@@ -1095,90 +988,3 @@ def set_game_night_custom_apps(names) -> None:
             lambda cfg: cfg.__setitem__("game_night_custom_apps", cleaned))
     except Exception:
         pass
-
-
-# --------------------------------------------------------------------------- #
-# Startup Manager
-# --------------------------------------------------------------------------- #
-
-def get_startup_disabled() -> list:
-    """[{source, name, command, value_type}] for every item the user has
-    disabled — the data needed to put each one back exactly as it was."""
-    try:
-        items = load_config().get("startup_disabled")
-        return list(items) if isinstance(items, list) else []
-    except Exception:
-        return []
-
-
-def add_startup_disabled(record: dict) -> bool:
-    """Record one newly-disabled item. True when stored.
-
-    Single-lock RMW (H9 contract): the caller has already made the live
-    change (removed the registry value / moved the shortcut) by the time
-    this is called, so losing the race here would strand that change
-    with no way back — the lock makes that not happen."""
-    try:
-        source = str(record.get("source", "")).strip()
-        name = str(record.get("name", "")).strip()[:200]
-        command = str(record.get("command", ""))[:4096]
-        value_type = record.get("value_type", "")
-        value_type = value_type if isinstance(value_type, str) else ""
-        if not source or not name:
-            return False
-        # BUG-016: held_name was dropped here. This function rebuilds the
-        # record from an explicit whitelist and held_name was not on it, so
-        # startup_manager's careful os.path.basename(dest) never reached the
-        # config -- SEC-002 was silently defeated and EVERY restore fell
-        # through to the legacy guess-the-extension path, which can then
-        # hard-fail on the tamper check. Carry it through.
-        held_name = str(record.get("held_name", "")).strip()
-        clean = {"source": source, "name": name, "command": command,
-                 "value_type": value_type}
-        if held_name:
-            clean["held_name"] = os.path.basename(held_name)[:200]
-
-        def _mut(cfg):
-            items = cfg.get("startup_disabled")
-            if not isinstance(items, list):
-                items = []
-            items = [r for r in items
-                     if not (r.get("source") == source and r.get("name") == name)]
-            items.append(clean)
-            # BUG-015: `clean` was appended and the list then truncated from
-            # the END, so once the log was full the record just written was
-            # discarded immediately. The caller has ALREADY removed the
-            # registry value / moved the shortcut by this point, so that
-            # stranded a live change with no undo -- the exact outcome the
-            # single-lock docstring above exists to prevent. This is an undo
-            # log, so keep the newest.
-            if len(items) > _STARTUP_MAX:
-                items = items[-_STARTUP_MAX:]
-            cfg["startup_disabled"] = items
-
-        update_config(_mut)
-        return True
-    except Exception:
-        return False
-
-
-def remove_startup_disabled(source: str, name: str) -> bool:
-    """Drop one record once its item has been re-enabled. True when
-    something was actually removed."""
-    try:
-        removed = {"hit": False}
-
-        def _mut(cfg):
-            items = cfg.get("startup_disabled")
-            if not isinstance(items, list):
-                return
-            kept = [r for r in items
-                    if not (r.get("source") == source and r.get("name") == name)]
-            if len(kept) != len(items):
-                removed["hit"] = True
-            cfg["startup_disabled"] = kept
-
-        update_config(_mut)
-        return removed["hit"]
-    except Exception:
-        return False

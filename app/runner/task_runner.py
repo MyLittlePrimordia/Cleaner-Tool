@@ -19,29 +19,34 @@ scheduler import it and cannot diverge.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Iterable, Optional
 
 from app.utils import TaskCancelled, TaskSkipped, TaskContext
 
-# The five outcomes. Strings rather than an Enum because the GUI's existing
-# call sites compare against literals and the tuple shape is part of its
-# (tested) contract.
+# The four outcomes. Strings rather than an Enum because the GUI's existing
+# call sites compare against literals (the tuple of all four went in the
+# 2026-10 sweep — nothing read it).
 OK = "ok"
 SKIP = "skip"
 STOP = "stop"
 FAIL = "fail"
 
-ALL_OUTCOMES = (OK, SKIP, STOP, FAIL)
-
 
 @dataclass
 class TaskOutcome:
     """What happened to one task. `bytes_freed` is the task's own accounting
-    (an int return), never a guess."""
+    (an int return), never a guess.
+
+    `changes` is R-005's typed "what changed" record: the `app.changes.Change`
+    entries the shared write layer appended while THIS task ran. The context's
+    ledger spans the whole run, so `invoke_task` slices its own window rather
+    than handing every outcome the same list.
+    """
     status: str
     bytes_freed: int = 0
     error: Optional[BaseException] = None
+    changes: tuple = ()
 
     @property
     def ok(self) -> bool:
@@ -87,21 +92,48 @@ def invoke_task(ctx, task, mode: str = "run", strict_ok: bool = True) -> TaskOut
     func = task.revert if mode == "revert" else task.run
     if func is None:
         return TaskOutcome(FAIL, 0, None)
+    start = change_cursor(ctx)
+
+    def _done(status, nbytes=0, exc=None):
+        return TaskOutcome(status, nbytes, exc, changes_since(ctx, start))
+
     try:
         result = func(ctx)
         if isinstance(result, int) and not isinstance(result, bool):
-            return TaskOutcome(OK, result, None)
+            return _done(OK, result)
         if isinstance(result, bool) and not result:
             if strict_ok:
                 raise RuntimeError("Task returned False")
-            return TaskOutcome(OK, 0, None)
-        return TaskOutcome(OK, 0, None)
+            return _done(OK)
+        return _done(OK)
     except TaskSkipped as exc:
-        return TaskOutcome(SKIP, 0, exc)
+        return _done(SKIP, 0, exc)
     except TaskCancelled as exc:
-        return TaskOutcome(STOP, 0, exc)
+        return _done(STOP, 0, exc)
     except Exception as exc:
-        return TaskOutcome(FAIL, 0, exc)
+        return _done(FAIL, 0, exc)
+
+
+def change_cursor(ctx) -> Optional[int]:
+    """Where a task starts in the run's change ledger, or None.
+
+    Public because the GUI worker also calls a task through a thin wrapper
+    (for testability) and still has to slice that task's own changes out of the
+    shared context ledger.
+    """
+    bucket = getattr(ctx, "changes", None)
+    return len(bucket) if isinstance(bucket, list) else None
+
+
+def changes_since(ctx, start) -> tuple:
+    """The ledger entries added since `start`. Works for failed/stopped tasks
+    too: a task that raised after two writes DID change those two values."""
+    if start is None:
+        return ()
+    bucket = getattr(ctx, "changes", None)
+    if not isinstance(bucket, list):
+        return ()
+    return tuple(bucket[start:])
 
 
 @dataclass
@@ -113,8 +145,10 @@ class RunSummary:
     failed: int = 0
     stopped: bool = False
     bytes_freed: int = 0
+    changes: list = field(default_factory=list)
 
     def add(self, outcome: TaskOutcome) -> None:
+        self.changes.extend(getattr(outcome, "changes", ()) or ())
         if outcome.ok:
             self.succeeded += 1
             self.bytes_freed += outcome.bytes_freed
@@ -146,6 +180,11 @@ def run_batch(ctx, tasks: Iterable, mode: str = "run", strict_ok: bool = True,
     summary = RunSummary()
     for task in tasks:
         if ctx.cancelled():
+            # B-006: a Stop pressed BEFORE the first task (or between two)
+            # used to leave `stopped` False, because only a TaskCancelled
+            # RAISED BY A TASK set it. The closing block then called a run the
+            # user had just cancelled "clean", and the exit code said success.
+            summary.stopped = True
             if log:
                 log("Cancelled — remaining tasks were skipped.")
             break
@@ -163,6 +202,21 @@ def run_batch(ctx, tasks: Iterable, mode: str = "run", strict_ok: bool = True,
         if outcome.stopped:
             break
     return summary
+
+
+def log_block(log: Callable[[str], None], summary: str) -> None:
+    """Write a finished run's verdict between the transcript's rules.
+
+    Shared by every surface that produces a run transcript - the GUI's task
+    runner, its install runner and the headless scheduler - so a log reads the
+    same whichever kind of run wrote it: banner, then the block. It lives here
+    rather than in app/ui/app.py because a scheduled run has no Tk at all, and
+    its stdout is the only record of the run; it must end the way a windowed
+    run does, not with a bare sentence.
+    """
+    log("=" * 48)
+    log(summary)
+    log("=" * 48)
 
 
 def print_context(log_prefix: str = "[AUTO]",

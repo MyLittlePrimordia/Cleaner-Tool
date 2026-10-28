@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import tkinter as tk
 
-from app.ui.theme import COLORS, _hex_lerp, F
+from app.ui.theme import COLORS, _hex_lerp
 
 class ToggleSwitch(tk.Canvas):
     """Material 3 switch: 52x32 track, 16px thumb (off) growing to 24px (on).

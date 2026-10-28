@@ -8,12 +8,16 @@ about any other dialog except where noted.
 from __future__ import annotations
 
 import tkinter as tk
-from tkinter import ttk, messagebox
 from app.ui.base import ThemedModal, Tooltip
 from app.ui.hardware.drives import _drive_gains
-from app.ui.theme import COLORS, F, TAB_ACCENTS, _hex_lerp, _round_rect_points
-from app.ui.widgets import AnimatedButton, ScrollableRoundedPanel
+from app.ui.theme import (
+    COLORS, TAB_ACCENTS, TYPE, _hex_lerp, _round_rect_points, SPACE_1, SPACE_2,
+    SPACE_3,
+)
+from app.ui.metrics import GROUP_GAP, HAIRLINE_NUDGE, INDENT, TEXT_NUDGE, TIGHT_GAP
+from app.ui.widgets import EmptyState, ModalFooter, ScrollableRoundedPanel
 from app.benchmark import compare as _measure_compare
+from app.changes import change_detail, collapse, counts_text
 from app.utils import format_bytes
 
 
@@ -48,12 +52,20 @@ class ScorecardDialog(ThemedModal):
 
     _ROWS_INLINE = 12    # beyond this the row list scrolls
     _ROW_H = 26          # per-row height budget for the panel cap
+    _CHANGE_ROWS = 8     # named change lines before "and N more"
+    _ROW_CHANGE_LINES = 4  # change lines revealed under one task row
 
     def __init__(self, parent, *, tab_name, mode, cancelled, results,
                  total_bytes, before=None, after=None, needs_reboot=False,
                  on_run_again=None, ok_text="Close",
-                 before_drives=None, after_drives=None, measurements=None):
+                 before_drives=None, after_drives=None, measurements=None,
+                 changes=(), accounted=None):
         self._run_again_cb = on_run_again
+        # N-010: removed-vs-regained, reconciled by the run worker from the
+        # same two snapshots this dialog draws. None (older callers, smoke
+        # fixtures) means "not reported", never "verified" - the card simply
+        # has nothing to explain.
+        self._accounted = accounted
         # Feature 3 (Copy results) needs the raw numbers after the widgets
         # are built, so they are kept on the instance rather than living
         # only as locals inside this constructor.
@@ -62,11 +74,11 @@ class ScorecardDialog(ThemedModal):
         self._cancelled = bool(cancelled)
         self._total_bytes = total_bytes or 0
         # Audit fix (Scorecard "why failed"): results grew a 4th element
-        # (a short failure reason) but existing callers — including this
-        # file's own construction site above and several smoke-test
-        # fixtures — still pass 3-tuples. Normalize once here instead of
-        # requiring every caller to know about the new shape.
-        results = [tuple(r) + (None,) if len(r) < 4 else tuple(r)
+        # (a short failure reason); R-005 adds a 5th (the task's own typed
+        # changes). Existing callers - including several smoke-test fixtures -
+        # still pass 3- and 4-tuples. Normalize once here instead of requiring
+        # every caller to know about the new shape.
+        results = [tuple(r) + (None,) * (5 - len(r)) if len(r) < 5 else tuple(r)
                    for r in (results or [])]
         self._results = list(results)
         self._needs_reboot = bool(needs_reboot)
@@ -74,6 +86,10 @@ class ScorecardDialog(ThemedModal):
         # N-002: (before, after) lightweight readings, or None. Rendered below
         # the chips; an empty compare() means "no measurable change".
         self._measurements = measurements
+        # R-005: typed records the write layer collected during the run. One
+        # row per (kind, target), first prior -> last target; a no-op run
+        # records nothing and the whole block stays absent.
+        self._changes = collapse(list(changes or ()))
         tab_accent = TAB_ACCENTS.get(tab_name, COLORS["accent_green"])
         if cancelled:
             self._title = ("Undo Stopped" if mode == "revert"
@@ -87,10 +103,10 @@ class ScorecardDialog(ThemedModal):
 
         # counts straight from the per-task results (never from stale
         # counters — the dialog owns its own truth)
-        ok_n = sum(1 for _l, s, _b, _r in results if s == "ok")
-        skip_n = sum(1 for _l, s, _b, _r in results if s == "skip")
-        fail_n = sum(1 for _l, s, _b, _r in results if s == "fail")
-        stop_n = sum(1 for _l, s, _b, _r in results if s == "stop")
+        ok_n = sum(1 for _l, s, _b, _r, _c in results if s == "ok")
+        skip_n = sum(1 for _l, s, _b, _r, _c in results if s == "skip")
+        fail_n = sum(1 for _l, s, _b, _r, _c in results if s == "fail")
+        stop_n = sum(1 for _l, s, _b, _r, _c in results if s == "stop")
         self._counts = (ok_n, skip_n, fail_n, stop_n)
 
         super().__init__(parent, title=self._title,
@@ -103,12 +119,12 @@ class ScorecardDialog(ThemedModal):
         self._hero_lbl = None
         if total_bytes and total_bytes > 0:
             hero = tk.Frame(body, bg=COLORS["bg"])
-            hero.pack(fill="x", pady=(2, 0))
+            hero.pack(fill="x", pady=(TEXT_NUDGE, 0))
             self._hero_lbl = tk.Label(hero, text=format_bytes(total_bytes),
-                                      font=(F, 26, "bold"), bg=COLORS["bg"],
+                                      font=TYPE["metric_large"], bg=COLORS["bg"],
                                       fg=COLORS["accent_green"])
             self._hero_lbl.pack()
-            tk.Label(hero, text="disk space freed", font=(F, 10),
+            tk.Label(hero, text="disk space freed", font=TYPE["body_medium"],
                      bg=COLORS["bg"], fg=COLORS["subtext"]).pack()
 
         # before/after free-space bar — only when the run freed space AND
@@ -116,19 +132,19 @@ class ScorecardDialog(ThemedModal):
         self._bar_canvas = None
         if (total_bytes and total_bytes > 0 and before and after
                 and before[1] and after[1]):
-            b_avail, b_total = (before[0] or 0), before[1]
+            b_avail = before[0] or 0
             a_avail, a_total = (after[0] or 0), after[1]
             if a_avail >= b_avail and a_total > 0:
                 bar_wrap = tk.Frame(body, bg=COLORS["bg"])
-                bar_wrap.pack(fill="x", padx=18, pady=(8, 0))
+                bar_wrap.pack(fill="x", pady=(SPACE_2, 0))
                 tk.Label(bar_wrap,
                          text=f"C:  {format_bytes(b_avail)}  →  {format_bytes(a_avail)} free",
-                         font=(F, 9, "bold"), bg=COLORS["bg"],
+                         font=TYPE["label_medium"], bg=COLORS["bg"],
                          fg=COLORS["text"]).pack(anchor="w")
                 self._bar_canvas = tk.Canvas(bar_wrap, height=16,
                                              highlightthickness=0, bd=0,
                                              bg=COLORS["bg"])
-                self._bar_canvas.pack(fill="x", pady=(4, 0))
+                self._bar_canvas.pack(fill="x", pady=(SPACE_1, 0))
                 self._bar_canvas.bind(
                     "<Configure>",
                     lambda e, b=b_avail, a=a_avail, t=a_total:
@@ -142,20 +158,41 @@ class ScorecardDialog(ThemedModal):
                 self._draw_bar(self._bar_canvas, b_avail, a_avail, a_total,
                                width=self._modal_w - 36)
 
+        # N-010: the sentence that makes the number above checkable. Shown
+        # only when there is something to explain (the run removed bytes and
+        # the disk disagreed, or free space could not be read at all), so a
+        # normal run's card gains no line.
+        self._verified_lbl = None
+        try:
+            _note = accounted.note() if accounted is not None else ""
+        except Exception:
+            _note = ""
+        if _note:
+            self._verified_lbl = tk.Label(
+                body, text=_note, font=TYPE["caption"], bg=COLORS["bg"],
+                fg=COLORS["subtext"], anchor="w", justify="left",
+                wraplength=self.body_width(26))
+            self._verified_lbl.pack(fill="x", pady=(SPACE_2, 0))
+
         # status chips
         chips = tk.Frame(body, bg=COLORS["bg"])
-        chips.pack(fill="x", padx=18, pady=(10, 0))
-        tk.Label(chips, text=f"✓  {ok_n} done", font=(F, 10, "bold"),
+        chips.pack(fill="x", pady=(GROUP_GAP, 0))
+        tk.Label(chips, text=f"✓  {ok_n} done", font=TYPE["label_large"],
                  bg=COLORS["bg"], fg=COLORS["accent_green"]).pack(side="left")
         if skip_n:
-            tk.Label(chips, text=f"⊘  {skip_n} skipped", font=(F, 10, "bold"),
-                     bg=COLORS["bg"], fg=COLORS["subtext"]).pack(side="left", padx=(12, 0))
+            tk.Label(chips, text=f"⊘  {skip_n} skipped", font=TYPE["label_large"],
+                     bg=COLORS["bg"], fg=COLORS["subtext"]).pack(side="left", padx=(SPACE_3, 0))
         if fail_n:
-            tk.Label(chips, text=f"✕  {fail_n} failed", font=(F, 10, "bold"),
-                     bg=COLORS["bg"], fg=COLORS["accent_red"]).pack(side="left", padx=(12, 0))
+            tk.Label(chips, text=f"✕  {fail_n} failed", font=TYPE["label_large"],
+                     bg=COLORS["bg"], fg=COLORS["accent_red"]).pack(side="left", padx=(SPACE_3, 0))
         if stop_n:
-            tk.Label(chips, text="◦  stopped early", font=(F, 10, "bold"),
-                     bg=COLORS["bg"], fg=COLORS["accent_yellow"]).pack(side="left", padx=(12, 0))
+            tk.Label(chips, text="◦  stopped early", font=TYPE["label_large"],
+                     bg=COLORS["bg"], fg=COLORS["accent_yellow"]).pack(side="left", padx=(SPACE_3, 0))
+
+        # R-005: the run's own typed change list, before the measured block.
+        self._change_rows = None
+        self._change_lbl = None
+        self._render_changes(body)
 
         # N-002: what else moved besides disk space (memory / restart flag).
         # Nothing is shown when the readings never happened, and "no
@@ -171,21 +208,26 @@ class ScorecardDialog(ThemedModal):
         self._drive_rows = None
         if len(self._gains) > 1:
             drow = self._drive_rows = tk.Frame(body, bg=COLORS["bg"])
-            drow.pack(fill="x", padx=18, pady=(8, 0))
-            tk.Label(drow, text="Space freed on each drive", font=(F, 9, "bold"),
+            drow.pack(fill="x", pady=(SPACE_2, 0))
+            tk.Label(drow, text="Space freed on each drive", font=TYPE["label_medium"],
                      bg=COLORS["bg"], fg=COLORS["subtext"]).pack(anchor="w")
             line = tk.Frame(drow, bg=COLORS["bg"])
-            line.pack(fill="x", pady=(3, 0))
+            line.pack(fill="x", pady=(TIGHT_GAP, 0))
             for root, gained in self._gains[:6]:
                 chip = tk.Frame(line, bg=COLORS["bg_alt"])
-                chip.pack(side="left", padx=(0, 8))
-                tk.Label(chip, text=str(root).rstrip("\\"), font=(F, 9, "bold"),
+                chip.pack(side="left", padx=(0, SPACE_2))
+                tk.Label(chip, text=str(root).rstrip("\\"), font=TYPE["label_medium"],
                          bg=COLORS["bg_alt"], fg=COLORS["text"]).pack(
-                             side="left", padx=(8, 4), pady=3)
-                tk.Label(chip, text="+" + format_bytes(gained), font=(F, 9, "bold"),
+                             side="left", padx=(SPACE_2, SPACE_1), pady=TIGHT_GAP)
+                tk.Label(chip, text="+" + format_bytes(gained), font=TYPE["label_medium"],
                          bg=COLORS["bg_alt"],
                          fg=COLORS["accent_green"]).pack(
-                             side="left", padx=(0, 8), pady=3)
+                             side="left", padx=(0, SPACE_2), pady=TIGHT_GAP)
+
+        # H-011: ONE read of the ledger per card. The month line, the link and
+        # the viewer all work from this list instead of each re-loading (and
+        # re-copying) the whole config on the Tk thread.
+        self._history_runs = self._load_history_runs()
 
         # "How is my PC doing?" (feature 10) — one friendly sentence, and
         # only once there is more than this single run to talk about.
@@ -193,12 +235,34 @@ class ScorecardDialog(ThemedModal):
         self._month_lbl = None
         month_text = self._month_summary()
         if month_text:
-            self._month_lbl = tk.Label(body, text=month_text, font=(F, 9),
+            self._month_lbl = tk.Label(body, text=month_text, font=TYPE["caption"],
                                        bg=COLORS["bg"], fg=COLORS["subtext"])
-            self._month_lbl.pack(pady=(8, 0))
+            self._month_lbl.pack(pady=(SPACE_2, 0))
+
+        # R-005: the ledger outlives the card now, so offer the one place to
+        # look back at earlier runs. Only when there is something to show.
+        self._history_lbl = None
+        if self._history_available():
+            self._history_lbl = tk.Label(body, text="View past runs \u203a",
+                                         font=TYPE["caption"], bg=COLORS["bg"],
+                                         fg=self._title_accent, cursor="hand2",
+                                         takefocus=1)
+            self._history_lbl.pack(pady=(SPACE_1, 0))
+            self._history_lbl.bind("<Button-1>",
+                                   lambda _e: self._open_past_runs())
+            # I-008: the link is the only way into the ledger, so it is a Tab
+            # stop with Return/Space as well as a click target. Both return
+            # "break": the card binds Return to Close, and opening the viewer
+            # must not also dismiss the card underneath it.
+            def _open_from_keyboard(_event=None):
+                self._open_past_runs()
+                return "break"
+
+            self._history_lbl.bind("<Return>", _open_from_keyboard)
+            self._history_lbl.bind("<space>", _open_from_keyboard)
 
         # hairline separator
-        tk.Frame(body, bg=COLORS["hairline"], height=1).pack(fill="x", padx=18, pady=(10, 4))
+        tk.Frame(body, bg=COLORS["hairline"], height=1).pack(fill="x", pady=(GROUP_GAP, SPACE_1))
 
         # per-task rows — rounded panel capped at _ROWS_INLINE rows tall;
         # the floating scrollbar only appears when content overflows
@@ -215,8 +279,8 @@ class ScorecardDialog(ThemedModal):
         # panel is then the only widget that can give ground — it shrinks and
         # its own scrollbar takes over. Packing it in visual order meant the
         # panel claimed its full height and the buttons lost.
-        brow = tk.Frame(body, bg=COLORS["bg"])
-        brow.pack(side="bottom", fill="x", padx=18, pady=(12, 10))
+        self._footer = footer = ModalFooter(body, accent=self._title_accent)
+        footer.pack_footer()
 
         n_rows = len(results)
         panel_h = max(52, min(n_rows, self._ROWS_INLINE) * self._ROW_H + 16)
@@ -224,12 +288,14 @@ class ScorecardDialog(ThemedModal):
         panel.config(height=panel_h)   # after ctor (its Canvas init pins height=10)
         # fill="both" + expand: absorb whatever the body has left, and give
         # space back when the task list is short
-        panel.pack(fill="both", expand=True, padx=18, pady=(2, 0))
+        panel.pack(fill="both", expand=True, pady=(TEXT_NUDGE, 0))
         if not results:
-            tk.Label(panel.inner, text="No tasks ran.", font=(F, 9),
-                     bg=COLORS["bg_alt"], fg=COLORS["subtext"]).pack(pady=12)
-        for label, status, nbytes, reason in results:
-            self._build_row(panel.inner, label, status, nbytes, reason)
+            EmptyState(panel.inner, glyph="\u25cb", text="No tasks ran.",
+                       detail="Nothing was selected, so nothing changed.",
+                       bg=COLORS["bg_alt"],
+                       wrap=max(240, self.body_width(26))).pack(fill="x")
+        for label, status, nbytes, reason, changes in results:
+            self._build_row(panel.inner, label, status, nbytes, reason, changes)
         # settle scroll metrics NOW (ctor-time) so scroll_enabled is
         # correct even before the canvas ever maps — the harness asserts
         # on it without pumping Configure events
@@ -244,27 +310,21 @@ class ScorecardDialog(ThemedModal):
             banner = self._reboot_banner = tk.Frame(body, bg=COLORS["alert_amber_bg"])
             tk.Label(banner,
                      text="⚠  Restart needed — some changes only take effect after a reboot.",
-                     font=(F, 9, "bold"), bg=COLORS["alert_amber_bg"],
-                     fg=COLORS["accent_yellow"]).pack(anchor="w", padx=10, pady=8)
-            banner.pack(fill="x", padx=18, pady=(10, 0))
+                     font=TYPE["label_medium"], bg=COLORS["alert_amber_bg"],
+                     fg=COLORS["accent_yellow"]).pack(anchor="w", padx=GROUP_GAP, pady=SPACE_2)
+            banner.pack(fill="x", pady=(GROUP_GAP, 0))
 
-        # buttons — Close primary (accent fill), Clean Again secondary
-        if self._run_again_cb is not None:
-            AnimatedButton(brow, text="Clean Again", command=self._run_again,
-                           bg=COLORS["surface"], fg=COLORS["text"],
-                           font=(F, 9, "bold"), padx=18,
-                           pady=7).pack(side="right", padx=(8, 0))
+        # buttons — Close primary (accent fill), the two secondary actions
+        # to its left. The shared footer packs the primary first, so a
+        # secondary that disappears (no "Clean Again" on an Undo run) cannot
+        # move Close.
+        footer.button(ok_text, self.close, kind="primary")
         # Feature 3: plain-English summary straight to the clipboard, so a
         # user can paste it into a Discord help thread without screenshots.
-        self._copy_btn = AnimatedButton(
-            brow, text="Copy results", command=self._copy_results,
-            bg=COLORS["surface"], fg=COLORS["text"],
-            font=(F, 9, "bold"), padx=18, pady=7)
-        self._copy_btn.pack(side="right", padx=(8, 0))
-        AnimatedButton(brow, text=ok_text, command=self.close,
-                       bg=self._title_accent, fg=COLORS["black"],
-                       font=(F, 9, "bold"), padx=22,
-                       pady=7).pack(side="right")
+        self._copy_btn = footer.button("Copy results", self._copy_results,
+                                       kind="secondary")
+        if self._run_again_cb is not None:
+            footer.button("Clean Again", self._run_again, kind="secondary")
 
         # Return mirrors Close (single primary action on this card)
         dlg.bind("<Return>", lambda _e: self.close())
@@ -280,7 +340,8 @@ class ScorecardDialog(ThemedModal):
             "stop": ("◦", COLORS["accent_yellow"]),
         }.get(status, ("•", COLORS["subtext"]))
 
-    def _build_row(self, parent, label, status, nbytes, reason=None):
+    def _build_row(self, parent, label, status, nbytes, reason=None,
+                   changes=()):
         """One compact one-liner: status glyph | task label (+ plain-
         language suffix for skip/fail/stop) | bytes freed (right). Same
         bg_alt row look as the preset summary cells.
@@ -291,11 +352,19 @@ class ScorecardDialog(ThemedModal):
         wrong. The real reason was already being captured (and logged)
         right at the point of failure; it just never rode along into the
         Scorecard's own results. Show a short version inline (tooltip
-        carries the full text — some exception messages run long)."""
+        carries the full text — some exception messages run long).
+
+        R-005: a row whose task changed something can be clicked to reveal
+        THAT task's own change lines, instead of leaving the run-wide list as
+        the only detail. The affordance shows the count so a row is never a
+        dead click; the detail panel is packed after the row on demand, which
+        keeps a quiet run's card exactly as compact as it was."""
         glyph, gcolor = self._glyphs(status)
         row = tk.Frame(parent, bg=COLORS["bg_alt"])
-        tk.Label(row, text=glyph, font=(F, 9, "bold"), bg=COLORS["bg_alt"],
-                 fg=gcolor, width=2, anchor="w").pack(side="left")
+        glyph_lbl = tk.Label(row, text=glyph, font=TYPE["label_medium"],
+                             bg=COLORS["bg_alt"], fg=gcolor, width=2,
+                             anchor="w")
+        glyph_lbl.pack(side="left")
         text, fg = label, COLORS["text"]
         full_reason = None
         if status == "skip":
@@ -312,20 +381,70 @@ class ScorecardDialog(ThemedModal):
         elif status == "stop":
             text += "  — stopped"
             fg = COLORS["subtext"]
-        lbl = tk.Label(row, text=text, font=(F, 9), bg=COLORS["bg_alt"], fg=fg,
+        lbl = tk.Label(row, text=text, font=TYPE["caption"], bg=COLORS["bg_alt"], fg=fg,
                        anchor="w", justify="left",
                        wraplength=self.body_width(28))
-        lbl.pack(side="left", padx=(2, 0))
+        lbl.pack(side="left", padx=(TEXT_NUDGE, 0))
         if full_reason:
             try:
                 Tooltip(lbl, full_reason)
             except Exception:
                 pass
         if nbytes and nbytes > 0:
-            tk.Label(row, text=format_bytes(nbytes), font=(F, 9, "bold"),
+            tk.Label(row, text=format_bytes(nbytes), font=TYPE["label_medium"],
                      bg=COLORS["bg_alt"],
                      fg=COLORS["accent_green"]).pack(side="right")
-        row.pack(fill="x", pady=1)
+        row.pack(fill="x", pady=HAIRLINE_NUDGE)
+
+        changes = collapse(tuple(changes or ()))
+        if changes:
+            self._attach_row_changes(parent, row, label, lbl, glyph_lbl, changes)
+
+    def _attach_row_changes(self, parent, row, label, lbl, glyph_lbl, changes):
+        """Add the click-to-reveal count and the hidden detail panel to a row."""
+        count = len(changes)
+        toggle = tk.Label(row, text="\u25b8 %d" % count, font=TYPE["caption"],
+                          bg=COLORS["bg_alt"], fg=COLORS["subtext"],
+                          cursor="hand2")
+        toggle.pack(side="right", padx=(SPACE_2, 0))
+
+        detail = tk.Frame(parent, bg=COLORS["bg_alt"])
+        shown = list(changes[:self._ROW_CHANGE_LINES])
+        for change in shown:
+            tk.Label(detail, text="   %s" % self._change_line(change),
+                     font=TYPE["caption"], bg=COLORS["bg_alt"], fg=COLORS["subtext"],
+                     anchor="w", justify="left",
+                     wraplength=self.body_width(24)).pack(
+                         fill="x", padx=(INDENT, SPACE_2))
+        extra = count - len(shown)
+        if extra > 0:
+            tk.Label(detail, text="   \u2026 and %d more" % extra,
+                     font=TYPE["caption"], bg=COLORS["bg_alt"],
+                     fg=COLORS["subtext"], anchor="w").pack(
+                         fill="x", padx=(INDENT, SPACE_2), pady=(0, TEXT_NUDGE))
+
+        state = {"open": False}
+
+        def _toggle(_event=None):
+            if state["open"]:
+                detail.pack_forget()
+            else:
+                detail.pack(fill="x", after=row)
+            state["open"] = not state["open"]
+            toggle.config(text=("\u25be" if state["open"] else "\u25b8")
+                          + " %d" % count)
+            try:
+                self._rows_panel.refresh_scroll()
+            except Exception:
+                pass
+
+        for widget in (row, lbl, glyph_lbl, toggle):
+            widget.bind("<Button-1>", _toggle)
+            try:
+                widget.config(cursor="hand2")
+            except Exception:
+                pass
+        return detail
 
     # ---- before/after bar ---------------------------------------------- #
 
@@ -367,6 +486,118 @@ class ScorecardDialog(ThemedModal):
         except Exception:
             pass
 
+    # ---- history (R-005) ------------------------------------------------ #
+
+    @staticmethod
+    def _load_history_runs():
+        """The ledger, read ONCE per card (H-011). Never raises."""
+        try:
+            from app import history
+            return history.runs()
+        except Exception:
+            return []
+
+    def _history_available(self) -> bool:
+        """True when the runs this card loaded contain at least one entry."""
+        return bool(self._history_runs)
+
+    def _open_past_runs(self):
+        """Open the history viewer over this card with the list we already
+        hold, then re-grab.
+
+        Nested modals are an established pattern here (themed confirms do the
+        same); the inner close releases the grab, so the scorecard has to
+        take it back or Escape would stop closing it. The viewer hands back
+        the one fact that can change while this card is up (it cleared the
+        ledger), which is what `_sync_history_lines` acts on.
+        """
+        cleared = False
+        try:
+            from app.ui.dialogs.past_runs_dialog import PastRunsDialog
+            viewer = PastRunsDialog(self._dlg, entries=self._history_runs)
+            viewer.wait()
+            cleared = bool(getattr(viewer, "cleared", False))
+        except Exception:
+            pass
+        finally:
+            try:
+                self._dlg.grab_set()
+            except Exception:
+                pass
+        if cleared:
+            self._history_runs = []
+            self._sync_history_lines()
+
+    def _sync_history_lines(self):
+        """Hide the history lines after the viewer cleared the ledger.
+
+        No config read here: `self._history_runs` is the card's one snapshot,
+        and the viewer already reported the only change possible while this
+        card is up. They are only ever HIDDEN - the ledger cannot grow until
+        the next run's card.
+        """
+        try:
+            if self._month_lbl is not None:
+                text = self._month_summary()
+                if text:
+                    self._month_lbl.config(text=text)
+                else:
+                    self._month_lbl.pack_forget()
+        except Exception:
+            pass
+        try:
+            if self._history_lbl is not None and not self._history_available():
+                self._history_lbl.pack_forget()
+        except Exception:
+            pass
+
+    # ---- typed changes (R-005) ----------------------------------------- #
+
+    @staticmethod
+    def _change_line(change) -> str:
+        return "%s: %s" % (change.label, change_detail(change))
+
+    def _render_changes(self, body):
+        """The run's typed change list, with counts grouped by kind.
+
+        Capped at _CHANGE_ROWS named lines: a privacy-baseline run touches
+        dozens of values, and the card's job is the shape of the result rather
+        than a registry dump. Copy results keeps every line.
+        """
+        if not self._changes:
+            return
+        wrap = tk.Frame(body, bg=COLORS["bg"])
+        wrap.pack(fill="x", pady=(GROUP_GAP, 0))
+        tk.Label(wrap, text="What changed", font=TYPE["label_medium"],
+                 bg=COLORS["bg"], fg=COLORS["subtext"]).pack(anchor="w")
+        self._change_lbl = tk.Label(
+            wrap, text=counts_text(self._changes), font=TYPE["caption"],
+            bg=COLORS["bg"], fg=COLORS["subtext"], anchor="w",
+            justify="left", wraplength=self.body_width(26))
+        self._change_lbl.pack(anchor="w", pady=(HAIRLINE_NUDGE, TEXT_NUDGE))
+        self._change_rows = []
+        for change in self._changes[:self._CHANGE_ROWS]:
+            line = tk.Frame(wrap, bg=COLORS["bg"])
+            line.pack(fill="x", pady=HAIRLINE_NUDGE)
+            lbl = tk.Label(line, text=change.label, font=TYPE["caption"],
+                           bg=COLORS["bg"], fg=COLORS["text"], anchor="w")
+            lbl.pack(side="left")
+            try:
+                Tooltip(lbl, change.target)
+            except Exception:
+                pass
+            tk.Label(line, text=change_detail(change),
+                     font=TYPE["label_medium"], bg=COLORS["bg"],
+                     fg=(COLORS["accent_green"] if change.after is not None
+                         else COLORS["subtext"])).pack(side="right")
+            self._change_rows.append(line)
+        extra = len(self._changes) - len(self._change_rows)
+        if extra > 0:
+            tk.Label(wrap, text="\u2026 and %d more \u2014 Copy results lists "
+                     "them all." % extra, font=TYPE["caption"],
+                     bg=COLORS["bg"], fg=COLORS["subtext"],
+                     anchor="w").pack(anchor="w", pady=(TEXT_NUDGE, 0))
+
     # ---- before/after readings (N-002) --------------------------------- #
 
     def _render_measurements(self, body):
@@ -385,26 +616,26 @@ class ScorecardDialog(ThemedModal):
         if rows is None:
             return
         wrap = tk.Frame(body, bg=COLORS["bg"])
-        wrap.pack(fill="x", padx=18, pady=(10, 0))
-        tk.Label(wrap, text="Before \u2192 after", font=(F, 9, "bold"),
+        wrap.pack(fill="x", pady=(GROUP_GAP, 0))
+        tk.Label(wrap, text="Before \u2192 after", font=TYPE["label_medium"],
                  bg=COLORS["bg"], fg=COLORS["subtext"]).pack(anchor="w")
         if not rows:
             self._measure_lbl = tk.Label(
                 wrap, text="No measurable change to memory or restart state.",
-                font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
+                font=TYPE["caption"], bg=COLORS["bg"], fg=COLORS["subtext"],
                 anchor="w", justify="left", wraplength=self.body_width(26))
-            self._measure_lbl.pack(anchor="w", pady=(3, 0))
+            self._measure_lbl.pack(anchor="w", pady=(TIGHT_GAP, 0))
             return
         tones = {"good": COLORS["accent_green"], "bad": COLORS["accent_red"],
                  "warn": COLORS["accent_yellow"]}
         self._measure_rows = []
         for row in rows:
             line = tk.Frame(wrap, bg=COLORS["bg"])
-            line.pack(fill="x", pady=1)
-            tk.Label(line, text=row.get("label", ""), font=(F, 9),
+            line.pack(fill="x", pady=HAIRLINE_NUDGE)
+            tk.Label(line, text=row.get("label", ""), font=TYPE["caption"],
                      bg=COLORS["bg"], fg=COLORS["text"],
                      anchor="w").pack(side="left")
-            tk.Label(line, text=row.get("text", ""), font=(F, 9, "bold"),
+            tk.Label(line, text=row.get("text", ""), font=TYPE["label_medium"],
                      bg=COLORS["bg"],
                      fg=tones.get(row.get("tone"), COLORS["text"])).pack(
                          side="right")
@@ -421,14 +652,17 @@ class ScorecardDialog(ThemedModal):
         an accountant's figure, and the wording should not pretend
         otherwise."""
         try:
-            from app.config_persist import freed_since
-            total, runs = freed_since(30)
+            # H-011: the card's own read, through the one window rule.
+            from app.history import reclaimed_in
+            total, runs = reclaimed_in(self._history_runs, 30)
         except Exception:
             return ""
         # One run in the window IS this run — nothing extra to say.
         if runs < 2 or total <= 0:
             return ""
-        return ("You've freed about %s in the last 30 days, across %d cleans."
+        # "runs", not "cleans": since R-005 a Tweak/Repair/Undo run is
+        # recorded too, so the count is every run in the window.
+        return ("You've freed about %s in the last 30 days, across %d runs."
                 % (format_bytes(total), runs))
 
     def _summary_text(self):
@@ -437,6 +671,14 @@ class ScorecardDialog(ThemedModal):
         lines = ["Cleaner Tool — %s" % self._title]
         if self._total_bytes and self._total_bytes > 0:
             lines.append("Space freed: %s" % format_bytes(self._total_bytes))
+        # N-010: the same qualification the card shows, so a pasted report
+        # cannot carry a measured-looking number without its caveat.
+        try:
+            _note = self._accounted.note() if self._accounted is not None else ""
+        except Exception:
+            _note = ""
+        if _note:
+            lines.append("  " + _note)
         for root, gained in self._gains:
             lines.append("  %s  +%s free" % (str(root).rstrip("\\"),
                                              format_bytes(gained)))
@@ -450,6 +692,11 @@ class ScorecardDialog(ThemedModal):
         lines.append("Result: " + ", ".join(parts))
         if self._needs_reboot:
             lines.append("Restart needed for some changes to take effect.")
+        # R-005: the typed change list, complete (the card caps its rows).
+        if self._changes:
+            lines.append("What changed (%s):" % counts_text(self._changes))
+            for change in self._changes:
+                lines.append("  " + self._change_line(change))
         # N-002: mirror the card's honest before/after into the copyable text.
         if self._measurements:
             try:
@@ -468,7 +715,7 @@ class ScorecardDialog(ThemedModal):
                                  "state.")
         if self._results:
             lines.append("")
-            for label, status, nbytes, reason in self._results:
+            for label, status, nbytes, reason, task_changes in self._results:
                 word = {"ok": "done", "skip": "nothing to do",
                         "fail": "failed", "stop": "stopped"}.get(status, status)
                 row = "  %s — %s" % (label, word)
@@ -481,6 +728,10 @@ class ScorecardDialog(ThemedModal):
                 if status == "fail" and reason:
                     row += ": %s" % reason
                 lines.append(row)
+                # R-005: the same per-task detail the card reveals on click,
+                # but complete - the card caps its sub-rows.
+                for change in collapse(task_changes or ()):
+                    lines.append("      " + self._change_line(change))
         return "\n".join(lines)
 
     def _copy_results(self):

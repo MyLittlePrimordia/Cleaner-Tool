@@ -18,7 +18,8 @@ from __future__ import annotations
 import tkinter as tk
 
 from app.ui.dialogs._tool_page import ToolPage
-from app.ui.theme import COLORS, F
+from app.ui.theme import COLORS, RADIUS_SURFACE, TYPE, SPACE_3
+from app.ui.metrics import COMPACT_INSET, GROUP_GAP, ROW_PAD, TEXT_NUDGE
 from app.ui.widgets import RoundedCard
 
 _NOTES_CAP = 1500
@@ -66,11 +67,11 @@ class AppUpdateDialog(ToolPage):
 
     def _section(self, title):
         card = RoundedCard(self.content, fill=COLORS["surface"],
-                           bg=COLORS["bg"], radius=14)
-        card.pack(fill="x", padx=2, pady=5)
-        tk.Label(card.body, text=title, font=(F, 10, "bold"),
+                           bg=COLORS["bg"], radius=RADIUS_SURFACE)
+        card.pack(fill="x", padx=TEXT_NUDGE, pady=COMPACT_INSET)
+        tk.Label(card.body, text=title, font=TYPE["label_large"],
                  bg=COLORS["surface"], fg=COLORS["text"], anchor="w").pack(
-            fill="x", padx=12, pady=(9, 2))
+            fill="x", padx=SPACE_3, pady=(ROW_PAD, TEXT_NUDGE))
         return card.body
 
     # ---------------------------------------------------------------- render
@@ -104,9 +105,9 @@ class AppUpdateDialog(ToolPage):
             if len(notes) > _NOTES_CAP:
                 notes = notes[:_NOTES_CAP].rstrip() + "\u2026"
             body = self._section("What's new")
-            tk.Label(body, text=notes, font=(F, 9), bg=COLORS["surface"],
+            tk.Label(body, text=notes, font=TYPE["caption"], bg=COLORS["surface"],
                      fg=COLORS["text"], justify="left", anchor="w",
-                     wraplength=520).pack(fill="x", padx=12, pady=(0, 10))
+                     wraplength=520).pack(fill="x", padx=SPACE_3, pady=(0, GROUP_GAP))
 
         # How the automatic path works (or why it is off)
         ok, why = self_update.can_self_update()
@@ -118,10 +119,10 @@ class AppUpdateDialog(ToolPage):
                     "check or the swap fails, nothing is changed.")
         else:
             text = ("Automatic updates are not available here. %s" % why)
-        tk.Label(body, text=text, font=(F, 9), bg=COLORS["surface"],
+        tk.Label(body, text=text, font=TYPE["caption"], bg=COLORS["surface"],
                  fg=COLORS["text"] if ok else COLORS["subtext"],
                  justify="left", anchor="w", wraplength=520).pack(
-            fill="x", padx=12, pady=(0, 10))
+            fill="x", padx=SPACE_3, pady=(0, GROUP_GAP))
 
         # Buttons
         try:
@@ -180,7 +181,8 @@ class AppUpdateDialog(ToolPage):
         ok, msg = self_update.stage_download(
             resolved["url"], resolved["sha256"], resolved.get("size", 0),
             on_progress=prog, cancelled=lambda: token[0])
-        return {"ok": ok, "error": msg}
+        return {"ok": ok, "error": msg,
+                "cancelled": (not ok and self_update.is_cancellation(msg))}
 
     def _start_auto(self):
         from app import self_update
@@ -199,8 +201,14 @@ class AppUpdateDialog(ToolPage):
         self._busy = False
         self.set_busy(False)
         if not res.get("ok"):
-            self.status.stop(res.get("error") or "The update could not be "
-                             "prepared.", COLORS["accent_red"])
+            if res.get("cancelled"):
+                # B-004: a Stop is not a failure - it is not red, it does not
+                # blame the network, and the offer is left exactly as it was.
+                self.status.stop("Update cancelled \u2014 nothing was changed.",
+                                 COLORS["subtext"])
+            else:
+                self.status.stop(res.get("error") or "The update could not be "
+                                 "prepared.", COLORS["accent_red"])
             self._render()
             return
         self._state = "ready"

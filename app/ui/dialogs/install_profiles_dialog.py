@@ -8,10 +8,11 @@ about any other dialog except where noted.
 from __future__ import annotations
 
 import tkinter as tk
-from tkinter import ttk, messagebox
-from app.ui.base import ThemedModal
-from app.ui.theme import COLORS, F, TAB_ACCENTS
-from app.ui.widgets import AnimatedButton, RoundedEntry, ScrollableRoundedPanel
+from app.ui.base import ThemedModal, _themed_askyesno
+from app.ui.theme import COLORS, TAB_ACCENTS, TYPE, SPACE_1, SPACE_2, SPACE_3
+from app.ui.metrics import CARD_BODY_INSET, CONTROL_GAP, PAGE_INSET, TEXT_NUDGE
+from app.ui.widgets import (AnimatedButton, EmptyState, ModalFooter,
+                            RoundedEntry, ScrollableRoundedPanel, ToolRow)
 
 
 class InstallProfilesDialog(ThemedModal):
@@ -40,24 +41,24 @@ class InstallProfilesDialog(ThemedModal):
 
         tk.Label(body, text="Save the apps you have ticked, and put them "
                             "back any time.",
-                 font=(F, 10, "bold"), bg=COLORS["bg"], fg=COLORS["text"],
-                 anchor="w").pack(fill="x", pady=(0, 2))
+                 font=TYPE["label_large"], bg=COLORS["bg"], fg=COLORS["text"],
+                 anchor="w").pack(fill="x", pady=(0, TEXT_NUDGE))
         tk.Label(body, text="Handy after a fresh Windows install — tick your "
                             "usual apps once, save them, load them next time.",
-                 font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
+                 font=TYPE["caption"], bg=COLORS["bg"], fg=COLORS["subtext"],
                  anchor="w", wraplength=self.body_width(28), justify="left").pack(
-                     fill="x", pady=(0, 14))
+                     fill="x", pady=(0, CARD_BODY_INSET))
 
         # --- save row ---
         save_box = tk.Frame(body, bg=COLORS["bg_alt"])
-        save_box.pack(fill="x", pady=(0, 14))
+        save_box.pack(fill="x", pady=(0, CARD_BODY_INSET))
         inner = tk.Frame(save_box, bg=COLORS["bg_alt"])
-        inner.pack(fill="x", padx=14, pady=12)
+        inner.pack(fill="x", padx=CARD_BODY_INSET, pady=SPACE_3)
         n_now = self._current_count()
         self._save_hint = tk.Label(
-            inner, text=self._save_hint_text(n_now), font=(F, 9),
+            inner, text=self._save_hint_text(n_now), font=TYPE["caption"],
             bg=COLORS["bg_alt"], fg=COLORS["subtext"], anchor="w")
-        self._save_hint.pack(fill="x", pady=(0, 6))
+        self._save_hint.pack(fill="x", pady=(0, CONTROL_GAP))
         entry_row = tk.Frame(inner, bg=COLORS["bg_alt"])
         entry_row.pack(fill="x")
         self._name_var = tk.StringVar(value="")
@@ -66,9 +67,8 @@ class InstallProfilesDialog(ThemedModal):
         self._entry.pack(side="left")
         self._save_btn = AnimatedButton(
             entry_row, text="Save", command=self._save,
-            bg=TAB_ACCENTS["Install"], fg=COLORS["black"],
-            font=(F, 9, "bold"), padx=20, pady=7)
-        self._save_btn.pack(side="left", padx=(8, 0))
+            role="filled", size="sm", accent=TAB_ACCENTS["Install"])
+        self._save_btn.pack(side="left", padx=(SPACE_2, 0))
         self._save_btn.set_enabled(bool(n_now))
         try:
             self._entry.entry.bind("<Return>", lambda _e: self._save())
@@ -76,24 +76,25 @@ class InstallProfilesDialog(ThemedModal):
             pass
 
         # --- saved list ---
-        tk.Label(body, text="Saved setups", font=(F, 9, "bold"),
+        tk.Label(body, text="Saved setups", font=TYPE["label_medium"],
                  bg=COLORS["bg"], fg=COLORS["subtext"],
-                 anchor="w").pack(fill="x", pady=(0, 4))
+                 anchor="w").pack(fill="x", pady=(0, SPACE_1))
         self._panel = ScrollableRoundedPanel(body)
         self._panel.config(height=210)
         self._panel.pack(fill="x")
         self._rows_holder = self._panel.inner
 
-        self._status = tk.Label(body, text="", font=(F, 9), bg=COLORS["bg"],
-                                fg=COLORS["subtext"])
-        self._status.pack(pady=(10, 0))
-
-        brow = tk.Frame(body, bg=COLORS["bg"])
-        brow.pack(fill="x", pady=(12, 0))
-        AnimatedButton(brow, text="Close", command=self.close,
-                       bg=TAB_ACCENTS["Install"], fg=COLORS["black"],
-                       font=(F, 9, "bold"), padx=22,
-                       pady=7).pack(side="right")
+        # Status and Close share the one footer: the label used to float
+        # above a separate button row, which is a second bottom bar invented
+        # for this dialog alone. It now lives in the footer's hint slot, in
+        # the same place ToolPage puts its status line.
+        self._footer = ModalFooter(body, accent=TAB_ACCENTS["Install"])
+        self._footer.pack_footer()
+        self._status = tk.Label(self._footer.hint_slot, text="",
+                                font=TYPE["caption"], bg=COLORS["bg"],
+                                fg=COLORS["subtext"], anchor="w")
+        self._status.pack(side="left", fill="x", expand=True)
+        self._footer.button("Close", self.close, kind="primary")
 
         self._refresh_rows()
 
@@ -137,8 +138,11 @@ class InstallProfilesDialog(ThemedModal):
         except Exception:
             profiles = {}
         if not profiles:
-            tk.Label(holder, text="No saved setups yet.", font=(F, 9),
-                     bg=COLORS["bg_alt"], fg=COLORS["subtext"]).pack(pady=16)
+            EmptyState(holder, glyph="\u2606", text="No saved setups yet.",
+                       detail="Name a set of ticked apps and it lands here.",
+                       bg=COLORS["bg_alt"],
+                       wrap=max(240, self.body_width(26))).pack(
+                           fill="x", pady=(CARD_BODY_INSET, PAGE_INSET))
         else:
             for name in sorted(profiles, key=lambda n: n.lower()):
                 self._build_row(holder, name, profiles[name])
@@ -148,25 +152,24 @@ class InstallProfilesDialog(ThemedModal):
             pass
 
     def _build_row(self, parent, name, ids):
-        row = tk.Frame(parent, bg=COLORS["bg_alt"])
-        tk.Label(row, text=name, font=(F, 10, "bold"), bg=COLORS["bg_alt"],
-                 fg=COLORS["text"], anchor="w").pack(side="left", padx=(10, 6),
-                                                     pady=7)
+        """One saved set: a ToolRow with its two actions in the action slot."""
         n = len(ids or [])
-        tk.Label(row, text="%d app%s" % (n, "" if n == 1 else "s"),
-                 font=(F, 9), bg=COLORS["bg_alt"],
-                 fg=COLORS["subtext"]).pack(side="left")
-        AnimatedButton(row, text="Delete",
-                       command=lambda nm=name: self._delete(nm),
-                       bg=COLORS["surface"], fg=COLORS["subtext"],
-                       font=(F, 9, "bold"), padx=12,
-                       pady=5).pack(side="right", padx=(6, 10), pady=5)
-        AnimatedButton(row, text="Load",
+        row = ToolRow(parent, title=name,
+                      sub="%d app%s" % (n, "" if n == 1 else "s"),
+                      size="md", show_dot=False)
+        # Right-to-left: the first packed action is the rightmost, so Delete
+        # sits at the outer edge and Load immediately to its left - the same
+        # order every other row's actions use.
+        AnimatedButton(row.actions, text="Delete",
+                       command=lambda nm=name, c=n: self._delete(nm, c),
+                       role="text", size="sm").pack(side="right",
+                                                    padx=(CONTROL_GAP, SPACE_1))
+        AnimatedButton(row.actions, text="Load",
                        command=lambda nm=name, i=list(ids or []): self._load(nm, i),
-                       bg=TAB_ACCENTS["Install"], fg=COLORS["black"],
-                       font=(F, 9, "bold"), padx=16,
-                       pady=5).pack(side="right", pady=5)
-        row.pack(fill="x", pady=2)
+                       role="filled", size="sm",
+                       accent=TAB_ACCENTS["Install"]).pack(side="right")
+        row.bind_content()
+        row.pack(fill="x", pady=TEXT_NUDGE)
 
     # ---- actions -------------------------------------------------- #
 
@@ -216,11 +219,50 @@ class InstallProfilesDialog(ThemedModal):
         except Exception:
             pass
 
-    def _delete(self, name):
+    def _confirm_delete(self, name, count):
+        """Ask before a saved setup is thrown away. False means keep it.
+
+        Delete was the one destructive action in this dialog with no
+        question attached: one mis-aimed click on a row took a setup away
+        for good, while every other destructive action in the app (Process
+        Manager, Uninstall leftovers, service changes) asks first. The
+        count goes in the message because the name alone does not say how
+        much is going. A confirm that cannot be shown counts as No, so a
+        broken dialog can never be read as consent.
+        """
+        msg = ""
+        if count:
+            msg = "It holds %d app%s.\n\n" % (
+                count, "" if count == 1 else "s")
+        msg += ("The apps themselves stay installed — only the saved "
+                "setup is removed, and you can save the same picks again.")
+        try:
+            return bool(_themed_askyesno(
+                self._dlg, "Delete '%s'?" % name, msg,
+                accent=TAB_ACCENTS["Install"],
+                yes_text="Delete", no_text="Keep it"))
+        except Exception:
+            return False
+
+    def _delete(self, name, count=0):
+        if not self._confirm_delete(name, count):
+            return
+        ok = False
         try:
             from app.config_persist import delete_install_profile
-            delete_install_profile(name)
-        except Exception:
-            pass
+            ok = bool(delete_install_profile(name))
+        except Exception as exc:
+            # Used to be dropped on the floor, then "Deleted" was said
+            # anyway: the row stayed on screen and the status line lied.
+            try:
+                from app.utils import log_or_swallow
+                log_or_swallow(None, "could not delete the saved setup "
+                               "%r" % name, exc)
+            except Exception:
+                pass
         self._refresh_rows()
-        self._say("Deleted '%s'." % name)
+        if ok:
+            self._say("Deleted '%s'." % name)
+        else:
+            self._say("Couldn't delete '%s' — the saved setups file may be "
+                      "in use. Try again in a moment." % name)

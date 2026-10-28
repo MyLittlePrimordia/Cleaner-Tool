@@ -13,10 +13,14 @@ from app.ui.widgets.rounded_card import RoundedCard
 from app.ui.widgets.entry import RoundedEntry
 
 from app.ui.widgets.dropdown import M3Dropdown
-from tkinter import ttk, messagebox
 from app.ui.dialogs._tool_page import ToolPage
-from app.ui.theme import COLORS, F, TAB_ACCENTS
+from app.ui.theme import (
+    COLORS, RADIUS_SURFACE, TAB_ACCENTS, TYPE, SPACE_1, SPACE_2, SPACE_4,
+)
+from app.ui.metrics import CARD_BODY_INSET, GROUP_GAP, TIGHT_GAP
+from app.ui.base import Tooltip
 from app.ui.widgets import AnimatedButton
+from app.config_schema import GAMEPING_MAX
 
 
 class _Row(RoundedCard):
@@ -47,19 +51,20 @@ class GameServerPingDialog(ToolPage):
         self._landed = [0]     # painted this round (Tk thread only)
         self._total = [0]
         self._poll_after = None
+        # U-008: order/remember live in the data module (pure and testable);
+        # this dialog owns only the widget. Until the installed-games scan
+        # lands, `order_titles()` is the same A-Z list with Custom pinned to
+        # the end (the fix for Custom landing among the C's).
+        self._quiet = False          # True while WE set the picker value
+        self._installed = ()         # titles of games found on this PC
         try:
             from app import gameping as _gp0
-            # user-reported: "Custom" sorted alphabetically landed in the
-            # middle of the list (near the C's) instead of standing out as
-            # the catch-all option. Sort everything else A-Z, then pin
-            # Custom to the end where users expect a catch-all/"other"
-            # entry to live.
-            _rest = sorted((t for t, k in _gp0.GAME_TABS if k != "custom"),
-                           key=lambda t: t.casefold())
-            _games = tuple(_rest) + ("Custom",)
+            _games = _gp0.order_titles()
         except Exception:
             _games = ("Fortnite",)
-        self._game_var = tk.StringVar(value=_games[0])
+        self._saved_pick = self._saved_game()
+        self._game_var = tk.StringVar(
+            value=self._initial_game(_games, self._saved_pick))
         super().__init__(parent, title="Game Server Ping",
                          accent=TAB_ACCENTS["Clean"],
                          scope="Ping is a measurement only — nothing is "
@@ -82,12 +87,15 @@ class GameServerPingDialog(ToolPage):
             self._game_combo = M3Dropdown(
                 self.toolbar, textvariable=self._game_var, values=_games,
                 state="readonly", width=42 if tk.TkVersion >= 8.6 else 38,
-                font=(F, 11))
+                font=TYPE["body_large"])
             self._game_combo.pack(side="left")
+            Tooltip(self._game_combo,
+                    "Games already installed on this PC are listed first, "
+                    "marked \u25cf. Custom covers anything not listed.")
         except Exception:
             pass
         try:
-            self._game_var.trace_add("write", lambda *_a: self._start_test())
+            self._game_var.trace_add("write", lambda *_a: self._on_game_change())
         except Exception:
             pass
         self._test_btn = self.add_button("Test", self._start_test,
@@ -96,19 +104,126 @@ class GameServerPingDialog(ToolPage):
         self._method_lbl = tk.Label(body, text="")
         self._custom_row = tk.Frame(body, bg=COLORS["bg"])
         self._rows_body = tk.Frame(body, bg=COLORS["bg"])
-        self._rows_body.pack(fill="x", pady=(4, 0))
-        self._verdict_lbl = tk.Label(body, text="", font=(F, 13, "bold"),
+        self._rows_body.pack(fill="x", pady=(SPACE_1, 0))
+        self._verdict_lbl = tk.Label(body, text="", font=TYPE["readout_small"],
                                      bg=COLORS["bg"], fg=COLORS["text"])
-        self._verdict_lbl.pack(pady=(16, 0))
+        self._verdict_lbl.pack(pady=(SPACE_4, 0))
         self.on_close(self._cancel)
         self._start_test()
+        self._order_by_installed()
 
     # ---- target lists ------------------------------------------------- #
+
+    # ---- remembering the pick / ordering by what is installed (U-008) -- #
+
+    @staticmethod
+    def _saved_game():
+        """The bare title saved by an earlier session, or "".
+
+        Stored bare (no ● marker) because the marker depends on what is
+        installed today, not on what was installed when it was saved.
+        """
+        try:
+            from app.config_persist import load_config
+            return str(load_config().get("gameping_last_game") or "")
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _initial_game(games, saved):
+        """The pick to open on: the saved game while it still exists.
+
+        A title that is gone (renamed tab, hand-edited config) falls back to
+        the first row rather than being handed to the picker.
+        """
+        if saved and saved in games:
+            return saved
+        return games[0] if games else "Custom"
+
+    def _on_game_change(self):
+        self._remember_pick()
+        self._start_test()
+
+    def _remember_pick(self):
+        """Save the pick for next time. Best-effort: a failed write must not
+        swallow the ping the user just asked for."""
+        if getattr(self, "_quiet", False):
+            return
+        try:
+            from app import gameping as _gp
+            from app.config_persist import update_config
+            title = _gp.bare_title(self._game_var.get())
+            if not title:
+                return
+
+            def _mut(cfg):
+                cfg["gameping_last_game"] = title
+            update_config(_mut)
+        except Exception:
+            pass
+
+    def _order_by_installed(self):
+        """U-008: float the games this PC already has to the top.
+
+        Off the Tk thread: discovering installed games reads the registry and
+        every Steam library manifest, which is seconds on a big library.
+        Until it lands the picker is the plain A-Z list.
+        """
+        def _scan():
+            try:
+                from app.game_catalog import installed_games
+                names = [(g.get("name") or "") for g in installed_games() or []]
+            except Exception:
+                return
+            if not names:
+                return
+            try:
+                self.after(0, lambda: self._apply_installed_order(names))
+            except Exception:
+                pass
+        try:
+            import threading
+            threading.Thread(target=_scan, daemon=True,
+                             name="gameping-installed").start()
+        except Exception:
+            pass
+
+    def _apply_installed_order(self, names):
+        try:
+            from app import gameping as _gp
+            # This page is a ThemedModal, not a Widget: the window is _dlg.
+            # Nothing may touch Tk from the scan thread after close().
+            if getattr(self, "_modal_closed", False):
+                return
+            dlg = getattr(self, "_dlg", None)
+            if dlg is not None and not dlg.winfo_exists():
+                return
+            hits = _gp.installed_titles(names)
+            if not hits or set(hits) == set(self._installed):
+                return
+            first_scan = not self._installed
+            self._installed = hits
+            current = _gp.bare_title(self._game_var.get())
+            if first_scan and not self._saved_pick:
+                # Nothing was ever picked, so the page opened on whatever
+                # sorted first. Now that we know what is installed, start on
+                # the top row instead of pinging a game nobody owns.
+                current = hits[0]
+            values = _gp.picker_values(names)
+            self._quiet = True
+            try:
+                self._game_combo.configure(values=values)
+                if current:
+                    self._game_var.set(_gp.mark_installed(current, hits))
+            finally:
+                self._quiet = False
+        except Exception:
+            pass
 
     def _tab_key(self):
         try:
             from app import gameping as _gp
-            want = self._game_var.get()
+            want = _gp.bare_title(self._game_var.get())
             for title, key in _gp.GAME_TABS:
                 if title == want:
                     return key
@@ -145,16 +260,14 @@ class GameServerPingDialog(ToolPage):
                 pass
             if not show:
                 return
-            self._custom_row.pack(pady=(8, 0))
-            _ce = RoundedEntry(self._custom_row, width=34, font=(F, 11))
+            self._custom_row.pack(pady=(SPACE_2, 0))
+            _ce = RoundedEntry(self._custom_row, width=34, font=TYPE["body_large"])
             _ce.pack(side="left")
             self._custom_entry = _ce.entry
             AnimatedButton(self._custom_row, text="Add",
                            command=self._add_custom,
-                           bg=COLORS["secondary_container"],
-                           fg=COLORS["on_secondary_container"],
-                           font=(F, 10, "bold"), padx=22,
-                           pady=9).pack(side="left", padx=(8, 0))
+                           role="tonal", size="md").pack(side="left",
+                                                         padx=(SPACE_2, 0))
         except Exception:
             pass
 
@@ -178,7 +291,10 @@ class GameServerPingDialog(ToolPage):
                 hosts = cfg.get("gameping_hosts")
                 if not isinstance(hosts, list):
                     hosts = cfg["gameping_hosts"] = []
-                if saved not in hosts and len(hosts) < 64:
+                # I-007: the schema's cap, not a second literal 64. A drifted
+                # copy would make the dialog reject targets the loader accepts
+                # (or the reverse) with nothing to catch it.
+                if saved not in hosts and len(hosts) < GAMEPING_MAX:
                     hosts.append(saved)
             _update(_mut)
             try:
@@ -249,24 +365,24 @@ class GameServerPingDialog(ToolPage):
         for key, title, _kind, _host, _port in targets:
             try:
                 row = _Row(self._rows_body, fill=COLORS["bg_alt"],
-                           bg=COLORS["bg"], radius=16, min_height=48)
-                row.pack(fill="x", pady=3)
+                           bg=COLORS["bg"], radius=RADIUS_SURFACE, min_height=48)
+                row.pack(fill="x", pady=TIGHT_GAP)
                 rb = row.body
-                tk.Label(rb, text=title, font=(F, 11, "bold"),
+                tk.Label(rb, text=title, font=TYPE["card_title"],
                          bg=COLORS["bg_alt"], fg=COLORS["text"],
-                         anchor="w").pack(side="left", padx=(14, 0), pady=10)
+                         anchor="w").pack(side="left", padx=(CARD_BODY_INSET, 0), pady=GROUP_GAP)
                 if custom:
-                    _rm = tk.Label(rb, text="\u2715", font=(F, 10),
+                    _rm = tk.Label(rb, text="\u2715", font=TYPE["body_medium"],
                                    bg=COLORS["bg_alt"], fg=COLORS["subtext"],
                                    cursor="hand2")
-                    _rm.pack(side="left", padx=(8, 0))
+                    _rm.pack(side="left", padx=(SPACE_2, 0))
                     _rm.bind("<Button-1>",
                              lambda _e, raw=key: self._remove_custom(raw),
                              add="+")
-                ms = tk.Label(rb, text="\u2026", font=(F, 11),
+                ms = tk.Label(rb, text="\u2026", font=TYPE["body_large"],
                               bg=COLORS["bg_alt"], fg=COLORS["subtext"],
                               anchor="e")
-                ms.pack(side="right", padx=(0, 14))
+                ms.pack(side="right", padx=(0, CARD_BODY_INSET))
                 self._rows[key] = {"ms": ms, "row": row}
             except Exception:
                 pass

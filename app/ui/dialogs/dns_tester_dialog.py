@@ -11,10 +11,12 @@ import tkinter as tk
 
 from app.ui.widgets.rounded_card import RoundedCard
 from app.ui.widgets.entry import RoundedEntry
-from tkinter import ttk, messagebox
 from app.ui.base import Tooltip, _themed_askyesno
 from app.ui.dialogs._tool_page import ToolPage
-from app.ui.theme import COLORS, F, TAB_ACCENTS, _hex_lerp
+from app.ui.theme import (
+    COLORS, RADIUS_SURFACE, TAB_ACCENTS, TYPE, _hex_lerp, SPACE_1, SPACE_2, SPACE_3,
+)
+from app.ui.metrics import CARD_BODY_INSET, CONTROL_GAP, GROUP_GAP, ROW_PAD, TIGHT_GAP
 from app.ui.widgets import AnimatedButton, AnimatedProgressBar
 
 
@@ -75,7 +77,6 @@ class DnsTesterDialog(ToolPage):
         # REDESIGN 2026-10: migrated onto the shared ToolPage shell — the
         # descriptive intro label became the Header banner and the hand-built
         # button row moved into the shared footer roles.
-        dlg = self._dlg
         body = self.content
 
         # F09: honest methodology — TCP:53 handshake ranking (stdlib-only),
@@ -88,11 +89,11 @@ class DnsTesterDialog(ToolPage):
         # progress (indeterminate — probe count is known but per-probe
         # latency isn't; the honest signal is rows landing below)
         self._bar = AnimatedProgressBar(body, accent=TAB_ACCENTS["Tweak"])
-        self._bar.pack(fill="x", pady=(14, 0))
+        self._bar.pack(fill="x", pady=(CARD_BODY_INSET, 0))
         self._bar.set_indeterminate(True)
-        self._status_lbl = tk.Label(body, text="Starting…", font=(F, 10),
+        self._status_lbl = tk.Label(body, text="Starting…", font=TYPE["body_medium"],
                                     bg=COLORS["bg"], fg=COLORS["subtext"])
-        self._status_lbl.pack(pady=(6, 10))
+        self._status_lbl.pack(pady=(CONTROL_GAP, GROUP_GAP))
 
         self._rows_body = tk.Frame(body, bg=COLORS["bg"])
         self._rows_body.pack(fill="x")
@@ -103,21 +104,19 @@ class DnsTesterDialog(ToolPage):
         # is required; secondary is optional (falls back to primary-only
         # if left blank, same as any single-address custom host).
         custom_row = tk.Frame(body, bg=COLORS["bg"])
-        custom_row.pack(pady=(14, 0))
-        _pf = RoundedEntry(custom_row, width=16, font=(F, 11))
-        _pf.pack(side="left", padx=4)
+        custom_row.pack(pady=(CARD_BODY_INSET, 0))
+        _pf = RoundedEntry(custom_row, width=16, font=TYPE["body_large"])
+        _pf.pack(side="left", padx=SPACE_1)
         self._custom_primary_entry = _pf.entry
         Tooltip(self._custom_primary_entry, "Primary DNS IP (required)")
-        _sf = RoundedEntry(custom_row, width=16, font=(F, 11))
-        _sf.pack(side="left", padx=4)
+        _sf = RoundedEntry(custom_row, width=16, font=TYPE["body_large"])
+        _sf.pack(side="left", padx=SPACE_1)
         self._custom_secondary_entry = _sf.entry
         Tooltip(self._custom_secondary_entry, "Secondary DNS IP (optional)")
         AnimatedButton(custom_row, text="Add & Test",
                        command=self._add_custom_dns,
-                       bg=COLORS["secondary_container"],
-                       fg=COLORS["on_secondary_container"],
-                       font=(F, 10, "bold"), padx=22,
-                       pady=9).pack(side="left", padx=(8, 0))
+                       role="tonal", size="md").pack(side="left",
+                                                      padx=(SPACE_2, 0))
         for _e in (self._custom_primary_entry, self._custom_secondary_entry):
             try:
                 _e.bind("<Return>", lambda _ev: self._add_custom_dns())
@@ -309,7 +308,7 @@ class DnsTesterDialog(ToolPage):
         """Build one server row (shared by the built-in list and a
         user-added Custom entry) and register it in self._row_widgets."""
         row = _PickRow(self._rows_body, fill=COLORS["bg_alt"],
-                       bg=COLORS["bg"], radius=16, min_height=44)
+                       bg=COLORS["bg"], radius=RADIUS_SURFACE, min_height=44)
         rb = row.body
         try:
             _pri, _sec = self._pair_for(ip)
@@ -317,22 +316,22 @@ class DnsTesterDialog(ToolPage):
         except Exception:
             _pair_txt = ip
         title = name + ("  (current)" if is_current else "")
-        name_lbl = tk.Label(rb, text=title, font=(F, 11, "bold"),
+        name_lbl = tk.Label(rb, text=title, font=TYPE["card_title"],
                             bg=COLORS["bg_alt"], fg=COLORS["text"],
                             anchor="w")
-        name_lbl.pack(side="left", padx=(12, 0), pady=9)
-        ip_lbl = tk.Label(rb, text=_pair_txt, font=(F, 9),
+        name_lbl.pack(side="left", padx=(SPACE_3, 0), pady=ROW_PAD)
+        ip_lbl = tk.Label(rb, text=_pair_txt, font=TYPE["caption"],
                           bg=COLORS["bg_alt"], fg=COLORS["muted"])
-        ip_lbl.pack(side="left", padx=(10, 0))
-        badge = tk.Label(rb, text="", font=(F, 9, "bold"),
+        ip_lbl.pack(side="left", padx=(GROUP_GAP, 0))
+        badge = tk.Label(rb, text="", font=TYPE["label_medium"],
                          bg=COLORS["bg_alt"], fg=COLORS["accent_green"])
-        badge.pack(side="left", padx=(8, 0))
-        pick = tk.Label(rb, text="", font=(F, 10, "bold"),
+        badge.pack(side="left", padx=(SPACE_2, 0))
+        pick = tk.Label(rb, text="", font=TYPE["label_large"],
                         bg=COLORS["bg_alt"], fg=TAB_ACCENTS["Tweak"])
-        pick.pack(side="left", padx=(6, 0))
-        ms = tk.Label(rb, text="…", font=(F, 11, "bold"),
+        pick.pack(side="left", padx=(CONTROL_GAP, 0))
+        ms = tk.Label(rb, text="…", font=TYPE["card_title"],
                       bg=COLORS["bg_alt"], fg=COLORS["subtext"])
-        ms.pack(side="right", padx=(0, 14))
+        ms.pack(side="right", padx=(0, CARD_BODY_INSET))
         self._row_widgets[ip] = {"row": row, "ms": ms, "badge": badge,
                                  "pick": pick, "name": name,
                                  "current": is_current}
@@ -344,7 +343,7 @@ class DnsTesterDialog(ToolPage):
                        lambda e, _ip=ip: self._select_ip(_ip), add="+")
             except Exception:
                 pass
-        row.pack(fill="x", pady=3)
+        row.pack(fill="x", pady=TIGHT_GAP)
         return row
 
     def _build_rows(self, targets, skipped_current=None, _gen=None):

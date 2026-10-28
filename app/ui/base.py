@@ -14,11 +14,12 @@ from __future__ import annotations
 import tkinter as tk
 from tkinter import messagebox
 
-from app.config import FONT_FAMILY
 from app.ui.theme import (
-    COLORS, F, SHAPE_XL, TYPE, _next_transparent_color,
-    _release_transparent_color, _round_rect_points,
+    COLORS, DIALOG_PAD_BOTTOM, DIALOG_PAD_TOP, DIALOG_PAD_X, RADIUS_WINDOW, TYPE,
+    _next_transparent_color, _release_transparent_color, _round_rect_points,
+    SPACE_2, ui_scale,
 )
+from app.ui.metrics import GROUP_GAP, TEXT_NUDGE
 # The themed message boxes moved in from app/gui.py build their buttons with
 # AnimatedButton. This is base -> widgets, which is the allowed direction
 # (widgets know nothing about modals), so it introduces no cycle.
@@ -26,7 +27,7 @@ from app.ui.widgets.button import AnimatedButton
 # Tooltip is a widget (it moved to app/ui/widgets/tooltip.py so that the
 # window chrome, which is also a widget, does not have to import upward).
 # Re-exported here because most of the app has always imported it from base.
-from app.ui.widgets.tooltip import Tooltip
+from app.ui.widgets.tooltip import Tooltip  # noqa: F401  (re-export)
 
 # BUG-001: every feature dialog needs a safe way to hand work from a worker
 # thread to the Tk thread, and the only correct way is TkDispatcher -- calling
@@ -240,8 +241,13 @@ class ThemedModal:
     SIZE_MIN = (720, 520)
     SIZE_MAX = (1120, 880)
 
-    RADIUS = 16
-    _TITLE_H = 44
+    #: The dialog card's corner radius, and therefore the inset its content
+    #: frame needs. These were two different numbers (16 here, SHAPE_XL 28 on
+    #: the polygon), so the body was inset for a 16px arc on a 28px face and
+    #: the square content frame could sit over the curve (DESIGN G-002). The
+    #: role, not the rung: the same 28px is `RADIUS_WINDOW` everywhere else.
+    RADIUS = RADIUS_WINDOW
+    _TITLE_H = 48
 
     @classmethod
     def _proportional_size(cls, parent):
@@ -251,7 +257,15 @@ class ThemedModal:
         unavailable -- an unmapped window reports 1x1, which would otherwise
         collapse every dialog to the minimum.
         """
-        fallback = (cls.WIDTH, cls.HEIGHT)
+        # DPI-SCALED (2026-10 visual pass): the parent is measured in physical
+        # pixels. The fraction already follows it, but the min/max caps were
+        # 96-DPI numbers, so at 200% every popup stopped at 1120x880 while its
+        # text doubled -- a 1120px dialog holding 200%-sized rows showed six
+        # of thirty-three. Scale the ladder with the display, not just the
+        # fraction, so a dialog keeps the same logical footprint at every DPI.
+        scale = ui_scale(parent)
+        fallback = (int(round(cls.WIDTH * scale)),
+                    int(round(cls.HEIGHT * scale)))
         try:
             pw = int(parent.winfo_width())
             ph = int(parent.winfo_height())
@@ -261,8 +275,10 @@ class ThemedModal:
         if pw <= 1 or ph <= 1:
             return fallback
         frac_w, frac_h = cls.SIZE_FRACTION
-        min_w, min_h = cls.SIZE_MIN
-        max_w, max_h = cls.SIZE_MAX
+        min_w, min_h = (int(round(cls.SIZE_MIN[0] * scale)),
+                        int(round(cls.SIZE_MIN[1] * scale)))
+        max_w, max_h = (int(round(cls.SIZE_MAX[0] * scale)),
+                        int(round(cls.SIZE_MAX[1] * scale)))
         w = max(min_w, min(max_w, int(pw * frac_w)))
         h = max(min_h, min(max_h, int(ph * frac_h)))
         return w, h
@@ -282,13 +298,14 @@ class ThemedModal:
     _MODAL_OPEN: "dict[int, object]" = {}
 
     def __init__(self, parent, *, title, accent=None, size=None,
-                 scrim=True, no_x=False):
+                 scrim=True, no_x=False, headline_below=False):
         try:
             root = parent.winfo_toplevel()
         except Exception:
             root = parent
         self._modal_root = root
         self._modal_title = title
+        self._headline_below = bool(headline_below)
         self._modal_accent = accent or COLORS["accent_blue"]
         self._modal_scrim_on = bool(scrim)
         self._modal_closed = False
@@ -365,7 +382,7 @@ class ThemedModal:
         card.pack(fill="both", expand=True)
         try:
             card.create_polygon(
-                _round_rect_points(0, 0, w - 1, h - 1, SHAPE_XL),
+                _round_rect_points(0, 0, w - 1, h - 1, self.RADIUS),
                 smooth=True, fill=COLORS["bg"], outline="")
         except Exception:
             pass
@@ -381,14 +398,36 @@ class ThemedModal:
             pass     # M3: dialogs carry no accent dot
         except Exception:
             pass
+        # ONE title per window (design audit C-002).
+        #
+        # A subclass that draws its own headline below the strip (every Tools
+        # popup does: glyph + question) passes headline_below=True, and this
+        # strip then carries the window's NAME as an overline - small, muted,
+        # uppercase - instead of a second 16pt heading 40px above the real
+        # one. Two bold titles stacked is what made the popups read as
+        # "designed by two people": Speaker Test / "Tap a direction to hear
+        # it." at 16 and 14 bold. A dialog with no headline of its own keeps
+        # the full title here, exactly as before.
+        # x = the content column's left edge (RADIUS + 2), not 24: the strip's
+        # text now starts exactly above the banner's icon column instead of
+        # 6-8px to the left of it, which is the sort of misalignment that
+        # reads as "nothing lines up" without anyone being able to say why.
+        _tx = self.RADIUS + 2
         try:
-            card.create_text(24, 9, text=title, font=(F, 13),
-                             fill=COLORS["text"], anchor="nw")
+            if headline_below:
+                card.create_text(_tx, 16, text=str(title or "").upper(),
+                                 font=TYPE["overline"],
+                                 fill=COLORS["subtext"], anchor="nw")
+            else:
+                card.create_text(_tx, 9, text=title,
+                                 font=TYPE["dialog_title"],
+                                 fill=COLORS["text"], anchor="nw")
         except Exception:
             pass
         if not no_x:
             try:
-                card.create_text(w - 14, 8, text="✕", font=(F, 11, "bold"),
+                card.create_text(w - _tx, 8, text="✕",
+                                 font=TYPE["card_title"],
                                  fill=COLORS["subtext"], anchor="ne",
                                  tags=("dlg_x",))
 
@@ -419,11 +458,21 @@ class ThemedModal:
         # hand-rolled move; canvas-level with X + region guards)
         self._drag_bind(card)
 
-        # content area — subclasses build here
+        # content area — subclasses build here.
+        #
+        # ONE inset for every popup (2026-10 sweep): the body starts at the
+        # shared DIALOG_PAD_X inside the content column and ends
+        # DIALOG_PAD_BOTTOM above the card's bottom edge, so a ToolPage banner,
+        # a plain dialog's list and their buttons all sit on the same left
+        # edge. Before this, five dialogs padded their own children by 18px
+        # while the other thirty had no inset at all, which is why two popups
+        # at the same window size put their text 16px apart.
         body = self.body = tk.Frame(card, bg=COLORS["bg"])
-        card.create_window(self.RADIUS + 2, self._TITLE_H + 2, window=body,
-                           anchor="nw", width=w - 2 * (self.RADIUS + 2),
-                           height=h - self._TITLE_H - 2 - self.RADIUS)
+        _bx = self.RADIUS + 2 + DIALOG_PAD_X
+        card.create_window(_bx, self._TITLE_H + 2 + DIALOG_PAD_TOP,
+                           window=body, anchor="nw", width=w - 2 * _bx,
+                           height=(h - self._TITLE_H - 2 - self.RADIUS
+                                   - DIALOG_PAD_TOP - DIALOG_PAD_BOTTOM))
 
         # uniform close paths: X, Escape, WM_DELETE (native X can appear
         # if the borderless fallback engaged on exotic setups)
@@ -538,7 +587,17 @@ class ThemedModal:
         Floor of 180px matches ToolShell: below that a wrap produces one
         character per line, which is worse than no wrap at all.
         """
-        return max(180, int(getattr(self, "_modal_w", 800)) - int(margin))
+        width = (int(getattr(self, "_modal_w", 800))
+                 - 2 * (self.RADIUS + 2 + DIALOG_PAD_X))
+        # Once the body is laid out, its real width is the truth (the card
+        # scales with the parent, and a test harness may size it directly).
+        try:
+            live = int(self.body.winfo_width())
+            if live > 1:
+                width = live
+        except Exception:
+            pass
+        return max(180, int(width) - int(margin))
 
     def close(self):
         """Single close path: run hook, drop the scrim, destroy. Safe to
@@ -619,10 +678,6 @@ class ThemedModal:
         except Exception:
             pass
 
-    def _close(self):
-        """Legacy close alias (internal buttons + smoke harness route)."""
-        self.close()
-
     @classmethod
     def any_open(cls) -> bool:
         """True while at least one ThemedModal dialog exists. The
@@ -652,8 +707,6 @@ class ThemedModal:
                 return False
 
 
-
-
 # --------------------------------------------------------------------------- #
 # Themed message boxes (moved here from app/gui.py in H12)
 # --------------------------------------------------------------------------- #
@@ -680,9 +733,9 @@ def _themed_askyesno(parent, title: str, message: str, accent: str = None,
                     accent=accent or COLORS["accent_yellow"],
                     size=None, scrim=True)
         body = modal.body
-        tk.Label(body, text=message, font=(FONT_FAMILY, 9), bg=COLORS["bg"],
+        tk.Label(body, text=message, font=TYPE["caption"], bg=COLORS["bg"],
                  fg=COLORS["text"], wraplength=modal.body_width(28),
-                 justify="left").pack(fill="x", pady=(8, 10))
+                 justify="left").pack(fill="x", pady=(SPACE_2, GROUP_GAP))
 
         def _yes():
             result["ok"] = True
@@ -693,15 +746,14 @@ def _themed_askyesno(parent, title: str, message: str, accent: str = None,
             modal.close()
 
         brow = tk.Frame(body, bg=COLORS["bg"])
-        brow.pack(fill="x", pady=(2, 8))
+        brow.pack(fill="x", pady=(TEXT_NUDGE, SPACE_2))
         AnimatedButton(brow, text=no_text, command=_no,
-                       bg=COLORS["surface"], fg=COLORS["text"],
-                       font=(FONT_FAMILY, 9, "bold"), padx=22,
-                       pady=7).pack(side="right", padx=(8, 0))
+                       role="secondary", size="md").pack(side="right",
+                                                          padx=(SPACE_2, 0))
         AnimatedButton(brow, text=yes_text, command=_yes,
-                       bg=accent or COLORS["accent_yellow"],
-                       fg=COLORS["black"], font=(FONT_FAMILY, 9, "bold"),
-                       padx=22, pady=7).pack(side="right")
+                       role="filled", size="md",
+                       accent=accent or COLORS["accent_yellow"]).pack(
+                           side="right")
         modal._dlg.bind("<Return>", lambda _e: _yes())
         # Escape default: No (already bound to close by the base — the
         # False result stands because nothing overrode result["ok"])
@@ -731,15 +783,14 @@ def _themed_notice(parent, title: str, message: str, accent: str,
         modal = _TM(parent, title=title, accent=accent,
                     size=None, scrim=True)
         body = modal.body
-        tk.Label(body, text=message, font=(FONT_FAMILY, 9), bg=COLORS["bg"],
+        tk.Label(body, text=message, font=TYPE["caption"], bg=COLORS["bg"],
                  fg=COLORS["text"], wraplength=modal.body_width(28),
-                 justify="left").pack(fill="x", pady=(8, 10))
+                 justify="left").pack(fill="x", pady=(SPACE_2, GROUP_GAP))
         brow = tk.Frame(body, bg=COLORS["bg"])
-        brow.pack(fill="x", pady=(2, 8))
+        brow.pack(fill="x", pady=(TEXT_NUDGE, SPACE_2))
         AnimatedButton(brow, text=ok_text, command=modal.close,
-                       bg=accent,
-                       fg=COLORS["black"], font=(FONT_FAMILY, 9, "bold"),
-                       padx=22, pady=7).pack(side="right")
+                       role="filled", size="md", accent=accent).pack(
+                           side="right")
         modal._dlg.bind("<Return>", lambda _e: modal.close())
         modal.wait()
     except Exception:
@@ -776,13 +827,3 @@ def _themed_showerror(parent, title: str, message: str, accent: str = None,
     _themed_notice(parent, title, message,
                    accent or COLORS["accent_red"], ok_text,
                    messagebox.showerror)
-
-
-
-
-
-
-
-
-
-

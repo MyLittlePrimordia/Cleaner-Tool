@@ -10,7 +10,6 @@ after a clean that worked. These resolve %SystemDrive% instead.
 from __future__ import annotations
 
 import os
-import string
 
 def _system_drive_root() -> str:
     """Root of the drive Windows is actually installed on, e.g. 'C:\\'.
@@ -69,17 +68,12 @@ def _drive_gains(before_map, after_map):
 
     Sorted biggest gain first. Drives missing from either snapshot, or
     that did not gain, are left out — the card never invents a number.
+
+    N-010: the maths moved to `app/freed.py`, which the run worker now uses
+    to reconcile the card's hero number with these same gains. This stays as
+    the name the scorecard and the suite already import; it delegates so there
+    is one definition of "a drive gained space" rather than two that can
+    drift.
     """
-    gains = []
-    try:
-        for root, before in (before_map or {}).items():
-            after = (after_map or {}).get(root)
-            if not before or not after:
-                continue
-            delta = (after[0] or 0) - (before[0] or 0)
-            if delta > 0:
-                gains.append((root, delta))
-    except Exception:
-        return []
-    gains.sort(key=lambda g: g[1], reverse=True)
-    return gains
+    from app.freed import gains
+    return list(gains(before_map, after_map))

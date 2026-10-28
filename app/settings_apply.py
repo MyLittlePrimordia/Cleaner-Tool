@@ -15,6 +15,8 @@ from __future__ import annotations
 from typing import Dict, List, Tuple
 
 HEALTH_MODES = ("off", "startup", "daily", "weekly")
+#: Window animations: follow the OS setting, or force it for this app.
+ANIMATION_MODES = ("system", "on", "off")
 
 
 def apply_settings(values: Dict[str, object],
@@ -31,6 +33,12 @@ def apply_settings(values: Dict[str, object],
       close_to_tray   bool
       health_mode     str    off | startup | daily | weekly
       drivers_folder  str    '' = the default folder next to the exe
+      window_animations str  system (follow Windows) | on | off
+      ui_scale        str    system (display + 125% floor) | 100..200
+      watch_enabled   bool   N-006: quiet watch may notify at all
+      watch_free      int    percent free that marks a drive
+      watch_drop      int    health-score points worth a notice
+      watch_missed    bool   mention a schedule that stopped or failed
 
     `results` are short past-tense phrases for a status line; `errors` are
     things the user must be told about (a task that could not be created).
@@ -124,6 +132,52 @@ def apply_settings(values: Dict[str, object],
         plain["drivers_folder"] = str(v["drivers_folder"] or "").strip()
     if "quarantine_enabled" in v:
         plain["quarantine_enabled"] = bool(v["quarantine_enabled"])
+    if "quarantine_days" in v:
+        # The dropdown carries the schema's numbers as ints; anything else is
+        # "keep until emptied" rather than a number nobody can see.
+        try:
+            days = int(v["quarantine_days"])
+        except (TypeError, ValueError):
+            days = 0
+        from app.config_schema import QUARANTINE_DAYS
+        plain["quarantine_days"] = days if days in QUARANTINE_DAYS else 0
+    if "window_animations" in v and str(v["window_animations"]) in ANIMATION_MODES:
+        plain["window_animations"] = str(v["window_animations"])
+    # --- quiet watch (N-006) --------------------------------------------
+    # Clamped here as well as in the schema so what is written is what the
+    # Settings row said; a value outside the range falls back to the watch
+    # module's own default instead of silently becoming the nearest edge.
+    if "watch_enabled" in v:
+        plain["watch_enabled"] = bool(v["watch_enabled"])
+    if "watch_missed" in v:
+        plain["watch_missed_run"] = bool(v["watch_missed"])
+    if "watch_free" in v:
+        from app import watch as _watch
+        try:
+            chosen = int(v["watch_free"])
+        except (TypeError, ValueError):
+            chosen = _watch.FREE_DEFAULT
+        plain["watch_free_percent"] = (
+            chosen if _watch.FREE_MIN <= chosen <= _watch.FREE_MAX
+            else _watch.FREE_DEFAULT)
+    if "watch_drop" in v:
+        from app import watch as _watch
+        try:
+            chosen = int(v["watch_drop"])
+        except (TypeError, ValueError):
+            chosen = _watch.SCORE_DROP_DEFAULT
+        plain["watch_score_drop"] = (
+            chosen if _watch.SCORE_DROP_MIN <= chosen <= _watch.SCORE_DROP_MAX
+            else _watch.SCORE_DROP_DEFAULT)
+    if "ui_scale" in v:
+        # The dropdown stores the bare percentage ("150"); tolerate a hand-set
+        # "150%" but never write a value the schema would reject on next load.
+        from app.config_schema import UI_SCALES
+        scale = str(v["ui_scale"] or "").strip().lower()
+        if scale.endswith("%"):
+            scale = scale[:-1].strip()
+        if scale in UI_SCALES:
+            plain["ui_scale"] = scale
     if plain:
         try:
             def _mut(c, _p=plain):
@@ -133,6 +187,32 @@ def apply_settings(values: Dict[str, object],
                 results.append("Close to tray on" if
                                plain["close_to_tray_enabled"]
                                else "Close to tray off")
+            if "watch_enabled" in plain:
+                results.append("Quiet watch on" if plain["watch_enabled"]
+                               else "Quiet watch off")
+            if "quarantine_days" in plain:
+                results.append(
+                    "Quarantine keeps files for %d days" % plain["quarantine_days"]
+                    if plain["quarantine_days"] else
+                    "Quarantine keeps files until you empty it")
+            if "window_animations" in plain:
+                results.append("Window animations " + {
+                    "system": "follow Windows",
+                    "on": "on",
+                    "off": "off",
+                }[plain["window_animations"]])
+            if "ui_scale" in plain and str(
+                    cfg.get("ui_scale", "system")) != plain["ui_scale"]:
+                # Honest about WHEN it applies: Tk's scale is read before the
+                # first widget exists, so a live change would reflow the page
+                # under the user's cursor. Only when it actually changed - a
+                # Save for an unrelated toggle must not keep asking for a
+                # restart.
+                results.append(
+                    "Interface scale: " + (
+                        "Automatic" if plain["ui_scale"] == "system"
+                        else plain["ui_scale"] + "%") +
+                    " (restart to apply)")
         except Exception as exc:                      # noqa: BLE001
             errors.append("Could not save settings: %s" % exc)
     return results, errors

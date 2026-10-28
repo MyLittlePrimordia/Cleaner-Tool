@@ -5,8 +5,10 @@ download, install - and people come back to it.
 
     Header    the answer ("3 drivers can be updated", "1 device has no
               driver") in the same Header every Tools dialog uses
-    Toolbar   Scan this PC, a "check every device" option, and the folder
-              downloads go to (open / change)
+    Toolbar   Scan this PC, a "check every device" option, the folder
+              downloads go to (open / change), and Driver store - the old
+              package versions Windows keeps after every driver update
+              (U-005: they are exported before they are removed)
     List      one row per driver package: checkbox, the device(s), installed
               version -> available version, size, and a Missing / Update tag
     Footer    progress bar + live status, Select all, Download selected, and
@@ -35,10 +37,13 @@ from app.ui.widgets.checkbox import M3Checkbutton
 from tkinter import filedialog
 
 from app.ui.base import _themed_askyesno, _themed_showinfo
-from app.ui.theme import COLORS, F, TAB_ACCENTS
-from app.ui.widgets import AnimatedButton, Tooltip
+from app.ui.theme import (
+    COLORS, PAGE_BOTTOM, PAGE_GUTTER, PAGE_TOP, SECTION_GAP, TAB_ACCENTS, TYPE,
+    SPACE_2,
+)
+from app.ui.metrics import CARD_BODY_INSET, CONTROL_GAP, GROUP_GAP
+from app.ui.widgets import AnimatedButton, PageActionBar, PageLead, Tooltip
 from app.ui.widgets.datatable import DataTable
-from app.ui.widgets.header import Header
 
 ACCENT = TAB_ACCENTS["Drivers"]
 
@@ -75,74 +80,91 @@ class DriversTab(tk.Frame):
         self._dispatch = getattr(app, "_dispatch", None)
 
         pad = tk.Frame(self, bg=COLORS["bg"])
-        pad.pack(fill="both", expand=True, padx=24, pady=(6, 10))
+        pad.pack(fill="both", expand=True, padx=PAGE_GUTTER,
+                 pady=(PAGE_TOP, PAGE_BOTTOM))
 
-        self.header = Header(pad, accent=ACCENT)
-        self.header.pack(fill="x")
-        self.header.set_state("?", COLORS["muted"])
-        self.header.set_title("Find drivers for this PC.")
-        self.header.set_sub("Scan checks your hardware and looks for missing "
-                            "or newer drivers online. Nothing is installed "
-                            "unless you choose it.")
+        # The app bar already names the page. This is the page's RESULT block
+        # (C-003): one state line, one sentence, one supporting line. The
+        # dialog Header that used to live here was a second title.
+        self.lead = PageLead(pad, accent=ACCENT)
+        self.lead.pack(fill="x", pady=(0, SECTION_GAP))
+        self.lead.set(overline="DRIVERS", headline="Find drivers for this PC.",
+                      sub="Scan checks your hardware and looks for missing "
+                          "or newer drivers online. Nothing is installed "
+                          "unless you choose it.",
+                      meta="No scan run yet.")
+        self.header = self.lead      # compatibility with the old call sites
 
         bar = tk.Frame(pad, bg=COLORS["bg"])
-        bar.pack(fill="x", pady=(10, 8))
+        bar.pack(fill="x", pady=(0, SECTION_GAP))
         self.scan_btn = AnimatedButton(
-            bar, text="Scan this PC", command=self._scan, bg=ACCENT,
-            fg=COLORS["black"], font=(F, 9, "bold"), padx=16, pady=6)
+            bar, text="Scan this PC", command=self._scan,
+            role="filled", size="sm", accent=ACCENT)
         self.scan_btn.pack(side="left")
         self._full = tk.BooleanVar(value=False)
         full = M3Checkbutton(
             bar, text="Check every device (slower)", variable=self._full,
             bg=COLORS["bg"], fg=COLORS["subtext"], selectcolor=COLORS["bg"],
             activebackground=COLORS["bg"], activeforeground=COLORS["text"],
-            font=(F, 9), bd=0, highlightthickness=0)
-        full.pack(side="left", padx=(14, 0))
+            font=TYPE["caption"], bd=0, highlightthickness=0)
+        full.pack(side="left", padx=(CARD_BODY_INSET, 0))
         Tooltip(full, "By default only devices that are missing a driver or "
                       "have an older third-party driver are checked.")
-        self.folder_lbl = tk.Label(bar, text="", font=(F, 9),
+        self.folder_lbl = tk.Label(bar, text="", font=TYPE["caption"],
                                    bg=COLORS["bg"], fg=COLORS["muted"],
                                    anchor="e")
         self.change_btn = AnimatedButton(
             bar, text="Change folder\u2026", command=self._change_folder,
-            bg=COLORS["bg"], fg=COLORS["primary"], variant="outlined",
-            font=(F, 10, "bold"), padx=16, pady=6)
+            role="outlined", size="md")
         self.change_btn.pack(side="right")
         self.open_btn = AnimatedButton(
             bar, text="Open folder", command=self._open_folder,
-            bg=COLORS["bg"], fg=COLORS["primary"], variant="outlined",
-            font=(F, 10, "bold"), padx=16, pady=6)
-        self.open_btn.pack(side="right", padx=(0, 6))
-        self.folder_lbl.pack(side="right", padx=(0, 10))
+            role="outlined", size="md")
+        self.open_btn.pack(side="right", padx=(0, CONTROL_GAP))
+        self.folder_lbl.pack(side="right", padx=(0, GROUP_GAP))
 
-        # footer first so its space is reserved (house rule)
-        foot = tk.Frame(pad, bg=COLORS["bg"])
-        foot.pack(side="bottom", fill="x", pady=(10, 0))
-        self.rail = tk.Canvas(foot, height=6, bg=COLORS["bg_alt"],
-                              highlightthickness=0, bd=0)
-        self.rail.pack(fill="x")
-        self.rail.bind("<Configure>", lambda e: self._paint_rail())
-        self._frac = 0.0
-        row = tk.Frame(foot, bg=COLORS["bg"])
-        row.pack(fill="x", pady=(8, 0))
-        self.status = tk.Label(row, text="", font=(F, 9), bg=COLORS["bg"],
+        # U-005: the old driver packages Windows keeps. Deliberately a quiet
+        # outlined button beside Scan rather than a list on this page: the
+        # page's job is "find me a newer driver", and the store is the one
+        # thing here that reclaims space instead of adding a driver.
+        self.store_btn = AnimatedButton(
+            bar, text="Driver store\u2026", command=self._open_store,
+            role="outlined", size="md")
+        self.store_btn.pack(side="left", padx=(CARD_BODY_INSET, 0))
+        Tooltip(self.store_btn,
+                "Windows keeps every earlier version of a driver you update. "
+                "See the ones nothing is using and remove them — each is "
+                "exported to your Drivers folder first.")
+
+        # Footer first so its space is reserved (house rule). One action bar,
+        # page-sized primary at the far right, secondaries before it.
+        self.bar = PageActionBar(pad)
+        self.bar.pack(side="bottom", fill="x")
+        self.status = tk.Label(self.bar.hint_slot, text="",
+                               font=TYPE["caption"], bg=COLORS["bg"],
                                fg=COLORS["subtext"], anchor="w")
         self.status.pack(side="left", fill="x", expand=True)
         self.install_btn = AnimatedButton(
-            row, text="Download & install", command=self._download_install,
-            bg=ACCENT, fg=COLORS["black"], font=(F, 9, "bold"), padx=14,
-            pady=6)
+            self.bar.primary_slot, text="Download & install",
+            command=self._download_install, role="filled", size="lg",
+            accent=ACCENT)
         self.install_btn.pack(side="right")
         self.download_btn = AnimatedButton(
-            row, text="Download only", command=self._download_only,
-            bg=COLORS["surface"], fg=COLORS["text"], font=(F, 9), padx=14,
-            pady=6)
-        self.download_btn.pack(side="right", padx=(0, 8))
+            self.bar.secondary_slot, text="Download only",
+            command=self._download_only, role="secondary", size="md")
+        self.download_btn.pack(side="right", padx=(0, SPACE_2))
         self.all_btn = AnimatedButton(
-            row, text="Select all", command=self._toggle_all,
-            bg=COLORS["surface"], fg=COLORS["text"], font=(F, 9), padx=12,
-            pady=6)
-        self.all_btn.pack(side="right", padx=(0, 8))
+            self.bar.secondary_slot, text="Select all", command=self._toggle_all,
+            role="secondary", size="md")
+        self.all_btn.pack(side="right", padx=(0, SPACE_2))
+
+        # The progress rail keeps its own thin line above the action bar; the
+        # shared ProgressRow migration (C-004) moves it onto that component.
+        self.rail = tk.Canvas(pad, height=6, bg=COLORS["bg_alt"],
+                              highlightthickness=0, bd=0)
+        self.rail.pack(side="bottom", fill="x", pady=(SPACE_2, 0))
+        self.rail.bind("<Configure>", lambda e: self._paint_rail())
+        self._frac = 0.0
         Tooltip(self.install_btn, "Makes a restore point, backs up the driver "
                                   "being replaced, then installs. Needs "
                                   "administrator rights.")
@@ -222,6 +244,7 @@ class DriversTab(tk.Frame):
         idle = not self._busy and not self._run_locked
         for b, on in ((self.install_btn, have), (self.download_btn, have),
                       (self.scan_btn, idle),
+                      (self.store_btn, idle),
                       (self.all_btn, bool(self._items) and idle)):
             try:
                 b.set_enabled(on)
@@ -252,6 +275,7 @@ class DriversTab(tk.Frame):
         self.header.set_state("…", COLORS["muted"])
         self.header.set_title("Scanning...")
         self.header.set_sub("")
+        self.lead.set(meta="Reading your hardware now…")
         self._say("Reading your devices...")
         self._progress(0.0)
         full = bool(self._full.get())
@@ -289,6 +313,7 @@ class DriversTab(tk.Frame):
             self.header.set_title("Could not finish the scan.",
                                   COLORS["accent_yellow"])
             self.header.set_sub(err)
+            self.lead.set(meta="The online catalog could not be reached.")
             self.table.set_empty(
                 "The online lookup did not work",
                 "You can search the Microsoft Update Catalog in your browser "
@@ -302,6 +327,9 @@ class DriversTab(tk.Frame):
                                 "directly." % (
                                     res.get("checked", 0),
                                     "" if res.get("checked") == 1 else "s"))
+            self.lead.set(meta="Checked %d device%s. Nothing to install." % (
+                res.get("checked", 0),
+                "" if res.get("checked") == 1 else "s"))
             self.table.set_empty("Everything checked is up to date.", "",
                                  glyph="✓")
         else:
@@ -318,6 +346,9 @@ class DriversTab(tk.Frame):
             self.header.set_sub("Tick the ones you want. Download only saves "
                                 "the files; Download & install also installs "
                                 "them.")
+            self.lead.set(meta="%d device%s checked. Tick what you want." % (
+                res.get("checked", 0),
+                "" if res.get("checked") == 1 else "s"))
         self._say("")
         self._render()
 
@@ -425,6 +456,26 @@ class DriversTab(tk.Frame):
         except Exception:
             self._say("Could not open the folder.", COLORS["accent_yellow"])
 
+    def _open_store(self):
+        """U-005: the driver store, on top of this page (modal).
+
+        Imported here rather than at module scope: the tab is built during
+        app start-up, and this window shells out to pnputil the moment it
+        opens, which has no business happening before the page is even shown.
+        """
+        if self._busy or self._run_locked:
+            return
+        try:
+            from app.ui.dialogs.driver_store_dialog import DriverStoreDialog
+            DriverStoreDialog(self.winfo_toplevel(), self.app).wait()
+        except Exception as exc:                        # noqa: BLE001
+            try:
+                from app.ui.errors import explain
+                self._say(explain(exc), COLORS["accent_yellow"])
+            except Exception:
+                self._say("Could not open the driver store.",
+                          COLORS["accent_yellow"])
+
     def _change_folder(self):
         path = filedialog.askdirectory(parent=self.winfo_toplevel(),
                                        title="Choose where drivers are saved")
@@ -432,9 +483,9 @@ class DriversTab(tk.Frame):
             return
         from app.drivers import folder
         if not folder.writable(path):
-            _themed_showinfo(self.winfo_toplevel(), "Cannot use that folder",
-                             "Cleaner Tool cannot write to that folder. "
-                             "Choose another.", accent=ACCENT)
+            _themed_showinfo(self.winfo_toplevel(), "That Folder Is Not Writable",
+                             "Choose a different place for drivers - Cleaner "
+                             "Tool needs to create files there.", accent=ACCENT)
             return
         try:
             from app.settings_apply import apply_settings
@@ -538,14 +589,27 @@ class DriversTab(tk.Frame):
             return
         done_ok = [r for r in result["results"] if r["ok"]]
         fail = [r for r in result["results"] if not r["ok"]]
+        if done_ok:
+            # A driver update can change the adapter name, VRAM and board
+            # firmware. Facts cache hardware for a day, so this is the event
+            # that has to clear it (AUDIT TX-001).
+            try:
+                from app import facts
+                facts.invalidate("hardware.gpu", "hardware.board",
+                                 "hardware.cpu")
+            except Exception:
+                pass
         text = "Installed %d driver%s" % (len(done_ok), "" if len(done_ok)
                                           == 1 else "s")
         if fail:
             text += "; %d failed (%s)" % (len(fail), fail[0]["detail"])
         if result.get("reboot"):
             text += ". Restart your PC to finish."
-        self._say(text, COLORS["accent_yellow"] if fail
-                  else COLORS["accent_green"])
+        # The header below is this page's outcome line - the scan reports the
+        # same way. Saying the identical sentence again in the footer would
+        # put the result on screen twice, so the footer only drops the
+        # progress caption it was carrying.
+        self._say("")
         self.header.set_state("✓" if not fail else "!",
                               COLORS["accent_green"] if not fail
                               else COLORS["accent_yellow"])

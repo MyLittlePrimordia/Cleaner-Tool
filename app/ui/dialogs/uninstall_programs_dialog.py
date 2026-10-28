@@ -12,11 +12,15 @@ import os
 import tkinter as tk
 
 from app.ui.widgets.checkbox import M3Checkbutton
-from tkinter import ttk, messagebox
 from app.ui.base import _themed_askyesno
 from app.ui.dialogs._tool_page import ToolPage
-from app.ui.theme import COLORS, F, TAB_ACCENTS, ICON_ROW_PX, icon_bg_rgb
+from app.ui.theme import (
+    COLORS, ICON_ROW_PX, RADIUS_PILL, TAB_ACCENTS, TYPE, icon_bg_rgb, SPACE_1,
+    SPACE_2, SPACE_3,
+)
+from app.ui.metrics import CONTROL_GAP, GROUP_GAP, HAIRLINE_NUDGE, TEXT_NUDGE
 from app.ui.widgets import AnimatedButton, RoundedEntry, ScrollableRoundedPanel
+from app.utils import format_bytes
 
 # Icons are composited onto an opaque plate, so that plate must be the
 # exact row background or the icon shows a square edge. This file's rows
@@ -31,6 +35,44 @@ _icon_bg = icon_bg_rgb(COLORS["bg"])
 #: would mislabel these as broken, which is why this is an explicit table
 #: rather than `rc != 0`.
 _UNINSTALL_REBOOT_CODES = (3010, 1641)
+
+
+def _admin_gated(paths):
+    """Count leftovers Windows will refuse without administrator rights.
+
+    AUDIT TL-007: removal used to run and then blame the result ("may be
+    locked, in use, or need administrator rights"), so a folder in Program
+    Files read as a random failure. This is a pre-flight fact, not a guess:
+    machine-wide hives and the three protected trees are the locations a
+    standard token cannot write, so the confirmation can say exactly how many
+    of the selected items need the app to be elevated. Tk-free and cheap.
+    """
+    try:
+        from app.elevation import is_admin
+        if is_admin():
+            return 0
+    except Exception:
+        return 0
+    roots = []
+    for var in ("ProgramFiles", "ProgramFiles(x86)", "SystemRoot",
+                "ProgramData"):
+        value = os.environ.get(var)
+        if value:
+            roots.append(value.rstrip("\\").lower())
+    gated = 0
+    for p in paths or ():
+        p = str(p or "")
+        if p.startswith("REGKEY::"):
+            parts = p.split("::", 2)
+            if len(parts) == 3 and parts[1].strip().upper() == "HKLM":
+                gated += 1
+            continue
+        if p.startswith(("STARTUP::", "SHORTCUT::")):
+            continue
+        low = p.rstrip("\\").lower()
+        if any(low == r or low.startswith(r + "\\") for r in roots):
+            gated += 1
+    return gated
 
 
 def classify_uninstall(rc, err):
@@ -60,15 +102,6 @@ def classify_uninstall(rc, err):
     if rc in _UNINSTALL_REBOOT_CODES:
         return "reboot"
     return "unclear"
-
-
-def _tally_uninstall(results):
-    """{outcome: count} for a finished batch."""
-    out = {}
-    for _p, rc, err in results:
-        k = classify_uninstall(rc, err)
-        out[k] = out.get(k, 0) + 1
-    return out
 
 
 def describe_uninstall_batch(tally):
@@ -102,8 +135,8 @@ def describe_uninstall_batch(tally):
 
 class _PillEntry(RoundedEntry):
     """Search box as a full pill (M3 search bar), centred by its caller."""
-    RADIUS = 24
-    PAD_Y = 10
+    RADIUS = RADIUS_PILL
+    PAD_Y = GROUP_GAP
 
 
 class UninstallProgramsDialog(ToolPage):
@@ -172,16 +205,16 @@ class UninstallProgramsDialog(ToolPage):
         self._select_all_var = tk.BooleanVar(value=False)
         M3Checkbutton(
             self.toolbar, text="Select all", variable=self._select_all_var,
-            command=self._on_select_all, font=(F, 9), bg=COLORS["bg"],
+            command=self._on_select_all, font=TYPE["caption"], bg=COLORS["bg"],
             fg=COLORS["text"], selectcolor=COLORS["surface"],
             activebackground=COLORS["bg"], activeforeground=COLORS["text"]
-        ).pack(side="right", pady=(0, 2))
+        ).pack(side="right", pady=(0, TEXT_NUDGE))
 
         self._search_var = tk.StringVar()
         self._search_var.trace_add("write", lambda *_: self._apply_filter())
         entry = _PillEntry(self.toolbar, textvariable=self._search_var, width=50,
-                           font=(F, 11))
-        entry.pack(side="left", pady=(0, 2))
+                           font=TYPE["body_large"])
+        entry.pack(side="left", pady=(0, TEXT_NUDGE))
         self._search_entry = entry.entry
         self._search_placeholder = "Type to filter…"
         self._search_entry.insert(0, self._search_placeholder)
@@ -192,11 +225,17 @@ class UninstallProgramsDialog(ToolPage):
         # Program list (keeps its own scroll panel)
         self._list_panel = ScrollableRoundedPanel(body)
         self._list_panel.config(height=280)
-        self._list_panel.pack(fill="both", expand=True, pady=(0, 6))
+        self._list_panel.pack(fill="both", expand=True, pady=(0, CONTROL_GAP))
         self._list_body = self._list_panel.inner
 
         # Leftover review panel (hidden until after uninstall)
         self._leftover_frame = tk.Frame(body, bg=COLORS["bg"])
+        #: path -> kind for the panel currently on screen. Kept beside
+        #: `_leftover_vars` so the tick helpers can tell a folder (deleting it
+        #: removes files the user can see) from a registry/startup/shortcut
+        #: row (deleting it changes behaviour, and its only evidence is a
+        #: name match).
+        self._leftover_kinds = {}
         # packed on demand
 
         # REDESIGN 2026-10: shell footer — Uninstall Selected is the one
@@ -367,14 +406,14 @@ class UninstallProgramsDialog(ToolPage):
             # statement about a search, and no search has run.
             short = error.strip().splitlines()[0][:140] or "unknown error"
             tk.Label(self._list_body, text="Couldn't read your programs.",
-                     font=(F, 10, "bold"), bg=COLORS["bg"],
+                     font=TYPE["label_large"], bg=COLORS["bg"],
                      fg=COLORS["accent_yellow"], anchor="w",
-                     bd=0, highlightthickness=0).pack(fill="x", padx=8,
-                                                       pady=(12, 2))
-            tk.Label(self._list_body, text=short, font=(F, 9),
+                     bd=0, highlightthickness=0).pack(fill="x", padx=SPACE_2,
+                                                       pady=(SPACE_3, TEXT_NUDGE))
+            tk.Label(self._list_body, text=short, font=TYPE["caption"],
                      bg=COLORS["bg"], fg=COLORS["subtext"], anchor="w",
                      justify="left", wraplength=self.body_width(28),
-                     bd=0, highlightthickness=0).pack(fill="x", padx=8)
+                     bd=0, highlightthickness=0).pack(fill="x", padx=SPACE_2)
             try:
                 self._list_panel.refresh_scroll()
             except Exception:
@@ -383,8 +422,8 @@ class UninstallProgramsDialog(ToolPage):
         if not self._shown:
             tk.Label(self._list_body,
                      text="No matching programs.",
-                     font=(F, 10), bg=COLORS["bg"], fg=COLORS["subtext"],
-                     anchor="w").pack(fill="x", padx=8, pady=12)
+                     font=TYPE["body_medium"], bg=COLORS["bg"], fg=COLORS["subtext"],
+                     anchor="w").pack(fill="x", padx=SPACE_2, pady=SPACE_3)
             try:
                 self._list_panel.refresh_scroll()
             except Exception:
@@ -405,16 +444,16 @@ class UninstallProgramsDialog(ToolPage):
             self._checked[pid] = var
 
         row = tk.Frame(self._list_body, bg=COLORS["bg"], cursor="hand2")
-        row.pack(fill="x", padx=4, pady=1)
+        row.pack(fill="x", padx=SPACE_1, pady=HAIRLINE_NUDGE)
 
         cb = M3Checkbutton(
             row, variable=var, command=lambda p=prog: self._update_uninstall_btn(),
             bg=COLORS["bg"], activebackground=COLORS["bg"],
             selectcolor=COLORS["surface"])
-        cb.pack(side="left", padx=(2, 2), pady=2)
+        cb.pack(side="left", padx=(TEXT_NUDGE, TEXT_NUDGE), pady=TEXT_NUDGE)
 
         icon_lbl = tk.Label(row, bg=COLORS["bg"])
-        icon_lbl.pack(side="left", padx=(0, 6), pady=2)
+        icon_lbl.pack(side="left", padx=(0, CONTROL_GAP), pady=TEXT_NUDGE)
         self._set_row_icon(icon_lbl, prog)
 
         name = prog.get("name") or "(unknown)"
@@ -429,9 +468,9 @@ class UninstallProgramsDialog(ToolPage):
         if publisher:
             left += f"  —  {publisher}"
         left += size_txt
-        lbl = tk.Label(row, text=left, font=(F, 9), bg=COLORS["bg"],
+        lbl = tk.Label(row, text=left, font=TYPE["caption"], bg=COLORS["bg"],
                        fg=COLORS["text"], anchor="w", justify="left")
-        lbl.pack(side="left", fill="x", expand=True, padx=6, pady=4)
+        lbl.pack(side="left", fill="x", expand=True, padx=CONTROL_GAP, pady=SPACE_1)
 
         # clicking anywhere on the row (not just the checkbox hitbox)
         # toggles selection, same reachable-target size the rest of the
@@ -537,8 +576,8 @@ class UninstallProgramsDialog(ToolPage):
         more = f", and {len(checked) - 5} more" if len(checked) > 5 else ""
         plural = "1 program" if len(checked) == 1 else f"{len(checked)} programs"
         if not _themed_askyesno(
-                self._dlg, "Confirm Uninstall",
-                f"Uninstall {plural}?\n\n{names}{more}\n\n"
+                self._dlg, f"Uninstall {plural}?",
+                f"{names}{more}\n\n"
                 "A System Restore point is attempted first as a safety "
                 "net, then each program's own uninstaller runs in turn. "
                 "After they finish you can review any leftovers.",
@@ -682,6 +721,19 @@ class UninstallProgramsDialog(ToolPage):
                     return
                 seen_paths.add(it["path"])
                 it["label"] = f"{it['label']}  —  {owner_name}"
+                if it.get("kind") == "folder":
+                    # U-007: a leftover without a size cannot be judged - the
+                    # same row could be 4 KB of empty folders or 9 GB of game
+                    # data. Measured here on the worker thread (this scan
+                    # already walks these trees) and cancellable like every
+                    # other walk. None = unreadable, which the panel leaves
+                    # unlabelled rather than printing a confident "0 B".
+                    try:
+                        from app.storage_scan import measure_folder_tree
+                        it["bytes"] = measure_folder_tree(
+                            it["path"], cancelled=lambda: token[0])
+                    except Exception:
+                        it["bytes"] = None
                 items.append(it)
 
             for prog in started_ok:
@@ -930,37 +982,79 @@ class UninstallProgramsDialog(ToolPage):
         except Exception:
             pass
         self._leftover_vars = {}
+        self._leftover_kinds = {}
 
     def _show_leftover_review(self, summary_name, items):
         self._clear_leftover_panel()
-        self._leftover_frame.pack(fill="x", pady=(10, 0))
+        self._leftover_frame.pack(fill="x", pady=(GROUP_GAP, 0))
         tk.Label(self._leftover_frame,
                  text=f"Possible leftovers for {summary_name} — check what to remove:",
-                 font=(F, 9, "bold"), bg=COLORS["bg"], fg=COLORS["text"],
-                 anchor="w").pack(fill="x", pady=(0, 4))
+                 font=TYPE["label_medium"], bg=COLORS["bg"], fg=COLORS["text"],
+                 anchor="w").pack(fill="x", pady=(0, SPACE_1))
+        risky = [it for it in items if it.get("kind") != "folder"]
+        if risky:
+            # U-007: these used to arrive pre-ticked, with no size and no
+            # explanation. A registry key or startup entry is a ROW, not a
+            # file, and the only evidence it belongs to the app is a name
+            # match - so the safe default is off, and the panel says why.
+            tk.Label(self._leftover_frame,
+                     text="Folders start ticked (with their size). Registry, "
+                          "startup and shortcut entries start unticked - "
+                          "tick one only if you recognise it.",
+                     font=TYPE["micro_regular"], bg=COLORS["bg"],
+                     fg=COLORS["subtext"], anchor="w", justify="left",
+                     wraplength=self.body_width(28)).pack(
+                         fill="x", padx=SPACE_1, pady=(0, SPACE_1))
         for item in items:
-            var = tk.BooleanVar(value=True)
+            kind = item.get("kind") or ""
+            var = tk.BooleanVar(value=(kind == "folder"))
             self._leftover_vars[item["path"]] = var
+            self._leftover_kinds[item["path"]] = kind
+            label = item["label"]
+            size = item.get("bytes")
+            if kind == "folder" and isinstance(size, int) and size > 0:
+                label = f"{label}  ({format_bytes(size, compact=True)})"
             cb = M3Checkbutton(
-                self._leftover_frame, text=item["label"], variable=var,
-                font=(F, 9), bg=COLORS["bg"], fg=COLORS["text"],
+                self._leftover_frame, text=label, variable=var,
+                font=TYPE["caption"], bg=COLORS["bg"], fg=COLORS["text"],
                 selectcolor=COLORS["surface"], activebackground=COLORS["bg"],
                 activeforeground=COLORS["text"], anchor="w",
                 wraplength=self.body_width(28), justify="left")
-            cb.pack(fill="x", padx=4, pady=1)
+            cb.pack(fill="x", padx=SPACE_1, pady=HAIRLINE_NUDGE)
         brow = tk.Frame(self._leftover_frame, bg=COLORS["bg"])
-        brow.pack(fill="x", pady=(6, 0))
+        brow.pack(fill="x", pady=(CONTROL_GAP, 0))
+        AnimatedButton(
+            brow, text="Tick folders",
+            command=lambda: self._tick_only_folders(True),
+            role="secondary", size="sm").pack(side="left")
+        AnimatedButton(
+            brow, text="Untick all",
+            command=lambda: self._tick_only_folders(False),
+            role="secondary", size="sm").pack(side="left", padx=(CONTROL_GAP, 0))
         AnimatedButton(
             brow, text="Delete Selected Leftovers",
             command=lambda: self._delete_leftovers(summary_name),
-            bg=COLORS.get("accent_red", "#c44"),
-            fg=COLORS["black"], font=(F, 9, "bold"),
-            padx=12, pady=6).pack(side="right")
+            role="filled", size="sm",
+            accent=COLORS.get("accent_red", "#c44")).pack(side="right")
         AnimatedButton(
             brow, text="Skip",
             command=self._skip_leftovers,
-            bg=COLORS["surface"], fg=COLORS["text"],
-            font=(F, 9, "bold"), padx=12, pady=6).pack(side="right", padx=(0, 6))
+            role="secondary", size="sm").pack(side="right", padx=(0, CONTROL_GAP))
+
+    def _tick_only_folders(self, folders: bool):
+        """Tick the folder candidates, or clear every tick.
+
+        Deliberately not a blanket "tick all": a registry key or startup
+        entry whose target is missing is worth removing, but a name match is
+        thinner evidence than a folder that still exists, so those stay the
+        user's explicit choice.
+        """
+        for path, var in self._leftover_vars.items():
+            try:
+                var.set(bool(folders)
+                        and self._leftover_kinds.get(path) == "folder")
+            except Exception:
+                pass
 
     def _skip_leftovers(self):
         self._clear_leftover_panel()
@@ -971,55 +1065,34 @@ class UninstallProgramsDialog(ToolPage):
         if not paths:
             self.status.stop("Nothing selected to delete.")
             return
+        n_left = len(paths)
+        suffix = "" if n_left == 1 else "s"
+        # AUDIT TL-007: say up front which items a standard token cannot
+        # remove, instead of reporting them as unexplained failures after.
+        gated = _admin_gated(paths)
+        self._admin_gated_last = gated
+        admin_note = ""
+        if gated:
+            admin_note = ("\n\n%d of these are in a protected location "
+                          "(Program Files, Windows or a machine-wide "
+                          "registry key). Windows will refuse them unless "
+                          "this app is running as administrator." % gated)
         if not _themed_askyesno(
-                self._dlg, "Confirm Delete",
-                f"Delete {len(paths)} selected leftover item(s) for {summary_name}?\n\n"
+                self._dlg, f"Delete {n_left} leftover item{suffix}?",
+                f"These belong to {summary_name}.\n\n"
                 "This cannot be undone. (A removed startup entry can still "
-                "be restored later from Startup Manager.)",
+                "be restored later from Startup Manager.)" + admin_note,
                 yes_text="Delete", no_text="Cancel"):
             return
 
         def work():
-            freed = 0
-            ok_count = 0
             try:
-                from app.utils import (
-                    TaskContext, clean_folder_contents, reg_delete_key)
-                ctx = TaskContext(
-                    log=lambda m: None,
-                    set_status=lambda m: None,
-                    cancelled=lambda: False,
-                )
-                for p in paths:
-                    try:
-                        if p.startswith("REGKEY::"):
-                            _tag, hive, key_path = p.split("::", 2)
-                            if reg_delete_key(ctx, hive, key_path):
-                                ok_count += 1
-                        elif p.startswith("STARTUP::"):
-                            item_id = p[len("STARTUP::"):]
-                            from app.startup_manager import set_item_enabled
-                            okd, _msg = set_item_enabled(item_id, False)
-                            if okd:
-                                ok_count += 1
-                        elif p.startswith("SHORTCUT::"):
-                            target = p[len("SHORTCUT::"):]
-                            try:
-                                os.remove(target)
-                                ok_count += 1
-                            except OSError:
-                                pass
-                        else:
-                            freed += clean_folder_contents(
-                                ctx, p, remove_root=True)
-                            ok_count += 1
-                    except Exception:
-                        pass
+                ok_count, failed, freed = self._remove_leftover_items(paths)
             except Exception:
-                pass
+                ok_count, failed, freed = 0, len(paths), 0
             try:
                 self._dispatch.post(
-                    lambda: self._after_leftover_delete(ok_count, freed))
+                    lambda: self._after_leftover_delete(ok_count, failed, freed))
             except Exception:
                 pass
 
@@ -1027,11 +1100,96 @@ class UninstallProgramsDialog(ToolPage):
         threading.Thread(target=work, daemon=True).start()
         self.status.stop("Deleting selected leftovers…")
 
-    def _after_leftover_delete(self, ok_count, freed):
+    def _remove_leftover_items(self, paths):
+        """Remove the selected leftovers. Returns (removed, failed, bytes).
+
+        Tk-free so it can run on the worker thread and be tested on its own.
+        An item counts as REMOVED only when its own call said so (registry
+        key, startup entry, shortcut) or the folder is really gone afterwards.
+        The folder case used to be counted unconditionally: `clean_folder_contents`
+        returns 0 for a protected root, a junction, a missing path or a folder
+        whose every file was locked, and the old code reported that as a
+        removal — so "Removed 5 leftover item(s)" could cover five access
+        denials. Anything that raises, and anything that did nothing, is a
+        failure now, so the status line can say how much actually went.
+        """
+        try:
+            from app.utils import (
+                TaskContext, clean_folder_contents, reg_delete_key)
+            from app.startup_manager import set_item_enabled
+        except Exception:
+            # Without the helpers nothing can run at all.
+            return 0, len(paths), 0
+        ctx = TaskContext(
+            log=lambda m: None,
+            set_status=lambda m: None,
+            cancelled=lambda: False,
+        )
+        freed = removed = failed = 0
+        for p in paths:
+            try:
+                if p.startswith("REGKEY::"):
+                    _tag, hive, key_path = p.split("::", 2)
+                    if reg_delete_key(ctx, hive, key_path):
+                        removed += 1
+                    else:
+                        failed += 1
+                elif p.startswith("STARTUP::"):
+                    okd, _msg = set_item_enabled(p[len("STARTUP::"):], False)
+                    if okd:
+                        removed += 1
+                    else:
+                        failed += 1
+                elif p.startswith("SHORTCUT::"):
+                    try:
+                        os.remove(p[len("SHORTCUT::"):])
+                    except FileNotFoundError:
+                        # Already gone (usually the uninstaller removed it):
+                        # the leftover is not there, so there is nothing to
+                        # report as failed either.
+                        pass
+                    removed += 1
+                else:
+                    got = clean_folder_contents(ctx, p, remove_root=True)
+                    freed += got
+                    try:
+                        gone = not os.path.exists(p)
+                    except Exception:
+                        gone = False
+                    if got or gone:
+                        removed += 1
+                    else:
+                        failed += 1
+            except Exception:
+                failed += 1
+        return removed, failed, freed
+
+    def _after_leftover_delete(self, ok_count, failed, freed):
         mb = freed / (1024 * 1024) if freed else 0
-        self.status.stop(
-            f"Removed {ok_count} leftover item(s)"
-                 + (f" (~{mb:.1f} MB freed)." if mb > 0 else "."))
+        size = f" (~{mb:.1f} MB freed)" if mb > 0 else ""
+        gated = int(getattr(self, "_admin_gated_last", 0) or 0)
+        try:
+            from app.elevation import is_admin as _is_admin
+            elevated = bool(_is_admin())
+        except Exception:
+            elevated = True          # cannot tell: never invent a cause
+        why = "they may be locked, in use, or need administrator rights"
+        if gated and not elevated:
+            why += ("; %d %s in a protected location and need the app running "
+                    "as administrator" % (gated, "is" if gated == 1 else "are"))
+        if not ok_count and failed:
+            self.status.stop(
+                f"Could not remove any of the {failed} selected leftover "
+                f"item(s) — {why}.", COLORS["accent_red"])
+        elif failed:
+            self.status.stop(
+                f"Removed {ok_count} of {ok_count + failed} leftover "
+                f"item(s){size}; {failed} could not be removed — {why}.",
+                COLORS["accent_yellow"])
+        else:
+            self.status.stop(
+                f"Removed {ok_count} leftover item(s){size}.",
+                COLORS["accent_green"])
         self._clear_leftover_panel()
         self._refresh()
 

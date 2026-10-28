@@ -9,11 +9,13 @@ moved out (H4/H5 widgets+theme+hardware, H12 dialogs, H13 tabs, H14 the shell).
 The layering, bottom-up:
 
     app/ui/theme.py     palette, fonts, colour blending, geometry
-    app/ui/hardware/    XInput, MMDevice, capture, drives   (Tk-free)
+    app/ui/hardware/    drive sampling                     (Tk-free)
     app/ui/widgets/     one widget per module
     app/ui/base.py      ThemedModal, the scrim, Tooltip, themed message boxes
     app/ui/dialogs/     one feature dialog per module
     app/ui/tabs/        one tab page per module
+    app/ui/runflow.py   the run engine, composed into Application
+    app/ui/traycontrols.py  the tray menu, composed into Application
     app/ui/app.py       Application: the composition root
 
 The rule the split enforces: nothing below `base` imports anything above it,
@@ -42,18 +44,23 @@ from app.ui.widgets.chrome import (  # noqa: F401
 from app.ui.hardware.drives import (  # noqa: F401
     _drive_gains, _snapshot_all_drives, _system_drive_root,
 )
-from app.ui.hardware.xinput import (  # noqa: F401
-    _XINPUT_BUTTONS, _XINPUT_RUMBLE_MS, _XINPUT_STICK_DEADZONE,
-    _XINPUT_TRIGGER_THRESHOLD, _xinput_rumble, _xinput_state_fn,
+# Explicit re-exports, NOT a wildcard: `from ... import *` makes static
+# analysis give up on this module, which is how three undefined names shipped
+# in v1 (audit 2026-10, B14). Adding a dialog means adding it here too.
+from app.ui.dialogs import (  # noqa: F401
+    AppUpdateDialog, DnsTesterDialog, DriverStoreDialog,
+    DriveToolkitDialog,
+    DuplicatesDialog,
+    FileLockDialog, GameServerPingDialog, HardwareMonitorDialog,
+    InstallProfilesDialog,
+    NetworkConnectionsDialog, PilotDialog, ProcessManagerDialog,
+    RestorePointDialog, SafetyCenterDialog, ScorecardDialog, ServicesDialog,
+    SpecsDialog, SpeedTestDialog, StartupManagerDialog,
+    StorageInsightDialog, UninstallProgramsDialog, UpdatePickerDialog,
+    _CatalogPickerDialog,
 )
-from app.ui.hardware.mmdev import (  # noqa: F401
-    _MM_COM_INIT, _MM_STATE_NAMES, _InputMeter, _PadReportStats, _mm_guid,
-    _mm_vfn,
-)
-from app.ui.hardware.capture import _capture_inputs, _default_capture_id  # noqa: F401
-from app.ui.dialogs import *  # noqa: F401,F403
 from app.ui.tabs import (  # noqa: F401
-    AdminGateFrame, InstallTab, TaskTab, ToolsTab,
+    AdminGateFrame, HealthTab, InstallTab, TaskTab, ToolsTab,
 )
 from app.ui.app import Application, _TAB_STATUS  # noqa: F401
 from app.config import (  # noqa: F401
@@ -65,11 +72,11 @@ from app.utils import (  # noqa: F401
     IS_WINDOWS, TaskCancelled, TaskContext, TaskSkipped, format_bytes,
 )
 from app.config_persist import (  # noqa: F401
-    get_tweak_state, mark_tweak_applied, mark_tweak_reverted,
+    get_tweak_state, load_config, mark_tweak_applied, mark_tweak_reverted,
 )
 from app.elevation import is_admin, relaunch_as_admin  # noqa: F401
 from app.toast import (  # noqa: F401
-    notify_clean_complete, notify_low_space, show_toast,
+    notify_clean_complete, show_toast,
 )
 from app.warnings import check_dangerous_combos, check_info_notices  # noqa: F401
 from app.runner import CancellationToken  # noqa: F401
@@ -83,6 +90,18 @@ def launch():
     (M16)."""
     import tkinter as tk
     root = tk.Tk()
+    # UI DENSITY (2026-10): the Settings page owns the choice, so read it
+    # before the first widget exists. "system" is the historical default (Tk's
+    # 96-DPI 1.333 looks small on a 100% display, so the floor raises it to
+    # 125%); an explicit 100..200 forces that density instead, including below
+    # the floor. This also grows the window via device_scale and the icons via
+    # winfo_fpixels, so the whole surface stays proportional.
+    from app.dpi import apply_ui_density
+    try:
+        ui_scale = str(load_config().get("ui_scale", "system"))
+    except Exception:
+        ui_scale = "system"        # a broken config must never block launch
+    apply_ui_density(root, ui_scale)
     Application(root)
     root.mainloop()
 
@@ -101,19 +120,28 @@ __all__ = [
     "BorderlessChrome", "_enable_dark_titlebar", "_set_window_icon",
     # hardware
     "_drive_gains", "_snapshot_all_drives", "_system_drive_root",
-    "_xinput_state_fn", "_xinput_rumble", "_XINPUT_BUTTONS",
-    "_XINPUT_RUMBLE_MS", "_XINPUT_STICK_DEADZONE", "_XINPUT_TRIGGER_THRESHOLD",
-    "_InputMeter", "_PadReportStats", "_mm_guid", "_mm_vfn", "_MM_STATE_NAMES",
-    "_MM_COM_INIT", "_capture_inputs", "_default_capture_id",
+    # dialogs (explicit - see the import above)
+    "AppUpdateDialog",
+    "DnsTesterDialog",
+    "DriverStoreDialog",
+    "DriveToolkitDialog", "DuplicatesDialog", "FileLockDialog",
+    "GameServerPingDialog",
+    "HardwareMonitorDialog",
+    "InstallProfilesDialog", "NetworkConnectionsDialog",
+    "PilotDialog", "ProcessManagerDialog", "RestorePointDialog",
+    "SafetyCenterDialog", "ScorecardDialog", "ServicesDialog",
+    "SpecsDialog", "SpeedTestDialog",
+    "StartupManagerDialog", "StorageInsightDialog", "UninstallProgramsDialog",
+    "UpdatePickerDialog", "_CatalogPickerDialog",
     # tabs
-    "AdminGateFrame", "InstallTab", "TaskTab", "ToolsTab",
+    "AdminGateFrame", "HealthTab", "InstallTab", "TaskTab", "ToolsTab",
     # misc re-exports the suite and callers expect
     "COLORS", "APP_NAME", "FONT_FAMILY", "WINDOW_SIZE", "WINDOW_MIN_SIZE",
     "RISK_SAFE", "RISK_ADVANCED", "RISK_REBOOT", "TABS", "PRESETS",
     "TAB_NAMES", "IS_WINDOWS", "TaskContext", "TaskSkipped", "TaskCancelled",
     "format_bytes", "get_tweak_state", "mark_tweak_applied",
     "mark_tweak_reverted", "is_admin", "relaunch_as_admin", "show_toast",
-    "notify_clean_complete", "notify_low_space", "check_dangerous_combos",
+    "notify_clean_complete", "check_dangerous_combos",
     "check_info_notices", "CancellationToken", "invoke_task",
     "_TAB_STATUS",
 ]

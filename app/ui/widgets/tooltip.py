@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import tkinter as tk
 
-from app.ui.theme import COLORS, F
+from app.ui.theme import COLORS, TYPE
+from app.ui.metrics import GROUP_GAP, LABEL_GAP
 
 
 class Tooltip:
@@ -99,7 +100,15 @@ class Tooltip:
         'invalid command name ...!toplevel.!label'. Parenting to root
         (which lives for the whole session) plus winfo_exists guards makes
         the tooltip immune to page rebuilds."""
-        if cls._shared_tip is not None and not cls._shared_tip.winfo_exists():
+        try:
+            alive = (cls._shared_tip is not None
+                     and cls._shared_tip.winfo_exists())
+        except Exception:
+            # The window outlived its interpreter/root (a rebuilt root, or a
+            # test that destroyed one): winfo_exists raises instead of
+            # answering False, and that used to leave every later tip dead.
+            alive = False
+        if not alive:
             # stale handle (shouldn't happen with root parenting, but be
             # safe) — forget it and rebuild
             cls._shared_tip = None
@@ -111,8 +120,8 @@ class Tooltip:
             # NOT hairline: that is a border colour, and a #242424 tooltip\n            # window on a true-black canvas is a barely-visible smudge that\n            # happens to contain the text. A tooltip is a raised surface - it\n            # gets the surface tier, with hairline as its own edge.\n            tw.configure(bg=COLORS["surface"])
             cls._shared_label = tk.Label(
                 tw, text="", bg=COLORS["surface"], fg=COLORS["text"],
-                font=(F, 9), justify="left", wraplength=420,
-                padx=10, pady=7, bd=0,
+                font=TYPE["caption"], justify="left", wraplength=420,
+                padx=GROUP_GAP, pady=LABEL_GAP, bd=0,
             )
             cls._shared_label.pack()
             tw.withdraw()  # start hidden; _show positions + deiconifies
@@ -226,6 +235,44 @@ class Tooltip:
             Tooltip._cancel_pending_show()
         if Tooltip._current_widget == self.widget:
             Tooltip._hide_shared()
+
+    # ---- canvas owners ----------------------------------------------- #
+    #
+    # A Tooltip hangs off a widget's <Enter>/<Leave>. The DataTable draws its
+    # rows on ONE canvas, so a row is not a widget and cannot own a tip the
+    # usual way - yet a row is exactly where an explanation belongs (the Health
+    # report's "At least 4 GB can be cleaned" needs the sentence that says which
+    # folder was not looked at). These two classmethods let the canvas's owner
+    # reuse the same window, styling and 170-char cap, at coordinates it
+    # chooses; showing/hiding is the owner's call, driven by its own hover.
+
+    @classmethod
+    def show_at(cls, widget, text: str, x_root: int, y_root: int) -> None:
+        """Show `text` at SCREEN coordinates, owned by `widget` (a canvas)."""
+        flat = " ".join(str(text or "").split())
+        if not flat:
+            return
+        if len(flat) > 170:
+            flat = flat[:169].rstrip() + "…"
+        try:
+            cls._ensure_shared(widget)
+        except Exception:
+            return
+        if cls._shared_tip is None or cls._shared_label is None:
+            return
+        try:
+            cls._shared_label.config(text=flat)
+            cls._shared_tip.wm_geometry("+%d+%d" % (int(x_root), int(y_root)))
+            cls._shared_tip.deiconify()
+            cls._current_widget = widget
+        except Exception:
+            pass
+
+    @classmethod
+    def hide_at(cls, widget) -> None:
+        """Withdraw the shared tip only if `widget` put it up."""
+        if cls._current_widget is widget:
+            cls._hide_shared()
 
     @classmethod
     def _hide_shared(cls):

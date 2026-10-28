@@ -273,6 +273,67 @@ def list_startup_items():
     return items
 
 
+#: Below this the startup list is normal, not a finding worth carrying to
+#: Health or the hub. Health's own startup card starts warning at more than
+#: ten entries; twelve enabled is the point where a review actually helps.
+STARTUP_FINDING_MIN = 12
+
+
+def publish_startup_finding(items) -> list:
+    """Publish the enabled-startup count (AUDIT TX-002).
+
+    `items` is the same list `list_startup_items()` returns. A failed read is
+    not passed here at all (the dialog keeps its error state), and None is
+    ignored rather than treated as an empty machine. A successful empty list
+    DOES clear the finding: nothing starts with Windows is a real answer.
+
+    Only enabled entries count. A row Windows has switched off, or one this
+    app is holding, is already not costing sign-in time - warning about it
+    would tell the user to fix something they already fixed.
+    """
+    if not isinstance(items, (list, tuple)):
+        return []
+    try:
+        from app import insights
+        from app.insights import Finding
+        import time as _time
+    except Exception:
+        return []
+
+    valid = [item for item in items if isinstance(item, dict)]
+    enabled = [item for item in valid if item.get("enabled")]
+    if len(enabled) < STARTUP_FINDING_MIN:
+        try:
+            return insights.replace("startup.")
+        except Exception:
+            return []
+
+    total = len(valid)
+    n = len(enabled)
+    if n == total:
+        detail = ("All %d start with Windows. Turning off the ones you do "
+                  "not need makes sign-in faster." % total)
+    else:
+        detail = ("%d of %d startup entries are on. Turning off the ones "
+                  "you do not need makes sign-in faster." % (n, total))
+    finding = Finding(
+        id="startup.enabled",
+        domain="system",
+        severity="warn",
+        title="%d program%s start%s with Windows" % (
+            n, "" if n == 1 else "s", "s" if n == 1 else ""),
+        detail=detail,
+        evidence={"enabled": n, "total": total},
+        action={"kind": "route", "target": "startup",
+                "label": "Open Startup Manager"},
+        observed_at=_time.time(),
+    )
+    try:
+        return insights.replace("startup.", finding)
+    except Exception:
+        return []
+
+
 def _enum_run_values(hive, wow64):
     """[(name, data, type_str)] for one Run key view. [] if the key
     does not exist or cannot be opened — both are normal, not errors

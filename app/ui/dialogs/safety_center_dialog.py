@@ -24,8 +24,9 @@ import os
 import tkinter as tk
 
 from app.ui.base import _themed_askyesno
-from app.ui.dialogs._tool_page import TOOL_ACCENT, ToolPage
-from app.ui.theme import COLORS, F
+from app.ui.dialogs._tool_page import ToolPage
+from app.ui.theme import COLORS, RADIUS_SURFACE, TYPE, SPACE_2, SPACE_3
+from app.ui.metrics import COMPACT_INSET, GROUP_GAP, ROW_PAD, TEXT_NUDGE
 from app.ui.widgets import AnimatedButton, RoundedCard
 
 
@@ -82,24 +83,23 @@ class SafetyCenterDialog(ToolPage):
     # ------------------------------------------------------------- layout
     def _build_section(self, key, title, buttons):
         card = RoundedCard(self.content, fill=COLORS["surface"],
-                           bg=COLORS["bg"], radius=14)
-        card.pack(fill="x", padx=2, pady=5)
+                           bg=COLORS["bg"], radius=RADIUS_SURFACE)
+        card.pack(fill="x", padx=TEXT_NUDGE, pady=COMPACT_INSET)
         body = card.body
-        tk.Label(body, text=title, font=(F, 10, "bold"),
+        tk.Label(body, text=title, font=TYPE["label_large"],
                  bg=COLORS["surface"], fg=COLORS["text"], anchor="w").pack(
-            fill="x", padx=12, pady=(9, 0))
-        status = tk.Label(body, text="Checking\u2026", font=(F, 9),
+            fill="x", padx=SPACE_3, pady=(ROW_PAD, 0))
+        status = tk.Label(body, text="Checking\u2026", font=TYPE["caption"],
                           bg=COLORS["surface"], fg=COLORS["subtext"],
                           anchor="w", justify="left", wraplength=580)
-        status.pack(fill="x", padx=12, pady=(2, 8))
+        status.pack(fill="x", padx=SPACE_3, pady=(TEXT_NUDGE, SPACE_2))
         row = tk.Frame(body, bg=COLORS["surface"])
-        row.pack(fill="x", padx=12, pady=(0, 10))
+        row.pack(fill="x", padx=SPACE_3, pady=(0, GROUP_GAP))
         btns = {}
         for label, command in buttons:
             b = AnimatedButton(row, text=label, command=command,
-                               bg=COLORS["surface_hover"], fg=COLORS["primary"],
-                               font=(F, 9, "bold"), padx=12, pady=5)
-            b.pack(side="left", padx=(0, 8))
+                               role="text", size="sm")
+            b.pack(side="left", padx=(0, SPACE_2))
             b.set_enabled(False)
             btns[label] = b
         self._sections[key] = {"card": card, "status": status, "buttons": btns}
@@ -324,8 +324,8 @@ class SafetyCenterDialog(ToolPage):
             return
         last = rec[-1]
         name = last.get("name") or "the last service"
-        if not _themed_askyesno(self, "Undo service change",
-                                "Put '%s' back to how it was?" % name,
+        if not _themed_askyesno(self, "Undo This Service Change?",
+                                "'%s' returns to how it was before." % name,
                                 accent=COLORS["accent_green"]):
             return
         self.set_busy(True)
@@ -348,9 +348,9 @@ class SafetyCenterDialog(ToolPage):
             self.status.stop("No tweaks to undo.", COLORS["accent_yellow"])
             return
         if not _themed_askyesno(
-                self, "Undo all tweaks",
-                "Put %d applied tweak(s) back to how they were before?" %
-                len(tasks), accent=COLORS["accent_green"]):
+                self, "Undo %d Applied Tweaks?" % len(tasks),
+                "Each one returns to the value recorded when it ran.",
+                accent=COLORS["accent_green"]):
             return
         # A revert run owns the app's progress UI, so this modal has to close
         # first; schedule the run after the close unwinds the modal wait().

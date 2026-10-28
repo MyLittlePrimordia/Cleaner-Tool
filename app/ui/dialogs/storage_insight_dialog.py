@@ -13,11 +13,16 @@ import tkinter as tk
 
 from app.ui.widgets.rounded_card import RoundedCard
 import tkinter.font as tkfont
-from tkinter import ttk, messagebox
 from app.ui.base import Tooltip
 from app.ui.dialogs._tool_page import ToolPage, fit_label
 from app.ui.hardware.drives import _system_drive_root
-from app.ui.theme import COLORS, F, TAB_ACCENTS, _measure_font
+from app.ui.theme import (
+    COLORS, F, RADIUS_SURFACE, TAB_ACCENTS, TYPE, _measure_font, SPACE_1, SPACE_2,
+    SPACE_3,
+)
+from app.ui.metrics import (
+    CARD_BODY_INSET, CONTROL_GAP, GROUP_GAP, LABEL_GAP, TEXT_NUDGE, TIGHT_GAP,
+)
 from app.ui.widgets import AnimatedButton, ScrollableRoundedPanel, ToggleSwitch
 from app.utils import format_bytes
 
@@ -64,11 +69,19 @@ class StorageInsightDialog(ToolPage):
         self.app = app
         self._scan_token = [True]   # replaced per scan; True = stopped
         self._scan_done = False
+        #: (done, total) of the junk-category walk, or None outside it. The
+        #: status bar shows a real fraction while this is set (AUDIT TV-006);
+        #: per-task messages keep the same fill instead of resetting it.
+        self._scan_step = None
         self._cat_vars = {}         # title -> BooleanVar
         self._cat_sizes = {}        # title -> measured bytes (None = pending)
+        self._cat_unknown = {}      # title -> members that declined to look
         self._cat_size_lbls = {}    # title -> size Label
         self._cat_refits = {}       # title -> callable: re-fit the title
         self._cat_keys = {}         # title -> member task keys
+        #: title -> per-member rows from the walk that produced the total
+        #: (U-003): label, description, its own size, and any skip reason.
+        self._cat_members = {}
         self._games = []            # measured game dicts
 
         accent = TAB_ACCENTS["Clean"]
@@ -76,7 +89,6 @@ class StorageInsightDialog(ToolPage):
                          scope="Estimates only what it can measure — a "
                                "cancelled scan says so.",
                          scroll=False)
-        dlg = self._dlg
         body = self.content
 
         # hero: live reclaimable total, now the banner headline
@@ -106,7 +118,7 @@ class StorageInsightDialog(ToolPage):
                 Tooltip(self.status.caption, _note)
             except Exception:
                 pass
-        self._bench_lbl = tk.Label(body, text="", font=(F, 9),
+        self._bench_lbl = tk.Label(body, text="", font=TYPE["caption"],
                                    bg=COLORS["bg"], fg=COLORS["subtext"],
                                    anchor="w", justify="left")
         self._bench_lbl.pack(side="bottom", anchor="w")
@@ -117,23 +129,35 @@ class StorageInsightDialog(ToolPage):
         # preset cards) — takes the remaining middle space; overflow
         # scrolls inside instead of pushing the footer out
         self._cols_panel = ScrollableRoundedPanel(body)
-        self._cols_panel.pack(fill="both", expand=True, pady=(10, 0))
+        self._cols_panel.pack(fill="both", expand=True, pady=(GROUP_GAP, 0))
         cols = tk.Frame(self._cols_panel.inner, bg=COLORS["bg"])
         cols.pack(fill="x")
         cols.grid_columnconfigure(0, weight=1, uniform="insight")
         cols.grid_columnconfigure(1, weight=1, uniform="insight")
 
         left = tk.Frame(cols, bg=COLORS["bg"])
-        left.grid(row=0, column=0, sticky="new", padx=(0, 6))
-        tk.Label(left, text="Reclaimable junk", font=(F, 10, "bold"),
-                 bg=COLORS["bg"], fg=COLORS["text"]).pack(anchor="w", pady=(0, 4))
+        left.grid(row=0, column=0, sticky="new", padx=(0, CONTROL_GAP))
+        tk.Label(left, text="Reclaimable junk", font=TYPE["label_large"],
+                 bg=COLORS["bg"], fg=COLORS["text"]).pack(anchor="w", pady=(0, SPACE_1))
         self._junk_body = tk.Frame(left, bg=COLORS["bg"])
         self._junk_body.pack(fill="x")
+        # N-002: the measured categories, ordered, in one window. A text
+        # button rather than a fourth footer action: the footer already
+        # overflows its row at the minimum window with three buttons, and this
+        # belongs beside the numbers it orders anyway.
+        self._plan_btn = AnimatedButton(
+            left, text="Reclaim plan  \u203a", command=self._open_reclaim_plan,
+            role="text", size="sm")
+        self._plan_btn.pack(anchor="w", pady=(SPACE_2, 0))
+        self._plan_btn.set_enabled(False)
+        Tooltip(self._plan_btn,
+                "The measured categories, biggest first, plus the tools that "
+                "need their own look. Nothing runs until you pick a step.")
 
         right = tk.Frame(cols, bg=COLORS["bg"])
-        right.grid(row=0, column=1, sticky="new", padx=(6, 0))
-        tk.Label(right, text="Biggest games", font=(F, 10, "bold"),
-                 bg=COLORS["bg"], fg=COLORS["text"]).pack(anchor="w", pady=(0, 4))
+        right.grid(row=0, column=1, sticky="new", padx=(CONTROL_GAP, 0))
+        tk.Label(right, text="Biggest games", font=TYPE["label_large"],
+                 bg=COLORS["bg"], fg=COLORS["text"]).pack(anchor="w", pady=(0, SPACE_1))
         self._games_body = tk.Frame(right, bg=COLORS["bg"])
         self._games_body.pack(fill="x")
 
@@ -234,12 +258,13 @@ class StorageInsightDialog(ToolPage):
             var.trace_add("write", lambda *_: self._refresh_estimate())
             self._cat_vars[title] = var
             self._cat_sizes[title] = None
+            self._cat_unknown[title] = 0
             outer = RoundedCard(self._junk_body, fill=COLORS["bg_alt"],
-                                bg=COLORS["bg"], radius=16, min_height=54)
+                                bg=COLORS["bg"], radius=RADIUS_SURFACE, min_height=54)
             inner = outer.body
             ToggleSwitch(inner, var).pack(side="left", anchor="center",
-                                          padx=(12, 6), pady=7)
-            lbl = tk.Label(inner, text=title, font=(F, 11, "bold"),
+                                          padx=(SPACE_3, CONTROL_GAP), pady=LABEL_GAP)
+            lbl = tk.Label(inner, text=title, font=TYPE["card_title"],
                            bg=COLORS["bg_alt"], fg=COLORS["text"],
                            anchor="w", justify="left")
             lbl.pack(side="left", anchor="center")
@@ -248,14 +273,32 @@ class StorageInsightDialog(ToolPage):
                 _names = [t.label for t in _TABS.get("Clean", [])
                           if t.key in keys]
                 Tooltip(lbl, tip + ("\n\nIncludes: " + ", ".join(_names)
-                                    if _names else ""))
+                                    if _names else "")
+                        + "\n\nClick the name or the size to see each "
+                          "cleaner's own number.")
             except Exception:
                 pass
-            size = tk.Label(inner, text="…", font=(F, 11, "bold"),
+            # U-003: the row is a door, not just a label. Clicking the title
+            # or the size opens the per-cleaner breakdown for THIS walk; the
+            # switch stays a switch (it is what ticks the category).
+            for _w in (lbl,):
+                try:
+                    _w.bind("<Button-1>",
+                            lambda _e, _t=title: self._show_category(_t))
+                    _w.config(cursor="hand2")
+                except Exception:
+                    pass
+            size = tk.Label(inner, text="…", font=TYPE["card_title"],
                             bg=COLORS["bg_alt"], fg=COLORS["subtext"],
                             anchor="e")
-            size.pack(side="right", anchor="center", padx=(6, 14))
+            size.pack(side="right", anchor="center", padx=(CONTROL_GAP, CARD_BODY_INSET))
             self._cat_size_lbls[title] = size
+            try:
+                size.bind("<Button-1>",
+                          lambda _e, _t=title: self._show_category(_t))
+                size.config(cursor="hand2")
+            except Exception:
+                pass
             # Width-fit pass 2026-10: the title is packed before the size pill
             # on the right, so at the minimum window a long title (237px of a
             # 241px budget) left the pill 4px and its text — the "…"
@@ -265,7 +308,7 @@ class StorageInsightDialog(ToolPage):
             # reqwidth lags a layout pass behind, and trusting it here left
             # the pill 8px short. The pill re-runs the fit whenever its text
             # grows (see _paint_category).
-            _fm11 = _measure_font(inner.winfo_toplevel(), (F, 11, "bold"))
+            _fm11 = _measure_font(inner.winfo_toplevel(), TYPE["card_title"])
 
             def _pill_room(_fm=_fm11, _lbl=size):
                 try:
@@ -280,13 +323,13 @@ class StorageInsightDialog(ToolPage):
                 size.bind("<Configure>", refit, add="+")
             except Exception:
                 pass
-            outer.pack(fill="x", pady=3)
+            outer.pack(fill="x", pady=TIGHT_GAP)
 
     def _build_games_placeholder(self):
         self._games_ph = tk.Label(self._games_body, text="Scanning libraries…",
-                                  font=(F, 9), bg=COLORS["bg"],
+                                  font=TYPE["caption"], bg=COLORS["bg"],
                                   fg=COLORS["subtext"])
-        self._games_ph.pack(anchor="w", pady=6)
+        self._games_ph.pack(anchor="w", pady=CONTROL_GAP)
 
     # ---- scan worker ---------------------------------------------------- #
 
@@ -314,12 +357,14 @@ class StorageInsightDialog(ToolPage):
             pass
         token = self._scan_token = [False]
         self._scan_done = False
+        self._scan_step = None
         try:
             self._clean_btn.set_enabled(False)
         except Exception:
             pass
         for title in self._cat_sizes:
             self._cat_sizes[title] = None
+            self._cat_unknown[title] = 0
             try:
                 self._cat_size_lbls[title].config(text="…",
                                                   fg=COLORS["subtext"])
@@ -354,9 +399,10 @@ class StorageInsightDialog(ToolPage):
 
         try:
             from app.storage_scan import (
-   SCAN_CATEGORIES, acquire_scan, release_scan, store_estimate,
-   find_game_libraries, make_measure_ctx, measure_clean_tasks,
-   sum_measured, count_unmeasured)
+   SCAN_CATEGORIES, acquire_scan, category_members, release_scan,
+   store_estimate, publish_junk_finding, find_game_libraries,
+   make_measure_ctx, measure_clean_tasks, sum_measured, sum_known,
+   count_unmeasured)
         except Exception:
             self._ui(self._set_scan_status, "Scan unavailable.")
             self._ui(self._scan_finished, True)
@@ -377,12 +423,18 @@ class StorageInsightDialog(ToolPage):
                 cancelled=dead)
             # phase 1: junk, one category at a time (live row updates)
             grand = 0
-            for title, keys, _tip in SCAN_CATEGORIES:
+            declined = []          # reasons the rows skipped, for the cache
+            total_cats = len(SCAN_CATEGORIES)
+            for idx, (title, keys, _tip) in enumerate(SCAN_CATEGORIES, 1):
                 if dead():
                     return
+                # Determinate: one category is one step of the walk, so the
+                # bar shows how much is LEFT instead of looping (TV-006).
+                self._ui(self._set_scan_step, idx, total_cats)
                 self._ui(self._set_scan_status, f"Scanning {title}…")
+                refused = {}
                 try:
-                    sizes = measure_clean_tasks(ctx, keys)
+                    sizes = measure_clean_tasks(ctx, keys, refused)
                 except Exception:
                     sizes = {}
                 if dead():
@@ -391,8 +443,16 @@ class StorageInsightDialog(ToolPage):
                 # not zero. Keep the grand total honest: if any category is
                 # unknown, the total is unknown, and the row says so rather
                 # than painting "0 B" for something nobody looked at.
-                cat_total = sum_measured(sizes)
+                # A cleaner that declined to look (Office/Steam live) is a
+                # known skip, not a hole: its row says "X + ?" and the
+                # headline stays a number. Only a real failure makes the
+                # total unknown.
+                cat_total = sum_measured(sizes, refused)
                 unknown = count_unmeasured(sizes)
+                # The rows say "+ ?" for a skip; the shared cache needs the
+                # same fact, or Health might quote this walk's number as if
+                # every folder had been looked at.
+                declined.extend(refused.values())
                 if grand is not None and cat_total is not None:
                     grand += cat_total
                 else:
@@ -401,16 +461,35 @@ class StorageInsightDialog(ToolPage):
                 # forwards with `fn(*args)`. Passing `unknown=` raised
                 # TypeError inside the scan worker, which meant _scan_finished
                 # never ran and the dialog hung on "Scanning..." forever.
+                #
+                # The row gets the KNOWN sum plus the count of members that
+                # declined to look (Office/Steam/FiveM running), so one skip
+                # reads "12.4 GB + ?" instead of blanking five real numbers -
+                # and never as 0, which claimed the category was already clean.
+                # U-003: the per-cleaner rows ride along with the total, so
+                # the row can open the breakdown of the SAME walk rather than
+                # measuring again (or reading the shared cache, which may be
+                # another dialog's walk).
                 self._ui(self._paint_category, title,
-                         cat_total if cat_total is not None else 0, unknown)
+                         sum_known(sizes), unknown,
+                         category_members(keys, sizes, refused))
             # a complete, uncancelled junk walk publishes the shared
             # estimate cache (Health + Nudge quote it instead of re-walking)
             if not dead():
-                store_estimate(grand)
+                store_estimate(grand, declined)
+                # TX-002: a finished walk also tells the rest of the app what
+                # it found. Only complete walks publish; a cancel or a total
+                # of None would be a claim the walk cannot make.
+                try:
+                    publish_junk_finding(grand, total_cats, len(declined))
+                except Exception:
+                    pass
         finally:
             release_scan()
-        # phase 2: game libraries (read-only sizing)
+        # phase 2: game libraries (read-only sizing) - no count to show, so
+        # back to the honest indeterminate rail.
         if not dead():
+            self._ui(self._set_scan_step, 0, 0)
             self._ui(self._set_scan_status, "Sizing installed games…")
         try:
             games = find_game_libraries(
@@ -425,16 +504,55 @@ class StorageInsightDialog(ToolPage):
         self._ui(self._paint_games, games)
         self._ui(self._scan_finished, cancelled)
 
+    def _show_category(self, title):
+        """Open the per-cleaner breakdown for one category row (U-003)."""
+        members = self._cat_members.get(title)
+        if not members:
+            # Before the walk reaches this row there is nothing measured to
+            # break down; say so instead of opening an empty list that reads
+            # like "this category is empty".
+            try:
+                self.status.stop("Still measuring this category…")
+            except Exception:
+                pass
+            return
+        try:
+            from app.ui.dialogs.storage_category_dialog import (
+                StorageCategoryDialog)
+            StorageCategoryDialog(self, title, members,
+                                  total=self._cat_sizes.get(title)).wait()
+        except Exception:
+            pass
+
     # ---- paints (Tk thread only) ---------------------------------------- #
 
     def _set_scan_status(self, text):
         try:
-            self.status.stop(text)
+            step = self._scan_step
+            if step:
+                # Inside the category walk: keep the determinate fill and put
+                # this message in front of the count, so a per-task line like
+                # "Scanning Edge cache…" does not blank the progress bar.
+                self.status.progress(step[0], step[1], text)
+            else:
+                self.status.stop(text)
         except Exception:
             pass
 
-    def _paint_category(self, title, total, unknown=0):
+    def _set_scan_step(self, done, total):
+        """Tk-side: enter/leave the determinate part of the scan."""
+        self._scan_step = (done, total) if total else None
+        try:
+            if self._scan_step:
+                self.status.progress(done, total, "Scanning")
+        except Exception:
+            pass
+
+    def _paint_category(self, title, total, unknown=0, members=None):
         self._cat_sizes[title] = total
+        self._cat_unknown[title] = unknown
+        if members is not None:
+            self._cat_members[title] = list(members)
         try:
             lbl = self._cat_size_lbls.get(title)
             if lbl is not None and lbl.winfo_exists():
@@ -442,7 +560,8 @@ class StorageInsightDialog(ToolPage):
                     # MED-002: "✓ clean" for a category we could not measure is
                     # the lie this finding is about. Say what is true.
                     lbl.config(
-                        text=(f"{format_bytes(total)}+ ?" if total else "? unknown"),
+                        text=(f"{format_bytes(total)} + ?" if total
+                              else "? unknown"),
                         fg=COLORS["accent_yellow"])
                 elif total and total > 0:
                     lbl.config(text=format_bytes(total),
@@ -501,28 +620,28 @@ class StorageInsightDialog(ToolPage):
             # the likely reason (custom/portable installs aren't in the
             # launcher libraries this scans) instead of a bare "not found".
             tk.Label(self._games_body, text="No game libraries detected on this PC.",
-                     font=(F, 9, "bold"), bg=COLORS["bg"],
-                     fg=COLORS["text"]).pack(anchor="w", pady=(6, 2))
+                     font=TYPE["label_medium"], bg=COLORS["bg"],
+                     fg=COLORS["text"]).pack(anchor="w", pady=(CONTROL_GAP, TEXT_NUDGE))
             tk.Label(self._games_body,
                      text="Custom or portable installs outside a launcher's "
                           "library folder won't show up here.",
-                     font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
+                     font=TYPE["caption"], bg=COLORS["bg"], fg=COLORS["subtext"],
                      wraplength=320, justify="left").pack(anchor="w")
             return
         shown = self._games[:self._MAX_GAMES]
         for g in shown:
             outer = RoundedCard(self._games_body, fill=COLORS["bg_alt"],
-                                bg=COLORS["bg"], radius=16, min_height=54)
+                                bg=COLORS["bg"], radius=RADIUS_SURFACE, min_height=54)
             inner = outer.body
             drive_lbl = tk.Label(inner, text=g.get("drive", ""),
-                                 font=(F, 9, "bold"),
+                                 font=TYPE["label_medium"],
                                  bg=COLORS["bg_alt"], fg=COLORS["subtext"],
                                  anchor="w")
-            drive_lbl.pack(side="left", anchor="center", padx=(8, 2),
-                           pady=6)
+            drive_lbl.pack(side="left", anchor="center", padx=(SPACE_2, TEXT_NUDGE),
+                           pady=CONTROL_GAP)
             _gname = self._short_game_name(g.get("name", "?"))
             lbl = tk.Label(inner, text=_gname,
-                           font=(F, 11, "bold"),
+                           font=TYPE["card_title"],
                            bg=COLORS["bg_alt"], fg=COLORS["text"],
                            anchor="w", justify="left")
             lbl.pack(side="left", anchor="center")
@@ -534,14 +653,12 @@ class StorageInsightDialog(ToolPage):
             open_btn = AnimatedButton(
                 inner, text="Open",
                 command=lambda p=g.get("path", ""): self._open_game_folder(p),
-                bg=COLORS["bg_alt"], fg=COLORS["primary"],
-                variant="outlined",
-                font=(F, 9, "bold"), padx=14, pady=5)
-            open_btn.pack(side="right", anchor="center", padx=(0, 12))
+                role="outlined", size="sm")
+            open_btn.pack(side="right", anchor="center", padx=(0, SPACE_3))
             size_lbl = tk.Label(inner, text=format_bytes(g.get("bytes", 0)),
-                                font=(F, 10), bg=COLORS["bg_alt"],
+                                font=TYPE["body_medium"], bg=COLORS["bg_alt"],
                                 fg=COLORS["text"], anchor="e")
-            size_lbl.pack(side="right", anchor="center", padx=(0, 8))
+            size_lbl.pack(side="right", anchor="center", padx=(0, SPACE_2))
             # Width-fit pass 2026-10: same shape as the junk rows above — the
             # name is packed before the drive chip, the size and the Open
             # button, so at the minimum window those were handed the leftovers
@@ -562,14 +679,16 @@ class StorageInsightDialog(ToolPage):
             # drive = text + padding + pack (8,2) + 6; Open = text + the
             # button's 6px lead-in + 14px padx each side + pack (0,12) + 6;
             # size = text + padding + pack (0,8) + 6.
-            _fm9 = _measure_font(inner.winfo_toplevel(), (F, 9, "bold"))
-            _fm10 = _measure_font(inner.winfo_toplevel(), (F, 10))
+            _fm9 = _measure_font(inner.winfo_toplevel(), TYPE["label_medium"])
+            _fm10 = _measure_font(inner.winfo_toplevel(), TYPE["body_medium"])
             _w_drive = _fm9.measure(g.get("drive", "")) + 2 + 8 + 2 + 6
             _w_open = _fm9.measure("Open") + 6 + 28 + 12 + 6
             _w_size = _fm10.measure(format_bytes(g.get("bytes", 0))) + 2 + 8 + 6
 
-            def _fixed_room():
-                return _w_drive + _w_open + _w_size
+            # Default-bound: a closure over the loop locals would make EVERY
+            # row measure its reserve from the LAST row's widths (B023).
+            def _fixed_room(_d=_w_drive, _o=_w_open, _s=_w_size):
+                return _d + _o + _s
 
             _fit_name = fit_label(inner, lbl, _gname, reserve=_fixed_room)
             try:
@@ -580,13 +699,13 @@ class StorageInsightDialog(ToolPage):
                 inner.after_idle(_fit_name)
             except Exception:
                 pass
-            outer.pack(fill="x", pady=3)
+            outer.pack(fill="x", pady=TIGHT_GAP)
         rest = self._games[self._MAX_GAMES:]
         if rest:
             tk.Label(self._games_body,
                      text=f"+{len(rest)} more games ({format_bytes(sum(g.get('bytes', 0) for g in rest))} total)",
-                     font=(F, 9), bg=COLORS["bg"],
-                     fg=COLORS["subtext"]).pack(anchor="w", pady=(4, 0))
+                     font=TYPE["caption"], bg=COLORS["bg"],
+                     fg=COLORS["subtext"]).pack(anchor="w", pady=(SPACE_1, 0))
         self._refresh_cols_scroll()
 
     def _refresh_cols_scroll(self):
@@ -603,19 +722,32 @@ class StorageInsightDialog(ToolPage):
     def _refresh_estimate(self):
         """Hero + footer estimate from checked categories (Tk thread)."""
         try:
-            total = sum(self._cat_sizes.get(t, 0) or 0
-                        for t, v in self._cat_vars.items() if v.get())
+            checked = [t for t, v in self._cat_vars.items() if v.get()]
+            total = sum(self._cat_sizes.get(t, 0) or 0 for t in checked)
+            unknown = sum(1 for t in checked if self._cat_unknown.get(t))
+            # "12.4 GB + ?" for a category where a cleaner declined to look:
+            # the number is what WAS measured, the "?" is what nobody looked
+            # at. Never "All clean" - that was the old claim, and it graded a
+            # skipped Office cache as an already-empty folder.
+            partial = (format_bytes(total) + " + ?") if total else "? unknown"
             if any(s is None for s in self._cat_sizes.values()):
                 self.banner.set_title("Scanning…", COLORS["subtext"])
+            elif unknown:
+                self.banner.set_title(partial, COLORS["accent_yellow"])
             elif total > 0:
                 self.banner.set_title(format_bytes(total),
                                       COLORS["accent_green"])
             else:
                 self.banner.set_title("All clean", COLORS["accent_green"])
             try:
-                self._clean_btn.config_text(
-                    f"Clean Selected ({format_bytes(total)})" if total > 0
-                    else "Clean Selected")
+                if unknown:
+                    self._clean_btn.config_text(
+                        f"Clean Selected ({partial})")
+                elif total > 0:
+                    self._clean_btn.config_text(
+                        f"Clean Selected ({format_bytes(total)})")
+                else:
+                    self._clean_btn.config_text("Clean Selected")
             except Exception:
                 pass
         except Exception:
@@ -630,6 +762,10 @@ class StorageInsightDialog(ToolPage):
                 self._set_scan_status("Scan complete — pick what to clean.")
             self._refresh_estimate()
             self._clean_btn.set_enabled(True)
+            try:
+                self._plan_btn.set_enabled(True)
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -642,6 +778,34 @@ class StorageInsightDialog(ToolPage):
                 _os.startfile(path)
         except Exception:
             pass
+
+    def _open_reclaim_plan(self):
+        """Hand the measured numbers to the plan, which owns the next screen.
+
+        Nobody re-scans: the plan is built from `_cat_sizes` / `_cat_keys` this
+        walk already produced, so the two windows can never disagree. Storage
+        Insight closes first - the plan is modal, and a Clean step it runs
+        needs the main window, not two stacked dialogs.
+        """
+        from app import reclaim
+        cats = []
+        for title, size in self._cat_sizes.items():
+            cats.append({
+                "title": title,
+                "bytes": size,
+                "keys": self._cat_keys.get(title) or [],
+                "unknown": self._cat_unknown.get(title) or 0,
+            })
+        plan = reclaim.build_plan(cats)
+        self.close()
+        try:
+            from app.ui.dialogs.reclaim_plan_dialog import ReclaimPlanDialog
+            ReclaimPlanDialog(self.app.root, self.app, plan).wait()
+        except Exception as exc:
+            try:
+                self.app.log("! Could not open the reclaim plan: %s" % exc)
+            except Exception:
+                pass
 
     def _clean_selected(self):
         """Close the dialog, then run the checked categories' real tasks

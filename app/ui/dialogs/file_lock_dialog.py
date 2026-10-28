@@ -30,8 +30,9 @@ from tkinter import filedialog as _fd
 
 from app.ui.base import _themed_askyesno
 from app.ui.dialogs._tool_page import TOOL_ACCENT, ToolPage
-from app.ui.theme import COLORS, F
-from app.ui.widgets import AnimatedButton, Tooltip
+from app.ui.theme import COLORS, TYPE, SPACE_1, SPACE_2, SPACE_4
+from app.ui.metrics import CONTROL_GAP
+from app.ui.widgets import AnimatedButton, PermissionNotice
 from app.ui.widgets.datatable import DataTable
 
 _COLUMNS = (
@@ -66,13 +67,16 @@ class FileLockDialog(ToolPage):
                                           kind="primary")
         self._again = self.add_button("Check again", self._refresh)
         self._other = self.add_button("Choose another", self._show_picker)
-        self._admin_btn = AnimatedButton(
-            self.foot_btns, text="Scan as admin", command=self._load_elevated,
-            bg=COLORS["surface"], fg=COLORS["accent_yellow"], font=(F, 9),
-            padx=14, pady=6)
-        Tooltip(self._admin_btn,
-                "Programs running as another user cannot be seen without "
-                "this. Windows will ask first.")
+        # AUDIT TV-010: the shared permission pattern. It explains WHY the
+        # normal scan is incomplete instead of offering a bare footer button,
+        # appears only in that state, and goes away once the elevated result
+        # lands. It sits above the table because it is about the result, not
+        # about the dialog's actions.
+        self._notice = PermissionNotice(
+            self.content,
+            reason="Programs running as another user are invisible to a "
+                   "normal scan.",
+            action_text="Scan as admin", on_action=self._load_elevated)
         self.on_close(self._stop)
         self._show_picker()
 
@@ -82,19 +86,18 @@ class FileLockDialog(ToolPage):
         self._picker = f
         inner = tk.Frame(f, bg=COLORS["bg"], bd=0)
         inner.place(relx=0.5, rely=0.42, anchor="center")
-        tk.Label(inner, text="What can't you delete?", font=(F, 11, "bold"),
+        tk.Label(inner, text="What can't you delete?", font=TYPE["card_title"],
                  bg=COLORS["bg"], fg=COLORS["text"]).pack()
         tk.Label(inner, text="Pick it and this will show which program has "
-                             "it open.", font=(F, 9), bg=COLORS["bg"],
-                 fg=COLORS["subtext"]).pack(pady=(4, 16))
+                             "it open.", font=TYPE["caption"], bg=COLORS["bg"],
+                 fg=COLORS["subtext"]).pack(pady=(SPACE_1, SPACE_4))
         row = tk.Frame(inner, bg=COLORS["bg"], bd=0)
         row.pack()
         AnimatedButton(row, text="Choose a folder", command=lambda: self._pick(True),
-                       bg=TOOL_ACCENT, fg=COLORS["black"], font=(F, 10, "bold"),
-                       padx=22, pady=10).pack(side="left", padx=6)
+                       role="filled", size="lg", accent=TOOL_ACCENT).pack(
+                           side="left", padx=CONTROL_GAP)
         AnimatedButton(row, text="Choose a file", command=lambda: self._pick(False),
-                       bg=COLORS["surface"], fg=COLORS["text"], font=(F, 10),
-                       padx=22, pady=10).pack(side="left", padx=6)
+                       role="secondary", size="lg").pack(side="left", padx=CONTROL_GAP)
 
     def _show_picker(self):
         self._stop_token[0] = False
@@ -108,7 +111,7 @@ class FileLockDialog(ToolPage):
         self.status.stop("")
         for b in (self._close_all, self._again, self._other):
             b.pack_forget()
-        self._admin_btn.pack_forget()
+        self._notice.pack_forget()
 
     def _show_results(self):
         self._picker.pack_forget()
@@ -116,7 +119,7 @@ class FileLockDialog(ToolPage):
             self.table.pack(fill="both", expand=True)
         for b in (self._close_all, self._again, self._other):
             if not b.winfo_manager():
-                b.pack(side="right", padx=(8, 0))
+                b.pack(side="right", padx=(SPACE_2, 0))
 
     # ------------------------------------------------------------ helpers
     def _stop(self):
@@ -130,10 +133,10 @@ class FileLockDialog(ToolPage):
             pass
 
     def _worker_failed(self, exc):
-        # B-017: _land_elevated is what normally re-enables this button; on a
+        # B-017: _land_elevated is what normally re-enables this action; on a
         # worker exception it must be restored here or it stays dead.
         try:
-            self._admin_btn.set_enabled(True)
+            self._notice.set_enabled(True)
         except Exception:
             pass
         super()._worker_failed(exc)
@@ -165,7 +168,10 @@ class FileLockDialog(ToolPage):
         seq = self._scan_seq
         target = self._target
         self.set_busy(True)
-        self.status.start("Checking...")
+        # The banner is this page's headline and it says what is happening;
+        # the strip only adds the moving rail, so its caption stays empty
+        # rather than printing the same three words twice in one dialog.
+        self.status.start("")
         self.banner.set_state("…", COLORS["muted"])
         self.banner.set_title("Checking...")
         self.banner.set_sub(target)
@@ -200,11 +206,14 @@ class FileLockDialog(ToolPage):
         except Exception:
             self._limits = {}
         try:
-            if self._limits.get("incomplete") and not self._elevated:
-                if not self._admin_btn.winfo_manager():
-                    self._admin_btn.pack(side="right", padx=(8, 0))
-            elif self._admin_btn.winfo_manager():
-                self._admin_btn.pack_forget()
+            show = (bool(self._limits.get("incomplete"))
+                    and not self._elevated
+                    and bool(self.table.winfo_manager()))
+            if show and not self._notice.winfo_manager():
+                self._notice.pack(fill="x", pady=(0, SPACE_2),
+                                  before=self.table)
+            elif not show and self._notice.winfo_manager():
+                self._notice.pack_forget()
         except Exception:
             pass
 
@@ -243,17 +252,23 @@ class FileLockDialog(ToolPage):
         if not self._target:
             return
         self.set_busy(True)
-        self._admin_btn.set_enabled(False)
+        self._notice.set_enabled(False)
         self.status.start("Waiting for the administrator prompt...")
         target = self._target
         self.run_worker(holders_elevated, self._land_elevated, target)
 
     def _land_elevated(self, data):
         self.set_busy(False)
-        self._admin_btn.set_enabled(True)
+        self._notice.set_enabled(True)
         if data.get("cancelled"):
-            self.status.stop("Administrator access was declined.",
-                             COLORS["accent_yellow"])
+            # A-008: the notice must change state, not repeat its invitation.
+            # The exact request is named behind "Why?" so the refusal is
+            # something the user can act on rather than a dead end.
+            self._notice.set_refused(
+                why="a read-only scan of every process's open handles "
+                    "(Restart Manager, with administrator rights)")
+            self.status.stop("Administrator access was refused \u2014 showing "
+                             "the normal scan only.", COLORS["accent_yellow"])
             return
         if data.get("error"):
             self.status.stop(data["error"], COLORS["accent_red"])
@@ -289,7 +304,6 @@ class FileLockDialog(ToolPage):
                 return
         self.status.start("Closing %s..." % name)
         self.set_busy(True)
-        target = self._target
 
         def _work():
             res = close_program(pid, force,
@@ -397,6 +411,3 @@ class FileLockDialog(ToolPage):
                 "Nothing has it open",
                 "You can delete or rename it now.", glyph="✓")
         self.table.set_rows(rows)
-
-    def _resize(self):
-        pass

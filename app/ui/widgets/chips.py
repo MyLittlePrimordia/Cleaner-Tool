@@ -17,15 +17,17 @@ from __future__ import annotations
 
 import tkinter as tk
 
-from app.ui.theme import (COLORS, F, _hex_lerp, _measure_font,
-                          _round_rect_points)
+from app.ui.theme import (
+    COLORS, TYPE, _hex_lerp, _measure_font, _round_rect_points
+)
+from app.ui.metrics import CHIP_PAD, CONTROL_GAP
 
 CHIP_H = 28
-GAP = 6
-PAD_X = 13
-FONT = (F, 9)
-FONT_ON = (F, 9, "bold")
-FONT_N = (F, 8)
+GAP = CONTROL_GAP
+PAD_X = CHIP_PAD
+FONT = TYPE["caption"]
+FONT_ON = TYPE["label_medium"]
+FONT_N = TYPE["micro_regular"]
 
 
 class ChipBar(tk.Canvas):
@@ -65,19 +67,11 @@ class ChipBar(tk.Canvas):
         if notify and self._cmd is not None:
             self._cmd(key)
 
-    def set_counts(self, counts):
-        self._counts = dict(counts or {})
-        self._draw()
 
     def set_enabled(self, on):
         self._enabled = bool(on)
         self._draw()
 
-    def needed_width(self):
-        try:
-            return self._layout()[-1]
-        except Exception:
-            return 0
 
     # internals
     def _fonts(self):
@@ -116,7 +110,6 @@ class ChipBar(tk.Canvas):
         if self._label:
             self.create_text(0, CHIP_H / 2, text=self._label, font=FONT_N,
                              fill=COLORS["muted"], anchor="w")
-        tint = _hex_lerp(COLORS["bg"], self._accent, 0.16)
         for key, text, x0, x1, n in boxes:
             on = key == self._sel
             hov = key == self._hover and self._enabled
@@ -141,10 +134,6 @@ class ChipBar(tk.Canvas):
                                    min(8, (CHIP_H - 4) // 2)),
                 smooth=True, fill=fill, outline=outline)
             has_n = n is not None
-            nw = 0
-            if has_n:
-                f, fb, fn = self._fonts()
-                nw = fn.measure(str(n)) + 7
             tx = x0 + PAD_X
             self.create_text(tx, CHIP_H / 2, text=text, anchor="w",
                              font=FONT_ON if on else FONT, fill=fg)

@@ -11,34 +11,50 @@ from app.utils import (
     clean_folder_contents, restart_explorer, reg_get_value, reg_delete_value,
     known_folder, atomic_write_text, resolve_exe, TaskSkipped,
 )
+from app.tasks.ps import ps_argv, run_ps, run_ps_checked
 
 _WINDIR = os.environ.get("WINDIR", "C:\\Windows")
 
 
+# U-006: these four lines are the whole answer to "is it stuck?". DISM and
+# SFC genuinely sit at one percentage for minutes while Windows scans the
+# component store, so the honest fix is naming the operation and saying that a
+# still number is normal - not a faster spinner. The run strip adds the
+# percentage and "step n of M" from the shared progress callback.
+_PAUSE_NOTE = (" DISM can hold one percentage for several minutes while it "
+               "works; that is normal, not a freeze.")
+
+
 def repair_sfc_scan(ctx: TaskContext):
-    ctx.set_status("Running System File Checker (sfc /scannow)... this can take several minutes.")
+    ctx.set_status("System File Checker: verifying every protected Windows "
+                   "file. Verification is the slow phase and may pause.")
     run_cmd_checked(ctx, "sfc /scannow", timeout=1800, success_codes=(0, 1))
 
 
 def repair_dism_restorehealth(ctx: TaskContext):
-    ctx.set_status("Running DISM RestoreHealth (downloads replacement files from Windows Update if needed)...")
+    ctx.set_status("DISM RestoreHealth: repairing the component store"
+                   " (downloads clean files from Windows Update if needed)."
+                   + _PAUSE_NOTE)
     run_cmd_checked(ctx, "DISM /Online /Cleanup-Image /RestoreHealth", timeout=1800,
                     success_codes=(0, 3010))
 
 
 def repair_dism_component_cleanup(ctx: TaskContext):
-    ctx.set_status("Cleaning up the WinSxS component store (frees space, keeps update rollback)...")
+    ctx.set_status("DISM cleanup: removing superseded files from the WinSxS "
+                   "component store (update rollback is kept)." + _PAUSE_NOTE)
     run_cmd_checked(ctx, "DISM /Online /Cleanup-Image /StartComponentCleanup", timeout=900,
                     success_codes=(0, 3010))
 
 
 def repair_dism_scanhealth(ctx: TaskContext):
-    ctx.set_status("Scanning Windows image for corruption (DISM ScanHealth)...")
+    ctx.set_status("DISM ScanHealth: scanning the Windows image for "
+                   "corruption (read-only)." + _PAUSE_NOTE)
     run_cmd_checked(ctx, "DISM /Online /Cleanup-Image /ScanHealth", timeout=900, success_codes=(0, 3010))
 
 
 def repair_dism_checkhealth(ctx: TaskContext):
-    ctx.set_status("Checking Windows image health (DISM CheckHealth)...")
+    ctx.set_status("DISM CheckHealth: asking whether the image already knows "
+                   "it is damaged (read-only, fast).")
     run_cmd_checked(ctx, "DISM /Online /Cleanup-Image /CheckHealth", timeout=600, success_codes=(0, 3010))
 
 
@@ -64,11 +80,10 @@ def _volume_is_ntfs(ctx: TaskContext, drive: str) -> bool:
     """chkdsk /scan and /spotfix are NTFS features. Asked through PowerShell
     so the answer does not depend on the Windows display language."""
     lines: list = []
-    run_cmd(ctx, [resolve_exe("powershell"), "-NoProfile", "-NonInteractive",
-                  "-Command",
-                  "(Get-Volume -DriveLetter %s -ErrorAction "
-                  "SilentlyContinue).FileSystem" % drive[0]],
-            shell=False, timeout=30, collect=lines)
+    run_ps(ctx,
+            "(Get-Volume -DriveLetter %s -ErrorAction "
+            "SilentlyContinue).FileSystem" % drive[0],
+            timeout=30, collect=lines, non_interactive=True)
     return any(ln.strip().upper() == "NTFS" for ln in lines)
 
 
@@ -238,8 +253,14 @@ def repair_windows_update_reset(ctx: TaskContext):
             rc = run_cmd(ctx, f"net stop {svc}", timeout=30)
             if rc == 0:
                 stopped_services.append(svc)
+            elif rc == 2:
+                # `net stop` answers 2 for "not started" (and, on some
+                # builds, for "already stopped"). That is the normal state of
+                # msiserver on most PCs; it is not a repair warning. Logging
+                # it as one made a healthy run look broken.
+                ctx.log(f"  {svc}: not running — nothing to stop.")
             else:
-                ctx.log(f"  ! Warning: could not stop {svc}")
+                ctx.log(f"  ! Warning: could not stop {svc} (code {rc})")
         
         sw_dist = f"{_WINDIR}\\SoftwareDistribution"
         catroot2 = f"{_WINDIR}\\System32\\catroot2"
@@ -299,7 +320,7 @@ def repair_windows_update_reset(ctx: TaskContext):
     finally:
         for svc in reversed(stopped_services):
             rc = run_cmd(ctx, f"net start {svc}", timeout=30)
-            if rc != 0:
+            if rc not in (0, 2):
                 ctx.log(f"  ! Warning: could not start {svc} (code {rc}) — may need reboot")
         # M10 fix: do NOT rmtree the .bak here — Windows may not have recreated
         # the original folder yet, and deleting the only copy would destroy the
@@ -331,9 +352,37 @@ def repair_windows_update_reset(ctx: TaskContext):
                     "only after Windows Update succeeds again.")
 
 
+def _service_is_running(name: str) -> bool:
+    """Best-effort `sc query` probe. Never raises; unknown reads as False."""
+    try:
+        from app.utils import run_capture
+        rc, out = run_capture(["sc", "query", name], timeout=10)
+        return rc == 0 and "RUNNING" in (out or "").upper()
+    except Exception:
+        return False
+
+
+def _wait_for_service(name: str, timeout: float = 20.0) -> bool:
+    """Poll until a service reports RUNNING (bounded, 0.5s steps)."""
+    import time as _time
+    deadline = _time.time() + max(1.0, float(timeout))
+    while _time.time() < deadline:
+        if _service_is_running(name):
+            return True
+        _time.sleep(0.5)
+    return _service_is_running(name)
+
+
 def repair_search_index(ctx: TaskContext):
     ctx.set_status("Rebuilding the Windows Search index...")
-    rc_stop = run_cmd(ctx, "net stop WSearch", timeout=30)
+    rc_stop = run_cmd(ctx, "net stop WSearch", timeout=60)
+    # 0 = stopped now; 2 = was not running (fine, we can clean it while down).
+    if rc_stop not in (0, 2):
+        ctx.log(f"  ! WSearch refused to stop (code {rc_stop}) — not deleting "
+                "a live index.")
+        raise RuntimeError(
+            "Windows Search would not stop, so its index was left alone. "
+            "Reboot, then re-run this repair.")
     # ProgramData is at drive root; handle bare "C:" correctly
     _sd = os.environ.get("SYSTEMDRIVE", "C:")
     if len(_sd) == 2 and _sd[1] == ":":
@@ -347,29 +396,58 @@ def repair_search_index(ctx: TaskContext):
     # search service keeps the index locked even after a clean `net stop`, so
     # this is the COMMON path, not an edge case: the task reliably claimed to
     # have rebuilt an index it never touched.
+    #
+    # 2026-10 (user logs): the old code deleted the "Windows" FOLDER itself.
+    # Windows Search then failed to start (service error 3221493761) because
+    # the service needs that directory and its inherited ACLs before it can
+    # create a fresh index. Clear the CONTENTS and re-create the folder, and
+    # verify the service actually came back.
     cleared = False
-    if os.path.exists(index_db):
-        if rc_stop != 0:
-            ctx.log(f"  ! WSearch stop failed (code {rc_stop}) — skipping "
-                    "delete to avoid a partial lock")
-        else:
-            try:
-                from app.utils import _is_reparse_point
-                if _is_reparse_point(index_db):
-                    ctx.log(f"  ! skipping junction/symlink search index "
-                            f"path: {index_db}")
-                else:
-                    shutil.rmtree(index_db, ignore_errors=False)
-                    cleared = True
-                    ctx.log(f"Cleared search index database at {index_db}")
-            except Exception as exc:
-                ctx.log(f"  ! could not clear search index: {exc}")
+    kept = 0
+    if os.path.isdir(index_db):
+        try:
+            from app.utils import _is_reparse_point
+            if _is_reparse_point(index_db):
+                ctx.log(f"  ! skipping junction/symlink search index "
+                        f"path: {index_db}")
+            else:
+                for entry in os.scandir(index_db):
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            shutil.rmtree(entry.path, ignore_errors=False)
+                        else:
+                            os.remove(entry.path)
+                    except OSError:
+                        kept += 1
+                cleared = True
+                ctx.log(f"Cleared search index contents at {index_db}")
+                if kept:
+                    ctx.log(f"  (skipped {kept} locked item(s) — Windows "
+                            "will rebuild around them)")
+        except Exception as exc:
+            ctx.log(f"  ! could not clear search index: {exc}")
     else:
         ctx.log(f"Search index path not found: {index_db} — nothing to clear")
-    rc_start = run_cmd(ctx, "net start WSearch", timeout=30)
-    if rc_start != 0:
-        ctx.log(f"  ! Warning: could not start WSearch (code {rc_start})")
-    if os.path.exists(index_db) and not cleared:
+    # The service expects this directory to exist. Re-create it even when it
+    # was already missing, so a stopped service has somewhere to build.
+    try:
+        os.makedirs(index_db, exist_ok=True)
+    except Exception as exc:
+        ctx.log(f"  ! could not re-create the search index folder: {exc}")
+    rc_start = run_cmd(ctx, "net start WSearch", timeout=60)
+    if rc_start not in (0, 2, 1056):
+        # `net start` uses 2 for "already started" too; 1056 is sc's version.
+        run_cmd(ctx, "sc start WSearch", timeout=60)
+    if not _wait_for_service("WSearch", timeout=25.0):
+        ctx.log("  ! Windows Search did not come back after the index was "
+                "cleared.")
+        ctx.log("  ! Start it in Services (services.msc -> Windows Search), "
+                "or restart the PC. The index rebuilds on its own.")
+        raise RuntimeError(
+            "The index was cleared, but Windows Search would not restart. "
+            "Start 'Windows Search' in Services or restart the PC; the "
+            "index will rebuild automatically.")
+    if os.path.isdir(index_db) and not cleared:
         # The index file is still there, so nothing was achieved. Say so
         # instead of letting the runner log a green tick.
         raise RuntimeError(
@@ -432,15 +510,25 @@ def repair_reregister_store_apps(ctx: TaskContext):
     # Use a PowerShell here-string so the per-package path is built reliably
     # without fragile nested quote escaping. -ErrorAction SilentlyContinue keeps
     # it non-fatal for packages that can't be re-registered.
+    # 2026-10 (user log): the unfiltered pipeline printed a wall of
+    # "Cannot find path ...\AppXManifest.xml" for every system package whose
+    # install location has no manifest (AIX, LKG shims, NcsiUwpApp, ...).
+    # Those packages cannot be re-registered, and the errors made a healthy
+    # run look broken. Filter to packages that actually have a manifest; the
+    # ones that do not are not repairable this way, and Windows recreates
+    # them from its own servicing store.
     ps_cmd = (
-        'powershell -NoProfile -Command '
-        '"Get-AppXPackage -AllUsers | ForEach-Object { '
-        'Add-AppxPackage -DisableDevelopmentMode '
-        '-Register ($_.InstallLocation + \'\\AppXManifest.xml\') -ErrorAction SilentlyContinue }"'
+        "Get-AppXPackage -AllUsers | Where-Object { "
+        "$_.InstallLocation -and (Test-Path "
+        "(Join-Path $_.InstallLocation 'AppXManifest.xml')) } | "
+        "ForEach-Object { Add-AppxPackage -DisableDevelopmentMode "
+        "-Register ($_.InstallLocation + '\\AppXManifest.xml') "
+        "-ErrorAction SilentlyContinue }"
     )
     # H5: a timed-out/failed 10-minute re-register used to log nothing and
     # count as success. Non-zero (or -1 cancel/timeout) raises honestly.
-    run_cmd_checked(ctx, ps_cmd, timeout=600)
+    # R-008: handed over as one argv word, so the inner quotes need no escaping.
+    run_ps_checked(ctx, ps_cmd, timeout=600)
 
 
 def repair_time_sync(ctx: TaskContext):
@@ -482,17 +570,15 @@ def repair_xbox_game_apps(ctx: TaskContext):
     _ok = 0
     _present = 0
     for pkg in packages:
-        rc = run_cmd(
+        rc = run_ps(
             ctx,
-            ["powershell", "-NoProfile", "-Command",
-             # B-0xx: exit 2 (not 0) when the package is absent. The old
-             # pipeline exited 0 with the package missing, so every absent
-             # package was counted and logged as "Re-registered" — a false
-             # success on any PC without Xbox / Game Pass installed.
-             f"$p = Get-AppxPackage -Name '{pkg}'; if (-not $p) {{ exit 2 }}; "
-             f"Add-AppxPackage -DisableDevelopmentMode -Register "
-             f"($p.InstallLocation + '\\AppXManifest.xml')"],
-            shell=False,
+            # B-0xx: exit 2 (not 0) when the package is absent. The old
+            # pipeline exited 0 with the package missing, so every absent
+            # package was counted and logged as "Re-registered" — a false
+            # success on any PC without Xbox / Game Pass installed.
+            f"$p = Get-AppxPackage -Name '{pkg}'; if (-not $p) {{ exit 2 }}; "
+            f"Add-AppxPackage -DisableDevelopmentMode -Register "
+            f"($p.InstallLocation + '\\AppXManifest.xml')",
             timeout=120,
         )
         if rc == 0:
@@ -505,13 +591,11 @@ def repair_xbox_game_apps(ctx: TaskContext):
             _present += 1
             ctx.log(f"  ! re-register failed for {pkg} (exit {rc})")
     # GamingServices also installs a Win32 service pair; re-register its appx explicitly
-    rc = run_cmd(
+    rc = run_ps(
         ctx,
-        ["powershell", "-NoProfile", "-Command",
-         "$p = Get-AppxPackage -Name 'Microsoft.GamingServices' -AllUsers; "
-         "if (-not $p) { exit 2 }; "
-         "$p | ForEach-Object { Add-AppxPackage -DisableDevelopmentMode -Register ($_.InstallLocation + '\\AppXManifest.xml') }"],
-        shell=False,
+        "$p = Get-AppxPackage -Name 'Microsoft.GamingServices' -AllUsers; "
+        "if (-not $p) { exit 2 }; "
+        "$p | ForEach-Object { Add-AppxPackage -DisableDevelopmentMode -Register ($_.InstallLocation + '\\AppXManifest.xml') }",
         timeout=120,
     )
     if rc == 0:
@@ -538,11 +622,8 @@ def repair_ssd_maintenance(ctx: TaskContext):
     # unchecked call still logged "Retrim complete".
     if run_cmd(ctx, "defrag /C /L /U /V", timeout=1800) != 0:
         ctx.log("  ! retrim pass reported an issue (HDD-only PC or access denied?) — continuing to health report.")
-    run_cmd(
-        ctx,
-        'powershell -NoProfile -Command "Get-PhysicalDisk | Select-Object FriendlyName, MediaType, HealthStatus | Format-Table -AutoSize"',
-        timeout=60,
-    )
+    run_ps(ctx, "Get-PhysicalDisk | Select-Object FriendlyName, MediaType, "
+               "HealthStatus | Format-Table -AutoSize", timeout=60)
     ctx.log("Retrim pass done. Any drive above shows OK health or needs attention.")
 
 
@@ -720,9 +801,8 @@ def repair_smart_verdict(ctx: TaskContext):
     import subprocess as _sp
     try:
         out = _sp.run(
-            ["powershell", "-NoProfile", "-Command",
-             "Get-PhysicalDisk | Select-Object FriendlyName, MediaType, HealthStatus, "
-             "@{n='Size';e={[math]::Round($_.Size/1GB)}} | ConvertTo-Csv -NoTypeInformation"],
+            ps_argv("Get-PhysicalDisk | Select-Object FriendlyName, MediaType, HealthStatus, "
+                    "@{n='Size';e={[math]::Round($_.Size/1GB)}} | ConvertTo-Csv -NoTypeInformation"),
             capture_output=True, text=True, timeout=60,
             creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
         )
@@ -741,7 +821,7 @@ def repair_smart_verdict(ctx: TaskContext):
     # split(",") would misalign the HealthStatus column.
     try:
         reader = _csv.reader(_io.StringIO("\n".join(lines)))
-        header = next(reader, None)
+        next(reader, None)          # discard the header row
         rows = list(reader)
     except Exception:
         rows = []
@@ -780,12 +860,11 @@ def repair_gpu_driver_age(ctx: TaskContext):
         # timestamp with an invariant culture FIRST, so the CSV always
         # carries "yyyy-MM-dd HH:mm:ss" regardless of regional settings.
         out = _sp.run(
-            ["powershell", "-NoProfile", "-Command",
-             "Get-CimInstance Win32_VideoController | "
-             "Where-Object DriverDate | Select-Object Name, DriverDate | "
-             "ForEach-Object { [PSCustomObject]@{ Name = $_.Name; "
-             "DriverDate = $_.DriverDate.ToString('yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture) } } | "
-             "ConvertTo-Csv -NoTypeInformation"],
+            ps_argv("Get-CimInstance Win32_VideoController | "
+                    "Where-Object DriverDate | Select-Object Name, DriverDate | "
+                    "ForEach-Object { [PSCustomObject]@{ Name = $_.Name; "
+                    "DriverDate = $_.DriverDate.ToString('yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture) } } | "
+                    "ConvertTo-Csv -NoTypeInformation"),
             capture_output=True, text=True, timeout=60,
             creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
         )
@@ -1132,8 +1211,7 @@ def restart_camera_devices(ctx: TaskContext):
         "if ($failed -gt 0) { exit 3 } else { exit 0 }"
     )
     _cam_out: list = []
-    rc = run_cmd(ctx, ["powershell", "-NoProfile", "-Command", ps],
-                 shell=False, timeout=180, collect=_cam_out)
+    rc = run_ps(ctx, ps, timeout=180, collect=_cam_out)
     if "NO_CAMERAS" in " ".join(_cam_out):
         raise RuntimeError(
             "No camera found on this PC — nothing to restart "
@@ -1210,8 +1288,7 @@ def find_power_drains(ctx: TaskContext):
     # this check just isn't for it
     try:
         _proc = _sp.run(
-            ["powershell", "-NoProfile", "-Command",
-             "if (Get-CimInstance Win32_Battery) { 'yes' } else { 'no' }"],
+            ps_argv("if (Get-CimInstance Win32_Battery) { 'yes' } else { 'no' }"),
             capture_output=True, text=True, timeout=30,
             creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
         )
@@ -1252,11 +1329,7 @@ def repair_enable_system_restore(ctx: TaskContext):
     """Re-enable System Protection on C: when something (or some debloat
     guide) turned it off — without it, Safety Checkpoints cannot save you."""
     ctx.set_status("Turning System Protection back on for C:...")
-    run_cmd_checked(
-        ctx,
-        'powershell -NoProfile -Command "Enable-ComputerRestore -Drive \'C:\\\'"',
-        timeout=300, success_codes=(0,),
-    )
+    run_ps_checked(ctx, "Enable-ComputerRestore -Drive 'C:\\'", timeout=300)
     ctx.log("System Protection is on for C: — Safety Checkpoints will work again.")
 
 
@@ -1594,7 +1667,6 @@ def audit_startup_impact(ctx: TaskContext):
     to real entries. Changes NOTHING — read-only by design (disabling
     startup entries is a user decision the app won't make silently)."""
     ctx.set_status("Listing what starts with Windows...")
-    import glob as _glob
     found: list = []
     # Run keys (per-user + machine)
     try:
@@ -1978,10 +2050,9 @@ def check_xmp_status(ctx: TaskContext):
     import subprocess as _sp
     try:
         out = _sp.run(
-            ["powershell", "-NoProfile", "-Command",
-             "Get-CimInstance Win32_PhysicalMemory | "
-             "Select-Object SMBIOSMemoryType, Speed, ConfiguredClockSpeed | "
-             "ConvertTo-Csv -NoTypeInformation"],
+            ps_argv("Get-CimInstance Win32_PhysicalMemory | "
+                    "Select-Object SMBIOSMemoryType, Speed, ConfiguredClockSpeed | "
+                    "ConvertTo-Csv -NoTypeInformation"),
             capture_output=True, text=True, timeout=60,
             creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
         )
@@ -2112,12 +2183,11 @@ def check_windows_activation(ctx: TaskContext):
     import subprocess as _sp
     try:
         out = _sp.run(
-            ["powershell", "-NoProfile", "-Command",
-             "(Get-CimInstance SoftwareLicensingProduct | "
-             "Where-Object { $_.PartialProductKey } | "
-             "Select-Object -First 1 -Property LicenseStatus, "
-             "Description, PartialProductKey | "
-             "ConvertTo-Csv -NoTypeInformation)"],
+            ps_argv("(Get-CimInstance SoftwareLicensingProduct | "
+                    "Where-Object { $_.PartialProductKey } | "
+                    "Select-Object -First 1 -Property LicenseStatus, "
+                    "Description, PartialProductKey | "
+                    "ConvertTo-Csv -NoTypeInformation)"),
             capture_output=True, text=True, timeout=60,
             creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
         )
@@ -2187,7 +2257,7 @@ def check_secureboot_tpm(ctx: TaskContext):
     def _ps(script, timeout=45):
         try:
             return _sp.run(
-                ["powershell", "-NoProfile", "-Command", script],
+                ps_argv(script),
                 capture_output=True, text=True, timeout=timeout,
                 creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
             )

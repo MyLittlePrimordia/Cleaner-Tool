@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import tkinter as tk
 
-from app.ui.theme import COLORS, _round_pts, F
+from app.ui.theme import COLORS, RADIUS_SURFACE, SPACE_2, SPACE_3, _round_pts
 
 class ScrollableRoundedPanel(tk.Canvas):
     """Rounded-corner content panel with a custom-drawn scrollbar.
@@ -28,9 +28,9 @@ class ScrollableRoundedPanel(tk.Canvas):
         almost nothing, so the Run button can never be pushed out of view
     """
 
-    RADIUS = 16
-    INSET_X = 12
-    INSET_Y = 8
+    RADIUS = RADIUS_SURFACE
+    INSET_X = SPACE_3
+    INSET_Y = SPACE_2
     SB_W = 16          # reserved right strip for the floating scrollbar
 
     def __init__(self, parent, fill_inner=False, hug=True, **kw):
@@ -162,9 +162,7 @@ class ScrollableRoundedPanel(tk.Canvas):
         its content without touching a single pack() call, which matters:
         the obvious alternative (sizing the panel to its content) would have
         meant the panel refusing expand=True, which is the one behaviour
-        this widget exists to guarantee - see the class docstring and
-        DetailPane's settle() notes on what propagate_height did to the
-        dialogs.
+        this widget exists to guarantee - see the class docstring.
 
         Consequence worth stating: the primary action row stays PINNED to
         the bottom of the page, so it does not move when the user switches
@@ -283,6 +281,44 @@ class ScrollableRoundedPanel(tk.Canvas):
 
     def _max_offset(self):
         return max(0, self._content_h - self._view_h)
+
+    def reveal(self, widget, pad=8):
+        """Scroll so `widget` (nested inside `inner`) is on screen.
+
+        Used by pages that navigate to one row from elsewhere (the Health
+        tab's decline line names a finding that lives in this panel). The
+        widget need not be a direct child: y offsets are summed up the parent
+        chain, so a row inside a section frame lands correctly.
+
+        A row taller than the viewport is aligned by its TOP - the reader
+        wants its heading, not its middle. Returns True when the widget was
+        measured, False for a widget outside this panel.
+        """
+        try:
+            self.inner.update_idletasks()
+            self.refresh_scroll(flush=False)
+            top = 0
+            node = widget
+            for _ in range(40):
+                if node is None or node is self.inner:
+                    break
+                top += node.winfo_y()
+                node = getattr(node, "master", None)
+            if node is not self.inner:
+                return False
+            height = max(1, widget.winfo_height())
+            view = self.view_height()
+            pad = max(0, int(pad))
+            offset = self._offset
+            if top - pad < offset or height + pad * 2 >= view:
+                offset = top - pad
+            elif top + height + pad > offset + view:
+                offset = top + height + pad - view
+            self._offset = max(0, min(offset, self._max_offset()))
+            self._apply()
+            return True
+        except Exception:
+            return False
 
     def _apply(self):
         max_off = self._max_offset()

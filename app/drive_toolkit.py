@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import os
 import random
-import time
 
 IS_WINDOWS = os.name == "nt"
 
@@ -56,14 +55,14 @@ def list_physical_disks(timeout=6.0):
     try:
         import subprocess as _sp
         import json as _json
+        from app.tasks.ps import ps_argv
         cmd = (
             "Get-PhysicalDisk -ErrorAction Stop | "
             "Select-Object FriendlyName,MediaType,HealthStatus,"
             "OperationalStatus,Size | ConvertTo-Json -Compress"
         )
         proc = _sp.run(
-            ["powershell", "-NoProfile", "-NonInteractive",
-             "-Command", cmd],
+            ps_argv(cmd, non_interactive=True),
             capture_output=True, text=True, timeout=timeout,
             creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0))
         raw = (proc.stdout or "").strip()
@@ -100,46 +99,71 @@ def list_physical_disks(timeout=6.0):
         return []
 
 
+def publish_health_findings(disks):
+    """Publish the drives Windows does not call healthy (AUDIT TX-002).
+
+    Called after a fresh read, so this namespace is authoritative: a drive
+    that was Warning yesterday and is Healthy today stops being a finding
+    without waiting for the seven-day expiry. An empty read means "could not
+    check", not "all healthy", and is deliberately NOT allowed to clear the
+    board - losing a real drive warning because PowerShell timed out would be
+    worse than showing a day-old one.
+    """
+    if not disks:
+        return []
+    try:
+        from app import insights
+        from app.insights import Finding, slug
+        import time as _time
+    except Exception:
+        return []
+
+    now = _time.time()
+    findings = []
+    seen = {}
+    for disk in disks:
+        health = str(disk.get("health") or "")
+        if health not in ("Warning", "Unhealthy"):
+            continue
+        name = str(disk.get("name") or "Drive")
+        base = "drivetoolkit.drive." + slug(name)
+        # Two identical models are a real configuration; give the second one
+        # its own id instead of letting one overwrite the other.
+        seen[base] = seen.get(base, 0) + 1
+        finding_id = base if seen[base] == 1 else "%s-%d" % (
+            base, seen[base])
+        failing = health == "Unhealthy"
+        try:
+            size_gb = round(int(disk.get("size_bytes") or 0) / (1024 ** 3), 1)
+        except (TypeError, ValueError):
+            size_gb = 0.0
+        findings.append(Finding(
+            id=finding_id,
+            domain="storage",
+            severity="critical" if failing else "warn",
+            title=("%s is failing" if failing
+                   else "%s reports a warning") % name,
+            detail=("Windows says this drive is unhealthy. Back up your "
+                    "files now; no software repairs a failing drive."
+                    if failing else
+                    "Windows is seeing early warning signs. Back up anything "
+                    "important and check the drive's cable and power."),
+            evidence={"drive": name, "health": health,
+                      "media": str(disk.get("media_type") or ""),
+                      "size_gb": size_gb},
+            action={"kind": "route", "target": "drivetoolkit",
+                    "label": "Open Drive Toolkit"},
+            observed_at=now,
+        ))
+    try:
+        return insights.replace("drivetoolkit.drive.", *findings)
+    except Exception:
+        return []
+
+
 # --------------------------------------------------------------------------- #
 # Speed — thin re-export, zero duplication
 # --------------------------------------------------------------------------- #
-
-def list_fixed_drives():
-    """[(letter, root, free_bytes, total_bytes)] for benchmarking targets.
-
-    Local to this module (not imported from gui.py) so drive_toolkit has
-    no dependency on the GUI — the same reason storage_scan.py and
-    pc_specs.py each keep their own small drive walker instead of
-    sharing one."""
-    if not IS_WINDOWS:
-        return []
-    out = []
-    try:
-        import ctypes as _ct
-        k32 = _ct.windll.kernel32
-        bitmask = k32.GetLogicalDrives()
-        for i in range(26):
-            if not (bitmask >> i) & 1:
-                continue
-            letter = chr(ord("A") + i)
-            root = f"{letter}:\\"
-            try:
-                if k32.GetDriveTypeW(_ct.c_wchar_p(root)) != 3:  # DRIVE_FIXED
-                    continue
-                free = _ct.c_ulonglong(0)
-                total = _ct.c_ulonglong(0)
-                if k32.GetDiskFreeSpaceExW(
-                        _ct.c_wchar_p(root), None,
-                        _ct.byref(total), _ct.byref(free)) == 0:
-                    continue
-                if total.value <= 0:
-                    continue
-                out.append((letter, root, free.value, total.value))
-            except Exception:
-                continue
-    except Exception:
-        return []
-    return out
 
 
 def benchmark_drive(root, size_mb=128, cancelled=None, progress_cb=None):

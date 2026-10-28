@@ -12,9 +12,61 @@ version-based, not hash-based.
 import hashlib
 import json
 import os
+import re
 import sys
 import urllib.request
 import urllib.error
+
+#: A release tag's version head: `v2.1.0`, `2.1`, `2.1.0-beta.2`, `2.1.0+ci`.
+#: Only the leading numeric segments are compared; a suffix is NOT a reason to
+#: call the release unreadable (B-001: `int("0-beta")` used to raise, and the
+#: surrounding `except` reported "no update" for a build newer than this one).
+_VERSION_HEAD = re.compile(r"^v?(\d+(?:\.\d+)*)")
+
+#: The checksum asset the build workflow publishes next to the exe.
+SHA_ASSET_NAME = "Cleaner-Tool.exe.sha256"
+
+
+def parse_version(text: str) -> "tuple[int, ...] | None":
+    """Numeric version key for a tag or version string, or None.
+
+    `v2.1.0` -> (2, 1, 0); `2.1.0-beta.2` -> (2, 1, 0); `latest` -> None.
+    """
+    m = _VERSION_HEAD.match(str(text or "").strip())
+    if not m:
+        return None
+    try:
+        return tuple(int(part) for part in m.group(1).split("."))
+    except ValueError:
+        return None
+
+
+def _pick_release(releases) -> "dict | None":
+    """The release with the HIGHEST version, else the rolling `latest` one.
+
+    B-002: the old loop returned the first versioned release in the API's
+    order, which is newest-CREATED first. A backport or re-cut published after
+    a newer feature release therefore shadowed it, and the check reported "up
+    to date" while a newer build existed.
+    """
+    best = None
+    best_key = None
+    latest = None
+    for release in releases or []:
+        if not isinstance(release, dict):
+            continue
+        tag = str(release.get("tag_name") or "")
+        if not tag:
+            continue
+        if tag == "latest":
+            latest = release
+            continue
+        key = parse_version(tag)
+        if key is None:
+            continue
+        if best_key is None or key > best_key:
+            best, best_key = release, key
+    return best if best is not None else latest
 
 
 def get_current_exe_path() -> str:
@@ -43,7 +95,8 @@ def get_current_exe_hash() -> str:
         return ""
 
 
-def fetch_latest_release_info(repo: str = "owner/repo", timeout: int = 10) -> dict:
+def fetch_latest_release_info(repo: str = "owner/repo",
+                              timeout: int = 10) -> "dict | None":
     """Fetch latest release info from GitHub API.
     
     Args:
@@ -51,7 +104,8 @@ def fetch_latest_release_info(repo: str = "owner/repo", timeout: int = 10) -> di
         timeout: Request timeout in seconds
         
     Returns:
-        dict with release info or None on failure
+        dict with release info, or None on failure (the annotation says so —
+        every caller already handles None)
     """
     try:
         # Fetch all releases and find the latest versioned one (not "latest")
@@ -66,19 +120,9 @@ def fetch_latest_release_info(repo: str = "owner/repo", timeout: int = 10) -> di
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             if resp.status == 200:
                 releases = json.loads(resp.read().decode('utf-8'))
-                # Find the latest release that's not the rolling "latest" tag
-                for release in releases:
-                    tag_name = release.get('tag_name', '')
-                    # Skip the rolling "latest" release, look for versioned tags
-                    if tag_name and tag_name != 'latest' and tag_name.startswith('v'):
-                        return release
-                # If no versioned release found, fall back to the rolling "latest"
-                for release in releases:
-                    tag_name = release.get('tag_name', '')
-                    if tag_name == 'latest':
-                        return release
-                # If no releases at all, return None
-                return None
+                # Highest version wins; the rolling "latest" is only the
+                # fallback when no versioned release exists at all.
+                return _pick_release(releases)
             return None
     except urllib.error.HTTPError as e:
         if e.code == 404:
@@ -200,16 +244,22 @@ def check_for_updates(repo: str = "owner/repo", timeout: int = 10) -> dict:
     # Version comparison
     try:
         if latest_version and latest_version != 'latest':
-            # Compare version numbers for versioned releases
-            current_parts = [int(x) for x in APP_VERSION.split('.')]
-            latest_parts = [int(x) for x in latest_version.split('.')]
-            
-            for i in range(max(len(current_parts), len(latest_parts))):
-                curr = current_parts[i] if i < len(current_parts) else 0
-                lat = latest_parts[i] if i < len(latest_parts) else 0
-                if lat > curr:
-                    result['update_available'] = True
-                    break
+            # B-001: parse the numeric head (a `-beta`/`+build` suffix is not
+            # an error) and NAME an unreadable tag instead of reporting "no
+            # update", which is what the old int()/except pair did.
+            current_parts = parse_version(APP_VERSION)
+            latest_parts = parse_version(latest_version)
+            if latest_parts is None or current_parts is None:
+                result['error'] = (
+                    "Could not read the release version %r; check the "
+                    "release page." % (latest_version,))
+            else:
+                for i in range(max(len(current_parts), len(latest_parts))):
+                    curr = current_parts[i] if i < len(current_parts) else 0
+                    lat = latest_parts[i] if i < len(latest_parts) else 0
+                    if lat > curr:
+                        result['update_available'] = True
+                        break
         elif latest_version == 'latest' and download_url:
             # For rolling "latest" releases, compare SHA256 hashes.
             # REL-002: if the remote body is too large or the download
@@ -217,7 +267,21 @@ def check_for_updates(repo: str = "owner/repo", timeout: int = 10) -> dict:
             try:
                 current_hash = get_current_exe_hash()
                 if current_hash:
-                    remote_hash = get_remote_exe_hash(download_url, timeout)
+                    # I-002: the build publishes a .sha256 sibling; reading
+                    # that is a few hundred bytes instead of hashing a
+                    # multi-hundred-MB exe on every check. Only when the
+                    # release has no checksum asset do we stream the binary.
+                    sha_url = ""
+                    for asset in assets or []:
+                        if (isinstance(asset, dict)
+                                and asset.get("name") == SHA_ASSET_NAME):
+                            sha_url = _trusted_release_url(
+                                asset.get("browser_download_url", ""), repo)
+                            break
+                    remote_hash = (fetch_sha256(sha_url, timeout=timeout)
+                                   if sha_url else "")
+                    if not remote_hash:
+                        remote_hash = get_remote_exe_hash(download_url, timeout)
                     if remote_hash and remote_hash != current_hash:
                         result['update_available'] = True
                     elif not remote_hash:
@@ -232,6 +296,32 @@ def check_for_updates(repo: str = "owner/repo", timeout: int = 10) -> dict:
         log_or_swallow(None, "update.version_parse", exc)
     
     return result
+
+
+_HEX64 = re.compile(r"\b([0-9a-fA-F]{64})\b")
+
+
+def fetch_sha256(url: str, timeout: int = 20) -> str:
+    """Read a published `<exe>.sha256` sibling and return its digest, or "".
+
+    The file is a few hundred bytes, so this is the cheap path for the rolling
+    `latest` tag. Three layouts are accepted, because it may be produced by
+    hand or by a different tool: a bare digest, `digest  filename` (what
+    `sha256sum` writes) and `SHA256 (file) = digest` (certutil).
+    """
+    if not url:
+        return ""
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "CleanerTool/2.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read(4096).decode("utf-8", "replace")
+    except Exception as exc:
+        from app.utils import log_or_swallow
+        log_or_swallow(None, "update.fetch_sha256", exc)
+        return ""
+    m = _HEX64.search(body)
+    return m.group(1).lower() if m else ""
 
 
 def get_remote_exe_hash(url: str, timeout: int = 30) -> str:

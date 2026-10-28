@@ -183,10 +183,14 @@ def icon_ppm_bytes(icon_spec, size=20, bg_rgb=(30, 30, 30)):
 
 def _extract_icon_rgba(path, index):
     """-> (bgra_bytes, width, height) or (None, 0, 0). Windows-only.
-    Always prefers the binary's 'small' icon resource (Windows' own
-    system-small-icon size, typically 16x16 — the closest native match to
-    a list row) and only falls back to 'large' when no small icon exists;
-    icon_ppm_bytes resizes whichever comes back to a uniform output size."""
+
+    Prefers the binary's LARGE icon resource (normally 32x32 or 48x48) and
+    falls back to the small one only when no large icon exists. The previous
+    order was backwards for today's UI: rows draw at 32px, so a 16x16 small
+    icon had to be upscaled 2x, which is why Startup Manager icons looked
+    blocky and malformed. Downscaling a real 32/48px icon to the row size is
+    the direction that stays crisp.
+    """
     shell32 = ctypes.windll.shell32
     user32 = ctypes.windll.user32
 
@@ -201,10 +205,9 @@ def _extract_icon_rgba(path, index):
     if not n or (not large.value and not small.value):
         return None, 0, 0
 
-    # Prefer whichever handle is populated; small (usually 16px) is the
-    # closer match to our ~20px row height, large (usually 32/48px) is
-    # the fallback when a binary has no small-icon resource.
-    hicon = small.value or large.value
+    # Large first: it is the real artwork at 32/48px and survives a
+    # downscale to the row's 32px target. Small is the fallback.
+    hicon = large.value or small.value
     try:
         return _hicon_to_bgra(hicon)
     finally:

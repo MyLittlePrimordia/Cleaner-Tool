@@ -15,9 +15,10 @@ from __future__ import annotations
 
 import tkinter as tk
 
-from app.ui.theme import COLORS, F, _hex_lerp
+from app.ui.theme import COLORS, ICON_HERO, TYPE, _hex_lerp, SPACE_3
+from app.ui.metrics import TEXT_NUDGE
 
-DISC = 44
+DISC = ICON_HERO
 
 
 class Header(tk.Frame):
@@ -27,17 +28,17 @@ class Header(tk.Frame):
         self._sub_full = ""
         self._disc = tk.Canvas(self, width=DISC, height=DISC,
                                bg=COLORS["bg"], highlightthickness=0, bd=0)
-        self._disc.pack(side="left", anchor="n", padx=(2, 12))
+        self._disc.pack(side="left", anchor="n", padx=(TEXT_NUDGE, SPACE_3))
         col = tk.Frame(self, bg=COLORS["bg"], bd=0)
         col.pack(side="left", fill="x", expand=True)
-        self._title = tk.Label(col, text="", font=(F, 14, "bold"),
+        self._title = tk.Label(col, text="", font=TYPE["banner_title"],
                                bg=COLORS["bg"], fg=COLORS["text"],
                                anchor="w", justify="left", bd=0)
         self._title.pack(fill="x")
-        self._sub = tk.Label(col, text="", font=(F, 9), bg=COLORS["bg"],
-                             fg=COLORS["subtext"], anchor="w",
-                             justify="left", bd=0)
-        self._sub.pack(fill="x", pady=(2, 0))
+        self._sub = tk.Label(col, text="", font=TYPE["caption"],
+                             bg=COLORS["bg"], fg=COLORS["subtext"],
+                             anchor="w", justify="left", bd=0)
+        self._sub.pack(fill="x", pady=(TEXT_NUDGE, 0))
         col.bind("<Configure>", self._wrap)
         self.set_state("", COLORS["muted"])
 
@@ -55,7 +56,7 @@ class Header(tk.Frame):
         c.create_oval(3, 3, DISC - 3, DISC - 3, fill=tint, outline="")
         if glyph:
             c.create_text(DISC / 2, DISC / 2, text=str(glyph),
-                          font=(F, 15, "bold"), fill=color)
+                          font=TYPE["readout_bold"], fill=color)
 
     def set_title(self, text, color=None):
         self._title_full = str(text or "")
@@ -66,6 +67,6 @@ class Header(tk.Frame):
         self._sub_full = str(text or "")
         self._sub.config(text=self._sub_full, fg=color or COLORS["subtext"])
         if self._sub_full:
-            self._sub.pack(fill="x", pady=(2, 0))
+            self._sub.pack(fill="x", pady=(TEXT_NUDGE, 0))
         else:
             self._sub.pack_forget()

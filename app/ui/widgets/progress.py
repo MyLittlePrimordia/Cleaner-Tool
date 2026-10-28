@@ -1,4 +1,4 @@
-"""AnimatedProgressBar with an indeterminate shimmer mode.
+"""AnimatedProgressBar with an indeterminate shimmer mode, and ProgressRow.
 
 H4. Extracted verbatim from app/gui.py (blueprint B1.2).
 """
@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import tkinter as tk
 
-from app.ui.theme import COLORS, _hex_lerp, F
+from app.ui.theme import COLORS, _hex_lerp
 
 class AnimatedProgressBar(tk.Canvas):
     """Material 3 linear progress indicator.
@@ -102,3 +102,67 @@ class AnimatedProgressBar(tk.Canvas):
             x0, y1, x0, y1 - r, x0, y0 + r, x0, y0,
         ]
         return self.create_polygon(points, smooth=True, **kw)
+
+
+class ProgressRow(tk.Frame):
+    """A strip that keeps the progress bar's height reserved at all times.
+
+    The run bar used to be packed only while something ran and forgotten
+    afterwards. `bottom` is the last band of the window, so adding 20px to it
+    took 20px away from the page above: every tab's content jumped up when a
+    run started, and jumped back when it ended. That is the layout analogue
+    of a flicker, and it happened on the one transition the app is named
+    after.
+
+    The row is always packed and always the same height; `show()`/`hide()`
+    only add or remove the bar INSIDE it. Idle, the strip is blank space
+    between the status row and the window edge, which is also where the bar
+    will appear, so nothing above it ever moves.
+
+    The bar stays `self.bar` (and the app keeps `self.progress_bar` pointing
+    at it), so every existing `set_fraction` / `set_indeterminate` call site
+    is unchanged.
+    """
+
+    #: 14px bar + 6px of optical breathing room. Fixed, not derived from the
+    #: bar's current height, so hiding the bar cannot shrink the strip.
+    HEIGHT = 20
+
+    def __init__(self, parent, accent=COLORS["primary"], bg=None, **kw):
+        try:
+            page_bg = bg or parent["bg"]
+        except Exception:
+            page_bg = bg or COLORS["bg"]
+        super().__init__(parent, bg=page_bg, height=self.HEIGHT, bd=0, **kw)
+        # Without this the frame collapses to the height its children ask
+        # for, which is zero while the bar is hidden - the entire point.
+        self.pack_propagate(False)
+        self.grid_propagate(False)
+        self.bar = AnimatedProgressBar(self, accent=accent,
+                                       height=self.HEIGHT)
+        self._shown = False
+
+    @property
+    def shown(self) -> bool:
+        return self._shown
+
+    def set_accent(self, accent):
+        try:
+            self.bar._accent = accent
+            self.bar._draw()
+        except Exception:
+            pass
+
+    def show(self):
+        if not self._shown:
+            self.bar.pack(fill="both", expand=True)
+            self._shown = True
+        try:
+            self.bar._draw()
+        except Exception:
+            pass
+
+    def hide(self):
+        if self._shown:
+            self.bar.pack_forget()
+            self._shown = False

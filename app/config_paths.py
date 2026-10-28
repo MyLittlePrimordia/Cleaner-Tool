@@ -21,13 +21,21 @@ from pathlib import Path
 def get_config_dir() -> Path:
     """Resolve the per-user state directory.
 
-    %LOCALAPPDATA% when it is a real directory, else the user's home, else
-    %TEMP%, else the CWD. The trailing "." fallback is the weakest link in
+    CLEANER_TOOL_HOME wins when set: the test suite points it at a temp
+    directory (conftest.py) so a run can never append to the real event log or
+    rewrite the user's config - both were observed doing exactly that before
+    the override existed. It is also the escape hatch for a portable/debug run.
+
+    Otherwise %LOCALAPPDATA% when it is a real directory, else the user's home,
+    else %TEMP%, else the CWD. The trailing "." fallback is the weakest link in
     this chain: it would place config.json in whatever directory the process
     was started from. It is unreachable on a normal Windows launch (all three
     earlier branches resolve), but it is the first thing to tighten if state
     is ever seen to land somewhere unexpected.
     """
+    override = os.environ.get("CLEANER_TOOL_HOME", "").strip()
+    if override:
+        return Path(override)
     base = os.environ.get("LOCALAPPDATA", "")
     if not base or not os.path.isdir(base):
         base = os.path.expanduser("~") or os.environ.get("TEMP", "") or "."

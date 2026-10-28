@@ -35,7 +35,7 @@ import tkinter as tk
 
 from app.ui.base import _themed_askyesno
 from app.ui.dialogs._tool_page import TOOL_ACCENT, ToolPage
-from app.ui.theme import COLORS, F
+from app.ui.theme import COLORS, TYPE, SPACE_2
 from app.ui.widgets import SearchField
 from app.ui.widgets.chips import ChipBar
 from app.ui.widgets.datatable import DataTable
@@ -110,7 +110,7 @@ class ServicesDialog(ToolPage):
         self._tabs = ChipBar(c, _TABS, initial="third",
                              command=lambda _k: self._render(),
                              accent=TOOL_ACCENT)
-        self._tabs.pack(anchor="w", pady=(0, 8))
+        self._tabs.pack(anchor="w", pady=(0, SPACE_2))
         self.table = DataTable(c, _COLUMNS, row_h=46, accent=TOOL_ACCENT,
                                two_line=True, show_header=False,
                                icon_col="display",
@@ -146,7 +146,7 @@ class ServicesDialog(ToolPage):
 
     # --------------------------------------------------------------- read
     def _start(self):
-        from app.svcs import services
+        from app.svcs import services, publish_service_findings
         token = self._stop_token
         token[0] = False
         self._scan_seq += 1
@@ -160,6 +160,13 @@ class ServicesDialog(ToolPage):
             except Exception as exc:                 # noqa: BLE001
                 data = {"services": [],
                         "error": "Could not read services: %s" % exc}
+            # Off the Tk thread: the bus writes config, and a service running
+            # from a user-writable folder is exactly what Health and the hub
+            # should be able to surface after this window closes.
+            try:
+                publish_service_findings(data)
+            except Exception:
+                pass
             if token[0]:
                 return
             self._ui(self._land, seq, data)
@@ -370,7 +377,7 @@ class ServicesDialog(ToolPage):
         menu = tk.Menu(self._dlg, tearoff=0, bg=COLORS["surface"],
                        fg=COLORS["text"], activebackground=TOOL_ACCENT,
                        activeforeground=COLORS["black"], bd=0,
-                       font=(F, 10))
+                       font=TYPE["body_medium"])
         cur = svc.get("start_mode") or "Manual"
         for mode, text in (("Automatic", "Automatic - starts with Windows"),
                            ("Manual", "Manual - starts when needed"),
@@ -450,7 +457,7 @@ class ServicesDialog(ToolPage):
         try:
             if undo_record_safe():
                 if not self._undo_btn.winfo_manager():
-                    self._undo_btn.pack(side="right", padx=(8, 0))
+                    self._undo_btn.pack(side="right", padx=(SPACE_2, 0))
             elif self._undo_btn.winfo_manager():
                 self._undo_btn.pack_forget()
         except Exception:

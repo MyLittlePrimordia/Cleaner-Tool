@@ -41,12 +41,11 @@ Threading: nothing here touches Tk; every function is safe on a worker.
 """
 from __future__ import annotations
 
-import base64
 import json
 from typing import Iterable, List, Optional
 
-from app.utils import (IS_WINDOWS, TaskContext, TaskSkipped, resolve_exe,
-                       run_cmd)
+from app.powershell import encode_command, ps_argv  # noqa: F401  (re-exported)
+from app.utils import IS_WINDOWS, TaskContext, TaskSkipped, run_cmd
 
 MARK = "##JSON##"
 
@@ -94,14 +93,15 @@ def parse_marker(lines: Iterable[str]) -> Optional[dict]:
     return found if isinstance(found, dict) else None
 
 
-def encode_command(script: str) -> str:
-    """base64(UTF-16LE) for powershell -EncodedCommand."""
-    return base64.b64encode(script.encode("utf-16-le")).decode("ascii")
-
-
 def powershell_argv(script: str) -> List[str]:
-    return [resolve_exe("powershell"), "-NoProfile", "-NonInteractive",
-            "-EncodedCommand", encode_command(script)]
+    """Encoded-command argv for the Windows Update scripts.
+
+    R-008: the exe lookup and the flags come from the shared runner. These
+    scripts are long, embedded JSON - so they go through the runner's
+    `encoded=True` form, which keeps the base64(UTF-16LE) hand-off (the script
+    never appears on the command line, so nothing in it needs escaping).
+    """
+    return ps_argv(script, non_interactive=True, encoded=True)
 
 
 def normalise(raw: dict) -> dict:

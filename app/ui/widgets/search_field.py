@@ -25,9 +25,9 @@ Depends only on app.ui.theme (and its sibling RoundedEntry, same layer).
 """
 from __future__ import annotations
 
-import tkinter as tk
 
-from app.ui.theme import COLORS, F
+from app.ui.theme import COLORS, RADIUS_PILL, TYPE
+from app.ui.metrics import FIELD_PAD
 from app.ui.widgets.entry import RoundedEntry
 
 #: The magnifier is DRAWN, not typed. Segoe UI's U+2315 TELEPHONE RECORDER
@@ -45,14 +45,14 @@ class SearchField(RoundedEntry):
 
     GLYPH_W = 48
     CLEAR_W = 30
-    RADIUS = 24       # full pill: the M3 search bar
-    PAD_Y = 11
+    RADIUS = RADIUS_PILL   # the search bar is the pill role
+    PAD_Y = FIELD_PAD
 
     def __init__(self, parent, textvariable=None, placeholder="Search",
                  width=20, font=None, accent=None, on_change=None, **kw):
         # M3 search bar: a wide centred pill (width in chars is a floor)
         super().__init__(parent, textvariable=textvariable,
-                         width=max(int(width), 52), font=font or (F, 11),
+                         width=max(int(width), 52), font=font or TYPE["body_large"],
                          accent=accent)
         self._ph = str(placeholder or "Search")
         self._on_change = on_change
@@ -160,13 +160,13 @@ class SearchField(RoundedEntry):
             text = self.text()
             if text:
                 cv.create_text(self._clear_cx(), mid, text=_CLEAR,
-                               font=(F, 9, "bold"),
+                               font=TYPE["label_medium"],
                                fill=(COLORS["text"] if self._clear_hover
                                      else COLORS["subtext"]),
                                anchor="center", tags="clr")
             elif not self._focused():
                 cv.create_text(self.GLYPH_W + 2, mid, text=self._ph,
-                               font=(F, 11), fill=COLORS["subtext"],
+                               font=TYPE["body_large"], fill=COLORS["subtext"],
                                anchor="w", tags="ph")
         except Exception:
             pass
@@ -187,7 +187,7 @@ class SearchField(RoundedEntry):
 
     def _clear_hit(self, x, y):
         try:
-            w, h = self.winfo_width(), self.winfo_height()
+            h = self.winfo_height()
             return (abs(x - self._clear_cx()) <= self.CLEAR_W / 2.0
                     and abs(y - h / 2.0) <= h / 2.0)
         except Exception:

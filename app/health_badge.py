@@ -6,10 +6,10 @@ Great / Good / Fair / Bad (or "Check PC" before the first check), and opens
 the full check on click. It re-checks by itself on the schedule the user
 chose in Settings (at startup, daily, weekly, or never).
 
-Everything here is READ-ONLY. The automatic check runs the same thirteen
-read-only sensors the report uses and records only the overall grade and the
-time. It never cleans, repairs or installs anything on its own - fixing is
-always a button the user presses (Fix everything in the report).
+Everything here is READ-ONLY. The automatic check runs the same read-only sensors the Health tab uses and
+records only the overall grade and the time. It never cleans, repairs or
+installs anything on its own - fixing is always a separate action the user
+starts from the owning tab or tool.
 
 Tk-free, so the check can run on a worker and the logic can be unit-tested.
 """
@@ -83,18 +83,33 @@ def age_text(last_ts: float, now: Optional[float] = None) -> str:
     return "%d day%s ago" % (d, "" if d == 1 else "s")
 
 
-def record(grade: str, when: Optional[float] = None) -> None:
+def record(grade: str, score: Optional[int] = None,
+           when: Optional[float] = None, findings=None) -> None:
     """Persist the result. Single-lock read-modify-write via update_config,
     never a stale whole-dict save. Never raises (a badge must not be able to
-    break the app)."""
+    break the app).
+
+    `score` is optional so an old caller that only knows the grade still
+    updates the badge; when it IS given, the same locked mutation appends the
+    point to the trend ledger (app/health_history), so a checkup never writes
+    config twice or leaves the badge and the history disagreeing.
+
+    `findings` (key -> grade) rides along with the score so a later decline
+    can name what changed, not only by how much.
+    """
     try:
         from app.config_persist import update_config
         g = str(grade or "").upper()
         ts = time.time() if when is None else float(when)
 
-        def _mut(cfg, _g=g, _t=ts):
+        def _mut(cfg, _g=g, _t=ts, _s=score, _f=findings):
             cfg["health_last_grade"] = _g if _g in _WORDS else ""
             cfg["health_last_check"] = _t
+            try:
+                from app.health_history import add_to_config
+                add_to_config(cfg, _s, _g, _t, findings=_f)
+            except Exception:
+                pass
         update_config(_mut)
     except Exception:
         pass
@@ -126,5 +141,15 @@ def quick_check(cancelled=lambda: False) -> str:
     grade = overall_grade(cards)
     if grade not in _WORDS:
         return ""
-    record(grade)
+    try:
+        from app import health_model
+        score = health_model.summarize(cards).get("score")
+    except Exception:
+        score = None
+    try:
+        from app.health_history import findings_from_cards
+        findings = findings_from_cards(cards)
+    except Exception:
+        findings = None
+    record(grade, score=score, findings=findings)
     return grade

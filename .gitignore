@@ -5,18 +5,18 @@ build/
 dist/
 *.spec
 .venv/
+.venv-build/
 venv/
 *.egg-info/
 
-# Local screenshot / verification output; not committed.
-shots/
+# Runtime data written next to the exe when running from source: the driver
+# store's default download/backup folder (app/drivers/folder.py).
+# Leading slash: anchored to the repo root. Unanchored, Windows' case-insensitive
+# matching also ignored app/drivers/ and silently dropped its modules.
+/Drivers/
 
-# Local scratch / one-off dev helpers that must not be shared or committed:
-#   _sf.py                 - per-machine screenshot helper (hardcoded %TEMP% path)
-#   test_elevation.py      - ad-hoc elevation diagnostic (not a pytest module)
-#   cleaner_smoke_export.txt - generated smoke-test log export
-#   screenshots/           - optional local README captures, not committed
-_sf.py
-test_elevation.py
-cleaner_smoke_export.txt
-screenshots/
+# Raw capture output from a local visual pass; regenerated on demand and not
+# committed. The curated README screenshots in screenshots/ ARE versioned:
+# the README embeds all eight, so a renamed or missing file is a broken
+# image on GitHub (which is case-sensitive; keep the names lowercase).
+shots/

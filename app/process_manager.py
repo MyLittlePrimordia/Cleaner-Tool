@@ -142,22 +142,6 @@ def _window_pids() -> set:
         return set()
 
 
-def classify_process(name: str, pid: int, window_pids=None) -> str:
-    """'system' | 'apps' | 'background'. Pure, never raises.
-
-    * system — in the protected set (read-only in the UI, no Close).
-    * apps — has a visible window (user-installed or not, the user SEES it).
-    * background — everything else safe-to-close (helpers, updaters)."""
-    try:
-        if is_system_process(name):
-            return "system"
-        if window_pids is not None and pid in window_pids:
-            return "apps"
-        return "background"
-    except Exception:
-        return "background"
-
-
 def group_processes(items: List[dict]) -> List[dict]:
     """Group per-PID rows by friendly display label.
 
@@ -678,11 +662,3 @@ def close_process(pid: int, force: bool = False,
         return r.returncode == 0
     except Exception:
         return False
-
-
-def list_top_processes(top_n: int = 12) -> List[dict]:
-    """One-shot helper: prime + sample after a short sleep for CPU %."""
-    s = ProcessSampler(top_n=top_n)
-    s.sample()  # prime
-    time.sleep(0.6)
-    return s.sample()

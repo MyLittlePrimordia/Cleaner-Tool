@@ -331,16 +331,31 @@ def restore_backup(zip_path: str, log=lambda _m: None,
             dest = item["path"]
             tmp = dest + ".cleanertool-restore"
             try:
+                # Re-check confinement at WRITE time: the plan was made
+                # earlier, and a folder swapped for a junction in between
+                # would otherwise redirect this write out of the save roots.
+                if plan.get("roots") and not _inside_roots(
+                        os.path.dirname(os.path.abspath(dest)), plan["roots"]):
+                    out["skipped"] += 1
+                    continue
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
+                want = item.get("size", 0)
+                wrote = 0
                 with zf.open(item["arcname"]) as src, open(tmp, "wb") as dst:
                     while True:
                         chunk = src.read(1024 * 256)
                         if not chunk:
                             break
                         dst.write(chunk)
+                        wrote += len(chunk)
+                # A short write would put a TRUNCATED save in place, which the
+                # game then treats as its real save. Only swap in a complete
+                # file; anything else leaves the current save untouched.
+                if want and wrote != want:
+                    raise OSError(f"short write ({wrote} of {want} bytes)")
                 os.replace(tmp, dest)
                 out["restored"] += 1
-                out["bytes"] += item.get("size", 0)
+                out["bytes"] += wrote
             except (OSError, PermissionError, zipfile.BadZipFile):
                 out["skipped"] += 1
                 try:

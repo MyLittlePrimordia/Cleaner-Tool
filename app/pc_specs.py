@@ -95,6 +95,10 @@ def _ps_query(class_name, props, timeout=4.0):
     try:
         import subprocess as _sp
         import json as _json
+        # R-008 follow-up: exe lookup and flags come from the shared PowerShell
+        # runner, so this probe cannot drift from the tasks'. Imported inside
+        # the call on purpose - pc_specs keeps its top-level imports minimal.
+        from app.tasks.ps import ps_argv
         prop_list = ",".join(props)
         cmd = (
             f"Get-CimInstance -ClassName {class_name} -ErrorAction Stop "
@@ -102,8 +106,7 @@ def _ps_query(class_name, props, timeout=4.0):
         )
         creationflags = getattr(_sp, "CREATE_NO_WINDOW", 0)
         proc = _sp.run(
-            ["powershell", "-NoProfile", "-NonInteractive",
-             "-Command", cmd],
+            ps_argv(cmd, non_interactive=True),
             capture_output=True, text=True, timeout=timeout,
             creationflags=creationflags)
         raw = (proc.stdout or "").strip()
@@ -490,13 +493,17 @@ def gpu_info():
     return names
 
 
-@_memo
 def storage_info():
-    """[{drive, label, fs, total, free}] fixed local disks. Never raises."""
+    """[{drive, label, fs, total, free}] fixed local disks. Never raises.
+
+    Deliberately NOT memoised (AUDIT TX-001): `free` changes whenever a
+    download, install or clean finishes, and this is the one reader the fact
+    store shares between PC Specs and Drive Toolkit. The old process-lifetime
+    memo made every surface show the free space from launch.
+    """
     out = []
     try:
         import ctypes as _ct
-        from ctypes import wintypes as _wt
         k32 = _ct.windll.kernel32
         for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ":
             root = letter + ":\\"

@@ -12,7 +12,10 @@ Tasks:
 
 import os
 
-from app.utils import TaskContext, TaskCancelled, clean_folder_contents, known_folder
+from app.utils import (
+    TaskContext, TaskCancelled, clean_folder_contents, known_folder,
+    mark_unmeasured,
+)
 from app import game_saves as _gs
 from app.tasks import launcher_paths as _lp
 from app.tasks.launcher_paths import (
@@ -323,7 +326,7 @@ def _process_running(image: str):
     None."""
     try:
         import subprocess as _sp
-        out = _sp.check_output(
+        out = _sp.check_output(  # dry-ok: read-only `tasklist` probe
             ['tasklist', '/fi', f'imagename eq {image}', '/fo', 'csv', '/nh'],
             text=True, timeout=10, stderr=_sp.DEVNULL,
             creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
@@ -420,9 +423,13 @@ def clean_fivem_cache(ctx: TaskContext):
         # MED-005: fail CLOSED — we could not prove the session is over.
         ctx.log("  ! could not determine whether FiveM is running - skipping "
                 "to avoid touching the live session.")
+        mark_unmeasured(ctx, "could not tell whether FiveM is running, so the "
+                             "cache was not looked at")
         return 0
     if _fivem:
         ctx.log("FiveM is running — skipping to avoid touching the live session.")
+        mark_unmeasured(ctx, "FiveM is running, so the cache was not looked at "
+                             "— quit FiveM and scan again")
         return 0
     localappdata = os.environ.get("LOCALAPPDATA", "")
     data = os.path.join(localappdata, "FiveM", "FiveM.app", "data") if localappdata else ""

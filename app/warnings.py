@@ -33,20 +33,6 @@ REBOOT_TWEAK_KEYS = [
 ]
 
 
-def reboot_required_keys(tweak_tasks) -> tuple:
-    """The reboot-required tweak keys, DERIVED from the Task objects.
-
-    Split out of this module (rather than computed at import) so the rule
-    lives in exactly one place while staying testable and cycle-free: the
-    caller passes the task list in. A Task opts in by carrying "REBOOT" in
-    its `risk` string, which is the same field the UI already renders as a
-    red "reboot required" badge -- so a tweak can no longer promise the user
-    a reboot in one place and go unlisted in another.
-    """
-    return tuple(t.key for t in tweak_tasks
-                 if "REBOOT" in (getattr(t, "risk", "") or "").upper())
-
-
 # Define dangerous combinations: (task_keys, warning_message)
 # Split into two tiers (user feedback: curated presets like Deep Clean /
 # Recommended Tweak always popped a white warning box, which felt like the

@@ -12,8 +12,10 @@ Supports running as a script (app/__main__.py) or as a module (-m).
 Headless flags (no window):
   --auto-clean          run the saved Clean/Repair selection now
   --auto-update         run "Update Everything" now
-  --dry-run [--json]    read-only preview of what the Clean tasks would
-                        reclaim; --json prints a machine-readable report
+  --plan [--json]       read-only preview of what the Clean tasks would
+                        reclaim; --json prints a machine-readable report.
+                        (--dry-run is accepted as an alias; in the GUI the
+                        same idea is called Preview.)
 """
 
 import sys
@@ -114,61 +116,79 @@ def _run_dry_run(as_json: bool) -> int:
     Runs every selected allowlisted Clean task with a dry_run context — the
     same functions and folder lists a real run uses, but nothing is
     deleted. Honors the app's honest 0-vs-None contract: a task that
-    cannot be measured reports as "unknown" (bytes null), a task with
-    effects outside file cleaning reports as "skipped". Prints a human
-    list, or a JSON report with --json. Always exits 0 when it produced a
-    report; a crash would propagate."""
+    cannot be measured reports as "unknown" (bytes null), a task that
+    DECLINED to look (Office/Steam/FiveM live) is unknown too and carries
+    its own reason (`declined` counts them, and `total_bytes` is then the
+    sum of what WAS measured rather than a blank), and a task that is not on SCAN_ALLOWLIST reports as
+    "skipped" (SCAN_EXCLUDED says why each one is not estimated). Prints a
+    human list, or a JSON report with --json. Always exits 0 when it
+    produced a report; a crash would propagate."""
     import json as _json
 
     from app.storage_scan import (
-        SCAN_ALLOWLIST, count_unmeasured, make_measure_ctx,
-        measure_clean_tasks, sum_measured)
+        SCAN_ALLOWLIST, make_measure_ctx, measure_clean_tasks, sum_measured)
     from app.utils import format_bytes
 
     keys = _selected_clean_keys()
     ctx = make_measure_ctx()
-    sizes = measure_clean_tasks(ctx, keys)
-    total = sum_measured(sizes)
+    reasons = {}
+    sizes = measure_clean_tasks(ctx, keys, reasons)
+    # A refusal (Office/Steam/FiveM live) is a known skip, so the total stays a
+    # number with the refusal named per target; a failure still blanks it.
+    total = sum_measured(sizes, reasons)
 
     def _entry(key):
         if key not in SCAN_ALLOWLIST:
             return {"key": key, "bytes": None, "status": "skipped"}
         value = sizes.get(key)
         if value is None:
-            return {"key": key, "bytes": None, "status": "unknown"}
+            entry = {"key": key, "bytes": None, "status": "unknown"}
+            if reasons.get(key):
+                # why it is unknown: "steam is running", "could not read the
+                # installed list" - the task's own words, not a generic note
+                entry["reason"] = reasons[key]
+            return entry
         return {"key": key, "bytes": value, "status": "measured"}
 
     targets = [_entry(k) for k in keys]
     skipped = sum(1 for t in targets if t["status"] == "skipped")
-    unmeasured = count_unmeasured(sizes)
+    declined = len(reasons)
+    # disjoint: `unmeasured` is a failure (nobody knows), `declined` is a cleaner
+    # that said why it did not look - both report bytes null, for different
+    # reasons, and the total treats them differently.
+    unmeasured = sum(1 for k, v in sizes.items()
+                     if v is None and k not in reasons)
 
     if as_json:
         print(_json.dumps({
-            "mode": "dry-run",
+            "mode": "plan",
             "total_bytes": total,
             "total_human": None if total is None else format_bytes(total),
             "targets_total": len(targets),
             "skipped": skipped,
             "unmeasured": unmeasured,
+            "declined": declined,
             "targets": targets,
         }, indent=2))
         return 0
 
-    print("Cleaner Tool - dry run (read-only preview)")
+    print("Cleaner Tool - plan (read-only preview)")
     if not targets:
         print("  No Clean tasks selected.")
     for t in targets:
         if t["status"] == "skipped":
-            label = "skipped (has effects outside file cleaning)"
+            label = "skipped (not a file-size estimate)"
         elif t["status"] == "unknown":
-            label = "unknown (could not measure)"
+            label = (f"unknown ({t['reason']})" if t.get("reason")
+                     else "unknown (could not measure)")
         else:
             label = format_bytes(t["bytes"])
         print(f"  {t['key']:<24} {label}")
     if total is None:
         print("  Total: unknown (some targets could not be measured)")
     else:
-        print(f"  Total reclaimable: about {format_bytes(total)}")
+        note = (f" ({declined} target(s) not measured)" if declined else "")
+        print(f"  Total reclaimable: about {format_bytes(total)}{note}")
     return 0
 
 
@@ -178,9 +198,12 @@ def main():
         print("This application is designed for Windows only.")
         return
 
-    # N-005: headless read-only preview. Handled before --auto-clean so a
-    # combined invocation (`--dry-run --auto-clean`) stays read-only.
-    if "--dry-run" in sys.argv:
+    # N-005: headless read-only plan. Handled before --auto-clean so a
+    # combined invocation (`--plan --auto-clean`) stays read-only.
+    # A-007: `--plan` is the documented name; `--dry-run` stays accepted so
+    # existing shortcuts and CI scripts keep working, but the GUI equivalent
+    # is called Preview, never "dry run".
+    if "--plan" in sys.argv or "--dry-run" in sys.argv:
         sys.exit(_run_dry_run(as_json="--json" in sys.argv))
 
     # M16: both flags present used to silently drop --auto-update (first
@@ -189,15 +212,17 @@ def main():
     want_update = "--auto-update" in sys.argv
     if want_clean or want_update:
         code = 0
+        # The summary is not echoed here: both headless entry points log their
+        # verdict inside the closing block (the same rule / verdict / rule a
+        # windowed run writes), so echoing it printed the same sentence twice,
+        # one line under the block that had just stated it.
         if want_clean:
             config = load_config()
             selected = config.get("selected_tasks", {})
-            success, summary = run_auto_clean(selected)
-            print(f"[AUTO] clean: {summary}")
+            success, _summary = run_auto_clean(selected)
             code |= 0 if success else 1
         if want_update:
-            success, summary = run_auto_update()
-            print(f"[AUTO] update: {summary}")
+            success, _summary = run_auto_update()
             code |= 0 if success else 1
         sys.exit(code)
 

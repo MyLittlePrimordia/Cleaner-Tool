@@ -38,6 +38,19 @@ def _size(n) -> str:
     return format_bytes(int(n or 0), compact=True)
 
 
+def _read_backups():
+    """Worker body: list the archives and stamp the clock, no Tk access.
+
+    AUDIT TL-002: this used to run inline on the Tk thread. Listing opens and
+    reads the manifest of every zip, so a network folder, a USB drive or a
+    folder with hundreds of backups froze the dialog before it could paint,
+    while the backup and restore paths already used run_worker.
+    """
+    import time
+    from app.game_saves import list_backups
+    return list_backups(), time.time()
+
+
 def _age(seconds: float) -> str:
     """Plain-English age: '2 days ago', 'just now'."""
     s = max(0.0, seconds)
@@ -103,17 +116,26 @@ class GameSavesDialog(ToolPage):
 
     # --------------------------------------------------------------- read
     def _refresh(self):
-        from app.game_saves import list_backups
-        import time as _time
+        self.set_busy(True)
+        self.status.start("Reading the backup folder…")
+        self.run_worker(_read_backups, self._land_read)
 
-        try:
-            rows = list_backups()
-        except Exception as exc:                      # noqa: BLE001
-            rows = []
-            self.status.stop("Could not read the backup folder: %s" % exc,
-                             COLORS["accent_red"])
+    def _land_read(self, payload):
+        rows, now = payload
         self._rows = rows
-        self._render(rows, _time.time())
+        self.set_busy(False)
+        self._render(rows, now)
+        self.status.stop("")
+
+    def _worker_failed(self, exc):
+        """Keep the banner honest when the folder cannot be read."""
+        super()._worker_failed(exc)
+        try:
+            self.banner.set_state("!", COLORS["accent_yellow"])
+            self.banner.set_title("Could not read the backup folder.")
+            self.banner.set_sub(str(exc) or "")
+        except Exception:
+            pass
 
     def _render(self, rows, now):
         out = []

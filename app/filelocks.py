@@ -88,17 +88,13 @@ CCH_RM_SESSION_KEY = 32
 CCH_RM_MAX_APP_NAME = 255
 CCH_RM_MAX_SVC_NAME = 63
 _ERROR_MORE_DATA = 234
-_RM_MAX_APP_TYPE = None
 
 #: RM_APPLICATION_TYPE
-_APP_TYPE_UNKNOWN = 0
 _APP_TYPE_MAIN_WINDOW = 1
 _APP_TYPE_OTHER_WINDOW = 2
 _APP_TYPE_SERVICE = 3
 _APP_TYPE_SERVER = 4
 
-#: REBOOT_REASON_SERVICE_SPECIFIC
-_REBOOT_REASON_SERVICE_SPECIFIC = 0x10
 
 #: taskkill speaks in raw Windows strings. These are the two that actually
 #: come up, translated into something a person can act on.
@@ -740,12 +736,6 @@ def close_program(pid: int, force: bool = False, timeout: int = 12,
     return {"ok": False, "message": tail}
 
 
-def still_locked(target: str, max_files: int = MAX_FILES) -> bool:
-    """Re-check after a close attempt, so the UI can say it worked."""
-    res = holders(target, max_files)
-    return bool(res.get("holders"))
-
-
 def scan_limits() -> dict:
     """Whether this scan could be incomplete, and why.
 
@@ -884,11 +874,14 @@ def holders_elevated(target: str, timeout: int = 90) -> dict:
     from app.infra.elevated_run import is_elevated, run_elevated
     if is_elevated():
         import subprocess
+        # R-008: argv from the shared runner, imported inside the call because
+        # this module keeps no app-level imports at module scope.
+        from app.tasks.ps import ps_argv
         script = _ELEVATED_SCAN.replace("__PATH__", target.replace("'", "''"))
         try:
             p = subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                 script], capture_output=True, timeout=timeout,
+                ps_argv(script, non_interactive=True), capture_output=True,
+                timeout=timeout,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             text = (p.stdout or b"").decode("utf-8", "replace")
             return _parse_elevated(text, target)

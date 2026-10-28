@@ -25,13 +25,12 @@ it. End program goes through the same refusal guards File Lock Finder uses.
 """
 from __future__ import annotations
 
-import os
 import threading
 import tkinter as tk
 
 from app.ui.base import _themed_askyesno
 from app.ui.dialogs._tool_page import TOOL_ACCENT, ToolPage
-from app.ui.theme import COLORS, F
+from app.ui.theme import COLORS, TYPE, SPACE_2
 from app.ui.widgets import SearchField
 from app.ui.widgets.datatable import DataTable
 
@@ -81,10 +80,10 @@ class NetworkConnectionsDialog(ToolPage):
             on_change=self._on_query)
         self._entry.pack(fill="x")
 
-        self._detail = tk.Label(self.content, text="", font=(F, 9),
+        self._detail = tk.Label(self.content, text="", font=TYPE["caption"],
                                 bg=COLORS["bg"], fg=COLORS["subtext"],
                                 anchor="w", justify="left", bd=0)
-        self._detail.pack(side="bottom", fill="x", pady=(8, 0))
+        self._detail.pack(side="bottom", fill="x", pady=(SPACE_2, 0))
         self.table = DataTable(self.content, _COLUMNS, row_h=46,
                                accent=TOOL_ACCENT, two_line=True,
                                show_header=False, icon_col="name",

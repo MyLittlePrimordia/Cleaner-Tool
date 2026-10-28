@@ -67,7 +67,6 @@ should do on a user's machine, at any privilege level.
 """
 from __future__ import annotations
 
-import ctypes
 import os
 import subprocess
 import sys
@@ -145,16 +144,6 @@ START_PLAIN = {
     "Unknown": "startup type unknown",
 }
 
-#: Status -> short plain label.
-STATUS_PLAIN = {
-    "Running": "Running",
-    "Stopped": "Stopped",
-    "StartPending": "Starting",
-    "StopPending": "Stopping",
-    "PausePending": "Pausing",
-    "Paused": "Paused",
-    "ContinuePending": "Resuming",
-}
 
 #: The account a service runs as, in words. "NT AUTHORITY\LocalService" is
 #: not something a newcomer can act on.
@@ -270,6 +259,16 @@ def registry_facts(names) -> dict:
     return out
 
 
+def _ps_argv(script: str, *, non_interactive: bool = True) -> list:
+    """PowerShell argv from the shared runner (R-008).
+
+    Resolved inside the call on purpose: this module has no app-level imports
+    at module scope, and the runner lives under app.tasks.
+    """
+    from app.tasks.ps import ps_argv
+    return ps_argv(script, non_interactive=non_interactive)
+
+
 def _run(argv, timeout):
     try:
         p = subprocess.run(
@@ -346,8 +345,7 @@ def services(timeout: int = 60) -> dict:
     if not IS_WINDOWS:
         return {"services": [], "error": "Services are Windows-only.",
                 "source": "none"}
-    rc, out, err = _run(["powershell", "-NoProfile", "-NonInteractive",
-                         "-Command", _PS], timeout)
+    rc, out, err = _run(_ps_argv(_PS), timeout)
 
     rows = []
     source = "wmi"
@@ -362,8 +360,7 @@ def services(timeout: int = 60) -> dict:
     # the tool useful with four fields instead of nine, and SAYS so via
     # `source` rather than pretending the detail is there.
     if not rows:
-        rc2, out2, err2 = _run(["powershell", "-NoProfile", "-NonInteractive",
-                                "-Command", _PS_FALLBACK], timeout)
+        rc2, out2, err2 = _run(_ps_argv(_PS_FALLBACK), timeout)
         source = "fallback"
         if rc2 == 0:
             for line in out2.splitlines():
@@ -687,8 +684,8 @@ def apply_change(name: str, action: str, timeout: int = 90) -> dict:
         import subprocess
         try:
             p = subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                 script], capture_output=True, timeout=timeout,
+                _ps_argv(script), capture_output=True,
+                timeout=timeout,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             out = (p.stdout or b"").decode("utf-8", "replace")
             if p.returncode == 0 and "CLEANER_OK" in out:
@@ -757,61 +754,160 @@ def _friendly_error(blob: str) -> str:
 # reintroduce a symlink/pre-plant write.
 
 
-#: Column order for as_clipboard_text. Fixed, and the header row is included,
-#: because the overwhelmingly common use for this list is pasting it into a
-#: forum thread - and "which of these did I install" is unanswerable from a
-#: screenshot of a dark dialog.
-CLIPBOARD_COLUMNS = ("Name", "Description", "Status", "Starts", "Account",
-                     "Publisher", "Path")
+#: Below this, the number of third-party automatic services is ordinary for
+#: a PC with a GPU, audio and a couple of launchers. At twelve, reviewing the
+#: list is worth the user's time - but it is still a review, not a fault.
+SERVICE_LOAD_MIN = 12
 
 
-def as_clipboard_text(rows) -> str:
-    """The services as tab-separated text, header first.
+def _service_exe(raw: str) -> str:
+    """A service ImagePath -> the executable path, or '' when it is not one.
 
-    Tab-separated rather than CSV because a service DESCRIPTION routinely
-    contains commas, and a quoted CSV blob pasted into a forum is mangled by
-    every forum editor there is. Windows' own services.msc exports tab-
-    delimited for the same reason.
-
-    Lives here, not in the dialog, so the formatting is testable without a
-    display and so there is exactly one definition of "what a row is".
+    Service paths routinely carry arguments ('"C:\\...\\x.exe" -k netsvcs')
+    and the occasional NT prefix. Only a real .exe can be checked against a
+    folder, so anything else is skipped rather than guessed at.
     """
-    out = ["\t".join(CLIPBOARD_COLUMNS)]
-    for r in rows or []:
-        out.append("\t".join(str(x or "").replace("\t", " ").replace(
-            "\n", " ") for x in (
-                r.get("display"), r.get("description"),
-                STATUS_PLAIN.get(r.get("status"), r.get("status")),
-                r.get("start_plain") or r.get("start_mode"),
-                r.get("account_plain"), r.get("publisher"), r.get("path"))))
-    return "\n".join(out)
+    s = (raw or "").strip().strip('"')
+    if not s:
+        return ""
+    s = os.path.expandvars(s)
+    if s.startswith("\\??\\"):
+        s = s[4:]
+    low = s.lower()
+    cut = low.find(".exe")
+    return s[:cut + 4] if cut != -1 else ""
 
 
-def open_services_msc() -> bool:
-    """Open Windows' own Services window.
-
-    The dialog can start and stop a service, but it cannot show you a
-    service's event log, its recovery actions, its service account, or its
-    security descriptor - all of which live in services.msc. Handing the user
-    a button that opens the real thing is worth more than any summary this
-    tool could render of it.
-
-    ShellExecuteW, NOT subprocess.Popen, and that is not a style choice.
-    services.msc is an MMC console file, not a PE executable: measured on
-    this machine, Popen fails with WinError 193 ("%1 is not a valid Win32
-    application") for BOTH the bare name and the full path. The shell knows
-    the .msc association; CreateProcess does not. Needs no elevation and no
-    console suppression. Never raises.
-    """
-    if not IS_WINDOWS:
+def _under(path: str, root: str) -> bool:
+    """True when `path` is inside `root` (case-insensitive, no raise)."""
+    if not path or not root:
         return False
     try:
-        exe = os.path.join(os.environ.get("WINDIR", r"C:\Windows"),
-                           "System32", "services.msc")
-        if not os.path.isfile(exe):
-            return False
-        rc = ctypes.windll.shell32.ShellExecuteW(None, "open", exe, None,
-                                                 None, 1)
-        return rc is not None and int(rc) > 32
+        p = os.path.normcase(os.path.abspath(path))
+        r = os.path.normcase(os.path.abspath(root)).rstrip("\\/")
+        return p == r or p.startswith(r + os.sep)
     except Exception:
         return False
+
+
+def _user_roots():
+    """Folders an ordinary user can write to. A Windows service launched from
+    one of these is a privilege problem: any program running as that user can
+    replace the executable before Windows starts it."""
+    keys = ("LOCALAPPDATA", "APPDATA", "TEMP", "TMP", "USERPROFILE", "PUBLIC")
+    roots = []
+    for key in keys:
+        value = os.environ.get(key)
+        if value:
+            roots.append(value)
+    profile = os.environ.get("USERPROFILE")
+    if profile:
+        roots.extend((os.path.join(profile, "Downloads"),
+                      os.path.join(profile, "Desktop")))
+    return roots
+
+
+def _third_party_service(row: dict) -> bool:
+    """A service that is probably a third-party product, not Windows.
+
+    Stricter than `is_microsoft()` on purpose: Microsoft ships some services
+    with a publisher string such as "Windows (R) Win 7 DDK provider", and an
+    empty publisher is unknown rather than evidence against the product. The
+    finding this feeds is a review prompt, so a false accusation is worse than
+    a missed count.
+    """
+    pub = (row.get("publisher") or "").strip().lower()
+    if not pub or "microsoft" in pub or "windows" in pub:
+        return False
+    exe = _service_exe(row.get("path") or "")
+    windir = os.environ.get("SystemRoot") or os.environ.get("WINDIR") \
+        or r"C:\Windows"
+    if exe and _under(exe, windir):
+        return False
+    return True
+
+
+def publish_service_findings(data) -> list:
+    """Publish what a service read found (AUDIT TX-002).
+
+    Two conclusions, both evidence-based:
+
+    * a service set up in a user-writable folder (critical when it is running,
+      because another program can replace the executable before the service
+      starts);
+    * many strict third-party automatic services, which is worth reviewing.
+
+    A fallback read lacks publishers, and an errored read has no standing to
+    clear old findings. Both leave the board alone rather than guess.
+    """
+    if not isinstance(data, dict) or data.get("error"):
+        return []
+    if data.get("source") not in (None, "wmi"):
+        return []
+    rows = [r for r in (data.get("services") or []) if isinstance(r, dict)]
+    if not rows:
+        return []
+    try:
+        from app import insights
+        from app.insights import Finding
+        import time as _time
+    except Exception:
+        return []
+
+    now = _time.time()
+    roots = _user_roots()
+    user_rows = []
+    for row in rows:
+        exe = _service_exe(row.get("path") or "")
+        if exe and any(_under(exe, root) for root in roots):
+            user_rows.append(row)
+
+    findings = []
+    if user_rows:
+        running = [r for r in user_rows if r.get("running")]
+        names = ", ".join(str(r.get("display") or r.get("name") or "?")
+                         for r in user_rows[:3])
+        if len(user_rows) > 3:
+            names += " and %d more" % (len(user_rows) - 3)
+        if len(user_rows) == 1:
+            title = ("A service runs from a user folder" if running
+                     else "A service is set up in a user folder")
+        else:
+            title = "%d services are set up in user folders" % len(user_rows)
+        findings.append(Finding(
+            id="services.user_path",
+            domain="system",
+            severity="critical" if running else "warn",
+            title=title,
+            detail=("Windows services run with high privileges, and files in "
+                    "a user folder can be replaced by another program. "
+                    + names + "."),
+            evidence={"count": len(user_rows), "running": len(running),
+                      "names": names[:120]},
+            action={"kind": "route", "target": "services",
+                    "label": "Open Services"},
+            observed_at=now,
+        ))
+
+    background = [r for r in rows
+                  if r.get("auto") and r.get("running")
+                  and _third_party_service(r)]
+    if len(background) >= SERVICE_LOAD_MIN:
+        findings.append(Finding(
+            id="services.background",
+            domain="system",
+            severity="warn",
+            title=("%d services from other companies start with Windows"
+                   % len(background)),
+            detail=("They run in the background from sign-in. Open Services "
+                    "and set the ones you do not need to Manual."),
+            evidence={"count": len(background)},
+            action={"kind": "route", "target": "services",
+                    "label": "Open Services"},
+            observed_at=now,
+        ))
+
+    try:
+        return insights.replace("services.", *findings)
+    except Exception:
+        return []

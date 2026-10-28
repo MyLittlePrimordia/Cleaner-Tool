@@ -39,28 +39,39 @@ optional):
     _head     True: a group header row               _dim    True: muted row
     _actions  [{"id", "text", "fg", "enabled"}]      drawn as small buttons
               at the right edge; clicks arrive in on_action(row, action_id).
+    _tip      a sentence to hover-show for this row, for a line whose
+              sub-text cannot fit the explanation (a Health row whose total
+              is a lower bound). Hovering a row without one shows nothing.
 
-Depends only on app.ui.theme, like every other widget.
+Depends only on app.ui.theme, plus the shared tip window in .tooltip for a
+row's hover tip (a canvas-drawn row is not a widget, so it cannot hang a
+Tooltip off itself).
 """
 from __future__ import annotations
 
 import tkinter as tk
 
-from app.ui.theme import (COLORS, F, FM, ICON_ROW_PX, _hex_lerp,
-                          _measure_font, _round_rect_points, ellipsize)
+from app.ui.theme import (
+    COLORS, ICON_ROW_PX, TYPE, _hex_lerp, _measure_font,
+    _round_rect_points, ellipsize
+)
+from app.ui.metrics import CONTROL_GAP, GROUP_GAP
 
-PAD = 10                 # horizontal inset inside a cell
+PAD = GROUP_GAP                 # horizontal inset inside a cell
 SB_W = 14                # reserved strip for the scrollbar on the right
 CHECK_W = 28             # room taken by a row checkbox
 CHIP_H = 22              # inline action button height
-CHIP_GAP = 6
+CHIP_GAP = CONTROL_GAP
+#: Hover-hold before a row's `_tip` appears. Mirrors Tooltip.SHOW_DELAY_MS:
+#: sweeping the pointer down a list must not pop a tip per row it crosses.
+TIP_DELAY_MS = 400
 
-FONT = (F, 9)
-FONT_B = (F, 9, "bold")
-FONT_SUB = (F, 8)
-FONT_HEAD = (F, 8, "bold")
-FONT_PILL = (F, 8, "bold")
-FONT_MONO = (FM, 9)
+FONT = TYPE["caption"]
+FONT_B = TYPE["label_medium"]
+FONT_SUB = TYPE["micro_regular"]
+FONT_HEAD = TYPE["label_small"]
+FONT_PILL = TYPE["label_small"]
+FONT_MONO = TYPE["mono"]
 
 
 def ellipsize_mid(text, font, room):
@@ -149,6 +160,7 @@ class DataTable(tk.Frame):
         self._empty = None       # dict(glyph, text, detail, action)
         self._sb_drag = None
         self._sb_thumb = None
+        self._tip_after = None   # pending row-tip show (see _retip)
         # M3 overlay scrollbar: shown while scrolling/hovering, faded out
         # ~1.4s after the user stops (a permanently-visible bar read as a
         # scrollbar nested inside the popup - user report).
@@ -209,6 +221,9 @@ class DataTable(tk.Frame):
         """Replace the data. Selection and scroll position survive when the
         selected row is still present."""
         self._src = list(rows or [])
+        # The row set changed under the pointer: whatever tip is up (or armed)
+        # describes a row that may no longer exist at that position.
+        self._tip_cancel()
         self._has_checks = any("_check" in r for r in self._src)
         self._empty_rows_changed()
         self._apply_sort()
@@ -294,6 +309,10 @@ class DataTable(tk.Frame):
             except Exception:
                 pass
             self._sb_after = None
+        # A tip must not outlive the canvas: its timer is interpreter-wide, and
+        # the window is parented to the ROOT, so one left up would keep
+        # floating over the app after this table's dialog has closed.
+        self._tip_cancel()
 
     def set_columns(self, columns):
         """Swap the column set (e.g. two views of one dialog). Clears sort."""
@@ -305,6 +324,11 @@ class DataTable(tk.Frame):
         self._redraw()
 
     def set_sort(self, col_key, descending=False):
+        """Sort by `col_key`, or clear the sort with a falsy key.
+
+        The header click and any programmatic sort go through here, so the
+        arrow, the row order and the redraw happen in one place.
+        """
         self._sort = (col_key, bool(descending)) if col_key else None
         self._apply_sort()
         self._draw_head()
@@ -596,7 +620,7 @@ class DataTable(tk.Frame):
         chev = row.get("_chev") if first else None
         if chev:
             cv.create_text(x + 4, cy, text="⌄" if chev == "open" else "›",
-                           font=(F, 11, "bold"), fill=COLORS["subtext"])
+                           font=TYPE["chevron_small"], fill=COLORS["subtext"])
             x += 16
             room -= 16
         if spec.get("dot"):
@@ -654,36 +678,46 @@ class DataTable(tk.Frame):
                                    "center": "center"}[anchor])
 
     def _draw_empty(self, W, H):
+        """The empty state, painted on the canvas.
+
+        A virtualised table cannot host a child widget per state, so this is
+        the second painter of the shared EmptyState design. It reads
+        EmptyState.METRICS instead of carrying its own fonts and gaps: the
+        two must not drift, or a table's "nothing here" and a packed list's
+        "nothing here" stop looking like the same sentence.
+        """
+        from app.ui.widgets.empty_state import METRICS as EM
         cv = self._cv
         e = self._empty or {}
         if not e:
             return
         cx = W / 2
-        y = max(30, H / 2 - 46)
+        y = max(EM["pad_top"], H / 2 - 46)
         if e.get("glyph"):
-            cv.create_text(cx, y, text=e["glyph"], font=(F, 22),
+            cv.create_text(cx, y, text=e["glyph"], font=EM["glyph_font"],
                            fill=self._accent)
-            y += 34
-        cv.create_text(cx, y, text=e.get("text", ""), font=FONT_B,
+            y += EM["glyph_gap"]
+        cv.create_text(cx, y, text=e.get("text", ""), font=EM["text_font"],
                        fill=COLORS["text"], width=max(160, W - 80),
                        justify="center")
-        y += 22
+        y += EM["text_gap"]
         if e.get("detail"):
-            cv.create_text(cx, y, text=e["detail"], font=FONT_SUB,
+            cv.create_text(cx, y, text=e["detail"], font=EM["detail_font"],
                            fill=COLORS["subtext"], width=max(160, W - 100),
                            justify="center", anchor="n")
-            y += 36
+            y += EM["detail_gap"]
         act = e.get("action")
         if act:
-            f = self._measure(FONT_B)
+            f = self._measure(EM["text_font"])
             bw = f.measure(act[0]) + 34
+            bh = EM["action_h"]
             y += 8
             cv.create_polygon(
-                _round_rect_points(cx - bw / 2, y, cx + bw / 2, y + 32, 9),
+                _round_rect_points(cx - bw / 2, y, cx + bw / 2, y + bh, 9),
                 smooth=True, fill=self._accent, outline="")
-            cv.create_text(cx, y + 16, text=act[0], font=FONT_B,
-                           fill=COLORS["black"])
-            self._hits.append((cx - bw / 2, y, cx + bw / 2, y + 32,
+            cv.create_text(cx, y + bh / 2, text=act[0],
+                           font=EM["text_font"], fill=COLORS["black"])
+            self._hits.append((cx - bw / 2, y, cx + bw / 2, y + bh,
                                "empty_action", act[1]))
 
     def _draw_scrollbar(self, W, H):
@@ -718,6 +752,9 @@ class DataTable(tk.Frame):
         self._top += dy
         self._clamp()
         if self._top != old:
+            # The rows moved under a stationary pointer, so the row the tip
+            # describes is no longer under it.
+            self._tip_cancel()
             self._redraw()
 
     def _on_wheel(self, e):
@@ -809,11 +846,66 @@ class DataTable(tk.Frame):
         if i != self._hover:
             self._hover = i
             self._redraw()
+            self._retip(e)
 
     def _on_leave(self, _e):
+        self._tip_cancel()
         if self._hover != -1:
             self._hover = -1
             self._redraw()
+
+    # ---- hover tip ---------------------------------------------------- #
+
+    def _row_tip(self, i):
+        """Row `i`'s `_tip` text, or ''. Also the staleness check: the tip
+        that fires must still match the row under the pointer."""
+        if 0 <= i < len(self._rows):
+            return str(self._rows[i].get("_tip") or "")
+        return ""
+
+    def _retip(self, e):
+        """The pointer reached a different row: drop what was showing and arm
+        the new row's tip if it has one.
+
+        A row without a tip takes the previous row's sentence away at once,
+        rather than leaving it hanging beside a row it does not describe.
+        """
+        self._tip_cancel()
+        tip = self._row_tip(self._hover)
+        if not tip:
+            return
+        x, y = e.x_root + 14, e.y_root + 18
+        try:
+            self._tip_after = self._cv.after(
+                TIP_DELAY_MS, lambda: self._show_tip(tip, x, y))
+        except Exception:
+            self._tip_after = None
+
+    def _show_tip(self, text, x, y):
+        """The hold elapsed. Show only if that row is STILL the hovered one:
+        a redraw or scroll can move rows under a stationary pointer."""
+        self._tip_after = None
+        if self._row_tip(self._hover) != text:
+            return
+        try:
+            from app.ui.widgets.tooltip import Tooltip
+            Tooltip.show_at(self._cv, text, x, y)
+        except Exception:
+            pass
+
+    def _tip_cancel(self, hide=True):
+        if self._tip_after is not None:
+            try:
+                self._cv.after_cancel(self._tip_after)
+            except Exception:
+                pass
+            self._tip_after = None
+        if hide:
+            try:
+                from app.ui.widgets.tooltip import Tooltip
+                Tooltip.hide_at(self._cv)
+            except Exception:
+                pass
 
     def _step(self, n):
         if not self._rows:
@@ -841,10 +933,7 @@ class DataTable(tk.Frame):
                 continue
             if self._xs[i] <= e.x < self._xs[i] + self._ws[i]:
                 if self._sort and self._sort[0] == c["key"]:
-                    self._sort = (c["key"], not self._sort[1])
+                    self.set_sort(c["key"], not self._sort[1])
                 else:
-                    self._sort = (c["key"], bool(c.get("desc_first", False)))
-                self._apply_sort()
-                self._draw_head()
-                self._redraw()
+                    self.set_sort(c["key"], bool(c.get("desc_first", False)))
                 return

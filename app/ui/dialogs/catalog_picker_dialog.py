@@ -8,10 +8,11 @@ about any other dialog except where noted.
 from __future__ import annotations
 
 import tkinter as tk
-from tkinter import ttk, messagebox
 from app.ui.base import ThemedModal, Tooltip
-from app.ui.theme import COLORS, F, TAB_ACCENTS, _hex_lerp
-from app.ui.widgets import AnimatedButton, RoundedEntry, ScrollableRoundedPanel
+from app.ui.theme import COLORS, TAB_ACCENTS, TYPE, _hex_lerp, SPACE_1
+from app.ui.metrics import CARD_BODY_INSET, CONTROL_GAP, HAIRLINE_NUDGE, TEXT_NUDGE
+from app.ui.widgets import (EmptyState, ModalFooter, RoundedEntry,
+                            ScrollableRoundedPanel, ToolRow)
 
 
 class _CatalogPickerDialog(ThemedModal):
@@ -48,7 +49,7 @@ class _CatalogPickerDialog(ThemedModal):
         self._search_var = tk.StringVar()
         self._search_var.trace_add("write", lambda *_: self._apply_filter())
         entry = RoundedEntry(body, textvariable=self._search_var)
-        entry.pack(fill="x", pady=(2, 6))
+        entry.pack(fill="x", pady=(TEXT_NUDGE, CONTROL_GAP))
         # placeholder text (RoundedEntry has no -placeholder option — Tk's
         # Entry doesn't support one; same convention as the Install tab's
         # search box: insert literal text, clear/restore on focus, and
@@ -61,15 +62,16 @@ class _CatalogPickerDialog(ThemedModal):
         self._search_entry.bind("<FocusOut>", self._filter_focus_out)
 
         self._list_panel = panel = ScrollableRoundedPanel(body)
-        panel.pack(fill="both", expand=True, pady=(0, 4))
+        panel.pack(fill="both", expand=True, pady=(0, SPACE_1))
         self._list_body = panel.inner
         self._apply_filter()
 
-        brow = tk.Frame(body, bg=COLORS["bg"])
-        brow.pack(fill="x", pady=(4, 2))
-        AnimatedButton(brow, text="Cancel", command=self.close,
-                       bg=COLORS["surface"], fg=COLORS["text"],
-                       font=(F, 9, "bold"), padx=18, pady=6).pack(side="right")
+        # The shared footer owns the strip's insets and button placement, so
+        # this picker's Cancel sits where every other plain popup's
+        # secondary action sits (C-003).
+        self._footer = ModalFooter(body)
+        self._footer.pack_footer()
+        self._footer.button("Cancel", self.close, kind="secondary")
 
         if scan_fn is not None:
             # closing a dialog with a sweep in flight is safe: the poll
@@ -175,43 +177,47 @@ class _CatalogPickerDialog(ThemedModal):
                 break
         if not shown:
             # scanning state gets its own honest placeholder (not the
-            # empty state — "nothing found" while still searching lies)
-            text = (self._scanning_text if getattr(self, "_scanning", False)
-                    else self._empty_text)
-            tk.Label(self._list_body, text=text,
-                     font=(F, 9), bg=COLORS["bg_alt"],
-                     fg=COLORS["subtext"]).pack(pady=14)
+            # empty state — "nothing found" while still searching lies).
+            # Both go through EmptyState so the glyph and the one sentence
+            # sit where every other empty list puts them.
+            wrap = max(240, self.body_width(22))
+            if getattr(self, "_scanning", False):
+                EmptyState(self._list_body, glyph="\u23F3",
+                           text=self._scanning_text,
+                           bg=COLORS["bg_alt"], wrap=wrap).pack(
+                               fill="x", pady=CARD_BODY_INSET)
+            else:
+                EmptyState(self._list_body, glyph="\U0001F50D",
+                           text=self._empty_text,
+                           bg=COLORS["bg_alt"], wrap=wrap).pack(
+                               fill="x", pady=CARD_BODY_INSET)
         try:
             self._list_panel.refresh_scroll()
         except Exception:
             pass
 
     def _build_row(self, g):
-        row = tk.Frame(self._list_body, bg=COLORS["bg_alt"])
-        inner = tk.Frame(row, bg=COLORS["bg_alt"])
-        inner.pack(fill="both", expand=True)
-        chip = tk.Label(inner, text=g.get("launcher", "?"), font=(F, 9, "bold"),
-                        bg=_hex_lerp(COLORS["bg_alt"], COLORS["accent_sky"], 0.18),
-                        fg=COLORS["accent_sky"], padx=6, pady=2)
-        chip.pack(side="left", padx=(8, 6), pady=6)
+        """One pickable entry: the launcher chip leads, the name follows."""
         name = g.get("name", "?")
         tip = (f"{g.get('launcher', '')} — {g.get('folder', '')}"
                if g.get("folder") else name)
-        lbl = tk.Label(inner, text=name, font=(F, 9, "bold"),
-                       bg=COLORS["bg_alt"], fg=COLORS["text"],
-                       anchor="w", cursor="hand2")
-        lbl.pack(side="left", anchor="center")
+        row = ToolRow(self._list_body, title=name, size="sm", show_dot=False,
+                      leading_px=54,
+                      on_click=lambda _e=None: self._pick(g))
+        chip = tk.Label(row.leading, text=g.get("launcher", "?"),
+                        font=TYPE["label_medium"],
+                        bg=_hex_lerp(COLORS["bg_alt"], COLORS["accent_sky"],
+                                     0.18),
+                        fg=COLORS["accent_sky"], padx=CONTROL_GAP, pady=TEXT_NUDGE)
+        chip.pack(fill="both", expand=True)
         try:
-            Tooltip(lbl, tip)
+            Tooltip(row.title, tip)
         except Exception:
             pass
-        for w in (row, inner, chip, lbl):
-            try:
-                w.bind("<Button-1>",
-                       lambda e, _g=g: self._pick(_g), add="+")
-            except Exception:
-                pass
-        row.pack(fill="x", pady=1)
+        # The chip is added after the row bound its own tree, so it needs
+        # the hover/click bindings too or clicking the chip does nothing.
+        row.bind_content()
+        row.pack(fill="x", pady=HAIRLINE_NUDGE)
 
     def _pick(self, g):
         cb = self._on_pick

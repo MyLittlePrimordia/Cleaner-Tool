@@ -5,20 +5,22 @@ opens dialogs, but never imports another tab.
 """
 from __future__ import annotations
 
-import time
 import os
-import subprocess
 import threading
+import time
 
 import tkinter as tk
 
 from app.ui.widgets.checkbox import M3Checkbutton
-from tkinter import ttk, messagebox
 from app.ui.base import ThemedModal, Tooltip, _themed_showinfo, _themed_showerror
-from app.ui.dialogs.install_profiles_dialog import InstallProfilesDialog
-from app.ui.theme import (COLORS, F, ICON_ROW_PX, TAB_ACCENTS, ellipsize,
-                          icon_bg_rgb)
-from app.ui.widgets import AnimatedButton, ScrollableRoundedPanel
+from app.ui.theme import (
+    COLORS, EMOJI, ICON_ROW_PX, PAGE_BOTTOM, PAGE_GUTTER, SPACE_1, SPACE_2,
+    TAB_ACCENTS, TYPE, ellipsize, icon_bg_rgb, SPACE_3, SPACE_5,
+)
+from app.ui.metrics import COMPACT_INSET, CONTROL_GAP, GROUP_GAP, ROW_PAD, TEXT_NUDGE
+from app.ui.widgets import (
+    AnimatedButton, PageActionBar, ScrollableRoundedPanel
+)
 
 # Catalog rows are COLORS["bg"], so the icon plate must be that exact
 # colour; default_icon_ppm() fills the whole tile, and a mismatched fill
@@ -126,6 +128,10 @@ class InstallTab(tk.Frame):
         self._cat_sections = []  # (category, header, body, all_row_widgets) for the search filter
         self._bundle_rows = []   # (row_widget, searchable_text) — embedded bundle/task rows
         self._installed_ids = None  # cached set from install_tasks.get_installed_ids
+        # A-009: the badge labels by app id, so a re-read replaces them
+        # instead of stacking a second tick on the same row.
+        self._badges = {}
+        self._rescanning = False
         accent = TAB_ACCENTS["Install"]
 
         from app.app_catalog import APP_CATALOG, CATEGORY_ORDER, MANUAL_ONLY_APPS
@@ -138,40 +144,45 @@ class InstallTab(tk.Frame):
         self._search_focused = False
         self._search_entry = None  # no UI; _apply_search / focus helpers guard
 
-        # bottom-middle run row (user request: match the Clean/Repair/Tweak
-        # Run buttons). Packed before the panel so the panel fills the
-        # middle and the buttons can never be squeezed out of view.
-        self.run_row = tk.Frame(self, bg=COLORS["bg"])
-        self.run_row.pack(side="bottom", fill="x", padx=26, pady=(4, 10))
-        _btns = tk.Frame(self.run_row, bg=COLORS["bg"])
-        _btns.pack(anchor="center")
-        # Update button: updates are an action, not an install selection —
-        # live count from `winget upgrade` ("Update Apps (N)"). Starts in a
-        # scanning state; the worker below paints the real count. Yellow so
-        # it reads at a glance next to the green Install button.
+        # One page action bar, not two competing filled heroes (C-002).
+        # Install is the only filled primary; Update is a tonal secondary
+        # with its live count, and the provenance line gets its own row above
+        # the bar instead of sitting under the buttons.
+        self.bar = PageActionBar(self)
+        self.run_row = self.bar       # compatibility with the old call sites
+        self.bar.pack(side="bottom", fill="x", padx=PAGE_GUTTER,
+                      pady=(SPACE_1, PAGE_BOTTOM))
         self.update_btn = AnimatedButton(
-            _btns, text="Update Apps…", command=self._update_apps,
-            bg=COLORS["accent_yellow"], fg=COLORS["black"], font=(F, 12, "bold"), padx=28, pady=14,
-            radius=16,
+            self.bar.secondary_slot, text="Update Apps…",
+            command=self._update_apps, role="tonal", size="md",
         )
-        self.update_btn.pack(side="left", padx=6)
+        self.update_btn.pack(side="right", padx=(0, SPACE_2))
         self._update_count = None  # None = unknown/scanning, else int
         self.install_btn = AnimatedButton(
-            _btns, text="Install", command=self._install_selected,
-            bg=accent, fg=COLORS["black"], font=(F, 12, "bold"), padx=28, pady=14,
-            radius=16,
+            self.bar.primary_slot, text="Install",
+            command=self._install_selected, role="filled", size="lg",
+            accent=accent,
         )
-        self.install_btn.pack(side="left", padx=6)
+        self.install_btn.pack(side="right")
         self.install_btn.set_enabled(False)  # gray until something is picked
+
+        self._prov_row = tk.Frame(self, bg=COLORS["bg"])
+        self._prov_row.pack(side="bottom", fill="x", padx=PAGE_GUTTER,
+                            pady=(0, SPACE_1))
         # "My Setups" (feature 7) removed from the Install tab per user
         # request — the save/restore profile button next to Install/Update
-        # wasn't needed. _open_profiles() and the profiles storage stay in
-        # place (harmless, still reachable if a future surface wants them);
-        # self._profiles_btn is simply never created, and the guard at
+        # wasn't needed. The 2026-10 dead-code sweep then deleted the
+        # _open_profiles() hook the removal had left behind (no caller in
+        # the app). profiles storage (config_profiles) and its dialog are
+        # still present, but nothing opens the dialog any more: bringing
+        # the feature back means a surface AND its opener.
+        # self._profiles_btn is never created, and the guard at
         # set_run_enabled() already handles that via getattr(..., None).
 
+        self._build_provenance()
+
         panel = ScrollableRoundedPanel(self)
-        panel.pack(fill="both", expand=True, padx=26, pady=(4, 4))
+        panel.pack(fill="both", expand=True, padx=PAGE_GUTTER, pady=(SPACE_1, SPACE_1))
         self._panel = panel
 
         # --- Essentials: one-click tasks, split in two groups (user request):
@@ -244,9 +255,9 @@ class InstallTab(tk.Frame):
         # state) when the queue drains. It also still guards direct/harness
         # construction before any slice runs.
         self._placeholder = tk.Label(
-            panel.inner, text="Preparing catalog…", font=(F, 10),
+            panel.inner, text="Preparing catalog…", font=TYPE["body_medium"],
             bg=COLORS["bg"], fg=COLORS["subtext"])
-        self._placeholder.pack(pady=24)
+        self._placeholder.pack(pady=SPACE_5)
         try:
             panel.refresh_scroll()
         except Exception:
@@ -266,6 +277,140 @@ class InstallTab(tk.Frame):
         self._scans_started = True
         self._start_installed_badge_scan()
         self._start_update_count_scan()
+
+    def _build_provenance(self):
+        """U-002: say where the catalog came from and how old it is.
+
+        The list is bundled with the build, not fetched, so "214 apps" alone
+        would read as a live index. The caption names it as bundled and dates
+        it; the tooltip carries the part that keeps that honest - winget
+        re-resolves each ID when the install actually runs, so a retired
+        package fails at install time rather than being installed from this
+        file's memory of it.
+        """
+        try:
+            from app.app_catalog import provenance_line
+            text = provenance_line()
+        except Exception:
+            return
+        self._prov_lbl = tk.Label(
+            self._prov_row, text=text, font=TYPE["caption"],
+            bg=COLORS["bg"], fg=COLORS["subtext"], justify="left",
+            anchor="w")
+        self._prov_lbl.pack(fill="x")
+        # Narrow windows: wrap instead of clipping the tail of the line.
+        def _fit(event, lbl=self._prov_lbl):
+            try:
+                lbl.config(wraplength=max(200, event.width - 4))
+            except Exception:
+                pass
+        try:
+            self._prov_row.bind("<Configure>", _fit, add="+")
+        except Exception:
+            pass
+        Tooltip(self._prov_lbl,
+                "This list ships with the app; it is not downloaded. "
+                "winget re-checks every ID when you install, so an entry a "
+                "publisher has retired since the date above fails at install "
+                "time instead of silently installing something else.")
+
+        # A-009: the tick badges are a CACHED winget reading, so the count
+        # carries the time it was measured. "10 already installed" with no age
+        # reads as live state and then silently disagrees with a user who just
+        # uninstalled something outside the app.
+        self._scan_lbl = tk.Label(
+            self._prov_row, text=self._scan_note(), font=TYPE["micro_regular"],
+            bg=COLORS["bg"], fg=COLORS["muted"], justify="left", anchor="w")
+        self._scan_lbl.pack(fill="x", pady=(SPACE_2, 0))
+        try:
+            self._prov_row.bind("<Configure>",
+                                lambda e: _fit(e, self._scan_lbl), add="+")
+        except Exception:
+            pass
+        Tooltip(self._scan_lbl,
+                "The green ticks come from one winget read, not from watching "
+                "the machine. Visiting this tab re-reads it once the reading "
+                "is more than fifteen minutes old, so an app you removed "
+                "elsewhere loses its tick on the next visit.")
+
+    # ---------------- A-009: the reading, and its age ---------------- #
+
+    def _installed_catalog_count(self) -> int:
+        """How many BUNDLED catalog entries winget saw on this PC.
+
+        Counted from the set and the catalog rather than from painted rows, so
+        the sentence is right even before the chunked build has produced the
+        rows it will eventually tick.
+        """
+        ids = self._installed_ids or set()
+        try:
+            from app.app_catalog import APP_CATALOG
+        except Exception:
+            return 0
+        return sum(1 for app in APP_CATALOG
+                   if str(app.get("id") or "").lower() in ids)
+
+    def _scan_note(self) -> str:
+        """The badge count with the time it was measured (A-009)."""
+        try:
+            from app.health_badge import age_text
+            from app.tasks.winget import installed_scan_age
+            age = installed_scan_age()
+        except Exception:
+            return "Installed badges: not checked yet"
+        if age < 0 or self._installed_ids is None:
+            return "Installed badges: not checked yet"
+        n = self._installed_catalog_count()
+        return ("Installed badges: %d catalog app%s already on this PC "
+                "\u00b7 checked %s"
+                % (n, "" if n == 1 else "s",
+                   age_text(time.time() - age)))
+
+    def _update_scan_note(self):
+        label = getattr(self, "_scan_lbl", None)
+        if label is None:
+            return
+        try:
+            label.config(text=self._scan_note())
+        except Exception:
+            pass
+
+    def on_show(self):
+        """A badge is a measurement, not live state (A-009).
+
+        Every visit refreshes the age (it moved on while the tab was hidden),
+        and once the cached answer is older than INSTALLED_TTL the badges are
+        re-read in the background -- otherwise an app uninstalled outside the
+        cleaner keeps its tick for the rest of the session.
+        """
+        self.warm_scans()
+        self._update_scan_note()
+        try:
+            from app.tasks.winget import INSTALLED_TTL, installed_scan_age
+            stale = installed_scan_age() >= INSTALLED_TTL
+        except Exception:
+            stale = False
+        if stale and getattr(self, "_scans_started", False):
+            self._rescan_installed()
+
+    def _rescan_installed(self):
+        """Re-read the installed set, then replace the badges in place."""
+        if getattr(self, "_rescanning", False):
+            return
+        self._rescanning = True
+
+        def _scan():
+            try:
+                from app.tasks.install_tasks import get_installed_ids
+                ids = get_installed_ids(refresh=True)
+            except Exception:
+                ids = None
+            finally:
+                self._rescanning = False
+            if ids is not None:
+                self._post_to_tk(lambda: self._paint_installed_badges(ids))
+
+        threading.Thread(target=_scan, daemon=True).start()
 
     # ---------------- F6(a): chunked catalog build ---------------- #
 
@@ -386,32 +531,6 @@ class InstallTab(tk.Frame):
         else:
             self._catalog_finish()
 
-    def _ensure_catalog_built(self):
-        """F6(a): finish the queued catalog slices SYNCHRONOUSLY right now.
-
-        Kept for direct/harness callers that need synchronous completeness
-        (the repo smoke driver and measurement harness call it explicitly
-        after switching to Install). The UI no longer calls this from
-        _show_tab: reaching Install mid-build shows the page progressively
-        instead of force-draining the queue on the click (the old call
-        stalled the click 700-900 ms cold; measured 2026-09)."""
-        if self._catalog_ready:
-            return
-        if self._catalog_after is not None:
-            try:
-                self.after_cancel(self._catalog_after)
-            except Exception:
-                pass
-            self._catalog_after = None
-        while self._catalog_queue:
-            try:
-                self._catalog_queue.pop(0)()
-            except Exception as exc:
-                try:
-                    self.app.log(f"Install catalog: a section failed to build: {exc}")
-                except Exception:
-                    pass
-        self._catalog_finish()
 
     def _catalog_finish(self):
         """F6(a): catalog fully built — drop the placeholder, then apply
@@ -450,16 +569,6 @@ class InstallTab(tk.Frame):
 
     # ---------------- search box ---------------- #
 
-    def _search_focus_in(self, _e):
-        if not self._search_focused:
-            self._search_focused = True
-            if self._search_var.get().startswith("Search "):
-                self._search_var.set("")
-
-    def _search_focus_out(self, _e):
-        self._search_focused = False
-        if not self._search_var.get().strip():
-            self._search_var.set(self._search_placeholder)
 
     def _apply_search(self):
         """Filter-as-you-type, Custom-tab semantics (user request): typing
@@ -518,7 +627,7 @@ class InstallTab(tk.Frame):
                 buckets[col_index.get(str(row.winfo_parent()), 0)].append(row)
             for col, bucket in zip(col_frames, buckets):
                 for row in bucket:
-                    row.pack(fill="x", padx=4, pady=4)
+                    row.pack(fill="x", padx=SPACE_1, pady=SPACE_1)
             # the whole category BLOCK hides when nothing matched — the
             # divider ('outer' frame: header + body + bundle row) packs
             # directly under the panel's inner frame, so pack_forget on it
@@ -534,7 +643,7 @@ class InstallTab(tk.Frame):
                     outer_block.pack_forget()
             else:
                 if outer_block.winfo_manager() != "pack":
-                    outer_block.pack(fill="x", pady=(6, 4))
+                    outer_block.pack(fill="x", pady=(CONTROL_GAP, SPACE_1))
                 # restore the body to the category's RECORDED open/collapsed
                 # state (a search must not re-open a category the user
                 # collapsed — the ▸/▾ arrow would otherwise desync).
@@ -553,7 +662,7 @@ class InstallTab(tk.Frame):
                     continue
                 try:
                     if show_all or (q in text):
-                        _row.pack(fill="x", padx=10, pady=(2, 6))
+                        _row.pack(fill="x", padx=GROUP_GAP, pady=(TEXT_NUDGE, CONTROL_GAP))
                     else:
                         _row.pack_forget()
                 except Exception:
@@ -565,7 +674,7 @@ class InstallTab(tk.Frame):
                 ess_block = group["body"].master  # the 'ess' frame
                 if show_all:
                     if ess_block.winfo_manager() != "pack":
-                        ess_block.pack(fill="x", pady=(2, 6))
+                        ess_block.pack(fill="x", pady=(TEXT_NUDGE, CONTROL_GAP))
                 else:
                     if ess_block.winfo_manager() == "pack":
                         ess_block.pack_forget()
@@ -674,25 +783,49 @@ class InstallTab(tk.Frame):
         green stays reserved for this badge alone — the FOSS chip was
         recolored sky blue (accent_sky) so the two never read as one.)"""
         self._installed_ids = installed_ids or set()
+        # A-009: a re-read REPLACES the ticks. Painting twice used to append a
+        # second '✓ Installed' to every row, which is exactly what a refresh
+        # button would have done on a live badge.
+        for _old in list(getattr(self, "_badges", {}).values()):
+            try:
+                _old.destroy()
+            except Exception:
+                pass
+        self._badges = {}
         if not self._catalog_ready:
             # F6(a): the badge scan is kicked off at construction, but the
             # catalog rows build later in idle slices — hold the result so
             # _catalog_finish can paint it on the real rows.
             self._pending_badges = installed_ids or set()
+            self._update_scan_note()
             return
         n = 0
         for app_id, row in getattr(self, "_app_rows", {}).items():
             if app_id.lower() not in self._installed_ids:
                 continue
             n += 1
-            b = tk.Label(row, text="✓ Installed", font=(F, 8, "bold"),
+            b = tk.Label(row, text="✓ Installed", font=TYPE["label_small"],
                          bg=COLORS["bg"], fg=COLORS["accent_green"])
             # beside the name cluster, not exiled to the row's right edge —
             # packed left it lands right after the last badge (FOSS / OEM /
             # 🔗), keeping the marker adjacent to the app it belongs to
-            b.pack(side="left", padx=(6, 0))
+            b.pack(side="left", padx=(CONTROL_GAP, 0))
+            self._badges[app_id] = b
+        self._update_scan_note()
         if n:
-            self.app.log(f"Install tab: {n} of your catalog apps are already installed (badges shown).")
+            # A-009: say when this was measured. The badges are a cached
+            # winget reading, so the count without an age reads as live truth
+            # and then drifts silently after the user uninstalls something.
+            try:
+                from app.tasks.winget import installed_scan_age
+                from app.health_badge import age_text
+                age = installed_scan_age()
+                when = age_text(time.time() - age) if age >= 0 else "just now"
+            except Exception:
+                when = "just now"
+            self.app.log(
+                f"Install tab: {n} of your catalog apps were installed when "
+                f"this was checked ({when}); badges shown.")
 
     # ---------------- Update Apps button ---------------- #
 
@@ -754,12 +887,12 @@ class InstallTab(tk.Frame):
         'Install Selected Apps' includes them naturally, in TASKS order.
         Header is arrow + titles only (user request: no All/None buttons)."""
         ess = tk.Frame(parent, bg=COLORS["bg"])
-        ess.pack(fill="x", pady=(2, 6))
+        ess.pack(fill="x", pady=(TEXT_NUDGE, CONTROL_GAP))
         ess_head = tk.Frame(ess, bg=COLORS["bg"])
         ess_head.pack(fill="x")
-        _ess_title = tk.Label(ess_head, text=title, font=(F, 10, "bold"),
+        _ess_title = tk.Label(ess_head, text=title, font=TYPE["label_large"],
                               bg=COLORS["bg"], fg=accent)
-        _ess_title.pack(side="left", padx=(8, 4), pady=5)
+        _ess_title.pack(side="left", padx=(SPACE_2, SPACE_1), pady=COMPACT_INSET)
         # REDESIGN 2026-10: the subtitle is a tooltip on the title now. It
         # used to be a second, always-visible Label packed beside it, and an
         # EMPTY one (every caller after the text purge passes "") still
@@ -768,7 +901,7 @@ class InstallTab(tk.Frame):
         # what actually reclaims the space.
         _ess_sub = None
         if subtitle:
-            _ess_sub = tk.Label(ess_head, text=subtitle, font=(F, 8),
+            _ess_sub = tk.Label(ess_head, text=subtitle, font=TYPE["micro_regular"],
                                 bg=COLORS["bg"], fg=COLORS["subtext"])
             _ess_sub.pack(side="left")
         _help = _GROUP_HELP.get(title)
@@ -781,9 +914,9 @@ class InstallTab(tk.Frame):
         body = tk.Frame(ess, bg=COLORS["bg"])
         body.pack(fill="x")
         # arrow on the RIGHT like every other Install divider (user request)
-        arrow = tk.Label(ess_head, text="▾", font=(F, 10, "bold"),
+        arrow = tk.Label(ess_head, text="▾", font=TYPE["label_large"],
                          bg=COLORS["bg"], fg=accent, width=2)
-        arrow.pack(side="right", padx=(0, 10), pady=9)
+        arrow.pack(side="right", padx=(0, GROUP_GAP), pady=ROW_PAD)
 
         def toggle_ess(b=body, a=arrow):
             if b.winfo_ismapped():
@@ -820,7 +953,7 @@ class InstallTab(tk.Frame):
         col_frames = []
         for c in range(cols):
             cf = tk.Frame(body, bg=COLORS["bg"])
-            cf.grid(row=0, column=c, sticky="nsew", padx=(6, 6))
+            cf.grid(row=0, column=c, sticky="nsew", padx=(CONTROL_GAP, CONTROL_GAP))
             body.grid_columnconfigure(c, weight=1, uniform="catcols")
             col_frames.append(cf)
 
@@ -832,7 +965,7 @@ class InstallTab(tk.Frame):
             self.vars[f"task:{task.key}"] = var
             self._trace_install_var(var)
             row = tk.Frame(col_frames[ci % cols], bg=COLORS["bg"])
-            row.pack(fill="x", padx=10, pady=2)
+            row.pack(fill="x", padx=GROUP_GAP, pady=TEXT_NUDGE)
             cb = M3Checkbutton(row, variable=var, bg=COLORS["bg"],
                                 fg=COLORS["text"], activebackground=COLORS["bg"],
                                 selectcolor=COLORS["surface"], onvalue=True, offvalue=False)
@@ -841,10 +974,10 @@ class InstallTab(tk.Frame):
             # _row_icon — same helper + filename convention as the
             # catalog/bundle rows, keyed off the task label).
             self._row_icon(row, task.label)
-            name_lbl = tk.Label(row, text=task.label, font=(F, 9, "bold"),
+            name_lbl = tk.Label(row, text=task.label, font=TYPE["label_medium"],
                                 bg=COLORS["bg"], fg=COLORS["text"],
                                 anchor="w", bd=0)
-            name_lbl.pack(side="left", padx=(6, 4))
+            name_lbl.pack(side="left", padx=(CONTROL_GAP, SPACE_1))
             # REDESIGN 2026-10: ellipsize, like the catalog rows above. The
             # Essentials rows are a SEPARATE builder from _build_category, so
             # fixing one does not fix the other - which is how "Install
@@ -854,9 +987,9 @@ class InstallTab(tk.Frame):
             # admin shield only (user request: no "one-click" text — the
             # shield matches the Custom toggle rows)
             if getattr(task, "admin_required", False):
-                tg = tk.Label(row, text="🛡️", font=("Segoe UI Emoji", 9),
+                tg = tk.Label(row, text="🛡️", font=EMOJI["inline"],
                               bg=COLORS["bg"], fg=COLORS["text"], cursor="hand2")
-                tg.pack(side="left", padx=(6, 0))
+                tg.pack(side="left", padx=(CONTROL_GAP, 0))
                 Tooltip(tg, "Admin Required — needs Administrator rights (skipped in limited mode)")
             Tooltip(name_lbl, task.description)
             Tooltip(cb, task.description)
@@ -996,11 +1129,6 @@ class InstallTab(tk.Frame):
             pass
         return applied, max(0, len(wanted) - applied)
 
-    def _open_profiles(self):
-        try:
-            InstallProfilesDialog(self, self).wait()
-        except Exception:
-            pass
 
     def _install_selected(self):
         selected = self.selected_apps()
@@ -1101,13 +1229,13 @@ class InstallTab(tk.Frame):
             if img is not None:
                 lbl = tk.Label(row, image=img, bg=COLORS["bg"],
                                bd=0, highlightthickness=0)
-                lbl.pack(side="left", padx=(2, 0))
+                lbl.pack(side="left", padx=(TEXT_NUDGE, 0))
                 return lbl
         except Exception:
             pass
         try:
             sp = tk.Frame(row, bg=COLORS["bg"], width=size, height=size)
-            sp.pack(side="left", padx=(2, 0))
+            sp.pack(side="left", padx=(TEXT_NUDGE, 0))
             sp.pack_propagate(False)
         except Exception:
             pass
@@ -1115,20 +1243,20 @@ class InstallTab(tk.Frame):
 
     def _build_category(self, parent, cat, apps, manuals, accent):
         outer = tk.Frame(parent, bg=COLORS["bg"])
-        outer.pack(fill="x", pady=(6, 4))
+        outer.pack(fill="x", pady=(CONTROL_GAP, SPACE_1))
 
         header = tk.Frame(outer, bg=COLORS["bg"])
         header.pack(fill="x")
         # arrow on the RIGHT on every Install divider (user request)
-        arrow = tk.Label(header, text="▾", font=(F, 10, "bold"), bg=COLORS["bg"],
+        arrow = tk.Label(header, text="▾", font=TYPE["label_large"], bg=COLORS["bg"],
                          fg=accent, width=2)
-        arrow.pack(side="right", padx=(0, 10), pady=9)
-        _cat_title = tk.Label(header, text=cat, font=(F, 11, "bold"), bg=COLORS["bg"],
+        arrow.pack(side="right", padx=(0, GROUP_GAP), pady=ROW_PAD)
+        _cat_title = tk.Label(header, text=cat, font=TYPE["card_title"], bg=COLORS["bg"],
                               fg=accent)
-        _cat_title.pack(side="left", padx=(12, 6))
-        n_lbl = tk.Label(header, text=f"{len(apps) + len(manuals)} apps", font=(F, 9),
+        _cat_title.pack(side="left", padx=(SPACE_3, CONTROL_GAP))
+        n_lbl = tk.Label(header, text=f"{len(apps) + len(manuals)} apps", font=TYPE["caption"],
                          bg=COLORS["bg"], fg=COLORS["subtext"])
-        n_lbl.pack(side="left", padx=4)
+        n_lbl.pack(side="left", padx=SPACE_1)
         self._cat_count_lbls[cat] = n_lbl
 
         def toggle_cat():
@@ -1167,7 +1295,7 @@ class InstallTab(tk.Frame):
         col_frames = []
         for c in range(cols):
             cf = tk.Frame(body, bg=COLORS["bg"])
-            cf.grid(row=0, column=c, sticky="nsew", padx=(6, 6))
+            cf.grid(row=0, column=c, sticky="nsew", padx=(CONTROL_GAP, CONTROL_GAP))
             body.grid_columnconfigure(c, weight=1, uniform="catcols")
             col_frames.append(cf)
 
@@ -1176,12 +1304,12 @@ class InstallTab(tk.Frame):
             names, calm text color; hover turns it hyperlink-blue +
             underlined (click opens the primary link, 🔗 the mirror)."""
             fg = base_fg or COLORS["text"]
-            _font = (F, 9, "bold") if bold else (F, 9)
+            _font=TYPE["label_medium"] if bold else TYPE["caption"]
             lbl = tk.Label(parent, text=text, font=_font,
                            bg=COLORS["bg"], fg=fg, cursor="hand2")
 
             def _enter(_e):
-                lbl.config(font=(F, 9, "bold", "underline") if bold else (F, 9, "underline"),
+                lbl.config(font=TYPE["link"] if bold else TYPE["link_quiet"],
                            fg=COLORS["accent_blue"])
 
             def _leave(_e):
@@ -1238,7 +1366,7 @@ class InstallTab(tk.Frame):
             self.vars[app["id"]] = var
             self._trace_install_var(var)
             row = tk.Frame(col_frames[ci % cols], bg=COLORS["bg"])
-            row.pack(fill="x", padx=4, pady=4)
+            row.pack(fill="x", padx=SPACE_1, pady=SPACE_1)
             cb = M3Checkbutton(row, variable=var, bg=COLORS["bg"],
                                 fg=COLORS["text"], activebackground=COLORS["bg"],
                                 selectcolor=COLORS["surface"], onvalue=True, offvalue=False)
@@ -1252,21 +1380,21 @@ class InstallTab(tk.Frame):
             if hw:
                 tip += f" ({hw})"
             name_lbl = _make_name_link(row, app["name"], app["url"], tip)
-            name_lbl.pack(side="left", padx=(6, 4))
+            name_lbl.pack(side="left", padx=(CONTROL_GAP, SPACE_1))
             if app["foss"]:
                 # sky blue, NOT the tab accent: the accent IS green here, and
                 # green is the "✓ Installed" badge's color — the two chips sat
                 # next to each other in the same green (user feedback
                 # 2026-09-06). accent_sky is the palette's designated Install
                 # alt so FOSS/Installed read as different signals at a glance.
-                foss = tk.Label(row, text="FOSS", font=(F, 8, "bold"),
+                foss = tk.Label(row, text="FOSS", font=TYPE["label_small"],
                                 bg=COLORS["bg"], fg=COLORS["accent_sky"])
-                foss.pack(side="left", padx=(4, 0))
+                foss.pack(side="left", padx=(SPACE_1, 0))
             if hw:
-                hw_lbl = tk.Label(row, text="⚠ OEM", font=(F, 8, "bold"),
+                hw_lbl = tk.Label(row, text="⚠ OEM", font=TYPE["label_small"],
                                   bg=COLORS["bg"], fg=COLORS["accent_yellow"])
                 Tooltip(hw_lbl, f"Hardware restricted — {hw}. Do not install this on other systems.")
-                hw_lbl.pack(side="left", padx=(4, 0))
+                hw_lbl.pack(side="left", padx=(SPACE_1, 0))
             # mirror link (user design): 🔗 beside the name as the SECONDARY
             # link when a verified fallback_url exists; the name stays the
             # primary. ↗ arrows are gone entirely.
@@ -1284,7 +1412,7 @@ class InstallTab(tk.Frame):
         # when a mirror exists.
         for ci, app in enumerate(manuals):
             row = tk.Frame(col_frames[(len(apps) + ci) % cols], bg=COLORS["bg"])
-            row.pack(fill="x", padx=4, pady=4)
+            row.pack(fill="x", padx=SPACE_1, pady=SPACE_1)
             _checkbox_width_spacer(row)
             self._row_icon(row, app["name"])
             fallback = app.get("fallback_url", "")
@@ -1295,13 +1423,13 @@ class InstallTab(tk.Frame):
                 tip += " (mirror available via 🔗)"
             name_lbl = _make_name_link(row, app["name"], app["url"], tip,
                                         base_fg=COLORS["text"])
-            name_lbl.pack(side="left", padx=(6, 4))
+            name_lbl.pack(side="left", padx=(CONTROL_GAP, SPACE_1))
             if app["foss"]:
                 # sky blue to match the winget-row FOSS chips (green belongs
                 # to the "✓ Installed" badge alone — see _paint_installed_badges)
-                foss = tk.Label(row, text="FOSS", font=(F, 8, "bold"),
+                foss = tk.Label(row, text="FOSS", font=TYPE["label_small"],
                                 bg=COLORS["bg"], fg=COLORS["accent_sky"])
-                foss.pack(side="left", padx=(4, 0))
+                foss.pack(side="left", padx=(SPACE_1, 0))
             if fallback:
                 self._make_mirror_link(row, fallback)
             cat_rows.append((app["id"], row))
@@ -1320,19 +1448,19 @@ class InstallTab(tk.Frame):
             self.bundle_vars[_bundle.key] = (_bvar, _bundle)
             self._trace_install_var(_bvar)
             _brow = tk.Frame(outer, bg=COLORS["bg"])
-            _brow.pack(fill="x", padx=10, pady=(2, 6))
+            _brow.pack(fill="x", padx=GROUP_GAP, pady=(TEXT_NUDGE, CONTROL_GAP))
             _bcb = M3Checkbutton(_brow, variable=_bvar, bg=COLORS["bg"],
                                    fg=COLORS["text"], activebackground=COLORS["bg"],
                                    selectcolor=COLORS["surface"], onvalue=True, offvalue=False)
             _bcb.pack(side="left")
             self._row_icon(_brow, _bundle.label)
-            _blbl = tk.Label(_brow, text=_bundle.label, font=(F, 9, "bold"),
+            _blbl = tk.Label(_brow, text=_bundle.label, font=TYPE["label_medium"],
                              bg=COLORS["bg"], fg=COLORS["text"])
-            _blbl.pack(side="left", padx=(6, 4))
+            _blbl.pack(side="left", padx=(CONTROL_GAP, SPACE_1))
             if _bundle.admin_required:
-                _bsh = tk.Label(_brow, text="🛡️", font=("Segoe UI Emoji", 9),
+                _bsh = tk.Label(_brow, text="🛡️", font=EMOJI["inline"],
                                 bg=COLORS["bg"], fg=COLORS["text"], cursor="hand2")
-                _bsh.pack(side="left", padx=(6, 0))
+                _bsh.pack(side="left", padx=(CONTROL_GAP, 0))
                 Tooltip(_bsh, "Admin Required — needs Administrator rights (skipped in limited mode)")
             Tooltip(_blbl, _bundle.description)
             Tooltip(_bcb, _bundle.description)
@@ -1350,11 +1478,11 @@ class InstallTab(tk.Frame):
         effect on click so it feels alive). Press lights it in the tab
         accent; release opens the page and restores it. Same emoji font and
         size as the 🛡️ badge; no underline, ever."""
-        _font = ("Segoe UI Emoji", 9)
+        _font = EMOJI["inline"]
         mirror = tk.Label(row, text="🔗", font=_font,
                           bg=COLORS["bg"], fg=COLORS["subtext"],
                           cursor="hand2")
-        mirror.pack(side="left", padx=(4, 0))
+        mirror.pack(side="left", padx=(SPACE_1, 0))
 
         def _press(_e):
             try:
@@ -1374,93 +1502,18 @@ class InstallTab(tk.Frame):
         Tooltip(mirror, "Backup download (official mirror)")
         return mirror
 
-    @staticmethod
-    def _resolve_default_browser_cmd() -> "list[str] | None":
-        """Resolve the default https browser's launch command from the
-        registry (UserChoice ProgId -> shell\\open\\command), or None.
-
-        Why: os.startfile opens the URL via ShellExecute — but when the
-        browser is ALREADY RUNNING, Windows' focus-stealing prevention
-        leaves it in the background (taskbar flash, no window raise).
-        Launching the browser exe directly with the URL as argv raises
-        its window reliably, even when it's already open (user-reported:
-        'opens the link but doesn't bring up the browser in view').
-
-        Registry reality (verified on a live machine): the ProgId command
-        template is registered under HKEY_CLASSES_ROOT (the merged
-        HKCU+HKLM view) — e.g. FirefoxURL-<hash>\\shell\\open\\command —
-        and often NOT under HKCU\\Software\\Classes. Check both, HKCR
-        first as the authoritative merged view."""
-        try:
-            import winreg
-            import shlex
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                                r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice") as k:
-                prog_id, _ = winreg.QueryValueEx(k, "ProgId")
-            cmd = None
-            for root, prefix in ((winreg.HKEY_CLASSES_ROOT, prog_id),
-                                 (winreg.HKEY_CURRENT_USER, rf"Software\Classes\{prog_id}")):
-                try:
-                    with winreg.OpenKey(root, rf"{prefix}\shell\open\command") as k:
-                        cmd, _ = winreg.QueryValueEx(k, "")
-                        break
-                except OSError:
-                    continue
-            if not cmd:
-                return None
-            # template contains %1 (or empty) — strip it; shlex splits the
-            # quoted exe path correctly
-            cmd = cmd.replace("%1", "").replace("%*", "").strip()
-            parts = shlex.split(cmd, posix=False)
-            parts = [p.strip('"') for p in parts if p.strip('"')]
-            return parts or None
-        except Exception:
-            return None
-
     def _open_url(self, url: str):
-        """Open a URL in the user's browser AND bring the browser window to
-        the foreground.
+        """Open a URL so the browser window actually comes forward.
 
-        Route 1 (new, user-reported fix): launch the default browser's exe
-        directly with the URL as an argument — window raises even when the
-        browser is already running (ShellExecute/startfile leave a running
-        browser in the background behind focus-stealing prevention).
-        Route 2: os.startfile / ShellExecuteW (works when no browser is
-        running, or the exe launch failed).
-        Route 3: cmd start (last resort). All failures are shown, never
-        swallowed (the original 'links do nothing' bug on LTSC)."""
-        import os
-        import subprocess
-        # Route 1: direct browser launch (raises window if already running)
-        browser_cmd = self._resolve_default_browser_cmd()
-        if browser_cmd:
-            try:
-                subprocess.Popen([*browser_cmd, url],
-                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                return
-            except Exception:
-                pass  # fall through to the shell routes
-        # Route 2: shell default handler
-        try:
-            os.startfile(url)
-            return
-        except Exception:
-            pass
-        # Route 3: explicit shell open
-        try:
-            subprocess.Popen(["cmd", "/c", "start", "", url], shell=False,
-                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            return
-        except Exception as exc:
-            _themed_showerror(self, "Could Not Open Link",
-                              f"Couldn't open this page:\n{url}\n\n{exc}")
+        The route ladder (direct browser launch -> ShellExecute -> cmd
+        start) and the web-URL refusal now live in app/openlink.py: the
+        "Install failed" dialog offers the same download links (U-001),
+        and two copies of this would drift the moment one was tidied.
+        Failures are still shown to the user, never swallowed - the
+        original 'links do nothing' bug on LTSC."""
+        from app.openlink import open_web_url
+        open_web_url(
+            url,
+            show_error=lambda message: _themed_showerror(
+                self, "Could Not Open Link", message))
 
-    def _set_category(self, cat, on: bool):
-        from app.app_catalog import APP_CATALOG
-        for app in APP_CATALOG:
-            if app["category"] == cat and app["id"] in self.vars:
-                self.vars[app["id"]].set(on)
-        try:
-            self._refresh_install_count()
-        except Exception:
-            pass

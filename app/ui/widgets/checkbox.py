@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import tkinter as tk
 
-from app.ui.theme import COLORS, F, _hex_lerp, _round_rect_points
+from app.ui.theme import COLORS, TYPE, _hex_lerp, _round_rect_points
+from app.ui.metrics import TEXT_NUDGE
 
 
 class M3Checkbutton(tk.Frame):
@@ -44,11 +45,11 @@ class M3Checkbutton(tk.Frame):
         self._cv.pack(side="left")
         self._lbl = None
         if text:
-            self._lbl = tk.Label(self, text=text, font=font or (F, 9),
+            self._lbl = tk.Label(self, text=text, font=font or TYPE["caption"],
                                  bg=page, fg=self._fg, bd=0,
                                  wraplength=wraplength, anchor=anchor,
                                  justify=justify, cursor="hand2")
-            self._lbl.pack(side="left", fill="x", expand=True, padx=(2, 0))
+            self._lbl.pack(side="left", fill="x", expand=True, padx=(TEXT_NUDGE, 0))
 
         for w in (self._cv, self._lbl):
             if w is None:
@@ -112,8 +113,6 @@ class M3Checkbutton(tk.Frame):
     def select(self):
         self._var.set(self._on)
 
-    def deselect(self):
-        self._var.set(self._off)
 
     def toggle(self):
         self._var.set(self._off if self._is_on() else self._on)

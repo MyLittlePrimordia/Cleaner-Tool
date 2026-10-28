@@ -8,9 +8,11 @@ about any other dialog except where noted.
 from __future__ import annotations
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+
+from app import facts
 from app.ui.dialogs._tool_page import ToolPage
-from app.ui.theme import COLORS, F, TAB_ACCENTS, _hex_lerp
+from app.ui.theme import COLORS, RADIUS_SURFACE, TAB_ACCENTS, TYPE, _hex_lerp, SPACE_2
+from app.ui.metrics import CONTROL_GAP, TEXT_NUDGE
 from app.ui.widgets import AnimatedButton, ScrollableRoundedPanel
 from app.ui.widgets.rounded_card import RoundedCard
 
@@ -50,19 +52,19 @@ class SpecsDialog(ToolPage):
         # gets a tonal pill the way an M3 navigation rail marks the
         # current destination (before this, no row was visibly selected).
         nav = RoundedCard(cols, fill=COLORS["bg_alt"], bg=COLORS["bg"],
-                          radius=16, min_height=200)
+                          radius=RADIUS_SURFACE, min_height=200)
         try:
             nav.configure(width=158)
         except Exception:
             pass
-        nav.pack(side="left", fill="y", padx=(0, 8))
+        nav.pack(side="left", fill="y", padx=(0, SPACE_2))
         self._nav_btns = {}
         for tab in self._TABS:
             b = AnimatedButton(nav.body, text=tab,
                                command=lambda t=tab: self._show(t),
                                bg=COLORS["bg_alt"], fg=COLORS["subtext"],
-                               font=(F, 9, "bold"), padx=10, pady=5)
-            b.pack(fill="x", padx=6, pady=2)
+                               size="sm")
+            b.pack(fill="x", padx=CONTROL_GAP, pady=TEXT_NUDGE)
             self._nav_btns[tab] = b
         self._detail_panel = ScrollableRoundedPanel(cols)
         self._detail_panel.pack(side="left", fill="both", expand=True)
@@ -85,10 +87,10 @@ class SpecsDialog(ToolPage):
                 pass
         self._value_lbls = []
         for title, value in pairs:
-            tk.Label(self._detail, text=title, font=(F, 11, "bold"),
+            tk.Label(self._detail, text=title, font=TYPE["card_title"],
                      bg=COLORS["bg"], fg=COLORS["text"],
-                     anchor="w").pack(fill="x", pady=(8, 0))
-            v = tk.Label(self._detail, text=value or "Unknown", font=(F, 9),
+                     anchor="w").pack(fill="x", pady=(SPACE_2, 0))
+            v = tk.Label(self._detail, text=value or "Unknown", font=TYPE["caption"],
                          bg=COLORS["bg"], fg=COLORS["subtext"], anchor="w",
                          justify="left")
             v.pack(fill="x")
@@ -193,20 +195,43 @@ class SpecsDialog(ToolPage):
         if tab == "Summary":
             lines = _sp.summary_lines() or ["Nothing readable."]
             return [("Your PC at a glance", "\n".join(lines))]
+        # AUDIT TX-001: every section below is the SAME fact any other tool
+        # reads through app/facts. Hardware Monitor's adapter list and Drive
+        # Toolkit's picker come from the same two readers, so opening PC Specs
+        # after either one is a cache hit instead of a second registry/WMI
+        # pass. The engine imports above stay for Summary/_gb and the report.
         if tab == "OS":
-            cap, build = _sp.os_info()
-            return [("Operating System", cap), ("Version", build)]
+            f = facts.get("hardware.os")
+            if not f.ok:
+                return [("Operating System", "Unknown"),
+                        ("Version", f.error or "Unreadable")]
+            return [("Operating System", f.value.get("caption") or "Unknown"),
+                    ("Version", f.value.get("build") or "Unknown")]
         if tab == "CPU":
-            name, detail = _sp.cpu_info()
-            return [("Processor", name), ("Speed · Cores", detail)]
+            f = facts.get("hardware.cpu")
+            if not f.ok:
+                return [("Processor", "Unknown"),
+                        ("Speed · Cores", f.error or "Unreadable")]
+            return [("Processor", f.value.get("name") or "Unknown"),
+                    ("Speed · Cores", f.value.get("detail") or "Unknown")]
         if tab == "RAM":
-            head, detail = _sp.ram_info()
-            return [("Memory", head), ("Available", detail or "Unknown")]
+            f = facts.get("hardware.ram")
+            if not f.ok:
+                return [("Memory", "Unknown"),
+                        ("Available", f.error or "Unreadable")]
+            return [("Memory", f.value.get("headline") or "Unknown"),
+                    ("Available", f.value.get("detail") or "Unknown")]
         if tab == "Board":
-            name, detail = _sp.board_info()
-            return [("Motherboard", name), ("Firmware", detail or "Unknown")]
+            f = facts.get("hardware.board")
+            if not f.ok:
+                return [("Motherboard", "Unknown"),
+                        ("Firmware", f.error or "Unreadable")]
+            return [("Motherboard", f.value.get("name") or "Unknown"),
+                    ("Firmware", f.value.get("firmware") or "Unknown")]
         if tab == "Graphics":
-            gpus = _sp.gpu_info()
+            f = facts.get("hardware.gpu")
+            gpus = [g.get("name") for g in (f.value or [])
+                    if isinstance(g, dict) and g.get("name")] if f.ok else []
             rows = [(f"GPU {i + 1}", g) for i, g in enumerate(gpus)] or [
                 ("Graphics", "Unknown")]
             try:
@@ -224,11 +249,13 @@ class SpecsDialog(ToolPage):
                 pass
             return rows
         if tab == "Storage":
-            disks = _sp.storage_info()
-            return [(f"{d['drive']} {d['label']}".strip(),
-                     f"{_sp._gb(d['free'])} free of {_sp._gb(d['total'])}"
+            f = facts.get("disks.usage")
+            disks = f.value if f.ok else []
+            return [(f"{d.get('drive', '?')} {d.get('label', '')}".strip(),
+                     f"{_sp._gb(d.get('free', 0))} free of "
+                     f"{_sp._gb(d.get('total', 0))}"
                      + (f" · {d['fs']}" if d.get("fs") else ""))
-                    for d in disks] or [("Drives", "Unknown")]
+                    for d in (disks or [])] or [("Drives", "Unknown")]
         if tab == "Audio":
             names = _sp.audio_info()
             return [(f"Output {i + 1}", n) for i, n in enumerate(names)] or [

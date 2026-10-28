@@ -11,20 +11,23 @@ import os
 
 import tkinter as tk
 
+from app import facts
 from app.ui.widgets.rounded_card import RoundedCard
-from tkinter import ttk, messagebox
 from app.ui.base import Tooltip
 from app.ui.dialogs._tool_page import ToolPage, _ellipsize
-from app.ui.theme import COLORS, F, TAB_ACCENTS
+from app.ui.theme import COLORS, RADIUS_SURFACE, TAB_ACCENTS, TYPE, SPACE_2, SPACE_3
+from app.ui.metrics import (
+    CARD_BODY_INSET, COMPACT_INSET, CONTROL_GAP, GROUP_GAP, TEXT_NUDGE,
+)
 from app.ui.widgets import AnimatedProgressBar
 
 
 class HardwareMonitorDialog(ToolPage):
     """Hardware Monitor (Tools tab card): Task-Manager-style live stats —
     CPU/RAM, GPU/VRAM, Disk/Network in a 3-column x 2-row grid —
-    read-only, ~1s refresh. Same on-tick-directly pattern MicCheckDialog
-    uses for its level meter (the underlying Win32/PDH calls are fast
-    synchronous reads, not I/O, so no worker thread is needed).
+    read-only, ~1s refresh. It refreshes on the tick directly rather than
+    from a worker thread (the underlying Win32/PDH calls are fast
+    synchronous reads, not I/O).
 
     Cards match the Health report's card language exactly (hairline
     outer + bg_alt inner, fixed heights, AnimatedProgressBar) — not a
@@ -71,9 +74,15 @@ class HardwareMonitorDialog(ToolPage):
         self.banner.set_sub("CPU, memory, graphics, disk and network, live.")
 
         try:
-            from app.hw_monitor import cpu_static_info, gpu_list
+            from app.hw_monitor import cpu_static_info
             self._cpu_info = cpu_static_info()
-            self._gpu_list = gpu_list() or []
+            # AUDIT TX-001: PC Specs reads the same `hardware.gpu` fact. The
+            # provider is a registry read (no PDH/worker), so opening this
+            # dialog still paints immediately; the live samplers below stay
+            # direct because they are per-second readings, not facts.
+            gpu_fact = facts.get("hardware.gpu")
+            self._gpu_list = (list(gpu_fact.value or [])
+                              if gpu_fact.ok else [])
         except Exception:
             pass
         if not self._gpu_list:
@@ -92,7 +101,7 @@ class HardwareMonitorDialog(ToolPage):
         # Network. The grid fills the zone, so the cards grow into a tall
         # window instead of leaving a band of empty space under them.
         grid = self._grid = tk.Frame(body, bg=COLORS["bg"])
-        grid.pack(fill="both", expand=True, pady=(2, 0))
+        grid.pack(fill="both", expand=True, pady=(TEXT_NUDGE, 0))
         for c in (0, 1, 2):
             grid.columnconfigure(c, weight=1, uniform="hwcol")
         for r in (0, 1):
@@ -117,7 +126,7 @@ class HardwareMonitorDialog(ToolPage):
         # Honesty note only (empty = zero-height): GPU counters missing
         # entirely. No Close button — the popup X already closes this.
         self._note_lbl = tk.Label(
-            body, text="", font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
+            body, text="", font=TYPE["caption"], bg=COLORS["bg"], fg=COLORS["subtext"],
             anchor="center", justify="center")
         self._note_lbl.pack(fill="x")
 
@@ -158,8 +167,8 @@ class HardwareMonitorDialog(ToolPage):
         menu; the card face itself only ever shows the SELECTED name.
         Returns a dict of handles ("pick" = arrow label or None)."""
         outer = RoundedCard(parent, fill=COLORS["bg_alt"], bg=COLORS["bg"],
-                            radius=16, min_height=self._CARD_H)
-        outer.grid(row=row, column=col, sticky="nsew", padx=5, pady=5)
+                            radius=RADIUS_SURFACE, min_height=self._CARD_H)
+        outer.grid(row=row, column=col, sticky="nsew", padx=COMPACT_INSET, pady=COMPACT_INSET)
         inner = outer.body
         # Popup-fit pass 2026-10: a zero-height spacer above and below, both
         # growing. The grid now fills the content zone, so a card can be
@@ -167,18 +176,18 @@ class HardwareMonitorDialog(ToolPage):
         # height pooled under the last label and every card read top-heavy.
         tk.Frame(inner, bg=COLORS["bg_alt"]).pack(fill="both", expand=True)
         trow = tk.Frame(inner, bg=COLORS["bg_alt"])
-        trow.pack(anchor="center", pady=(10, 0))
-        title_lbl = tk.Label(trow, text=title, font=(F, 9, "bold"),
+        trow.pack(anchor="center", pady=(GROUP_GAP, 0))
+        title_lbl = tk.Label(trow, text=title, font=TYPE["label_medium"],
                              bg=COLORS["bg_alt"], fg=COLORS["text"])
         title_lbl.pack(side="left")
         pick_lbl = None
         if picker in ("gpu", "net"):
             # (F, 11): the 8pt glyph was easy to miss next to the 9pt
             # bold title — one step up so the picker reads as clickable.
-            pick_lbl = tk.Label(trow, text="▾", font=(F, 11),
+            pick_lbl = tk.Label(trow, text="▾", font=TYPE["body_large"],
                                 bg=COLORS["bg_alt"], fg=COLORS["subtext"],
                                 cursor="hand2")
-            pick_lbl.pack(side="left", padx=(6, 0))
+            pick_lbl.pack(side="left", padx=(CONTROL_GAP, 0))
             try:
                 # Tooltip FIRST: it binds <Enter>/<Leave> without add="+"
                 # (replacing), so the hover brightening below must come
@@ -195,20 +204,20 @@ class HardwareMonitorDialog(ToolPage):
                               w.config(fg=COLORS["subtext"]), add="+")
             except Exception:
                 pass
-        val_lbl = tk.Label(inner, text="—", font=(F, 16, "bold"),
+        val_lbl = tk.Label(inner, text="—", font=TYPE["metric_small"],
                            bg=COLORS["bg_alt"], fg=COLORS["text"],
                            anchor="center", justify="center")
-        val_lbl.pack(anchor="center", pady=(2, 0))
+        val_lbl.pack(anchor="center", pady=(TEXT_NUDGE, 0))
         bar = AnimatedProgressBar(inner, accent=COLORS["accent_green"])
-        bar.pack(fill="x", padx=14, pady=(8, 6))
-        name_lbl = tk.Label(inner, text="", font=(F, 9),
+        bar.pack(fill="x", padx=CARD_BODY_INSET, pady=(SPACE_2, CONTROL_GAP))
+        name_lbl = tk.Label(inner, text="", font=TYPE["caption"],
                             bg=COLORS["bg_alt"], fg=COLORS["subtext"],
                             anchor="center", justify="center")
-        name_lbl.pack(fill="x", padx=12)
-        sub_lbl = tk.Label(inner, text="", font=(F, 9),
+        name_lbl.pack(fill="x", padx=SPACE_3)
+        sub_lbl = tk.Label(inner, text="", font=TYPE["caption"],
                            bg=COLORS["bg_alt"], fg=COLORS["subtext"],
                            anchor="center", justify="center")
-        sub_lbl.pack(fill="x", padx=12)
+        sub_lbl.pack(fill="x", padx=SPACE_3)
         tk.Frame(inner, bg=COLORS["bg_alt"]).pack(fill="both", expand=True)
         # Captions are width-fitted (see _set_card_text): a 3-column grid
         # gives a card ~300px, and a device name is longer than that. The
@@ -348,12 +357,6 @@ class HardwareMonitorDialog(ToolPage):
             pass
         return []
 
-    def _net_menu_labels(self):
-        """Menu rows: Auto first, then every NIC."""
-        try:
-            return ["Auto (busiest)"] + self._net_iface_names()
-        except Exception:
-            return ["Auto (busiest)"]
 
     def _set_net(self, name_or_none):
         """Pin a NIC (None/"" = auto-busiest). Unknown names fall back
@@ -377,7 +380,7 @@ class HardwareMonitorDialog(ToolPage):
                            fg=COLORS["text"],
                            activebackground=COLORS["surface_hover"],
                            activeforeground=COLORS["text"],
-                           selectcolor=COLORS["text"], font=(F, 9))
+                           selectcolor=COLORS["text"], font=TYPE["caption"])
         except Exception:
             return None
 

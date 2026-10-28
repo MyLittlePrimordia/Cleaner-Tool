@@ -14,11 +14,16 @@ import tkinter as tk
 from app.ui.widgets.rounded_card import RoundedCard
 
 from app.ui.widgets.dropdown import M3Dropdown
-from tkinter import ttk, messagebox
 from app.ui.base import Tooltip, _themed_askyesno, _themed_showinfo
 from app.ui.dialogs._tool_page import ToolPage, fit_label
-from app.ui.theme import (COLORS, F, TAB_ACCENTS, ICON_ROW_PX, _hex_lerp,
-                          ellipsize, icon_bg_rgb, _measure_font)
+from app.ui.theme import (
+    COLORS, ICON_ROW_PX, RADIUS_SURFACE, TAB_ACCENTS, TYPE, _hex_lerp,
+    _measure_font, ellipsize, icon_bg_rgb, SPACE_1, SPACE_2,
+)
+from app.ui.metrics import (
+    CARD_BODY_INSET, COMPACT_INSET, CONTROL_GAP, GROUP_GAP, HAIRLINE_NUDGE,
+    PAGE_INSET, TEXT_NUDGE,
+)
 from app.ui.widgets import AnimatedButton, ScrollableRoundedPanel, ToggleSwitch
 from app.ui.dialogs.catalog_picker_dialog import _CatalogPickerDialog
 
@@ -278,10 +283,6 @@ class PilotDialog(ToolPage):
         if preset not in self._preset_names:
             preset = "Game Session"
 
-        try:
-            root = parent.winfo_toplevel()
-        except Exception:
-            root = parent
         super().__init__(parent, title="Game Session Auto-Pilot",
                          accent=TAB_ACCENTS["Tweak"],
                          scope="Applied tweaks stay until Undo reverts them.",
@@ -290,7 +291,6 @@ class PilotDialog(ToolPage):
         self.banner.set_title("Ready to play in one click")
         self.banner.set_sub("Turn on the right settings automatically when a "
                             "game starts.")
-        dlg = self._dlg
         body = self.content
 
         CARD = COLORS["bg_alt"]
@@ -310,15 +310,16 @@ class PilotDialog(ToolPage):
         cols.grid_columnconfigure(0, weight=1, uniform="pilcol")
         cols.grid_columnconfigure(1, weight=1, uniform="pilcol")
         col_l = tk.Frame(cols, bg=COLORS["bg"])
-        col_l.grid(row=0, column=0, sticky="new", padx=(0, 5))
+        col_l.grid(row=0, column=0, sticky="new", padx=(0, COMPACT_INSET))
         col_r = tk.Frame(cols, bg=COLORS["bg"])
-        col_r.grid(row=0, column=1, sticky="new", padx=(5, 0))
+        col_r.grid(row=0, column=1, sticky="new", padx=(COMPACT_INSET, 0))
 
         def _card(col, last=False):
-            c = RoundedCard(col, fill=CARD, bg=COLORS["bg"], radius=16)
-            c.pack(fill="x", pady=(0, 0 if last else 10))
+            c = RoundedCard(col, fill=CARD, bg=COLORS["bg"],
+                            radius=RADIUS_SURFACE)
+            c.pack(fill="x", pady=(0, 0 if last else GROUP_GAP))
             inner = tk.Frame(c.body, bg=CARD)
-            inner.pack(fill="x", padx=18, pady=14)
+            inner.pack(fill="x", padx=PAGE_INSET, pady=CARD_BODY_INSET)
             # A RoundedCard sizes itself from its body on the body's
             # <Configure>, but content that grows LATER (the close list
             # arriving from its background scan) changes the body's REQUESTED
@@ -335,17 +336,17 @@ class PilotDialog(ToolPage):
         self._enabled_var = tk.BooleanVar(
             value=bool(cfg.get("session_pilot_enabled", False)))
         ToggleSwitch(mrow, self._enabled_var).pack(side="left")
-        tk.Label(mrow, text="Watch for games", font=(F, 12, "bold"),
+        tk.Label(mrow, text="Watch for games", font=TYPE["subtitle"],
                  bg=CARD, fg=COLORS["text"]).pack(
-                     side="left", padx=(10, 0))
+                     side="left", padx=(GROUP_GAP, 0))
         # USER FIX 2026-10 (profile picker clipped): the picker used to share
         # the switch's LEFTOVER space and got 55px of the 218px it asked for,
         # so the profile name rendered as "Gam…" (user screenshot). It has
         # its own line now and stretches across the card; M3Dropdown draws its
         # own text through ellipsize(), so no preset name can be cut again.
         prow = tk.Frame(p1, bg=CARD)
-        prow.pack(fill="x", pady=(8, 0))
-        _prof = tk.Label(prow, text="Profile", font=(F, 10), bg=CARD,
+        prow.pack(fill="x", pady=(SPACE_2, 0))
+        _prof = tk.Label(prow, text="Profile", font=TYPE["body_medium"], bg=CARD,
                          fg=COLORS["subtext"])
         _prof.pack(side="left")
         try:
@@ -356,8 +357,8 @@ class PilotDialog(ToolPage):
         combo = self._preset_combo = M3Dropdown(
             prow, textvariable=self._preset_var,
             values=self._preset_names, state="readonly",
-            width=14, font=(F, 10))
-        combo.pack(side="left", fill="x", expand=True, padx=(10, 0))
+            width=14, font=TYPE["body_medium"])
+        combo.pack(side="left", fill="x", expand=True, padx=(GROUP_GAP, 0))
         try:
             combo.bind("<<ComboboxSelected>>", self._on_preset)
         except Exception:
@@ -382,12 +383,12 @@ class PilotDialog(ToolPage):
         _sub = ("Every installed game is watched" if watching_all
                 else f"{n_known} built-in games, plus any you add")
         _title = tk.Label(p2, text="Your watchlist",
-                          font=(F, 12, "bold"), bg=CARD,
+                          font=TYPE["subtitle"], bg=CARD,
                           fg=COLORS["text"], anchor="w")
         _title.pack(fill="x")
-        _sublbl = tk.Label(p2, text=_sub, font=(F, 10), bg=CARD,
+        _sublbl = tk.Label(p2, text=_sub, font=TYPE["body_medium"], bg=CARD,
                            fg=COLORS["subtext"], anchor="w")
-        _sublbl.pack(fill="x", pady=(1, 0))
+        _sublbl.pack(fill="x", pady=(HAIRLINE_NUDGE, 0))
         # USER FIX 2026-10 (headline sheared): the old single line read
         # "Watching 25 built-in games plus yours" -- wider than the
         # two-column card, and a Label that is handed less width than its
@@ -398,31 +399,30 @@ class PilotDialog(ToolPage):
         self._fit_label(p2, _title, "Your watchlist")
         self._fit_label(p2, _sublbl, _sub)
         self._games_body = tk.Frame(p2, bg=CARD)
-        self._games_body.pack(fill="x", pady=(4, 0))
+        self._games_body.pack(fill="x", pady=(SPACE_1, 0))
         # three ways to grow the watchlist (Phase-5): installed games,
         # installed apps, and the classic drive browse for portable exes.
         # UI fix (less clutter): collapsed the three separate buttons that
         # used to sit here into one "+ Add games…" button with a small
         # picker menu — same three ways in, one thing to look at.
         addrow = tk.Frame(p2, bg=CARD)
-        addrow.pack(fill="x", pady=(6, 0))
+        addrow.pack(fill="x", pady=(CONTROL_GAP, 0))
         self._add_btn = AnimatedButton(addrow, text="Add games",
                        command=self._open_add_menu,
-                       bg=CARD, fg=COLORS["primary"], variant="outlined",
-                       font=(F, 10, "bold"), padx=20, pady=8)
+                       role="outlined", size="md")
         self._add_btn.pack(side="left")
         # watch-all toggle (default ON for new users — user ruling
         # 2026-09-12; anyone whose config already carries a choice keeps
         # it. Detection is path-verified, never guessed.)
         wrow = tk.Frame(p2, bg=CARD)
-        wrow.pack(fill="x", pady=(8, 0))
+        wrow.pack(fill="x", pady=(SPACE_2, 0))
         self._watch_all_var = tk.BooleanVar(
             value=bool(cfg.get("session_pilot_watch_all", False)))
         ToggleSwitch(wrow, self._watch_all_var).pack(side="left")
         _wa_lbl = tk.Label(wrow, text="Watch all my installed games",
-                           font=(F, 11), bg=CARD,
+                           font=TYPE["body_large"], bg=CARD,
                            fg=COLORS["text"], anchor="w")
-        _wa_lbl.pack(side="left", padx=(10, 0))
+        _wa_lbl.pack(side="left", padx=(GROUP_GAP, 0))
         self._fit_label(wrow, _wa_lbl, "Watch all my installed games",
                         reserve=62)
         try:
@@ -446,9 +446,9 @@ class PilotDialog(ToolPage):
         self._close_card = getattr(p3, "card", None)
         tk.Label(p3,
                  text="Game Mode",
-                 font=(F, 12, "bold"), bg=CARD, fg=COLORS["text"],
+                 font=TYPE["subtitle"], bg=CARD, fg=COLORS["text"],
                  justify="left", anchor="w").pack(
-                     fill="x", pady=(0, 6))
+                     fill="x", pady=(0, CONTROL_GAP))
         try:
             from app.game_night import CLOSEABLE_APPS as _CLOSEABLE_APPS
             from app.config_persist import get_game_night as _get_gn
@@ -472,9 +472,9 @@ class PilotDialog(ToolPage):
         self._scan_inflight = False
         if _CLOSEABLE_APPS:
             _c3_hdr = tk.Label(p3, text="Close these while I play (optional)",
-                               font=(F, 10), bg=CARD,
+                               font=TYPE["body_medium"], bg=CARD,
                                fg=COLORS["subtext"], anchor="w")
-            _c3_hdr.pack(fill="x", pady=(0, 2))
+            _c3_hdr.pack(fill="x", pady=(0, TEXT_NUDGE))
             self._fit_label(p3, _c3_hdr, "Close these while I play (optional)")
             # Popup-fit pass 2026-10: this used to be a box pinned to 150px
             # holding two-line rows — 6 x 64px = 384px of list, so barely two
@@ -489,7 +489,7 @@ class PilotDialog(ToolPage):
             # The rows are built by _rebuild_close_rows, because adding or
             # removing one of YOUR apps has to repaint the whole list.
             self._close_panel = ScrollableRoundedPanel(p3)
-            self._close_panel.pack(fill="x", pady=(0, 6))
+            self._close_panel.pack(fill="x", pady=(0, CONTROL_GAP))
             self._close_holder = self._close_panel.inner
             # USER FEATURE 2026-10 (user request: "no option to add custom
             # apps"): your own programs in the close list. Any .exe on the
@@ -499,9 +499,8 @@ class PilotDialog(ToolPage):
             # quit, by name.
             self._add_app_btn = AnimatedButton(
                 p3, text="Add app", command=self._add_custom_app,
-                bg=CARD, fg=COLORS["primary"], variant="outlined",
-                font=(F, 10, "bold"), padx=20, pady=8)
-            self._add_app_btn.pack(anchor="w", pady=(0, 8))
+                role="outlined", size="md")
+            self._add_app_btn.pack(anchor="w", pady=(0, SPACE_2))
             try:
                 Tooltip(self._add_app_btn,
                         "Pick any program (.exe) to close while Game Mode is "
@@ -510,11 +509,10 @@ class PilotDialog(ToolPage):
                 pass
             self._begin_close_scan()
         mbrow = tk.Frame(p3, bg=CARD)
-        mbrow.pack(fill="x", pady=(2, 0))
+        mbrow.pack(fill="x", pady=(TEXT_NUDGE, 0))
         self._manual_btn = AnimatedButton(
             mbrow, text="", command=self._toggle_manual_session,
-            bg=COLORS["accent_green"], fg=COLORS["black"],
-            font=(F, 10, "bold"), padx=20, pady=8)
+            role="filled", size="md", accent=COLORS["accent_green"])
         self._manual_btn.pack(side="left")
         self._refresh_manual_btn()
 
@@ -613,35 +611,35 @@ class PilotDialog(ToolPage):
         if not items:
             tk.Label(self._games_body,
                      text="No custom games added yet",
-                     font=(F, 10), bg=COLORS["bg_alt"],
-                     fg=COLORS["subtext"]).pack(anchor="w", pady=2)
+                     font=TYPE["body_medium"], bg=COLORS["bg_alt"],
+                     fg=COLORS["subtext"]).pack(anchor="w", pady=TEXT_NUDGE)
             return
         for disp, ident, is_path in items[:self._MAX_SHOWN_GAMES]:
             row = tk.Frame(self._games_body, bg=COLORS["bg_alt"])
             tag = "📁" if is_path else "·"
-            tk.Label(row, text=tag, font=(F, 9),
+            tk.Label(row, text=tag, font=TYPE["caption"],
                      bg=COLORS["bg_alt"], fg=COLORS["subtext"]).pack(
-                         side="left", padx=(8, 2))
-            lbl = tk.Label(row, text=disp, font=(F, 9, "bold"),
+                         side="left", padx=(SPACE_2, TEXT_NUDGE))
+            lbl = tk.Label(row, text=disp, font=TYPE["label_medium"],
                            bg=COLORS["bg_alt"], fg=COLORS["text"],
                            anchor="w")
-            lbl.pack(side="left", padx=(0, 4), pady=4)
+            lbl.pack(side="left", padx=(0, SPACE_1), pady=SPACE_1)
             try:
                 Tooltip(lbl, ident)      # full path on hover
             except Exception:
                 pass
-            x = tk.Label(row, text="✕", font=(F, 9),
+            x = tk.Label(row, text="✕", font=TYPE["caption"],
                          bg=COLORS["bg_alt"], fg=COLORS["subtext"],
                          cursor="hand2")
-            x.pack(side="right", padx=(0, 8))
+            x.pack(side="right", padx=(0, SPACE_2))
             x.bind("<Button-1>", lambda e, n=ident: self._remove_game(n))
             Tooltip(x, "Stop watching this game")
-            row.pack(fill="x", pady=1)
+            row.pack(fill="x", pady=HAIRLINE_NUDGE)
         if len(items) > self._MAX_SHOWN_GAMES:
             tk.Label(self._games_body,
                      text=f"+{len(items) - self._MAX_SHOWN_GAMES} more watched",
-                     font=(F, 9), bg=COLORS["bg"],
-                     fg=COLORS["subtext"]).pack(anchor="w", pady=(2, 0))
+                     font=TYPE["caption"], bg=COLORS["bg"],
+                     fg=COLORS["subtext"]).pack(anchor="w", pady=(TEXT_NUDGE, 0))
 
     def _user_paths(self):
         try:
@@ -866,7 +864,7 @@ class PilotDialog(ToolPage):
             self._close_vars[key] = var
             ToggleSwitch(row, variable=var,
                          command=self._save_close_choice).pack(
-                             side="left", padx=(8, 6), pady=2)
+                             side="left", padx=(SPACE_2, CONTROL_GAP), pady=TEXT_NUDGE)
             # Reserved icon slot, sized in PIXELS (a Label's width is in
             # characters, so a Label "32" would be 32 characters across). It
             # is created EMPTY and filled in by _load_close_icons, so the row
@@ -875,21 +873,21 @@ class PilotDialog(ToolPage):
             icon_box = tk.Frame(row, width=ICON_ROW_PX, height=ICON_ROW_PX,
                                 bg=row_bg)
             icon_box.pack_propagate(False)
-            icon_box.pack(side="left", padx=(6, 10), pady=4)
+            icon_box.pack(side="left", padx=(CONTROL_GAP, GROUP_GAP), pady=SPACE_1)
             icon_lbl = tk.Label(icon_box, bg=row_bg)
             icon_lbl.pack(fill="both", expand=True)
             self._close_icon_slots[key] = (icon_lbl, tuple(exes or ()))
             name_lbl = tk.Label(row, text=self._clip_row_label(label),
-                                font=(F, 10, "bold"), bg=row_bg,
+                                font=TYPE["label_large"], bg=row_bg,
                                 fg=COLORS["text"], anchor="w")
             name_lbl.pack(side="left")
             if remove_ident is not None:
-                x = tk.Label(row, text="✕", font=(F, 9),
+                x = tk.Label(row, text="✕", font=TYPE["caption"],
                              bg=row_bg, fg=COLORS["subtext"],
                              cursor="hand2")
                 # packed before the name on purpose: the ✕ keeps its space
                 # when the row is too narrow for everything.
-                x.pack(side="right", padx=(6, 10))
+                x.pack(side="right", padx=(CONTROL_GAP, GROUP_GAP))
                 x.bind("<Button-1>", lambda e, n=remove_ident:
                        self._remove_custom_app(n))
                 try:
@@ -974,11 +972,11 @@ class PilotDialog(ToolPage):
             text = ("Checking installed apps…" if not ready else
                     "None of the usual background apps were found on this PC. "
                     "Use Add app for your own.")
-            tk.Label(self._close_holder, text=text, font=(F, 9),
+            tk.Label(self._close_holder, text=text, font=TYPE["caption"],
                      bg=COLORS["bg"], fg=COLORS["subtext"], anchor="w",
                      justify="left", wraplength=max(120, self.body_width(70)),
                      bd=0, highlightthickness=0).pack(
-                         anchor="w", padx=10, pady=8)
+                         anchor="w", padx=GROUP_GAP, pady=SPACE_2)
         except Exception:
             pass
 
@@ -1195,7 +1193,7 @@ class PilotDialog(ToolPage):
         if not name or not key:
             try:
                 _themed_showinfo(
-                    self._dlg, "Pick a program file",
+                    self._dlg, "That File Is Not a Program",
                     "Game Mode can only close Windows programs (.exe). "
                     "Nothing was added.")
             except Exception:
@@ -1376,7 +1374,15 @@ class PilotDialog(ToolPage):
             by_key = {t.key: t for t in _TABS.get("Tweak", [])}
             already = set()
             try:
-                from app.run_state import get_tweak_state
+                # app/config_tweaks, not the long-gone app.run_state: the
+                # registry moved when config_persist was split, and this
+                # import was left pointing at the deleted module. It failed
+                # into `already = set()` every time, so the preview listed
+                # every preset tweak as about to change even when Game Mode
+                # was already on - contradicting the exclusion this method's
+                # own docstring promises. PyInstaller's missing-module list
+                # is what surfaced it (`missing module named 'app.run_state'`).
+                from app.config_tweaks import get_tweak_state
                 already = set(get_tweak_state() or {})
             except Exception:
                 already = set()
@@ -1425,7 +1431,11 @@ class PilotDialog(ToolPage):
     def _report_game_mode(self):
         """What actually happened, in the dialog rather than the hidden log."""
         try:
-            from app.run_state import get_tweak_state
+            # Same stale import as _confirm_game_mode. Here the failure was
+            # worse than cosmetic: `on` stayed empty, so `keys` was always
+            # empty and the dialog always reported "Game Mode did not change
+            # anything" - even after a run that applied every setting.
+            from app.config_tweaks import get_tweak_state
             on = set(get_tweak_state() or {})
         except Exception:
             on = set()

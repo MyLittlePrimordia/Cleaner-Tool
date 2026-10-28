@@ -69,27 +69,21 @@ def _is_cloudflare_url(url: str) -> bool:
         return False
 
 
-DOWNLOAD_BYTES = (100_000, 1_000_000, 10_000_000)
-UPLOAD_BYTES = (100_000, 1_000_000)
 LEG_TIMEOUT_S = 10.0
 # Parallel multi-stream rounds (like Ookla/Cloudflare web: one TCP
 # stream cannot fill a fast pipe, and a lone 100KB sample is pure
 # handshake — that combo once reported 2.9 Mbps on a fast link).
 PARALLEL_STREAMS = 4
 DOWNLOAD_ROUNDS = (2_000_000, 10_000_000, 25_000_000)  # per stream
-# Upload rounds are deliberately bigger than the old (0.5, 2)MB pair: a
-# 2 MB-per-stream POST finishes inside TCP slow-start on a fast uplink
-# and mostly measures the handshake, which made uploads read low and
-# jumpy. (1, 4, 10)MB per stream x4 gives a sustained verdict on fast
-# links while slow links still stop after the small round (gates below).
+# Upload rounds are deliberately big: a small POST (0.5–2 MB per stream)
+# finishes inside TCP slow-start on a fast uplink and mostly measures the
+# handshake, which made uploads read low and jumpy. (1, 4, 10)MB per
+# stream x4 gives a sustained verdict on fast links while slow links still
+# stop after the small round (gates below).
 UPLOAD_ROUNDS = (1_000_000, 4_000_000, 10_000_000)     # per stream
 # Throwaway single-stream warmup before the measured download rounds
 # (TLS session + congestion window warm — unpainted, never the verdict).
 WARMUP_BYTES = 512_000
-# F08: worst-case data budget surfaced in the Tools dialog copy
-# ((2+10+25)MB x4 down + (1+4+10)MB x4 up ≈ 210MB on a fast link).
-ESTIMATED_MAX_MB = (sum(DOWNLOAD_ROUNDS) * PARALLEL_STREAMS
-                    + sum(UPLOAD_ROUNDS) * PARALLEL_STREAMS) / 1_000_000
 ROUND_MIN_MBPS = 25.0    # run the next download round above this…
 ROUND_FAST_MBPS = 250.0  # …and the jumbo round above this (else save data)
 UP_MIN_MBPS = 10.0       # …same pair for uploads (uplinks run slower)…
@@ -370,29 +364,6 @@ def _post_bytes(url: str, payload: bytes, timeout: float,
             except Exception:
                 return False
         return False
-
-
-def upload_mbps(num_bytes: int = 1_000_000,
-                timeout: float = LEG_TIMEOUT_S,
-                cancelled=None,
-                url: str = UPLOAD_URL) -> "float | None":
-    """Timed POST of random `num_bytes`; Mbps or None."""
-    is_cancelled = cancelled or (lambda: False)
-    try:
-        import os
-        payload = os.urandom(int(num_bytes))
-    except Exception:
-        return None
-    if is_cancelled():
-        return None
-    try:
-        t0 = time.perf_counter()
-        if not _post_bytes(url, payload, timeout):
-            return None
-        dt = time.perf_counter() - t0
-        return _mbps(len(payload), dt)
-    except Exception:
-        return None
 
 
 def _one_download_stream(url: str, num_bytes: int, timeout: float,

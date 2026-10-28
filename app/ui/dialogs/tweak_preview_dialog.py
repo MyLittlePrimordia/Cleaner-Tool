@@ -16,7 +16,8 @@ from tkinter import messagebox
 from tkinter.scrolledtext import ScrolledText
 
 from app.ui.base import ThemedModal
-from app.ui.theme import COLORS, F, FM
+from app.ui.theme import COLORS, TYPE, SPACE_1, SPACE_2
+from app.ui.metrics import TEXT_NUDGE
 from app.ui.widgets import AnimatedButton
 
 _SUBTITLE = ("These are the Windows settings the selected tweaks will change. "
@@ -32,11 +33,11 @@ def show_tweak_preview(parent, lines, *, title="Preview changes",
                             size=(760, 560))
         body = modal.body
         if subtitle:
-            tk.Label(body, text=subtitle, font=(F, 9), bg=COLORS["bg"],
+            tk.Label(body, text=subtitle, font=TYPE["caption"], bg=COLORS["bg"],
                      fg=COLORS["subtext"],
                      wraplength=modal.body_width(24),
-                     justify="left").pack(fill="x", pady=(2, 8))
-        txt = ScrolledText(body, wrap="none", font=(FM, 9),
+                     justify="left").pack(fill="x", pady=(TEXT_NUDGE, SPACE_2))
+        txt = ScrolledText(body, wrap="none", font=TYPE["mono"],
                            bg=COLORS["surface"], fg=COLORS["text"],
                            relief="flat", height=18,
                            insertbackground=COLORS["text"],
@@ -55,10 +56,10 @@ def show_tweak_preview(parent, lines, *, title="Preview changes",
         txt.insert("1.0", text)
         txt.config(state="disabled")
         brow = tk.Frame(body, bg=COLORS["bg"])
-        brow.pack(fill="x", pady=(8, 4))
+        brow.pack(fill="x", pady=(SPACE_2, SPACE_1))
         AnimatedButton(brow, text="Close", command=modal.close,
-                       bg=accent or COLORS["primary"], fg=COLORS["black"],
-                       font=(F, 9, "bold"), padx=22, pady=7).pack(side="right")
+                       role="filled", size="md",
+                       accent=accent or COLORS["primary"]).pack(side="right")
         modal._dlg.bind("<Return>", lambda _e: modal.close())
         modal.wait()
         return True

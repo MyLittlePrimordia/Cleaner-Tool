@@ -20,14 +20,17 @@ is closed by making its coverage permanent rather than incidental: the grading
 and the honesty contract are exercised directly by the test suite, instead of
 leaving the only tests for it as a side-effect inside a GUI smoke run.
 
-Grades the machine across five read-only sensors plus an overall
-score — no UI here (the dialog lives in gui.py):
+Grades the machine across eight read-only sensors plus an overall score — no
+UI here (app/ui/tabs/healthtab.py owns the surface):
 
-     disk     C: free-space ratio (instant ctypes read)
-     gpu      GPU driver age via the existing repair task (report-only)
-     smart    SMART verdict via the existing repair task (report-only)
-     windows  DISM CheckHealth via the existing repair task (admin only)
-     junk     reclaimable-bytes estimate via the Storage Insight engine
+     disk       C: free-space ratio (instant ctypes read)
+     memory     installed RAM and pagefile pressure
+     crashes    Windows reliability records for the last seven days
+     security   Defender real-time protection and update state
+     startup    how many programs launch at sign-in
+     smart      SMART verdict via the existing repair task (report-only)
+     windows    DISM CheckHealth via the existing repair task (admin only)
+     junk       reclaimable-bytes estimate via the Storage Insight engine
 
 Honesty rules (the app's standing contract):
   * Sensors never write anything; repair tasks are invoked for their
@@ -45,11 +48,10 @@ from __future__ import annotations
 import ctypes
 import sys
 
-from app.utils import TaskContext, TaskCancelled, TaskSkipped
+from app.utils import TaskCancelled, TaskSkipped
 from app.health_sensors import (
-    SLOW_SENSORS, sense_crashes, sense_disk_detail, sense_drivers,
-    sense_maintenance, sense_memory, sense_security, sense_startup,
-    sense_time,
+    sense_battery, sense_crashes, sense_drivers, sense_maintenance,
+    sense_memory, sense_security, sense_startup, sense_time,
 )
 
 # --------------------------------------------------------------------------- #
@@ -57,6 +59,12 @@ from app.health_sensors import (
 # --------------------------------------------------------------------------- #
 
 GRADE_SCORES = {"A": 4, "B": 3, "C": 2, "D": 1, "F": 0}
+
+#: Longest the report will wait for the slow sensors before finishing without
+#: them (each one normally lands in ~1-3s). Was an unbounded join, so a wedged
+#: WMI/reliability probe kept the whole report - and the Run slot - pending
+#: forever.
+SLOW_SENSOR_JOIN_S = 45.0
 
 
 def grade_disk_space(free_ratio: float) -> str:
@@ -248,13 +256,6 @@ def verdict_for(grade: str, n_fixes: int = 0):
 # run_health_scan, never exceptions out of it.
 # --------------------------------------------------------------------------- #
 
-def _collecting_ctx(log_list, set_status=None, cancelled=None) -> TaskContext:
-    return TaskContext(
-        log=log_list.append,
-        set_status=(set_status or (lambda _m: None)),
-        cancelled=(cancelled or (lambda: False)),
-    )
-
 
 def sense_disk(ctx) -> tuple:
     """System-drive free-space ratio + human numbers. Instant, no subprocess."""
@@ -333,37 +334,6 @@ def _run_report_task(ctx, fn):
         return ("fail", str(exc).splitlines()[0][:160] if str(exc) else "check failed")
 
 
-def sense_gpu(ctx) -> tuple:
-    from app.tasks.repair_tasks import repair_gpu_driver_age, get_gpu_manufacturer_download_url
-    import subprocess as _sp
-    
-    # First, get GPU name for manufacturer URL detection
-    gpu_name = ""
-    try:
-        out = _sp.run(
-            ["powershell", "-NoProfile", "-Command",
-             "Get-CimInstance Win32_VideoController | "
-             "Select-Object -ExpandProperty Name | Select-Object -First 1"],
-            capture_output=True, text=True, timeout=30,
-            creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
-        )
-        gpu_name = (out.stdout or "").strip()
-    except Exception:
-        pass
-    
-    outcome, msg = _run_report_task(ctx, repair_gpu_driver_age)
-    if outcome == "pass":
-        return ("A", "GPU drivers current", "No update nudge needed.", "")
-    if outcome == "fail":
-        # Get manufacturer download URL
-        download_url = get_gpu_manufacturer_download_url(gpu_name) if gpu_name else ""
-        note = download_url if download_url else ""
-        return ("C", "Driver update suggested",
-                msg or "Your GPU driver is over a year old.", note)
-    return ("?", "Couldn't check drivers",
-            msg or "Driver info unavailable on this PC.", "")
-
-
 def sense_smart(ctx) -> tuple:
     from app.tasks.repair_tasks import repair_smart_verdict
     outcome, msg = _run_report_task(ctx, repair_smart_verdict)
@@ -402,33 +372,73 @@ def sense_windows(ctx) -> tuple:
             msg or "The image check did not complete.", note)
 
 
+def lower_bound_note(reasons) -> str:
+    """One clause naming why a junk total is a lower bound, or ''.
+
+    The reasons are the cleaners' own words (`app.utils.mark_unmeasured`), so
+    the card repeats the sentence the run log already showed - naming which
+    app was open without the card having to guess or keep a second list of
+    apps in step with the tasks."""
+    seen = []
+    for reason in reasons or ():
+        text = str(reason or "").strip().rstrip(".")
+        if text and text not in seen:
+            seen.append(text)
+    return "; ".join(seen)
+
+
 def sense_junk(ctx) -> tuple:
     """Reclaimable-bytes estimate via the Storage Insight engine
     (dry-run task invocation — measures without deleting). Phase-6:
     consults the shared estimate cache first (a Storage dialog or nudge
     walk often just measured the same folders); a fresh walk runs under
-    the scan coordinator so two dialogs never double-walk the disk."""
+    the scan coordinator so two dialogs never double-walk the disk.
+
+    A cleaner that skipped (Office/Steam/FiveM live) is a known skip, so the
+    walk still returns a number - but a LOWER BOUND, and this card has to say
+    so. Without it, "About 4 GB can be cleaned" quietly presented a total that
+    omitted a skipped Office cache: the same all-clear the 0-vs-None contract
+    exists to prevent, one level up. The headline carries the marker because
+    it is the only field the report row renders."""
     try:
-        from app.storage_scan import cached_estimate, measure_all_cached
+        from app.storage_scan import (
+            cached_declined, cached_estimate, measure_all_cached)
         from app.utils import format_bytes as _fb
+        declined = []
         hit = cached_estimate()
         if hit is not None:
             total = hit[0]
+            declined.extend(cached_declined())
         else:
             total = measure_all_cached(
                 set_status=lambda m: ctx.set_status(m),
-                cancelled=ctx.cancelled)
+                cancelled=ctx.cancelled,
+                declined=declined)
         # F11: None = unknown (busy/cancel) — never "A / already empty".
         if total is None:
             return ("?", "Junk scan busy",
                     "Another scan is running — open Storage Insight for the full estimate.", "")
         grade = grade_junk(total)
+        skipped = lower_bound_note(declined)
         # BUG-021: verdict in the headline, figures in the detail - see the
         # matching note in sense_disk. This used to return the amount as the
         # headline and "Safe to clean." as the detail.
         if total <= 0:
+            if skipped:
+                # Nothing that could be measured is junk, but a skipped cache
+                # can still hold gigabytes: "already empty" would be a claim
+                # about a folder nobody looked at. Unknown, like the dialog's
+                # "? unknown" pill for the same case.
+                return ("?", "Nothing found so far",
+                        "The folders that could be measured are empty; %s."
+                        % skipped, "")
             return (grade, "Nothing to clean",
                     "Your junk folders are already empty.", "")
+        if skipped:
+            return (grade, "At least %s can be cleaned" % _fb(total),
+                    "%s of temporary files and leftovers, and possibly more: "
+                    "%s. Safe to remove - nothing personal is deleted."
+                    % (_fb(total), skipped), "")
         return (grade, "About %s can be cleaned" % _fb(total),
                 "%s of temporary files and leftovers. Safe to remove - "
                 "nothing personal is deleted." % _fb(total), "")
@@ -441,30 +451,40 @@ def sense_junk(ctx) -> tuple:
 #: thread and reports its card as it lands.
 #:
 #: BUG-044 measured the split rather than guessing it. Sequential, the report
-#: showed NOTHING for ~7.2s. With the split, the seven cheap cards are up in
-#: ~1.4s and the remaining six fill in underneath.
+#: showed NOTHING for several seconds. With the split, the seven cheap cards
+#: are up quickly and the slow ones fill in underneath.
 #:
 #: The fast set is everything that answers from one batched PowerShell launch
-#: plus an already-cached value. `gpu`, `smart`, `windows` and `junk` are
-#: read-only too, but each costs its own probe (measured 684ms, 1162ms, 3ms
-#: and 1110ms), so putting them in the fast set meant the first paint waited
-#: 4.3s for cards the user reads seconds later anyway.
+#: plus an already-cached value. `smart`, `windows` and `junk` are read-only
+#: too, but each costs its own probe, so putting them in the fast set meant
+#: the first paint waited for cards the user reads seconds later anyway.
+#: `drivers` reads the batched slow probe beside them; its query is the ~3s
+#: half of that probe, which is exactly why it does not belong in the first
+#: paint.
 #:
-#: Order is deliberate and fixed - the dialog's _ORDER mirrors it, so a card
+#: Order is deliberate and fixed: it is the order a stable priority list falls
+#: back on (health_model sorts by severity, then by this dict order), so a card
 #: filling in always means the same thing and the list never jumps around.
 SENSORS = (
     ("disk", "Disk Space", sense_disk, False),
     ("memory", "Memory & Pagefile", sense_memory, False),
     ("crashes", "Recent Crashes", sense_crashes, False),
     ("security", "Security", sense_security, False),
-    ("maintenance", "Drive Maintenance", sense_maintenance, False),
-    ("time", "Time & Updates", sense_time, False),
     ("startup", "Startup Programs", sense_startup, False),
-    ("gpu", "GPU Driver", sense_gpu, True),
+    # Both read the SAME batched probe the five cards above use, so they add
+    # a graded row without adding a probe (and stay in the fast set).
+    ("maintenance", "Drive Maintenance", sense_maintenance, False),
+    ("time", "Clock & Uptime", sense_time, False),
     ("smart", "SSD & Drives", sense_smart, True),
     ("windows", "Windows Files", sense_windows, True),
     ("junk", "Reclaimable Junk", sense_junk, True),
-    ("disks", "Your Drives", sense_disk_detail, True),
+    # N-003: laptops only. A desktop raises TaskSkipped, which becomes an
+    # explicit "Not applicable" card - not a pass and not a failure.
+    ("battery", "Battery Health", sense_battery, True),
+    # A device with no driver is broken hardware, and a missing driver is the
+    # one finding here whose fix has its own screen: the Drivers tab looks the
+    # package up and installs it. Last in the list because it depends on the
+    # slowest probe in the app.
     ("drivers", "Drivers", sense_drivers, True),
 )
 
@@ -514,8 +534,8 @@ def run_health_scan(ctx, on_card=None, sensors=None):
     "Checking..." for four seconds before showing anything at all.
 
     They now run after the fast ones, on a background thread, reporting each
-    card as it lands - so the eleven fast cards are on screen in well under a
-    second and the slow detail fills in underneath. The thread is JOINED
+    card as it lands - so the fast cards are on screen in well under a second
+    and the slow detail fills in underneath. The thread is JOINED
     before returning, which keeps the contract intact: the returned mapping
     still contains every card, so the dialog's overall grade and verdict are
     computed from the complete set rather than a partial one.
@@ -577,12 +597,31 @@ def run_health_scan(ctx, on_card=None, sensors=None):
                     return
                 run_one(key, title, fn)
 
-        th = threading.Thread(target=slow_worker, daemon=True)
+        th = threading.Thread(target=slow_worker, daemon=True,
+                              name="HealthScanSlow")
         th.start()
         # JOINED, not detached: the caller computes the overall grade from the
         # return value, so returning early would silently drop the slow cards
-        # out of the verdict.
-        th.join()
+        # out of the verdict. BOUNDED (audit 2026-10): an unbounded join on
+        # this thread hung the report forever if one WMI/reliability probe
+        # wedged. On timeout the unfinished sensors still get an honest
+        # "couldn't check" card, so the grade stays derived from every key.
+        th.join(timeout=SLOW_SENSOR_JOIN_S)
+        if th.is_alive():
+            for key, title, _fn, _slow in slow_specs:
+                if key in cards or cancelled():
+                    continue
+                card = {"key": key, "title": title, "grade": "?",
+                        "headline": "Still measuring",
+                        "detail": ("This check was taking too long, so the "
+                                   "report finished without it."),
+                        "note": ""}
+                cards[key] = card
+                if on_card is not None:
+                    try:
+                        on_card(key, card)
+                    except Exception:
+                        pass
 
     # A cancelled run still reports whatever it managed to finish.
     return cards

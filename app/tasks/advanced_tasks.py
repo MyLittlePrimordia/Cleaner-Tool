@@ -29,21 +29,20 @@ one logs which value it is assuming.
 """
 
 import os
-import subprocess
 
-from app.utils import (TaskContext, reg_set_value, reg_set_value_checked, reg_delete_value,
-                       reg_delete_key, run_cmd, run_cmd_checked, IS_WINDOWS)
+from app.utils import (TaskContext, reg_set_value_checked, reg_delete_value,
+                       run_cmd_checked, IS_WINDOWS)
+from app.tasks.ps import ps_argv
 
 # The snapshot primitives live with the tweaks that own them. tweak_tasks
-# does not import this module, so there is no cycle -- the same shape
-# monitor_test_dialog.py already uses for the display-mode helpers.
+# does not import this module, so sharing them here cannot create a cycle.
 from app.tasks.tweak_tasks import (  # noqa: E402
     _snap_reg_values, _restore_reg_values,
     get_tweak_snapshot, clear_tweak_snapshot, save_tweak_snapshot,
 )
 
 if IS_WINDOWS:
-    import winreg
+    pass
 
 
 def _apply_registry(ctx: TaskContext, task_id: str, specs, writes):
@@ -157,14 +156,14 @@ def disable_memory_compression(ctx: TaskContext):
     ctx.log("[Advanced] Disable Windows Memory Compression (For 32GB+ RAM PCs)")
     # H5: same honest-failure treatment; shell=False argv (no cmd.exe
     # quote mangling of the PS command).
-    run_cmd_checked(ctx, ["powershell", "-NoProfile", "-Command", "Disable-MMAgent -MemoryCompression"],
+    run_cmd_checked(ctx, ps_argv("Disable-MMAgent -MemoryCompression"),
                     shell=False, timeout=120)
     ctx.log("Windows Memory Compression disabled. For 32GB+ RAM, improves latency.")
 
 
 def revert_memory_compression(ctx: TaskContext):
     ctx.log("Re-enabling Windows Memory Compression...")
-    run_cmd_checked(ctx, ["powershell", "-NoProfile", "-Command", "Enable-MMAgent -MemoryCompression"],
+    run_cmd_checked(ctx, ps_argv("Enable-MMAgent -MemoryCompression"),
                     shell=False, timeout=120)
     ctx.log("Memory Compression re-enabled.")
 

@@ -28,7 +28,8 @@ from __future__ import annotations
 
 import tkinter as tk
 
-from app.ui.theme import COLORS, F, _measure_font, ellipsize
+from app.ui.metrics import CARD_BODY_INSET, GROUP_GAP, HAIRLINE_NUDGE, TEXT_NUDGE
+from app.ui.theme import COLORS, RADIUS_SURFACE, SPACE_2, TYPE, ellipsize
 from app.ui.widgets.rounded_card import RoundedCard
 
 #: Chevron glyphs. U+203A closed, U+2304 open - the pair the health report
@@ -38,7 +39,26 @@ CHEVRON_CLOSED = "›"
 CHEVRON_OPEN = "⌄"
 
 DOT_PX = 14
-PAD_X = 14
+PAD_X = CARD_BODY_INSET
+
+#: The row ladder. A list row is one of three sizes - there is no fourth.
+#:
+#: name -> (title font, second-line font, meta font, vertical pad, min height)
+#:
+#: `lg` is the Tools popup row, unchanged since the 2026-09 redesign: 11pt
+#: bold title, 9pt second line. `md` and `sm` read the semantic type roles,
+#: so a general list row cannot drift from a card title or a caption.
+#:
+#: The height is a FLOOR, not a fixed size: measured on a real root a
+#: single-line row is 37 / 45 / 52 px, and a row carrying a second line is
+#: 55 / 63 / 70. The ladder is what keeps the three rungs apart; a caller
+#: adds or omits the second line, and the row follows.
+SIZES = {
+    "lg": (TYPE["card_title"], TYPE["caption"], TYPE["body_medium"], 9, 52),
+    "md": (TYPE["row_title"], TYPE["caption"], TYPE["caption"], 7, 44),
+    "sm": (TYPE["label_medium"], TYPE["caption"], TYPE["caption"], 4, 36),
+}
+DEFAULT_SIZE = "lg"
 
 
 class ToolRow(RoundedCard):
@@ -51,19 +71,31 @@ class ToolRow(RoundedCard):
 
     def __init__(self, parent, title="", sub="", meta="", dot=None,
                  chevron=False, open_now=False, on_click=None, wrap=None,
-                 bg=None, accent=None):
+                 bg=None, accent=None, size=DEFAULT_SIZE, leading_px=0,
+                 show_dot=True, fill=None):
         self._page_bg = bg or (parent["bg"] if isinstance(
             parent, (tk.Frame, tk.Canvas)) else COLORS["bg"])
+        # One ladder, resolved before anything is built: a row that sized its
+        # own labels would be the fifth row height the audit counted.
+        t_font, s_font, m_font, pad_y, min_h = SIZES.get(
+            size, SIZES[DEFAULT_SIZE])
+        self.size = size if size in SIZES else DEFAULT_SIZE
+        self._pad_y = pad_y
+        self._show_dot = bool(show_dot)
+        self._leading_px = int(leading_px or 0)
         # REDESIGN 2026-10: the row face is a RoundedCard now, not a square
         # Frame with a 1px hairline parent. Every row in every Tools popup
         # goes through this class, so this one swap rounds the entire list
         # surface of the app at once - and, more importantly, makes a row the
-        # same shape as the StatTiles above it. Rounded numbers floating over
-        # square rows is what read as "Tkinter app with dark colours".
-        super().__init__(parent, fill=COLORS["bg_alt"], bg=self._page_bg,
-                         radius=16, min_height=52)
+        # same shape as the cards above it. Rounded surfaces over square rows
+        # is what read as "Tkinter app with dark colours".
+        # `fill` lets a row inside a card sit FLAT on that card's surface
+        # instead of drawing a second card inside it. It defaults to the
+        # raised row face every Tools list uses.
+        self._bg = fill or COLORS["bg_alt"]
+        super().__init__(parent, fill=self._bg, bg=self._page_bg,
+                         radius=RADIUS_SURFACE, min_height=min_h)
         self._accent = accent or COLORS["accent_sky"]
-        self._bg = COLORS["bg_alt"]
         self._hover = False
         self._selected = False
         self._on_click = on_click
@@ -82,30 +114,51 @@ class ToolRow(RoundedCard):
 
         # Packed right-to-left in reverse: the first pack(side="right") ends
         # up rightmost, so chev -> actions -> meta is the reading order.
-        self._chev = tk.Label(inner, text="", font=(F, 13, "bold"),
+        self._chev = tk.Label(inner, text="", font=TYPE["chevron"],
                               bg=self._bg, fg=COLORS["subtext"], width=1,
                               anchor="center", bd=0)
         self.actions = tk.Frame(inner, bg=self._bg, bd=0)
-        self.meta = tk.Label(inner, text=meta, font=(F, 10), bg=self._bg,
+        self.meta = tk.Label(inner, text=meta, font=m_font, bg=self._bg,
                              fg=COLORS["subtext"], anchor="e", bd=0)
 
         if self._wants_chev:
-            self._chev.pack(side="right", padx=(0, 10))
+            self._chev.pack(side="right", padx=(0, GROUP_GAP))
         self.actions.pack(side="right")
-        self.meta.pack(side="right", padx=(8, 2))
+        self.meta.pack(side="right", padx=(SPACE_2, TEXT_NUDGE))
+
+        # LEADING slot: a caller-fillable frame for an app icon, a chip or a
+        # checkbox. Width is requested up front so the text column starts at
+        # the same x on every row of a list, whether or not an icon has
+        # loaded yet - the same rule DataTable uses for its icon column.
+        self.leading = tk.Frame(inner, bg=self._bg, bd=0)
+        if self._leading_px:
+            # A leading slot with only a width and pack_propagate(False) has
+            # a requested height of ONE pixel, so Tk gives it one pixel and
+            # every app icon inside is clipped to a horizontal sliver. Give
+            # it a real square (or the row's content height, whichever is
+            # larger) and let the row grow to hold it.
+            leading_h = max(self._leading_px, min_h - 2 * pad_y)
+            self.leading.configure(width=self._leading_px,
+                                   height=leading_h)
+            self.leading.pack_propagate(False)
+            self.leading.pack(side="left", padx=(PAD_X, 0), pady=pad_y)
 
         self.dot = tk.Canvas(inner, width=DOT_PX, height=DOT_PX,
                              highlightthickness=0, bd=0, bg=self._bg)
-        self.dot.pack(side="left", padx=(PAD_X, 0))
+        if self._show_dot:
+            self.dot.pack(side="left", padx=(PAD_X, 0))
 
         col = self._col = tk.Frame(inner, bg=self._bg, bd=0)
-        col.pack(side="left", fill="x", expand=True, padx=(10, 0),
-                 pady=(9, 9))
-        self.title = tk.Label(col, text=title, font=(F, 11, "bold"),
+        col.pack(
+            side="left", fill="x", expand=True,
+            padx=(GROUP_GAP if self._show_dot or self._leading_px
+                  else PAD_X, 0),
+            pady=(pad_y, pad_y))
+        self.title = tk.Label(col, text=title, font=t_font,
                               bg=self._bg, fg=COLORS["text"], anchor="w",
                               justify="left", bd=0)
         self.title.pack(fill="x")
-        self.sub = tk.Label(col, text=sub, font=(F, 9), bg=self._bg,
+        self.sub = tk.Label(col, text=sub, font=s_font, bg=self._bg,
                             fg=COLORS["subtext"], anchor="w", justify="left",
                             wraplength=wrap or 600, bd=0)
         # An EMPTY second line is not packed at all. A 1px-tall empty Label
@@ -113,11 +166,11 @@ class ToolRow(RoundedCard):
         # Services has up to 288 rows: 288 phantom lines is the difference
         # between seeing a screen of services and seeing four.
         if sub:
-            self.sub.pack(fill="x", pady=(1, 0))
+            self.sub.pack(fill="x", pady=(HAIRLINE_NUDGE, 0))
         self._full_title = str(title or "")
 
         self._tintables = [inner, col, self.title, self.sub, self.meta,
-                           self._chev, self.actions, self.dot]
+                           self._chev, self.actions, self.dot, self.leading]
         self._bind_tree(inner)
         self._bind_tree(self)
         if self._on_click is not None:
@@ -129,6 +182,10 @@ class ToolRow(RoundedCard):
                 self.configure(takefocus=1)
             except Exception:
                 pass
+            # Keyboard is bound to the CARD only, never to its children:
+            # binding <space> to a child Label would swallow the space key
+            # across the whole list, and the card is the widget that can
+            # take focus anyway.
             self._bind_keyboard(self)
         # Re-fit the title whenever the row is given a width, so a
         # programmatic geometry change (a resize, a longer filter) does not
@@ -167,11 +224,18 @@ class ToolRow(RoundedCard):
             pass
         for c in w.winfo_children():
             self._bind_tree(c)
-        # Keyboard is bound to the CARD only, never to its children. Binding
-        # <space> to a child Label would swallow the space key across the whole
-        # list, and the card is the widget that can take focus anyway.
-        if self._on_click is not None:
-            self._bind_keyboard(self)
+
+    def bind_content(self, *widgets):
+        """Bind hover (and click) on widgets added after construction.
+
+        Tk reports Enter/Leave per widget, so a button packed into `actions`
+        or a label dropped into `leading` later never inherits the row's
+        tint: the pointer crosses it and that child stays the resting
+        colour, which reads as a pale patch inside the row. Call this once
+        the slots are filled.
+        """
+        for w in (widgets or (self.inner,)):
+            self._bind_tree(w)
 
     def _bind_keyboard(self, w):
         """Keyboard equivalents for <Button-1>, so a row is usable without a mouse.
@@ -326,7 +390,11 @@ class ToolRow(RoundedCard):
         behaviours (redesign 2026-10).
         """
         try:
-            room = self._col.winfo_width() - DOT_PX - 12
+            # The dot and the leading slot are siblings of the text column,
+            # so they are already outside its width - the small reserve here
+            # is the gap between them and the first glyph.
+            reserve = (DOT_PX + 12) if self._show_dot else 8
+            room = self._col.winfo_width() - reserve
             if room < 40:
                 return text          # not laid out yet; show it all
             return ellipsize(text, self.title.cget("font"), room)
@@ -339,16 +407,12 @@ class ToolRow(RoundedCard):
         self.sub.config(text=text)
         try:
             if text and not self.sub.winfo_manager():
-                self.sub.pack(fill="x", pady=(1, 0))
+                self.sub.pack(fill="x", pady=(HAIRLINE_NUDGE, 0))
             elif not text and self.sub.winfo_manager():
                 self.sub.pack_forget()
         except Exception:
             pass
 
-    def set_meta(self, text, color=None):
-        self.meta.config(text=str(text or ""))
-        if color is not None:
-            self.meta.config(fg=color)
 
     def set_dot(self, color):
         """Draw the status dot, or clear it when color is None."""
@@ -381,16 +445,6 @@ class ToolRow(RoundedCard):
         except Exception:
             pass
 
-    def set_actions_visible(self, on):
-        """Show or hide the caller's action slot without rebuilding."""
-        try:
-            if on:
-                if not self.actions.winfo_manager():
-                    self.actions.pack(side="right", before=self.meta)
-            else:
-                self.actions.pack_forget()
-        except Exception:
-            pass
 
     # ---- hover -------------------------------------------------------- #
 

@@ -71,8 +71,8 @@ def _merge_tweak():
 
 # Order is the on-screen order. Drivers sits beside Install (both are "get
 # software onto this PC"); Settings is last, where people look for it.
-TAB_NAMES = ["Clean", "Repair", "Tweak", "Install", "Drivers", "Tools",
-             "Settings"]
+TAB_NAMES = ["Clean", "Repair", "Tweak", "Health", "Install", "Drivers",
+             "Tools", "Settings"]
 
 TABS = {
     "Clean": _merge_clean(),
@@ -92,6 +92,10 @@ TABS = {
     # implementation shadowing this tab. Saying otherwise in the source is how
     # the next person ends up "fixing" a duplicate that does not exist.
     "Tools": [],
+    # Health is a full checkup page (app/ui/tabs/healthtab.py), not a task
+    # grid. Its empty list keeps the same no-special-cases contract as Tools,
+    # Drivers and Settings.
+    "Health": [],
     # Drivers and Settings are full pages (app/ui/tabs/driverstab.py,
     # settingstab.py), not task grids. Like Tools they carry an empty task
     # list so the tab machinery needs no special cases.

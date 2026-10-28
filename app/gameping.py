@@ -138,17 +138,6 @@ COMPANY_EDGES = (
 
 # ---- ICMP-endpoint games (official hosts where publishers ship one) ----
 
-# CS2 / Dota 2 / Deadlock (Valve): Valve has never published stable
-# public hostnames for its SDR matchmaking relays — the previous
-# "iad.valve.net" / "eat.valve.net" / etc. table was fiction; none of
-# those names have ever resolved, which is exactly why every row here
-# always came back "no reply". The real, honest way to test proximity
-# to Valve's network is Steam's own public ISteamDirectory/GetCMList
-# API, which hands back the live, current list of Steam Connection
-# Manager servers (these rotate — that's WHY there's no fixed hostname
-# list to hardcode) with real geographic labels baked into their
-# names. Fetched fresh each time the tab runs; see _valve_targets().
-VALVE_REGIONS = ()
 
 _VALVE_CITY_CODES = {
     "atl": "Atlanta", "iad": "Washington DC", "ord": "Chicago",
@@ -824,6 +813,85 @@ def method_note(key):
     if isinstance(key, str) and key.startswith("company_"):
         return GAME_METHODS["companies"]
     return ""
+
+
+# --------------------------------------------------------------------------- #
+# U-008: ordering the picker by what this PC actually has
+# --------------------------------------------------------------------------- #
+
+#: "● " in front of a picker entry whose game is installed already. A
+#: rendering prefix ONLY: the saved pick and every GAME_TABS lookup go through
+#: `bare_title()`, so the marker never reaches config.json or a target key.
+INSTALLED_MARK = "\u25cf "
+
+#: Tabs that are not a game: the diagnostic baseline, the 23 per-publisher
+#: "company edge" rows and the Custom catch-all. They never float to the top
+#: (Custom stays pinned to the bottom, where it always was).
+_NON_GAME_KEYS = frozenset({"baseline", "custom"}).union(
+    {"company_%d" % i for i in range(32)})
+
+#: Words too common to prove a match on their own.
+_TITLE_STOPWORDS = frozenset({
+    "the", "and", "for", "online", "game", "games", "edition", "series",
+})
+
+
+def _tokens(text) -> set:
+    """Significant words of a game name, lowercased ("EA SPORTS FC 25" ->
+    {"sports"}; two-letter noise like "ea"/"fc" is dropped on purpose)."""
+    return {w for w in re.split(r"[^0-9a-z]+", str(text or "").casefold())
+            if len(w) >= 3 and w not in _TITLE_STOPWORDS}
+
+
+def installed_titles(installed_names=()) -> tuple:
+    """Picker titles this PC appears to have installed, in picker order.
+
+    Matched by significant word, because the two lists are written for
+    different audiences: the catalog says "Counter-Strike 2" and "EA SPORTS
+    FC 25" where the tabs say "CS2, Dota 2 & Deadlock" and "EA Sports FC
+    (FIFA)". This only decides the ORDER of a picker, so a near-miss costs a
+    scroll and never a wrong measurement - which is why word overlap is enough
+    and nothing here has to be exact.
+    """
+    have = [t for t in (_tokens(n) for n in installed_names) if t]
+    if not have:
+        return ()
+    hits = []
+    for title, key in GAME_TABS:
+        if key in _NON_GAME_KEYS:
+            continue
+        want = _tokens(title)
+        if want and any(want & h for h in have):
+            hits.append(title)
+    return tuple(hits)
+
+
+def order_titles(installed_names=()) -> tuple:
+    """Picker order: installed games first, the rest A-Z, Custom last.
+
+    With nothing installed this is exactly the list the picker always showed.
+    """
+    hits = installed_titles(installed_names)
+    seen = set(hits)
+    rest = sorted((t for t, _k in GAME_TABS if t not in seen and t != "Custom"),
+                  key=lambda t: t.casefold())
+    return tuple(hits) + tuple(rest) + ("Custom",)
+
+
+def mark_installed(title, installed=()) -> str:
+    return (INSTALLED_MARK + title) if title in installed else title
+
+
+def bare_title(text) -> str:
+    """Strip the installed marker back off a picker value."""
+    text = str(text or "")
+    return text[len(INSTALLED_MARK):] if text.startswith(INSTALLED_MARK) else text
+
+
+def picker_values(installed_names=()) -> tuple:
+    """The dropdown's values, with the installed ones marked."""
+    hits = installed_titles(installed_names)
+    return tuple(mark_installed(t, hits) for t in order_titles(installed_names))
 
 
 def targets_for(key, custom_hosts=()):

@@ -27,7 +27,7 @@ must not reach up into app.ui.tabs or app.ui.app. That is why it takes the
 Application as an argument instead of importing it.
 
 Contract preservation: every `Application._open_*` name survives as a
-three-line delegating forwarder, because tools/smoke/*.py and several dialogs
+three-line delegating forwarder, because dev/tools/smoke/*.py and several dialogs
 call them by name. Nothing outside this module changed shape.
 """
 
@@ -43,13 +43,8 @@ from app.ui.dialogs.duplicates_dialog import DuplicatesDialog
 from app.ui.dialogs.game_readiness_dialog import GameReadinessDialog
 from app.ui.dialogs.game_saves_dialog import GameSavesDialog
 from app.ui.dialogs.game_server_ping_dialog import GameServerPingDialog
-from app.ui.dialogs.gamepad_dialog import GamepadDialog
 from app.ui.dialogs.hardware_monitor_dialog import HardwareMonitorDialog
-from app.ui.dialogs.health_report_dialog import HealthReportDialog
-from app.ui.dialogs.keyboard_tester_dialog import KeyboardTesterDialog
-from app.ui.dialogs.mic_check_dialog import MicCheckDialog
-from app.ui.dialogs.monitor_test_dialog import MonitorTestDialog
-from app.ui.dialogs.mouse_tester_dialog import MouseTesterDialog
+from app.ui.dialogs.health_history_dialog import HealthHistoryDialog
 from app.ui.dialogs.network_connections_dialog import NetworkConnectionsDialog
 from app.ui.dialogs.pilot_dialog import PilotDialog
 from app.ui.dialogs.process_manager_dialog import ProcessManagerDialog
@@ -57,13 +52,11 @@ from app.ui.dialogs.restore_point_dialog import RestorePointDialog
 from app.ui.dialogs.safety_center_dialog import SafetyCenterDialog
 from app.ui.dialogs.update_picker_dialog import UpdatePickerDialog
 from app.ui.dialogs.services_dialog import ServicesDialog
-from app.ui.dialogs.speaker_test_dialog import SpeakerTestDialog
 from app.ui.dialogs.specs_dialog import SpecsDialog
 from app.ui.dialogs.speed_test_dialog import SpeedTestDialog
 from app.ui.dialogs.startup_manager_dialog import StartupManagerDialog
 from app.ui.dialogs.storage_insight_dialog import StorageInsightDialog
 from app.ui.dialogs.uninstall_programs_dialog import UninstallProgramsDialog
-from app.ui.dialogs.webcam_dialog import WebcamDialog
 
 #: Returned by an `extra_arg` resolver to mean "do not open this dialog".
 ABORT = object()
@@ -78,28 +71,25 @@ DIALOGS = {
     "storage_insight": DialogSpec(StorageInsightDialog, guard_busy=True),
 
     # --- plain -----------------------------------------------------------
+    # 2026-10: the Advisor and What Changed windows came out of the app --
+    # nothing reached either of them, and the peripheral testers below (pad,
+    # keyboard, mouse, display, camera, mic, speakers) went with them. Their
+    # keys are gone rather than left dangling, so a caller written against an
+    # old note fails loudly at the registry instead of opening nothing.
     "dns_tester": DialogSpec(DnsTesterDialog),
     "process_manager": DialogSpec(ProcessManagerDialog),
     "pilot": DialogSpec(PilotDialog),
     "speed_test": DialogSpec(SpeedTestDialog),
     "hw_monitor": DialogSpec(HardwareMonitorDialog),
-    "gamepad_tester": DialogSpec(GamepadDialog),
-    "mic_check": DialogSpec(MicCheckDialog),
     "game_server_ping": DialogSpec(GameServerPingDialog),
-    "keyboard_tester": DialogSpec(KeyboardTesterDialog),
-    "monitor_test": DialogSpec(MonitorTestDialog),
-    "speaker_test": DialogSpec(SpeakerTestDialog),
     "drive_toolkit": DialogSpec(DriveToolkitDialog),
     "startup_manager": DialogSpec(StartupManagerDialog),
     "uninstall_programs": DialogSpec(UninstallProgramsDialog),
-    "webcam_test": DialogSpec(WebcamDialog),
-    "mouse_tester": DialogSpec(MouseTesterDialog),
     "pc_specs": DialogSpec(SpecsDialog),
     # guard_busy: the health scan is read-only but it shells out to DISM and
     # a disk walk, which would compete with a running task for the same I/O
     # and report stale numbers mid-run. Refuse politely instead.
-    "health_report": DialogSpec(HealthReportDialog, guard_busy=True),
-    # Not guard_busy, unlike health_report: reading the TCP/UDP tables is a
+    # Not guard_busy: reading the TCP/UDP tables is a
     # few milliseconds of in-memory kernel work (measured ~8 ms for 91 TCP +
     # 54 UDP rows), with no disk walk and no subprocess, so there is nothing
     # to contend with a running task over.
@@ -108,7 +98,7 @@ DIALOGS = {
     # reads the SCM and exits. ~385 ms, almost all of it PowerShell's own
     # start-up. Nothing to contend with a running task over.
     "services": DialogSpec(ServicesDialog),
-    # NOT guard_busy, unlike health_report: Restart Manager answers in
+    # NOT guard_busy: Restart Manager answers in
     # ~70 ms and holds no handle on the target, so there is nothing to
     # contend with a running task over. The ACTIONS can need elevation,
     # but only when the user actually presses close on someone else's
@@ -137,6 +127,9 @@ DIALOGS = {
     "game_saves": DialogSpec(GameSavesDialog),
     # Read-only checks; fixes route to real tweak tasks (own snapshots/undo).
     "game_readiness": DialogSpec(GameReadinessDialog),
+    # N-001: the dated list behind the Health trend. Config read only, so it
+    # neither needs the busy guard nor competes with a running task.
+    "health_history": DialogSpec(HealthHistoryDialog),
     # Opened from PC Health: choose exactly which Windows updates to install.
     "update_picker": DialogSpec(UpdatePickerDialog),
     # U-006: opened from the "Update available" banner; fetch+verify in place

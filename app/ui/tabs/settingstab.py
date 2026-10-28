@@ -33,21 +33,47 @@ import time
 import tkinter as tk
 
 from app.ui.base import _themed_askyesno, _themed_showinfo
-from app.ui.theme import COLORS, F, SHAPE_M, _hex_lerp, _round_rect_points
-from app.ui.widgets import AnimatedButton, Tooltip
+from app.ui.theme import (
+    CARD_INSET, COLORS, PAGE_BOTTOM, PAGE_GUTTER, PAGE_TOP, RADIUS_SURFACE,
+    SHAPE_M, SPACE_1, SPACE_2, SPACE_3, SPACE_4, SURFACE_CARD,
+    TYPE, _hex_lerp, _round_rect_points
+)
+from app.ui.metrics import CONTROL_GAP
+from app.ui.widgets import AnimatedButton, PageActionBar, Tooltip
 from app.ui.widgets.rounded_card import RoundedCard
 from app.ui.widgets.dropdown import M3Dropdown
 from app.ui.widgets.scroll import ScrollableRoundedPanel
 from app.ui.widgets.toggle import ToggleSwitch
 
-ACCENT = COLORS["accent_pink"]
-#: Settings sections are M3 filled cards on this surface tone.
-CARD = COLORS["bg_alt"]
+#: Settings is a destination of its own. It used to borrow the Tools pink,
+#: which made two tabs look like the same section (G-005); mauve was the one
+#: palette hue no other destination owns.
+ACCENT = COLORS["accent_mauve"]
+#: Settings sections are cards, so they use the shared card surface role.
+CARD = SURFACE_CARD
 
 
 _FREQ = (("Daily", "daily"), ("Weekly", "weekly"), ("Monthly", "monthly"))
 _HEALTH = (("Off", "off"), ("At startup", "startup"), ("Daily", "daily"),
            ("Weekly", "weekly"))
+#: "Follow Windows" is the default and the reason this is a three-way choice:
+#: a checkbox could only mean on or off and would silently override the OS
+#: Accessibility setting the user already made.
+_ANIM = (("Follow Windows", "system"), ("Always on", "on"), ("Off", "off"))
+#: Interface density. "Automatic" is the app's historical behaviour (the
+#: display's own scale, never below 125%); the percentages force that Windows
+#: density exactly, which is how a 100% user opts back under the floor. The
+#: numbers match Display > Scale in Windows Settings so the two can be
+#: compared at a glance.
+_UI_SCALE = (("Automatic (125%+)", "system"), ("100%", "100"),
+             ("125%", "125"), ("150%", "150"), ("175%", "175"),
+             ("200%", "200"))
+#: U-006: the Quarantine bin's retention window. "Until I empty it" is the
+#: default because deleting a kept file is the one thing this bin exists to
+#: prevent; the numbered options are the schema's own set, so a saved value
+#: always has a visible option to sit on.
+_QUAR_DAYS = (("Until I empty it", 0), ("7 days", 7), ("30 days", 30),
+              ("90 days", 90))
 
 #: (key, rail label) in rail order. One category per card group, so the rail
 #: reads as the page's table of contents and the pane never shows more than a
@@ -56,11 +82,38 @@ CATEGORIES = (
     ("general", "General"),
     ("maintenance", "Maintenance"),
     ("health", "PC Health"),
+    ("watch", "Quiet watch"),
     ("drivers", "Drivers"),
     ("data", "Data & logs"),
     ("tweaks", "Tweaks & backup"),
     ("quarantine", "Quarantine"),
 )
+
+#: N-006 thresholds as the dropdowns show them. A subset of the schema's
+#: ranges: Windows itself speaks in these steps, and a row with fifty options
+#: is a worse question than a row with four. A hand-edited value inside the
+#: range but not listed here keeps working; it simply shows its nearest label.
+_WATCH_FREE = (("5%", 5), ("10%", 10), ("15%", 15), ("20%", 20))
+_WATCH_DROP = (("5 points", 5), ("8 points", 8), ("12 points", 12),
+               ("20 points", 20))
+
+
+def _watch_choices(options, value, unit):
+    """The listed steps, plus the stored number when it is not one of them.
+
+    The schema accepts any whole value in its range, so a hand-edited 7 really
+    is a setting. Snapping the dropdown to the nearest step would show 5% and
+    then quietly rewrite the file as 5 on the next Save; carrying the stored
+    number as its own option keeps what the user set visible and re-savable.
+    """
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return options
+    if any(key == value for _label, key in options):
+        return options
+    return tuple(sorted(list(options) + [("%d%s" % (value, unit), value)],
+                        key=lambda item: item[1]))
 
 #: MINIMUM rail width. The real width is measured in `_rail_width()` from the
 #: widest category label at the CURRENT font/DPI, because a fixed pixel width
@@ -146,7 +199,7 @@ class _NavItem(tk.Canvas):
                     smooth=True, fill=ACCENT, outline="", tags="tick")
             self.create_text(
                 16, h / 2, text=self._text, anchor="w",
-                font=(F, 11, "bold") if self._selected else (F, 11),
+                font=TYPE["card_title"] if self._selected else TYPE["body_large"],
                 fill=COLORS["text"] if self._selected else COLORS["subtext"])
         except Exception:
             pass
@@ -174,19 +227,19 @@ class SettingsTab(tk.Frame):
         cfg = load_config()
 
         pad = tk.Frame(self, bg=COLORS["bg"])
-        pad.pack(fill="both", expand=True, padx=32, pady=(12, 12))
+        pad.pack(fill="both", expand=True, padx=PAGE_GUTTER,
+                 pady=(PAGE_TOP, PAGE_BOTTOM))
 
-        # ---- footer (Save + status) — quiet, minimal
-        foot = tk.Frame(pad, bg=COLORS["bg"])
-        foot.pack(side="bottom", fill="x", pady=(16, 0))
+        # ---- action bar (Save + status) — the same band every page uses
+        self.bar = PageActionBar(pad)
+        self.bar.pack(side="bottom", fill="x", pady=(SPACE_4, 0))
         self.status = tk.Label(
-            foot, text="", font=(F, 9), bg=COLORS["bg"],
-            fg=COLORS["subtext"], anchor="w")
+            self.bar.hint_slot, text="", font=TYPE["caption"],
+            bg=COLORS["bg"], fg=COLORS["subtext"], anchor="w")
         self.status.pack(side="left", fill="x", expand=True)
         self.save_btn = AnimatedButton(
-            foot, text="Save", command=self._save, bg=ACCENT,
-            fg=COLORS["black"], font=(F, 11, "bold"), padx=30, pady=12,
-            radius=16)
+            self.bar.primary_slot, text="Save", command=self._save,
+            role="filled", size="lg", accent=ACCENT)
         self.save_btn.pack(side="right")
         self.save_btn.set_enabled(False)
 
@@ -201,7 +254,7 @@ class SettingsTab(tk.Frame):
         rail.pack_propagate(False)
 
         pane = tk.Frame(body, bg=COLORS["bg"])
-        pane.pack(side="left", fill="both", expand=True, padx=(18, 0))
+        pane.pack(side="left", fill="both", expand=True, padx=(SPACE_4, 0))
 
         panel = ScrollableRoundedPanel(pane)
         panel._fill = COLORS["bg"]
@@ -217,7 +270,7 @@ class SettingsTab(tk.Frame):
         # ---- rail items
         for key, label in CATEGORIES:
             item = _NavItem(rail, label, lambda k=key: self._show_cat(k))
-            item.pack(fill="x", pady=(0, 4))
+            item.pack(fill="x", pady=(0, SPACE_1))
             self._nav_items[key] = item
 
         # ---- one content frame per category; each holds its own card(s)
@@ -228,6 +281,7 @@ class SettingsTab(tk.Frame):
         self._build_general(cfg)
         self._build_maintenance(cfg)
         self._build_health(cfg)
+        self._build_watch(cfg)
         self._build_drivers(cfg)
         self._build_data()
         self._build_tweaks()
@@ -276,6 +330,76 @@ class SettingsTab(tk.Frame):
                 var.set(str(cfg.get("schedule_time", "03:00")))
             except Exception:
                 pass
+        self._refresh_schedule_note()
+
+    def _refresh_schedule_note(self):
+        """Fetch and show the schedule's last/next run, off the Tk thread.
+
+        Get-ScheduledTaskInfo is a PowerShell process (~300 ms); doing it here
+        would stall a Settings visit the same way the old synchronous resync
+        did. Only a schedule the user has switched ON is probed - an off
+        switch has no run to describe.
+        """
+        lbl = getattr(self, "_sched_note", None)
+        if lbl is None:
+            return
+        var = self._vars.get("clean_schedule")
+        try:
+            enabled = bool(var.get()) if var is not None else False
+        except Exception:
+            enabled = False
+        if not enabled:
+            try:
+                lbl.config(text="", fg=COLORS["subtext"])
+            except Exception:
+                pass
+            return
+        try:
+            from app.config_persist import load_config
+            freq = str(load_config().get("schedule_frequency", "weekly"))
+        except Exception:
+            freq = "weekly"
+
+        def worker():
+            try:
+                from app import scheduler
+                text = scheduler.describe_schedule(
+                    scheduler.schedule_info(), frequency=freq)
+            except Exception:
+                text = {}
+            self._post_note(text)
+
+        import threading
+        threading.Thread(target=worker, daemon=True,
+                         name="SettingsScheduleNote").start()
+
+    def _post_note(self, info):
+        try:
+            self.app._dispatch.post(lambda: self._apply_note(info))
+            return
+        except Exception:
+            pass
+        try:
+            self.after(0, lambda: self._apply_note(info))
+        except Exception:
+            pass
+
+    def _apply_note(self, info):
+        lbl = getattr(self, "_sched_note", None)
+        if lbl is None:
+            return
+        text = str((info or {}).get("text") or "")
+        if not text:
+            text = "Could not read the scheduled task's last run."
+        tone = COLORS["subtext"]
+        if (info or {}).get("failed"):
+            tone = COLORS["accent_red"]
+        elif (info or {}).get("stale"):
+            tone = COLORS["accent_yellow"]
+        try:
+            lbl.config(text=text, fg=tone)
+        except Exception:
+            pass
 
     def _rail_width(self):
         """Width of the category rail, measured for the current font/DPI.
@@ -286,7 +410,7 @@ class SettingsTab(tk.Frame):
         a 200% display, where a hardcoded 196px clipped it."""
         try:
             import tkinter.font as tkfont
-            bold = tkfont.Font(font=(F, 11, "bold"))
+            bold = tkfont.Font(font=TYPE["card_title"])
             widest = max(bold.measure(label) for _key, label in CATEGORIES)
             return max(RAIL_MIN_W, 16 + widest + 16)
         except Exception:
@@ -304,6 +428,16 @@ class SettingsTab(tk.Frame):
         self._toggle(g, "auto_elevate", "Start as administrator",
                      bool(cfg.get("auto_elevate", False)),
                      "Approve once; later launches skip the prompt.")
+        self._choice(g, "window_animations", "Window animations", _ANIM,
+                     str(cfg.get("window_animations", "system")),
+                     tip="How windows fade in and out. System follows the "
+                         "Windows animation setting.")
+        self._choice(
+            g, "ui_scale", "Interface scale", _UI_SCALE,
+            str(cfg.get("ui_scale", "system")),
+            tip="How large text and controls are drawn. Automatic follows "
+                "this display and never goes below 125%; a percentage forces "
+                "that size. Takes effect after restarting the app.")
 
     def _build_maintenance(self, cfg):
         m = self._section(self._cats["maintenance"], "Automatic maintenance")
@@ -314,22 +448,69 @@ class SettingsTab(tk.Frame):
                      bool(cfg.get("schedule_update_enabled", False)),
                      "Runs winget upgrade on the same schedule.")
         self._choice(m, "frequency", "How often", _FREQ,
-                     str(cfg.get("schedule_frequency", "weekly")))
-        self._entry(m, "time", "Time", str(cfg.get("schedule_time", "03:00")))
+                     str(cfg.get("schedule_frequency", "weekly")),
+                     tip="How often Windows runs the schedule for the two "
+                         "switches above.")
+        # U-009: the field carries a consequence too - "Time" alone does not
+        # say whose clock, and 03:00 on a laptop that is asleep is a run that
+        # never happened.
+        self._entry(m, "time", "Time", str(cfg.get("schedule_time", "03:00")),
+                    tip="Local time. If the PC is off or asleep then, Windows "
+                        "runs the job when it next can (StartWhenAvailable).")
+        # A-003/U-009: a switch says what is configured, never whether the job
+        # has actually run. This line carries the last/next run Windows
+        # reports, so "On" cannot hide a schedule that has not fired in weeks.
+        self._sched_note = self._wrap_lbl(m, "", pady=(SPACE_1, 0))
 
     def _build_health(self, cfg):
         h = self._section(self._cats["health"], "PC Health")
         self._choice(h, "health_mode", "Check automatically", _HEALTH,
-                     str(cfg.get("health_check_mode", "startup")))
+                     str(cfg.get("health_check_mode", "startup")),
+                     tip="When the read-only checkup runs. Each result is "
+                         "recorded so the Health trend has points; nothing "
+                         "on your PC is changed.")
+
+    def _build_watch(self, cfg):
+        """N-006: the three conditions the app is allowed to interrupt for.
+
+        One card, four rows, and every row states what crossing it does. The
+        master switch is first because it is the answer to "why is this app
+        popping up at me": turning it off leaves the status-row chips and the
+        Health tab exactly as they were, and only silences the notification.
+        """
+        w = self._section(self._cats["watch"], "Quiet watch")
+        self._toggle(
+            w, "watch_enabled", "Let the app notify me",
+            bool(cfg.get("watch_enabled", True)),
+            "One notification when something needs attention, even while the "
+            "window is closed. Off keeps every warning inside the app.")
+        self._choice(
+            w, "watch_free", "Free space warning",
+            _watch_choices(_WATCH_FREE, cfg.get("watch_free_percent"), "%"),
+            cfg.get("watch_free_percent", 10),
+            tip="Marks a drive in the status row and says so once when it "
+                "drops below this. The warning clears only after it recovers "
+                "two points above.")
+        self._choice(
+            w, "watch_drop", "Health score drop",
+            _watch_choices(_WATCH_DROP, cfg.get("watch_score_drop"), " points"),
+            cfg.get("watch_score_drop", 8),
+            tip="Says so once when a checkup scores this much lower than the "
+                "one before it, and names the sensor that moved.")
+        self._toggle(
+            w, "watch_missed", "Missed schedule",
+            bool(cfg.get("watch_missed_run", True)),
+            "Says so once when the scheduled clean has not run for longer "
+            "than its interval, or when its last run failed.")
 
     def _build_drivers(self, cfg):
         d = self._section(self._cats["drivers"], "Drivers")
         self._folder_lbl = self._wrap_lbl(d, "")
         row = tk.Frame(d, bg=CARD)
-        row.pack(fill="x", pady=(8, 0))
+        row.pack(fill="x", pady=(SPACE_2, 0))
         self._btn(row, "Change folder\u2026", self._pick_folder).pack(side="left")
         self._btn(row, "Open folder", self._open_drivers).pack(
-            side="left", padx=(8, 0))
+            side="left", padx=(SPACE_2, 0))
         self._vars["drivers_folder"] = tk.StringVar(
             value=str(cfg.get("drivers_folder", "")))
         self._refresh_folder()
@@ -340,8 +521,63 @@ class SettingsTab(tk.Frame):
         row.pack(fill="x")
         self._btn(row, "Export logs", lambda: self.app.export_logs()).pack(
             anchor="w")
+        self._btn(row, "Create support bundle\u2026",
+                  self._create_support_bundle).pack(
+            anchor="w", pady=(SPACE_2, 0))
         self._btn(row, "Open data folder", self._open_data).pack(
-            anchor="w", pady=(8, 0))
+            anchor="w", pady=(SPACE_2, 0))
+
+    def _create_support_bundle(self):
+        """N-005: one redacted zip, previewed before it is written.
+
+        "Export logs" is a single .txt of this session. A bug report is
+        usually about a machine whose *settings* and *last run* matter as much
+        as the log, so this writes a small zip and -- because it contains
+        real configuration -- says exactly which files it holds before asking
+        where to put it.
+        """
+        from app import support_bundle
+        try:
+            files = support_bundle.build(
+                in_memory_log=getattr(self.app, "_log_lines", None))
+        except Exception as exc:
+            _themed_showinfo(self, "Could not build the bundle",
+                             "Nothing was written.\n\n%s: %s"
+                             % (type(exc).__name__, exc))
+            return
+        preview = "\n".join(support_bundle.summary_lines(files))
+        ok = _themed_askyesno(
+            self, "Create a support bundle?",
+            "The zip will contain these %d files:\n\n%s\n\n"
+            "They are redacted (no account name, no elevation token) and "
+            "nothing is uploaded - you choose where the zip is saved."
+            % (len(files), preview))
+        if not ok:
+            return
+        from tkinter import filedialog
+        path = filedialog.asksaveasfilename(
+            parent=self.winfo_toplevel(),
+            title="Save support bundle",
+            defaultextension=".zip",
+            initialfile=support_bundle.default_name(),
+            filetypes=[("Zip archive", "*.zip"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            support_bundle.write(files, path)
+        except Exception as exc:
+            _themed_showinfo(self, "Could not save the bundle",
+                             "Nothing was written to %s.\n\n%s: %s"
+                             % (path, type(exc).__name__, exc))
+            return
+        _themed_showinfo(
+            self, "Support bundle saved",
+            "%d files, %s.\n\n%s\n\nAttach it to a bug report. "
+            "manifest.txt inside lists what each file is for."
+            % (len(files),
+               support_bundle.human_size(support_bundle.total_bytes(files)),
+               path))
 
     def _build_tweaks(self):
         # The undo history is the one thing the user cannot get back, so it is
@@ -353,13 +589,13 @@ class SettingsTab(tk.Frame):
         self._btn(row, "Review applied tweaks\u2026", self._review_tweaks).pack(
             anchor="w")
         self._btn(row, "Undo all tweaks", self._undo_all_tweaks).pack(
-            anchor="w", pady=(8, 0))
+            anchor="w", pady=(SPACE_2, 0))
         self._btn(row, "Back up tweaks\u2026", self._backup_tweaks).pack(
-            anchor="w", pady=(8, 0))
+            anchor="w", pady=(SPACE_2, 0))
         self._btn(row, "Restore tweaks\u2026", self._restore_tweaks).pack(
-            anchor="w", pady=(8, 0))
+            anchor="w", pady=(SPACE_2, 0))
         self._btn(row, "Export change log\u2026", self._export_change_log).pack(
-            anchor="w", pady=(8, 0))
+            anchor="w", pady=(SPACE_2, 0))
 
     def _build_quarantine(self, cfg):
         # A deleted file cannot be brought back, so "undo a clean" gets its own
@@ -370,32 +606,39 @@ class SettingsTab(tk.Frame):
                      bool(cfg.get("quarantine_enabled", False)),
                      "Move cleaned files to a bin instead of deleting them, so "
                      "you can put them back.")
-        self._quar_lbl = self._wrap_lbl(t, "", pady=(6, 0))
+        self._choice(t, "quarantine_days", "Clear old files", _QUAR_DAYS,
+                     int(cfg.get("quarantine_days", 0) or 0),
+                     "Files in the bin older than this are deleted for good. "
+                     "Keep it long enough that you would notice a mistake.")
+        self._quar_lbl = self._wrap_lbl(t, "", pady=(CONTROL_GAP, 0))
         qrow = tk.Frame(t, bg=CARD)
-        qrow.pack(fill="x", pady=(8, 0))
+        qrow.pack(fill="x", pady=(SPACE_2, 0))
         self._btn(qrow, "Put files back", self._restore_quarantine).pack(
             anchor="w")
         self._btn(qrow, "Empty bin", self._empty_quarantine).pack(
-            anchor="w", pady=(8, 0))
+            anchor="w", pady=(SPACE_2, 0))
         self._refresh_quarantine()
 
     def _section(self, parent, title):
         """M3 filled card: primary-coloured title, content below."""
-        card = RoundedCard(parent, fill=CARD, bg=COLORS["bg"], radius=16)
-        card.pack(fill="x", pady=(0, 14))
+        card = RoundedCard(parent, fill=CARD, bg=COLORS["bg"],
+                           radius=RADIUS_SURFACE)
+        card.pack(fill="x", pady=(0, SPACE_3))
+        # A static section label is never an accent (G-004): accent means
+        # "interactive or active" everywhere else in the app.
         tk.Label(
-            card.body, text=title, font=(F, 11, "bold"),
-            bg=CARD, fg=COLORS["primary"], anchor="w"
-        ).pack(fill="x", padx=18, pady=(14, 4))
+            card.body, text=title, font=TYPE["section"],
+            bg=CARD, fg=COLORS["subtext"], anchor="w"
+        ).pack(fill="x", padx=CARD_INSET, pady=(CARD_INSET, SPACE_1))
         sec = tk.Frame(card.body, bg=CARD)
-        sec.pack(fill="x", padx=18, pady=(0, 12))
+        sec.pack(fill="x", padx=CARD_INSET, pady=(0, SPACE_3))
         return sec
 
     def _wrap_lbl(self, parent, text, pady=(0, 0)):
         """A supporting-text Label that wraps to the pane width instead of
         being clipped: registered so `_on_pane_cfg` keeps its wraplength in
         step with the space actually available."""
-        lbl = tk.Label(parent, text=text, font=(F, 9), bg=CARD,
+        lbl = tk.Label(parent, text=text, font=TYPE["caption"], bg=CARD,
                        fg=COLORS["subtext"], anchor="w", justify="left",
                        wraplength=360)
         lbl.pack(fill="x", pady=pady)
@@ -404,18 +647,18 @@ class SettingsTab(tk.Frame):
 
     def _row(self, card, label, tip=""):
         r = tk.Frame(card, bg=CARD)
-        r.pack(fill="x", pady=6)
+        r.pack(fill="x", pady=SPACE_2)
         left = tk.Frame(r, bg=CARD)
         left.pack(side="left", fill="x", expand=True)
         lb = tk.Label(
-            left, text=label, font=(F, 11), bg=CARD,
+            left, text=label, font=TYPE["body_large"], bg=CARD,
             fg=COLORS["text"], anchor="w")
         lb.pack(fill="x")
         if tip:
             # M3 list-item supporting text instead of a hover tooltip. It
             # WRAPS to the pane width; a fixed one-line Label here is exactly
             # what clipped the longest tips in the old three-column layout.
-            t = tk.Label(left, text=tip, font=(F, 9), bg=CARD,
+            t = tk.Label(left, text=tip, font=TYPE["caption"], bg=CARD,
                          fg=COLORS["subtext"], anchor="w", justify="left",
                          wraplength=360)
             t.pack(fill="x")
@@ -424,9 +667,7 @@ class SettingsTab(tk.Frame):
 
     def _btn(self, parent, text, cmd):
         return AnimatedButton(
-            parent, text=text, command=cmd,
-            bg=CARD, fg=COLORS["primary"], variant="outlined",
-            font=(F, 10, "bold"), padx=18, pady=7)
+            parent, text=text, command=cmd, role="outlined", size="md")
 
     # ----------------------------------------------------------- category nav
     def _on_pane_cfg(self, e):
@@ -482,34 +723,34 @@ class SettingsTab(tk.Frame):
         ToggleSwitch(r, variable=var, command=self._mark).pack(side="right")
         var.trace_add("write", self._mark)
 
-    def _choice(self, card, key, label, options, current):
+    def _choice(self, card, key, label, options, current, tip=""):
         """Modern flat dropdown — quiet surface, no system chrome."""
         names = {k: n for n, k in options}
         keys = {n: k for n, k in options}
         var = tk.StringVar(value=names.get(current, options[0][0]))
         self._vars[key] = (var, keys)
-        r = self._row(card, label)
+        r = self._row(card, label, tip)
 
         dd = M3Dropdown(r, textvariable=var,
                         values=[n for n, _k in options],
                         width=max(len(n) for n, _ in options) + 1,
-                        bg=CARD, font=(F, 10))
+                        bg=CARD, font=TYPE["body_medium"])
         dd.pack(side="right")
         self._menus.append(dd)
         var.trace_add("write", self._mark)
 
-    def _entry(self, card, key, label, value):
+    def _entry(self, card, key, label, value, tip=""):
         var = tk.StringVar(value=value)
         self._vars[key] = var
-        r = self._row(card, label)
+        r = self._row(card, label, tip)
         e = tk.Entry(
             r, textvariable=var, width=6, justify="center",
             bg=COLORS["surface"], fg=COLORS["text"],
             insertbackground=COLORS["text"], relief="flat",
-            font=(F, 10), highlightthickness=1,
+            font=TYPE["body_medium"], highlightthickness=1,
             highlightbackground=COLORS["hairline"],
             highlightcolor=COLORS["primary"])
-        e.pack(side="right", ipady=4, ipadx=6)
+        e.pack(side="right", ipady=SPACE_1, ipadx=CONTROL_GAP)
 
         def _e_enter(_ev, ent=e):
             try:
@@ -562,13 +803,20 @@ class SettingsTab(tk.Frame):
             self.app._refresh_health_badge()
         except Exception:
             pass
+        # the chrome caches this preference; without the nudge a toggle here
+        # would not show up until the next restart
+        try:
+            self.app._chrome.reload_animations()
+        except Exception:
+            pass
         self._dirty = False
+        self._refresh_schedule_note()
         if errors:
             self.save_btn.set_enabled(True)
             self._say(errors[0], COLORS["accent_red"])
             _themed_showinfo(
                 self.winfo_toplevel(),
-                "Some settings were not applied",
+                "Some Settings Were Not Applied",
                 "\n\n".join(errors), accent=ACCENT)
         else:
             self._say(
@@ -576,13 +824,28 @@ class SettingsTab(tk.Frame):
                 COLORS["accent_green"])
 
     def _refresh_quarantine(self):
+        # The line answers two questions at once: what is held, and when it
+        # goes away. Retention only runs at launch, so it says "cleared at the
+        # next start" rather than implying the number is already shrinking.
         try:
             from app import quarantine
             from app.utils import format_bytes
             n, total = quarantine.stats()
-            self._quar_lbl.config(
-                text=("%d file(s), %s held. Emptying reclaims the space."
-                      % (n, format_bytes(total))) if n else "The bin is empty.")
+            days = quarantine.retention_days()
+            oldest = quarantine.oldest_days()
+            if n:
+                text = "%d file(s), %s held" % (n, format_bytes(total))
+                if oldest:
+                    text += ", oldest %d day(s) old" % oldest
+                text += "."
+            else:
+                text = "The bin is empty."
+            if days:
+                text += (" Files are cleared at the next start once they are "
+                         "older than %d days." % days)
+            elif n:
+                text += " Kept until you empty the bin."
+            self._quar_lbl.config(text=text)
         except Exception:
             try:
                 self._quar_lbl.config(text="")
@@ -594,8 +857,8 @@ class SettingsTab(tk.Frame):
             from app import quarantine
             n, failed = quarantine.restore_all()
         except Exception as exc:
-            _themed_showinfo(self.winfo_toplevel(), "Could not restore",
-                             "The files could not be put back: %s" % exc,
+            _themed_showinfo(self.winfo_toplevel(), "Could Not Restore",
+                             "Windows returned:\n%s" % exc,
                              accent=ACCENT)
             return
         self._refresh_quarantine()
@@ -603,7 +866,8 @@ class SettingsTab(tk.Frame):
         if failed:
             msg += (" %d file(s) could not be put back because something now "
                     "exists at the original location." % failed)
-        _themed_showinfo(self.winfo_toplevel(), "Quarantine", msg, accent=ACCENT)
+        _themed_showinfo(self.winfo_toplevel(), "Restore Finished", msg,
+                         accent=ACCENT)
 
     def _empty_quarantine(self):
         try:
@@ -613,8 +877,9 @@ class SettingsTab(tk.Frame):
         except Exception:
             n, total = 0, 0
         if not n:
-            _themed_showinfo(self.winfo_toplevel(), "Quarantine",
-                             "The bin is already empty.", accent=ACCENT)
+            _themed_showinfo(self.winfo_toplevel(), "Bin Already Empty",
+                             "Files you quarantine are listed here before "
+                             "they are deleted for good.", accent=ACCENT)
             return
         if not _themed_askyesno(
                 self.winfo_toplevel(), "Empty the bin?",
@@ -626,8 +891,8 @@ class SettingsTab(tk.Frame):
             from app import quarantine
             quarantine.empty()
         except Exception as exc:
-            _themed_showinfo(self.winfo_toplevel(), "Could not empty",
-                             "The bin could not be emptied: %s" % exc,
+            _themed_showinfo(self.winfo_toplevel(), "Could Not Empty",
+                             "Windows returned:\n%s" % exc,
                              accent=ACCENT)
         self._refresh_quarantine()
 
@@ -685,8 +950,9 @@ class SettingsTab(tk.Frame):
             return
         if not groups:
             _themed_showinfo(
-                self.winfo_toplevel(), "Nothing applied",
-                "No tweaks are currently applied.", accent=COLORS["accent_yellow"])
+                self.winfo_toplevel(), "Nothing to Review",
+                "Apply tweaks on the Tweak tab and they will be listed here, "
+                "ready to undo.", accent=COLORS["accent_yellow"])
             return
         try:
             from app.ui.dialogs.tweak_snapshots_dialog import show_tweak_snapshots
@@ -701,9 +967,10 @@ class SettingsTab(tk.Frame):
         per-row browser and Undo-All)."""
         if not tasks:
             return
+        n_undo = len(tasks)
+        suffix = "" if n_undo == 1 else "s"
         if not _themed_askyesno(
-                self.winfo_toplevel(), "Undo tweak(s)?",
-                f"Put back {len(tasks)} tweak(s) to how they were before?\n\n"
+                self.winfo_toplevel(), f"Undo {n_undo} tweak{suffix}?",
                 "This restores the exact values recorded when each tweak ran.",
                 accent=COLORS["accent_red"],
                 yes_text="Undo Them", no_text="Go Back"):
@@ -766,7 +1033,7 @@ class SettingsTab(tk.Frame):
             added = tweak_center.restore_from(path)
         except Exception as exc:
             self._say(f"Restore failed: {exc}", COLORS["accent_red"])
-            _themed_showinfo(self.winfo_toplevel(), "Could not restore",
+            _themed_showinfo(self.winfo_toplevel(), "Could Not Restore",
                              str(exc), accent=COLORS["accent_red"])
             return
         self._say(f"Restored {added} tweak record(s).", COLORS["accent_green"])

@@ -12,7 +12,6 @@ If the registry write ever fails we fall back to PowerShell's id, so a toast
 still appears (just with the old attribution) rather than vanishing.
 """
 
-import os
 import subprocess
 import sys
 import time
@@ -191,9 +190,10 @@ def show_toast(title: str, message: str, duration: str = "short",
             # weighted strings in AV/EDR PowerShell-abuse heuristics
             # (Behavior:Win32/Execution.A!ml and similar), so dropping it
             # removes a false-positive trigger with no behavior change.
-            from app.utils import resolve_exe
+            # R-008: the flags and the exe lookup come from the shared runner.
+            from app.tasks.ps import ps_argv
             subprocess.Popen(
-                [resolve_exe("powershell"), "-NoProfile", "-Command", ps_script],
+                ps_argv(ps_script),
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -250,19 +250,9 @@ def notify_scheduled_run():
         "short"
     )
 
-
-def notify_low_space(drive_letter: str, free_gb: float):
-    """Nudge toast when a drive crosses the red fill threshold (<=5%
-    free). Fire-and-forget like the other notifiers: no delivery
-    guarantee, and never raised. Duration long — a low-space warning
-    deserves the full 25s on screen."""
-    try:
-        free_txt = f"{free_gb:.1f} GB"
-    except Exception:
-        free_txt = "very little space"
-    show_toast(
-        "Drive Nearly Full",
-        f"{drive_letter}: only {free_txt} free. Open Storage Insight "
-        "to see what's eating it and clean the safe junk.",
-        "long",
-    )
+# Quiet watch (N-006) deliberately does NOT live here. A drive crossing its
+# threshold now goes through app/watch.py so the free-space warning is the
+# same notice as a score drop or a stopped schedule - one owner for copy, one
+# owner for the episode memory. notify_low_space was removed with that move;
+# keeping it would have left a second, differently-worded path that nothing
+# could call without contradicting the watch's dedupe.

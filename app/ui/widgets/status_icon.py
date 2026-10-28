@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import tkinter as tk
 
-from app.ui.theme import COLORS
+from app.ui.theme import COLORS, ICON_CHIP
 
 
 class StatusIcon(tk.Canvas):
@@ -19,7 +19,7 @@ class StatusIcon(tk.Canvas):
         "info": "accent_blue",
     }
 
-    def __init__(self, parent, kind="ok", bg=None, size=22):
+    def __init__(self, parent, kind="ok", bg=None, size=ICON_CHIP):
         try:
             page = bg or parent["bg"]
         except Exception:

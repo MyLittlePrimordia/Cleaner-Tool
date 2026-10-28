@@ -15,7 +15,6 @@ from __future__ import annotations
 
 from enum import Enum, auto
 import threading
-from typing import Optional
 
 
 class RunState(Enum):
@@ -61,30 +60,6 @@ class RunState(Enum):
 
 _BUSY_STATES = frozenset({RunState.PREFLIGHT, RunState.RUNNING,
                           RunState.CANCELLING})
-
-#: States that classify a FINISHED run rather than a live one. They are
-#: what `Application.last_run_outcome` reports and are never parked in
-#: `Application._state`, so they have no outgoing transitions.
-OUTCOME_STATES = frozenset({RunState.DONE, RunState.ERROR})
-
-#: Every state that `_state` can actually hold.
-LIVE_STATES = frozenset(RunState) - OUTCOME_STATES
-
-#: Legal transitions of the LIVE state, i.e. of `Application._state`.
-#: Anything not listed here is a bug; this table is the single source of
-#: truth for which edges exist.
-#:
-#: DONE and ERROR are deliberately absent as targets: they are terminal
-#: classifications of a finished run, reported by `Application.last_run_outcome`
-#: rather than parked in `_state` for the two instructions between being set
-#: and being overwritten with IDLE. A state nobody can observe is a race, not
-#: a state.
-ALLOWED_TRANSITIONS = {
-    RunState.IDLE: {RunState.PREFLIGHT, RunState.RUNNING},
-    RunState.PREFLIGHT: {RunState.RUNNING, RunState.CANCELLING, RunState.IDLE},
-    RunState.RUNNING: {RunState.CANCELLING, RunState.IDLE},
-    RunState.CANCELLING: {RunState.IDLE},
-}
 
 
 class CancellationToken:

@@ -243,8 +243,10 @@ class UpdatePickerDialog(ToolPage):
             text += "; %d did not install" % bad
         if res.get("reboot"):
             text += ". Restart your PC to finish."
-        self.status.stop(text, COLORS["accent_yellow"] if bad
-                         else COLORS["accent_green"])
+        # The banner below carries the outcome (the Check path already ends
+        # the same way); the strip's caption only ever held the progress line,
+        # so it is cleared instead of repeating the banner's sentence.
+        self.status.stop("")
         self.banner.set_state("✓" if not bad else "!",
                               COLORS["accent_green"] if not bad
                               else COLORS["accent_yellow"])

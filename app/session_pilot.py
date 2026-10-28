@@ -138,7 +138,7 @@ def default_get_processes(timeout: int = 10, wanted=None):
     legacy resolve-everything behavior."""
     try:
         import subprocess as _sp
-        out = _sp.check_output(
+        out = _sp.check_output(  # dry-ok: read-only `tasklist` probe
             [resolve_exe("tasklist"), "/fo", "csv", "/nh"], text=True, timeout=timeout,
             errors="replace", stderr=_sp.DEVNULL,
             creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),

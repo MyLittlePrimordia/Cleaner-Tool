@@ -784,6 +784,46 @@ CATEGORY_ORDER = [
 ]
 
 
+#: U-002: when the IDs and links in this file were last checked live against
+#: winget and their own sites - i.e. the newest dated round in the changelog
+#: above. The Install tab prints this, because a bundled list with no date
+#: reads like a live feed: when a publisher retires a package (Lime3DS and
+#: MusicBee both had to be re-pointed in this file) the failure looks like a
+#: bug in this app instead of a stale entry. Installing still goes through
+#: winget, which re-resolves every ID at that moment.
+CATALOG_CHECKED = "2026-09-16"
+
+
+def provenance() -> dict:
+    """What the Install tab can honestly say about its list."""
+    return {
+        "checked": CATALOG_CHECKED,
+        "apps": len(APP_CATALOG),
+        "link_only": len(MANUAL_ONLY_APPS),
+        "categories": len(CATEGORY_ORDER),
+    }
+
+
+def provenance_line() -> str:
+    """The one line the Install tab shows under its buttons.
+
+    Kept short on purpose: it sits beside the page's action buttons, and the
+    "still verified by winget at install time" half of the story is the
+    tooltip (see InstallTab._build_provenance)."""
+    info = provenance()
+    when = ""
+    try:
+        import time
+        when = time.strftime("%d %b %Y",
+                             time.strptime(info["checked"], "%Y-%m-%d"))
+    except Exception:
+        when = info["checked"]
+    text = "Bundled list \u00b7 %d apps" % info["apps"]
+    if info["link_only"]:
+        text += " (+%d link-only)" % info["link_only"]
+    return text + " \u00b7 IDs last checked " + when
+
+
 def _validate():
     ids = [a["id"] for a in APP_CATALOG]
     if len(ids) != len(set(ids)):

@@ -9,9 +9,27 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional
+from typing import Callable, Optional
+
+from app.changes import record_command, record_registry
 
 IS_WINDOWS = sys.platform.startswith("win")
+
+from app.delete_safety import (  # noqa: F401  (re-exported on purpose)
+    _is_own_runtime,
+    _is_protected_root,
+    _is_reparse_point,
+    _own_runtime_roots,
+    clean_folder_contents,
+)
+
+# R-008: the exe lookup and the PowerShell argv are leaf modules now, so this
+# module can use the same builder every task uses. Both are imported at module
+# scope BECAUSE neither imports utils back (that is the whole point of the
+# split): exe_paths -> os, powershell -> exe_paths.
+from app.exe_paths import resolve_exe  # noqa: F401  (re-exported on purpose)
+from app.powershell import ps_argv
+
 
 if IS_WINDOWS:
     import winreg
@@ -19,34 +37,6 @@ if IS_WINDOWS:
 else:  # pragma: no cover
     winreg = None  # type: ignore
     ctypes = None  # type: ignore
-
-# FILE_ATTRIBUTE_REPARSE_POINT — junctions & directory symlinks. os.walk
-# does NOT treat Windows junctions as links (followlinks=False only guards
-# POSIX symlinks), so a junction planted in a cleaned folder would redirect
-# os.remove THROUGH it into arbitrary targets (verified empirically in the
-# audit: a canary file behind a junction was deleted). Everything that
-# walks/deletes must skip reparse points.
-_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
-
-
-def _is_reparse_point(path: str) -> bool:
-    """True if path is a junction / directory symlink / other reparse point.
-
-    Fail-closed: any error (INVALID_FILE_ATTRIBUTES, access denied, race)
-    is treated as a reparse point so cleaners refuse to walk/delete rather
-    than risk following a planted junction. Callers already log and skip.
-    """
-    if not IS_WINDOWS or ctypes is None:
-        # POSIX: os.walk(followlinks=False) already skips symlinks for us
-        return os.path.islink(path)
-    try:
-        attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path))
-        if attrs == 0xFFFFFFFF:  # INVALID_FILE_ATTRIBUTES — fail closed
-            return True
-        return bool(attrs & _FILE_ATTRIBUTE_REPARSE_POINT)
-    except Exception:
-        return True  # fail closed on any API/race error
-
 
 def known_folder(name: str, fallback: str = "", *, strict: bool = False) -> str:
     """Resolve a Windows known folder from HKCU\\...\\User Shell Folders,
@@ -74,47 +64,6 @@ def known_folder(name: str, fallback: str = "", *, strict: bool = False) -> str:
     except Exception:
         pass
     return fallback
-
-
-# SEC-002 hardening: known inbox-tool absolute paths, tried before a bare
-# name so a same-user-writable app/CWD directory can't shadow the real
-# tool for a process that sometimes runs elevated (install/repair/tweak
-# flows). Falls back to shutil.which(), then the bare name as a last
-# resort (logged) so this never breaks LTSC/Server SKUs where a tool
-# might live somewhere unexpected.
-_EXE_CACHE: dict = {}
-
-
-def resolve_exe(name: str) -> str:
-    """Absolute path for a well-known Windows inbox tool (winget,
-    powershell, schtasks, powercfg, tasklist, wevtutil, ping, net, ...).
-    Cached per-process. Never raises — worst case returns `name` itself,
-    identical to the old bare-name behavior."""
-    if name in _EXE_CACHE:
-        return _EXE_CACHE[name]
-    result = name
-    try:
-        system_root = os.environ.get("SystemRoot", r"C:\Windows")
-        sys32 = os.path.join(system_root, "System32")
-        candidates = [os.path.join(sys32, f"{name}.exe")]
-        if name == "winget":
-            # winget ships via the App Installer MSIX package, not System32 —
-            # WindowsApps holds a versioned real exe behind an alias stub;
-            # shutil.which() finds the per-user alias correctly.
-            candidates = []
-        for cand in candidates:
-            if os.path.isfile(cand):
-                result = cand
-                break
-        else:
-            import shutil as _shutil
-            which = _shutil.which(name)
-            if which:
-                result = which
-    except Exception:
-        result = name
-    _EXE_CACHE[name] = result
-    return result
 
 
 def atomic_write_text(dest: str, content: str, newline: str = "\n",
@@ -168,6 +117,34 @@ def atomic_write_text(dest: str, content: str, newline: str = "\n",
 
 import threading
 import queue
+
+
+#: Schemes a link from the UI may be handed to the shell with. Everything
+#: else — `file:`, `javascript:`, `ms-settings:` outside its own allowlist,
+#: a bare `C:\...`, or a typo — is refused by `is_web_url()`.
+WEB_URL_SCHEMES = frozenset({"http", "https"})
+
+
+def is_web_url(url: str) -> bool:
+    """True only for a well-formed http(s) URL.
+
+    Callers hand the result to the OS shell (os.startfile, `cmd /c start`,
+    ShellExecute), which resolves ANY scheme it knows — including `file:`
+    (opens a local path) and registered protocol handlers. Catalog metadata
+    is data, not code, so it gets validated at the boundary instead of being
+    trusted.
+    """
+    try:
+        from urllib.parse import urlsplit
+        text = (url or "").strip()
+        if not text or len(text) > 2048:
+            return False
+        parts = urlsplit(text)
+        if parts.scheme.lower() not in WEB_URL_SCHEMES:
+            return False
+        return bool(parts.hostname)
+    except Exception:
+        return False
 
 
 def exclusive_create_text(dest: str, content: str, newline: str = "\n",
@@ -336,12 +313,114 @@ class TaskContext:
     folder-cleaning tasks can be invoked directly for honest estimates
     with zero changes to any task module."""
 
+    progress: Optional[Callable[[float, str], None]] = None
+    """Optional `(percent, raw_line)` callback for a determinate progress bar.
+
+    Only commands whose output carries a real percentage use it (DISM, SFC,
+    chkdsk, defrag). `percent` is 0-100. The raw line is passed along so a
+    caller can show the tool's own stage text, but the app deliberately shows
+    its own task label instead: "DISM RestoreHealth 61%" is useful, a wall of
+    bracket characters is not. Default None keeps every existing caller and
+    the headless scheduler byte-identical.
+    """
+
     quarantine: Optional[object] = None
     """Optional app.quarantine.Quarantine handle (roadmap 2.5). When set, the
     clean funnel (clean_folder_contents) MOVES matched files into the bin
     instead of deleting them. Default None = ordinary deletes, so every
     existing caller is unchanged. Typed `object` to keep utils free of an
-    import on the quarantine module."""
+    import on the quarantine module.
+    """
+
+    notes: "list[str]" = field(default_factory=list)
+    """Lines a task wants its caller to show beside the outcome: facts only
+    the task knows, such as which update results a localized winget could not
+    report. NOT transcript lines - the task has already logged those.
+    The windowed install runner repeats them in the completion card, whose
+    counts alone cannot carry a list; headless callers have no card and keep
+    reading them out of the log they already capture.
+    """
+
+    changes: "list" = field(default_factory=list)
+    """Typed records of what the run actually changed (R-005).
+
+    Filled by the shared write layer (`reg_set_value*`, `reg_delete_value`,
+    `run_cmd*`) at the moment of the write, where the prior and new value are
+    both in hand - not reconstructed later from the transcript. The runner
+    slices it per task (`TaskOutcome.changes`) so the scorecard can group and
+    print real before -> after lines. Shared by reference in `derive()` for the
+    same reason `notes` is: a task that re-wraps the context must still land in
+    the run's ledger.
+    """
+
+    #: Count of files a clean had to leave alone because something held
+    #: them open (U-007). Collected by the shared delete walker, so the run
+    #: summary can explain a result smaller than the estimate instead of
+    #: presenting it as the whole answer. 0 when nothing was locked.
+    skipped_locked: int = 0
+
+    unmeasured: "list[str]" = field(default_factory=list)
+    """Reasons a task DECLINED TO LOOK, in its own words (`mark_unmeasured`).
+
+    Several cleaners refuse to run while the thing they clean is live - Office
+    holding unsynced edits, Steam mid-download, FiveM in a session - or when the
+    list they judge against is untrustworthy (orphan scan with a partial
+    installed-programs set). They return 0, which is the right answer for a real
+    run (nothing was freed either way) and a lie for an estimate: a dry pass
+    cannot tell "empty" from "did not look", so Storage Insight painted the
+    category as clean and graded it fine. The refusal is recorded here instead,
+    and `app.storage_scan` reports that task's size as unknown. Empty in the
+    ordinary case, so every other caller sees exactly what it saw before.
+    Shared by reference in `derive()` like `notes`, so a task that re-wraps the
+    context still reaches the caller's list.
+    """
+    def derive(self, *, log=None, set_status=None,
+               cancelled=None) -> "TaskContext":
+        """A copy with the given CALLBACKS replaced and the data fields kept.
+
+        H-005: a runner that wanted to reword the live status line rebuilt the
+        dataclass from scratch with `TaskContext(log=..., set_status=...,
+        cancelled=...)`. That silently dropped `dry_run`, `quarantine` and —
+        the one that mattered — `notes`, so the package names a localized
+        update run collected went into a list nobody read. Anything that
+        re-wraps a context goes through here instead, and `notes` is passed by
+        reference on purpose: a task appending to `ctx.notes` must land in the
+        caller's list.
+        """
+        return TaskContext(
+            log=log if log is not None else self.log,
+            set_status=(set_status if set_status is not None
+                        else self.set_status),
+            cancelled=(cancelled if cancelled is not None
+                       else self.cancelled),
+            dry_run=self.dry_run,
+            progress=self.progress,
+            quarantine=self.quarantine,
+            notes=self.notes,
+            changes=self.changes,
+            skipped_locked=self.skipped_locked,
+            unmeasured=self.unmeasured,
+        )
+
+
+def mark_unmeasured(ctx, reason: str) -> None:
+    """Record that this task declined to look, so its 0 is not a measurement.
+
+    Call this beside the `return 0` of every refusal-to-run ("Office may be
+    running", "Steam is running", "could not read the installed list"), never
+    beside a genuine empty result: the point is to separate 0 bytes from "no
+    answer", and a caller's estimate turns this into unknown.
+
+    Tolerant by design - a stub context without the field, or one that refuses
+    the append, must not turn a clean refusal into a crash.
+    """
+    try:
+        bucket = getattr(ctx, "unmeasured", None)
+        if bucket is None:
+            return
+        bucket.append(str(reason))
+    except Exception:
+        pass
 
 
 def log_or_swallow(ctx: "TaskContext | None", msg: str, exc: BaseException | None = None, *, level: str = "!") -> None:
@@ -424,26 +503,53 @@ class TaskCancelled(RuntimeError):
 
 import re as _re
 
-#: DISM prints "[=====   8.8%   ]" and SFC prints "Verification 45% complete."
-#: hundreds of times per run. In a deep repair that was ~600 of the log's 970
-#: lines, drowning the lines that matter. One line per 10% is enough to show
-#: progress; the rest are dropped.
+#: DISM prints "[=====   8.8%   ]", SFC prints "Verification 45% complete.",
+#: chkdsk prints "Progress: 118932 of 2000896 done; Stage: 5%; Total: 3%" and
+#: defrag prints "Retrim:  20% complete...". Hundreds of lines per run; in a
+#: deep repair that was ~600 of the log's 970 lines, drowning the lines that
+#: matter. One line per 10% is enough to show progress in the LOG; the run
+#: strip gets every 1% through the progress callback below, without printing.
 _PROGRESS_RES = (
     _re.compile(r"^\[[= ]*\s*(\d+(?:\.\d+)?)%\s*[= ]*\]$"),       # DISM
     _re.compile(r"^Verification\s+(\d+)%\s+complete\.?$", _re.I),   # SFC
+    _re.compile(r"^Retrim:\s*(\d+(?:\.\d+)?)%\s+complete", _re.I),
 )
+
+#: chkdsk's "Total" is NOT cumulative: it drops from ~37% back to ~6% when
+#: stage 2 starts (measured on the reference machine), so feeding it to a
+#: progress bar would move it backwards. It is still progress NOISE, though:
+#: hundreds of repeated lines. Recognise it so the log can drop it, and leave
+#: the bar indeterminate for that one command.
+_CHKDSK_PROGRESS_RE = _re.compile(
+    r"^Progress:\s*\d+\s+of\s+\d+\s+done;", _re.I)
 
 
 def _progress_percent(line: str):
-    """The percentage in a DISM/SFC progress line, else None."""
+    """The percentage in a DISM/SFC/defrag progress line, else None."""
     for rx in _PROGRESS_RES:
         m = rx.match(line)
         if m:
             try:
                 return float(m.group(1))
-            except ValueError:
+            except (TypeError, ValueError):
                 return None
     return None
+
+
+def _emit_progress(ctx, pct, line: str) -> None:
+    """Tell a UI (if one is attached) how far a command has got.
+
+    `TaskContext.progress` is optional so headless runs are byte-identical to
+    before. The callback must never be able to break a repair: a failing UI
+    hop is swallowed, exactly like the log callback.
+    """
+    cb = getattr(ctx, "progress", None)
+    if cb is None:
+        return
+    try:
+        cb(float(pct), str(line))
+    except Exception:
+        pass
 
 
 def store_available() -> bool:
@@ -464,11 +570,9 @@ def store_available() -> bool:
         return False
     try:
         out = subprocess.check_output(
-            [resolve_exe("powershell"), "-NoProfile", "-NonInteractive",
-             "-Command",
-             "if (Get-AppxPackage -Name Microsoft.WindowsStore "
-             "-ErrorAction SilentlyContinue) { 'STORE_YES' } "
-             "else { 'STORE_NO' }"],
+            ps_argv("if (Get-AppxPackage -Name Microsoft.WindowsStore "
+                    "-ErrorAction SilentlyContinue) { 'STORE_YES' } "
+                    "else { 'STORE_NO' }", non_interactive=True),
             text=True, timeout=25, stderr=subprocess.DEVNULL,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         return "STORE_YES" in (out or "")
@@ -490,7 +594,7 @@ def _popen_command(command, shell: bool):
         because Popen would otherwise try to execute the whole string as one
         program name.
     shell=True is still honoured for a caller that explicitly asks for
-    cmd.exe features, but nothing in the app does (tools/verify_run_cmd_no_shell
+    cmd.exe features, but nothing in the app does (dev/tools/verify_run_cmd_no_shell
     fails the build if one appears).
     """
     if shell or isinstance(command, (list, tuple)):
@@ -563,6 +667,7 @@ def run_cmd(ctx: TaskContext, command, shell: bool = False, timeout: Optional[in
             # commands (sfc, DISM) emit nothing for minutes and Cancel never fires.
             q: queue.Queue[Optional[str]] = queue.Queue()
             _last_bucket = [-1]       # last 10% step logged (progress lines)
+            _last_pct = [-1.0]        # last 1% step sent to the progress bar
 
             def _reader():
                 try:
@@ -621,13 +726,32 @@ def run_cmd(ctx: TaskContext, command, shell: bool = False, timeout: Optional[in
                 # Dropping the NULs recovers the ASCII text exactly.
                 line = item.replace("\x00", "").strip()
                 if line:
+                    # H-007: the 10% bucket check exists so the LOG does not
+                    # print the same progress line ten times. It used to
+                    # `continue` before the collect branch, so every repeat was
+                    # dropped from `collect` too - and `collect` is what the
+                    # winget upgrade summary parses. Progress lines are output
+                    # like any other; only their repetition is boring.
+                    log_line = True
                     pct = _progress_percent(line)
                     if pct is not None:
                         bucket = int(pct // 10)
                         if bucket == _last_bucket[0]:
-                            continue
-                        _last_bucket[0] = bucket
-                    ctx.log("  > " + line)
+                            log_line = False
+                        else:
+                            _last_bucket[0] = bucket
+                        # The strip is a different consumer from the log: it
+                        # wants whole percent steps, not 10% buckets.
+                        whole = int(pct)
+                        if whole != int(_last_pct[0]):
+                            _last_pct[0] = pct
+                            _emit_progress(ctx, pct, line)
+                    elif _CHKDSK_PROGRESS_RE.match(line):
+                        # Dropped from the log as repeated noise, and never
+                        # sent to the bar (see _CHKDSK_PROGRESS_RE).
+                        log_line = False
+                    if log_line:
+                        ctx.log("  > " + line)
                     if collect is not None:
                         collect.append(line)
 
@@ -673,7 +797,13 @@ def run_cmd(ctx: TaskContext, command, shell: bool = False, timeout: Optional[in
                     _kill_proc(proc)
                     return -1
                 time.sleep(0.1)
-            return proc.returncode if proc.returncode is not None else -1
+            rc = proc.returncode if proc.returncode is not None else -1
+            # R-005: a recognised service/task/power/boot command that
+            # succeeded is a typed change. The classifier ignores everything
+            # else (and the volatile net start/stop pair) by design.
+            if rc == 0:
+                record_command(ctx, command, ok=True)
+            return rc
         except Exception as exc:
             _kill_proc(proc)
             ctx.log(f"  ! ERROR running command: {exc}")
@@ -683,6 +813,42 @@ def run_cmd(ctx: TaskContext, command, shell: bool = False, timeout: Optional[in
         return -1
     finally:
         _set_current_proc(None)
+
+
+def run_capture(command, timeout: float = 30) -> "tuple[int | None, str]":
+    """Run a console command and return (returncode, combined output text).
+
+    I-001: the same five-line wrapper was written by hand in the scheduler, in
+    the elevated-launch helper and in a dozen task modules, and the copies
+    drifted in ways that only show up on a real machine:
+
+      * some omitted CREATE_NO_WINDOW, so every probe flashed a console in the
+        middle of a GUI run;
+      * some omitted `errors="replace"`, so a localized (non-UTF-8) Windows
+        raised UnicodeDecodeError and the probe looked like "the command
+        failed";
+      * some inherited the GUI's stdin, so a tool that asks a question
+        blocked;
+      * timeouts were chosen per copy, and a few were missing entirely.
+
+    returncode is None (and the text is the error) when the command could not
+    be run at all - never a fake 0, so a caller cannot mistake a launch
+    failure for success. Never raises. For long jobs with a transcript, use
+    run_cmd instead: this one buffers, so keep it for probes and status
+    queries.
+    """
+    try:
+        kwargs = {}
+        if IS_WINDOWS:
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        result = subprocess.run(
+            _popen_command(command, False),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, text=True, errors="replace",
+            timeout=timeout, **kwargs)
+        return result.returncode, result.stdout or ""
+    except Exception as exc:
+        return None, str(exc)
 
 
 def run_cmd_checked(ctx: TaskContext, command, shell: bool = False, timeout: Optional[int] = None,
@@ -705,6 +871,9 @@ def run_cmd_checked(ctx: TaskContext, command, shell: bool = False, timeout: Opt
     if rc not in success_codes:
         raise RuntimeError(f"Command failed (code {rc}): {command}")
     if rc != 0 and rc in success_codes:
+        # rc 0 already recorded itself inside run_cmd; a non-zero success
+        # (sfc's 1, DISM's 3010) did not, so record it here.
+        record_command(ctx, command, ok=True)
         ctx.log(f"  (completed successfully; exit code {rc} — a reboot may be required)")
     return rc
 
@@ -817,282 +986,6 @@ def format_bytes(size_bytes: float, compact: bool = False) -> str:
 # Cache, Program Files app shader caches. A containment check would have
 # broken core functionality; an exact check leaves all of them working.
 
-# Environment roots that must never be emptied. normcase'd env lookups, so
-# the caller does not need to trust how the value was spelled.
-#
-# TEMP/TMP are deliberately NOT here. %TEMP% is a legitimate cleaning target
-# by design -- clean_tasks.clean_user_temp_files passes it BARE (and so does
-# the disk-cleanup fallback at clean_tasks.py:886), and it is part of the
-# Quick/Deep Clean presets. It is scratch space whose entire purpose is to be
-# emptied, it holds no user data, and protecting it would silently free 0
-# bytes for a headline feature. Verified: %TEMP% bare is the ONLY protected
-# container any task passes unextended; everything else is a subfolder.
-_PROTECTED_ROOT_ENV = (
-    "SystemRoot", "windir", "ProgramData", "ProgramFiles",
-    "ProgramFiles(x86)", "ProgramW6432", "USERPROFILE", "LOCALAPPDATA",
-    "APPDATA", "PUBLIC",
-)
-
-# Well-known user data folders as (User Shell Folders value name, path
-# relative to %USERPROFILE%). BOTH are checked: the registry value honors
-# OneDrive / known-folder redirection, and the relative path is the fallback
-# for SKUs where the value is absent. That fallback is not theoretical --
-# known_folder() returns "" for MyPictures/MyVideo/MyMusic on this machine, so
-# a registry-only check would have left Pictures, Videos and Music UNPROTECTED.
-# The Downloads entry is a GUID because that is how User Shell Folders spells
-# it; Favorites is the legacy GUID.
-_PROTECTED_ROOT_SHELL = (
-    ("Desktop", "Desktop"),
-    ("Personal", "Documents"),
-    ("MyPictures", "Pictures"),
-    ("MyVideo", "Videos"),
-    ("MyMusic", "Music"),
-    ("{374DE290-123F-4565-9164-39C4925E467B}", "Downloads"),   # Downloads
-    ("{645FF040-5081-101B-9F08-00AA002F954E}", "Favorites"),   # legacy
-)
-
-
-def _norm_dir(path: str) -> str:
-    """Absolute + normalized + case-folded directory key for comparison."""
-    try:
-        return os.path.normcase(os.path.abspath(os.path.normpath(path)))
-    except Exception:
-        return ""
-
-
-def _is_protected_root(path: str) -> bool:
-    """True when `path` IS a protected container root (BUG-014).
-
-    Also refuses a bare drive root ("C:\\", "D:\\"). No caller should ever pass
-    one, and if one arrives it is certainly not a cache.
-
-    Deliberately does NOT walk up the tree. Refusing an ANCESTOR of a
-    protected root is already covered, because every dangerous ancestor is
-    itself in the list above: C:\\ , C:\\Windows, C:\\Users, C:\\Program Files,
-    C:\\ProgramData, and the user profile.
-
-    Fails CLOSED (returns True on any error), matching _is_reparse_point's
-    posture — an unanswerable question about a delete target must stop the
-    delete, not permit it."""
-    try:
-        if not path or not isinstance(path, str):
-            return False
-        norm = _norm_dir(path)
-        if not norm:
-            return False
-        drive, rest = os.path.splitdrive(norm)
-        if drive and not rest.strip("\\"):
-            return True   # bare drive root
-        for var in _PROTECTED_ROOT_ENV:
-            raw = os.environ.get(var, "")
-            if raw and norm == _norm_dir(raw):
-                return True
-        for shell, relative in _PROTECTED_ROOT_SHELL:
-            raw = known_folder(shell)
-            if raw and norm == _norm_dir(raw):
-                return True
-            prof = os.environ.get("USERPROFILE", "")
-            if prof and relative:
-                cand = os.path.join(prof, relative)
-                if norm == _norm_dir(cand):
-                    return True
-        # the whole per-user tree: C:\Users (and D:\Users, etc.) holds every
-        # local account's profile, so no single env var covers it.
-        try:
-            _d, tail = os.path.splitdrive(norm)
-            if tail.strip("\\").lower() == "users":
-                return True
-        except Exception:
-            pass
-        return False
-    except Exception:
-        return True
-
-
-def _own_runtime_roots() -> tuple:
-    """Folders this running app depends on, which a cleaner must never touch.
-
-    A PyInstaller one-file build unpacks itself into %TEMP%\\_MEIxxxxx and
-    loads its assets and lazily-imported modules from there for as long as it
-    runs. The temp-file cleaners walk %TEMP%; Windows keeps the files it has
-    open locked (so they were skipped), but everything it had NOT opened yet
-    was deleted out from under the running program. The next import or icon
-    load after a Deep Clean then failed and the window vanished - consistent
-    with a Deep Clean that "just closed the app". Nothing the app is running
-    from, and nothing it saves to, is junk.
-    """
-    roots = []
-    meipass = getattr(sys, "_MEIPASS", None)
-    if meipass:
-        roots.append(meipass)
-    if getattr(sys, "frozen", False):
-        try:
-            roots.append(os.path.dirname(sys.executable))
-        except Exception:
-            pass
-    try:
-        from app.config_paths import CONFIG_DIR
-        roots.append(str(CONFIG_DIR))             # config, logs, backups
-    except Exception:
-        pass
-    out = []
-    for r in roots:
-        try:
-            out.append(os.path.normcase(os.path.abspath(r)))
-        except Exception:
-            continue
-    return tuple(out)
-
-
-def _is_own_runtime(path: str, roots: Optional[tuple] = None) -> bool:
-    roots = _own_runtime_roots() if roots is None else roots
-    try:
-        p = os.path.normcase(os.path.abspath(path))
-    except Exception:
-        return False
-    return any(p == r or p.startswith(r + os.sep) for r in roots)
-
-
-def clean_folder_contents(ctx: TaskContext, folder_path: str, remove_root: bool = False,
-                           extensions: Optional[List[str]] = None) -> int:
-    bytes_freed = 0
-    skipped = 0
-    if not folder_path or not os.path.exists(folder_path):
-        return 0
-    # BUG-014: refuse protected container roots before touching anything.
-    # Placed ahead of the reparse check so the refusal is unconditional, and
-    # honored in dry_run too — a folder we would never clean has no
-    # meaningful size to estimate.
-    if _is_protected_root(folder_path):
-        try:
-            ctx.log(f"  ! refusing to clean a protected location: {folder_path}")
-        except Exception:
-            pass
-        return 0
-    # F03 entry guard: os.walk(top) enumerates THROUGH a junction root even
-    # with followlinks=False (only subdirs are pruned). Refuse to walk when
-    # the root itself is a reparse point — both _clean_many funnels land here.
-    if _is_reparse_point(folder_path):
-        try:
-            ctx.log(f"  ! skipping junction/symlink root: {folder_path}")
-        except Exception:
-            pass
-        return 0
-    # Storage Insight scan (2026-09): ctx.dry_run walks the exact same
-    # tree with the exact same guards (junctions, cancel checks) but
-    # never deletes — the returned total is what a real run WOULD free.
-    # The flag is ctx-carried (not a parameter) so every pure task
-    # function (_clean_many callers) measures correctly with no edits.
-    dry = bool(getattr(ctx, "dry_run", False))
-    # 2.5: opt-in Quarantine bin. When present, files are MOVED there instead
-    # of deleted (see the file loop below). None = ordinary deletes.
-    quarantine = getattr(ctx, "quarantine", None)
-    moved_to_quarantine = 0
-
-    # Security guard (audit HIGH finding): os.walk(topdown=False) cannot
-    # prune and does not treat Windows junctions as links — a junction
-    # anywhere under folder_path redirected deletions into its target
-    # (empirically verified). Walk top-down and skip reparse points.
-    stopped = False
-    _own = _own_runtime_roots()       # never delete what we are running from
-    for root, dirs, files in os.walk(folder_path, topdown=True, followlinks=False):
-        # F-3 audit fix: the Stop button previously only killed the tracked
-        # SUBPROCESS — this pure-Python walker kept deleting for minutes on
-        # big trees (shader caches: tens of thousands of files) after the
-        # user pressed Stop. Poll cancellation here (per directory) and per
-        # file below; a stop leaves the remaining files in place and returns
-        # the partial total, exactly like the run_cmd kill path.
-        if ctx.cancelled():
-            stopped = True
-            break
-        # never descend into junctions / symlinked dirs
-        dirs[:] = [d for d in dirs if not _is_reparse_point(os.path.join(root, d))
-                   and not _is_own_runtime(os.path.join(root, d), _own)]
-        for f in files:
-            if extensions and not any(f.lower().endswith(e.lower()) for e in extensions):
-                continue
-            filepath = os.path.join(root, f)
-            if _is_reparse_point(filepath) or _is_own_runtime(filepath, _own):
-                skipped += 1
-                continue
-            if ctx.cancelled():
-                stopped = True
-                break
-            try:
-                # Get size and remove atomically (avoid TOCTOU race).
-                # Dry-run: stat only, never remove — same accounting.
-                st = os.stat(filepath)
-                size = st.st_size
-                if not dry:
-                    # F5-2: re-verify IMMEDIATELY before removal — a path
-                    # that became a junction/symlink since enumeration would
-                    # redirect os.remove through it into the target.
-                    if _is_reparse_point(filepath):
-                        skipped += 1
-                        continue
-                    # 2.5: with the Quarantine bin active, move the file there
-                    # rather than deleting it. stash() returns False when it
-                    # cannot take the file (size cap, or a move error), and we
-                    # then delete as normal so the clean still cleans.
-                    if quarantine is not None and quarantine.stash(filepath):
-                        moved_to_quarantine += 1
-                    else:
-                        os.remove(filepath)
-                bytes_freed += size
-            except (PermissionError, OSError, FileNotFoundError):
-                skipped += 1
-                continue
-        if stopped:
-            break
-
-        if not extensions and not dry:
-            for d in dirs:
-                if ctx.cancelled():
-                    stopped = True
-                    break
-                dirpath = os.path.join(root, d)
-                try:
-                    if os.path.exists(dirpath) and not os.listdir(dirpath):
-                        # F5-2: re-check before rmdir — a junction planted
-                        # between enumeration and here must not be removed.
-                        if _is_reparse_point(dirpath):
-                            continue
-                        os.rmdir(dirpath)
-                except OSError:
-                    continue
-            if stopped:
-                break
-
-    if remove_root and not extensions and not dry and not _is_reparse_point(folder_path) and not stopped:
-        try:
-            if os.path.exists(folder_path) and not os.listdir(folder_path):
-                os.rmdir(folder_path)
-        except OSError:
-            pass
-
-    if stopped:
-        if dry:
-            ctx.log(f"  ! scan stopped early — sizes under {folder_path} are partial")
-        else:
-            ctx.log(f"  ! stopped early — some files were left in place under {folder_path}")
-    if skipped:
-        if dry:
-            ctx.log(f"  (skipped {skipped} unreadable files in {folder_path})")
-        else:
-            ctx.log(f"  (skipped {skipped} locked files in {folder_path})")
-    if moved_to_quarantine and not dry:
-        # Honesty: these bytes were moved, not reclaimed. Say so, and say how
-        # to actually get the space back, instead of letting the "freed"
-        # counter imply the disk is lighter than it is.
-        try:
-            ctx.log(f"  moved {moved_to_quarantine} file(s) under {folder_path} "
-                    "to the Quarantine bin — empty it in Settings to reclaim "
-                    "the space")
-        except Exception:
-            pass
-    return bytes_freed
-
-
 # --------------------------------------------------------------------------- #
 # Bundled asset resolution (works both from source and frozen PyInstaller exe)
 # --------------------------------------------------------------------------- #
@@ -1180,6 +1073,24 @@ def _describe_reg_write_error(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
+def _change_prior(ctx: TaskContext, hive: str, path: str, name: str):
+    """(prior value, known) for the change ledger - read only when recording.
+
+    A context whose `changes` list is missing (an old caller, a test double)
+    pays no extra registry read at all. A denied read is NOT "absent": it is
+    reported as unknown so the card never prints a false "not set -> 0".
+    """
+    if not isinstance(getattr(ctx, "changes", None), list):
+        return None, False
+    try:
+        prior, _type = reg_get_value_typed(ctx, hive, path, name)
+    except Exception:                                        # pragma: no cover
+        return None, False
+    if prior is _REG_DENIED:
+        return None, False
+    return prior, True
+
+
 def _reg_set_value_ex(ctx: TaskContext, hive: str, path: str, name: str, value,
                       value_type: str = "REG_DWORD"):
     """Write a registry value. Returns (ok, reason) — `reason` is a specific,
@@ -1192,12 +1103,16 @@ def _reg_set_value_ex(ctx: TaskContext, hive: str, path: str, name: str, value,
     # falsy to the documented default here.
     if not value_type:
         value_type = "REG_DWORD"
+    prior, prior_known = _change_prior(ctx, hive, path, name)
     ctx.log(f"reg add {hive}\\{path} /v {name or '(Default)'} /d {value}")
     key = None
     try:
         root = _HIVES[hive]
         key = winreg.CreateKeyEx(root, path, 0, _reg_access(write=True))
         winreg.SetValueEx(key, name if name else None, 0, _TYPE_MAP[value_type], value)
+        # R-005: record at the write, not in the transcript afterwards.
+        record_registry(ctx, hive, path, name, prior, value,
+                        before_known=prior_known, type_name=value_type)
         return True, ""
     except Exception as exc:
         ctx.log(f"  ! registry write failed: {exc}")
@@ -1244,6 +1159,7 @@ def reg_set_value_checked(ctx: TaskContext, hive: str, path: str, name: str, val
 
 
 def reg_delete_value(ctx: TaskContext, hive: str, path: str, name: str) -> bool:
+    prior, prior_known = _change_prior(ctx, hive, path, name)
     ctx.log(f"reg delete {hive}\\{path} /v {name or '(Default)'}")
     key = None
     try:
@@ -1257,6 +1173,8 @@ def reg_delete_value(ctx: TaskContext, hive: str, path: str, name: str) -> bool:
             pass
         key = winreg.OpenKey(root, path, 0, access)
         winreg.DeleteValue(key, name)
+        record_registry(ctx, hive, path, name, prior, None,
+                        before_known=prior_known)
         return True
     except FileNotFoundError:
         return True
@@ -1653,12 +1571,28 @@ def restore_point_create_ps(description: str = "Cleaner Tool - safety point") ->
     return (
         "$ErrorActionPreference='Stop';"
         "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+        # A disabled System Restore / VSS service is the common reason a
+        # checkpoint cannot be made (Windows 10/11 ships with System
+        # Protection OFF on many machines, and LTSC images often have the
+        # service disabled outright). Detect it as its own state BEFORE the
+        # 24-hour check, so the caller can report a skip with instructions
+        # instead of an unexplained failure.
+        "foreach ($n in @('SDRSVC','VSS')) {"
+        "$s = Get-Service -Name $n -ErrorAction SilentlyContinue;"
+        "if ($s -and $s.StartType -eq 'Disabled') "
+        "{ Write-Output 'RESTORE_DISABLED'; return }};"
+        "try {"
         "$last = Get-ComputerRestorePoint | Sort-Object CreationTime "
         "-Descending | Select-Object -First 1;"
         "if ($last -and ((Get-Date) - $last.CreationTime).TotalMinutes -lt 1440) "
         "{ Write-Output 'RESTORE_THROTTLED'; return };"
         "Checkpoint-Computer -Description '%s' -RestorePointType MODIFY_SETTINGS;"
-        "Write-Output 'RESTORE_OK'" % safe
+        "Write-Output 'RESTORE_OK'"
+        "} catch {"
+        "$m = [string]$_.Exception.Message;"
+        "if ($m -match 'service cannot be started|ServiceDisabled|disabled') "
+        "{ Write-Output 'RESTORE_DISABLED'; return };"
+        "throw }" % safe
     )
 
 
@@ -1668,7 +1602,7 @@ def create_restore_point(ctx: TaskContext, description: str = "GamerOpt Cleaner 
     # as an argv list (shell=False) so no escaping/quoting games are needed.
     ps_script = restore_point_create_ps(description)
     out: list = []
-    rc = run_cmd(ctx, ["powershell", "-NoProfile", "-Command", ps_script],
+    rc = run_cmd(ctx, ps_argv(ps_script),
                  shell=False, timeout=120, collect=out)
     blob = "\n".join(out)
     # BUG-013 / B-056: Windows allows only ONE System Restore checkpoint per 24
@@ -1676,6 +1610,20 @@ def create_restore_point(ctx: TaskContext, description: str = "GamerOpt Cleaner 
     # newest point is younger than that, so a throttled create is a skip, not a
     # failure. The English phrasings are kept only as a fallback.
     low = blob.lower()
+    # System Protection off / the restore service disabled. This is a
+    # machine-state answer, not a task failure: "Safety Checkpoint - failed:
+    # Task returned False" told the user nothing they could act on. Classify
+    # it as a skip, with the exact place to turn it on.
+    if ("restore_disabled" in low or "servicedisabled" in low
+            or "service cannot be started" in low):
+        ctx.log("  i Skipped: System Protection is off for this drive (or its "
+                "restore service is disabled), so Windows cannot make a "
+                "restore point.")
+        ctx.log("  i Turn it on: Start > type 'Create a restore point' > "
+                "Configure > Turn on system protection. Then run this again.")
+        raise TaskSkipped(
+            "System Protection is off for this drive, so Windows cannot "
+            "create restore points until it is turned on")
     if "restore_throttled" in low or "1440 minutes" in low or \
             "restore point cannot be created" in low:
         ctx.log("  i Skipped: Windows allows only one restore point per 24 hours,")
@@ -1684,6 +1632,6 @@ def create_restore_point(ctx: TaskContext, description: str = "GamerOpt Cleaner 
     if rc == 0 or "restore_ok" in low:
         ctx.log("Restore point created successfully.")
         return True
-    ctx.log("  ! Could not create a restore point (System Protection may be off for this drive).")
-    ctx.log("  ! Enable it: Settings > System > About > System protection, then retry.")
+    ctx.log("  ! Could not create a restore point for another reason (exit code %s)." % rc)
+    ctx.log("  ! Check that System Protection is on for this drive, then retry.")
     return False

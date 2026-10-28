@@ -33,11 +33,23 @@ import tempfile
 
 
 def _si_log(msg):
-    """Write to log file for debugging single-instance issues"""
+    """Write to the single-instance debug trail. Best-effort, bounded, safe.
+
+    B-003/H-001/I-003: this used to append with a plain `open(..., "a")` to a
+    fixed %TEMP% name and wrote its caller's text verbatim - including the
+    `--elevation-token=<secret>` argument. The text is now redacted and the
+    file is link-safe and size-capped (app.logsafe).
+    """
     try:
-        log_path = os.path.join(tempfile.gettempdir(), "cleaner_tool_single_instance.log")
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(f"[{os.getpid()}] {msg}\n")
+        from app.logsafe import append_text_no_follow, redact
+        text = redact(msg)
+        log_path = os.path.join(tempfile.gettempdir(),
+                                "cleaner_tool_single_instance.log")
+        append_text_no_follow(log_path, f"[{os.getpid()}] {text}\n")
+        # I-003: one place for the trail. A startup problem that only reached
+        # a %TEMP% file was missing from the crash log a bug report asks for.
+        from app.diagnostics import log as _diag_log
+        _diag_log("[single_instance] %s" % text)
     except Exception:
         pass
 
@@ -121,9 +133,7 @@ def _bind():
     values overflow it (CloseHandle on a truncated handle closes the
     wrong object or fails). Bound once, cached on the function."""
     import ctypes
-    wide = ctypes.sizeof(ctypes.c_void_p) == 8
     H = ctypes.c_void_p
-    U = ctypes.c_uint
     D = ctypes.c_uint32
     B = ctypes.c_int
     k = ctypes.windll.kernel32
@@ -188,7 +198,6 @@ def _null_dacl_attributes():
             _fields_ = [("nLength", _w.DWORD),
                         ("lpSecurityDescriptor", ctypes.c_void_p),
                         ("bInheritHandle", _w.BOOL)]
-        k = _k()
         a = _adv()
         sd = ctypes.create_string_buffer(64)
         if not a.InitializeSecurityDescriptor(sd, 1):
@@ -213,7 +222,6 @@ def _probe_namespace() -> str:
     ns = "Local"
     if _is_windows():
         try:
-            import ctypes
             k = _k()
             probe = f"Global\\CleanerTool_NsProbe_{os.getpid()}"
             h = k.CreateMutexW(None, False, probe)
@@ -247,7 +255,6 @@ def acquire(name: str | None = None):
     if not _is_windows():
         return object()
     try:
-        import ctypes
         k = _k()
         h = k.CreateMutexW(None, False, _full_name(name or _MUTEX_BASENAME))
         if not h:
@@ -367,24 +374,46 @@ def signal_existing(name: str | None = None) -> bool:
                 pass
 
 
-def check_signalled(name: str | None = None) -> bool:
-    """Winner poll (Tk thread): True once per delivered pulse. Drains the
-    auto-reset event; never raises. `name` overrides the event basename
-    (tests use unique names so they can never touch the real handoff)."""
-    h, _close = None, False
+def watch_show_event(on_pulse, stop, name: str | None = None,
+                     timeout_ms: int = 1000) -> None:
+    """Winner side, BLOCKING: call this from a worker thread and it runs
+    until `stop` is set, invoking `on_pulse()` once per delivered pulse.
+
+    Replaces the Tk-thread `after(500, ...)` poll, which woke the UI thread
+    twice a second for the life of the process just to check a kernel
+    object. Here the wait happens ON the worker (one blocking
+    WaitForSingleObject at a time), so the Tk thread pays nothing, and a
+    pulse is noticed within `timeout_ms` instead of up to a poll interval.
+
+    `on_pulse` runs on THIS thread - post to Tk yourself (TkDispatcher).
+    The timeout is what makes `stop` observable: an INFINITE wait would
+    keep the thread alive past app close. Never raises."""
+    h = None
     try:
-        if name is None:
-            h = ensure_show_event()
-        else:
-            h = _open_show_event(name)
-            _close = h is not None
+        if not _is_windows():
+            return
+        h = ensure_show_event(name)
         if not h:
-            return False
-        return _k().WaitForSingleObject(h, 0) == _WAIT_OBJECT_0
+            return
+        while not stop.is_set():
+            try:
+                rc = _k().WaitForSingleObject(h, int(timeout_ms))
+            except Exception:
+                return
+            if rc == _WAIT_OBJECT_0:
+                try:
+                    on_pulse()
+                except Exception:
+                    pass
+                # a pulse is a single focus request; don't spin if the
+                # consumer is slow - the next wait drains the next pulse
+                continue
     except Exception:
-        return False
+        return
     finally:
-        if _close and h:
+        # the handle belongs to _state when name is None (opened once at
+        # startup and reused); a named test handle is ours to close
+        if name is not None and h:
             try:
                 _k().CloseHandle(h)
             except Exception:
@@ -401,7 +430,10 @@ def is_elevation_child(argv=None) -> bool:
             if str(a).startswith("--elevation-token="):
                 try:
                     import sys as _sys
-                    print(f"[single_instance] Detected elevation child: {a}", file=_sys.stderr)
+                    from app.logsafe import redact
+                    # B-003: the argument IS the token; never print it raw.
+                    print(f"[single_instance] Detected elevation child: "
+                          f"{redact(a)}", file=_sys.stderr)
                     _si_log(f"Detected elevation child: {a}")
                 except Exception:
                     pass

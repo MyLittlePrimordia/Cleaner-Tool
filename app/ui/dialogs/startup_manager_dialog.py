@@ -8,17 +8,23 @@ about any other dialog except where noted.
 from __future__ import annotations
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+
+from app import facts
 from app.ui.base import Tooltip
 from app.ui.dialogs._tool_page import ToolPage
-from app.ui.theme import COLORS, F, TAB_ACCENTS, ICON_ROW_PX, icon_bg_rgb
-from app.ui.widgets import AnimatedButton, ScrollableRoundedPanel, ToggleSwitch
+from app.ui.theme import (
+    COLORS, ICON_ROW, TAB_ACCENTS, TYPE, icon_bg_rgb, icon_target_px,
+    SPACE_1, SPACE_2, SPACE_3,
+)
+from app.ui.metrics import HERO_OFFSET, PAGE_INSET, SECTION_BREAK, TEXT_NUDGE
+from app.ui.widgets import (AnimatedButton, EmptyState, ScrollableRoundedPanel,
+                            ToggleSwitch, ToolRow)
 from app.ui.tkdispatch import TkDispatcher
 
-# Rows sit directly on the page now (no per-row card fill), so the icon
-# plate must match the PAGE colour exactly - otherwise every app icon shows
-# the opaque square the extractor composites onto.
-_icon_bg = icon_bg_rgb(COLORS["bg"])
+# Rows are ToolRows, so their face is the shared `bg_alt` row fill. The icon
+# plate has to match THAT colour exactly - otherwise every app icon shows the
+# opaque square the extractor composites onto.
+_icon_bg = icon_bg_rgb(COLORS["bg_alt"])
 
 
 class StartupManagerDialog(ToolPage):
@@ -45,6 +51,9 @@ class StartupManagerDialog(ToolPage):
     def __init__(self, parent, app):
         self.app = app
         self._rows = {}     # item_id -> {"toggle": ToggleSwitch, "var": BooleanVar}
+        #: The last successful read, so a toggle can republish the enabled
+        #: count without re-running the registry walk.
+        self._items = []
         self._wrap_bound = False
         # icon state: command -> PhotoImage, plus the labels still waiting on
         # an extraction, so a Refresh never re-extracts the same file.
@@ -56,6 +65,7 @@ class StartupManagerDialog(ToolPage):
                          scope="Nothing is deleted — every switch turns "
                                "back on.",
                          scroll=False)
+        self._icon_px = icon_target_px(ICON_ROW, self)
         body = self.content
         self.banner.set_state("\U0001F680", TAB_ACCENTS["Tools"])
         self.banner.set_title("What starts with Windows?")
@@ -75,7 +85,10 @@ class StartupManagerDialog(ToolPage):
         # (it was the accent-filled button before), Refresh is secondary.
         # _say() now writes to the shared StatusLine.
         self.add_button("Close", self.close, kind="primary")
-        self.add_button("Refresh", self._refresh, kind="secondary")
+        # An explicit Refresh must re-read, not replay the fact store's
+        # five-minute cache; opening the dialog may use the cache.
+        self.add_button("Refresh", lambda: self._refresh(force=True),
+                        kind="secondary")
 
         self._refresh()
 
@@ -85,7 +98,7 @@ class StartupManagerDialog(ToolPage):
         except Exception:
             pass
 
-    def _refresh(self):
+    def _refresh(self, force=False):
         holder = self._panel.inner
         try:
             for w in list(holder.winfo_children()):
@@ -93,25 +106,23 @@ class StartupManagerDialog(ToolPage):
         except Exception:
             return
         self._rows = {}
-        # BUGFIX 2026-10: the exception was swallowed into `items = []`, which
-        # is the same value a genuinely-empty machine produces. Both rendered
-        # one string - "Nothing found - or this PC couldn't be checked." - so
-        # a user whose read failed was told, with equal confidence, that they
-        # might have nothing, and had no way to tell the two apart or to retry
-        # a read that had not actually happened.
-        err = None
-        try:
-            from app.startup_manager import list_startup_items
-            items = list_startup_items()
-        except Exception as exc:
-            items, err = None, str(exc)
-        if err is not None:
-            self._paint_error(holder, err)
+        # BUGFIX 2026-10: a failed read must never look like an empty
+        # machine. AUDIT TX-001: the read is the shared `system.startup`
+        # fact, so a failure keeps its reason (`ok=False`) instead of
+        # collapsing into the same `[]` a clean README would produce.
+        fact = facts.get("system.startup", max_age=0 if force else None)
+        if not fact.ok:
+            self._paint_error(holder, fact.error or "unknown error")
             return
+        items = fact.value or []
+        self._items = list(items)
+        self._publish_finding()
         if not items:
-            tk.Label(holder, text="Nothing is set to start with Windows.",
-                     font=(F, 9), bg=COLORS["bg"],
-                     fg=COLORS["subtext"]).pack(pady=20)
+            EmptyState(
+                holder, glyph="\U0001F31E",
+                text="Nothing is set to start with Windows.",
+                wrap=max(240, self.body_width(24))).pack(
+                    fill="x", pady=(PAGE_INSET, SECTION_BREAK))
             try:
                 self._panel.refresh_scroll()
             except Exception:
@@ -128,6 +139,66 @@ class StartupManagerDialog(ToolPage):
         n_on = sum(1 for i in items if i["enabled"])
         self._say("%d of %d start with Windows." % (n_on, len(items)))
         self._bind_wrap()
+        # U-002: the measured cost arrives after the list, off the Tk thread.
+        # Rows appear immediately with no number; they gain one when Windows'
+        # own boot events have been read. A slow read never delays the list.
+        self._load_boot_perf()
+
+    def _load_boot_perf(self):
+        """Read last-boot duration + per-app startup cost. Never blocks Tk."""
+        def work():
+            from app import boot_perf
+            return boot_perf.summary()
+
+        self.run_worker(work, self._land_boot_perf)
+
+    def _land_boot_perf(self, summary):
+        from app import boot_perf
+
+        self._boot_perf = summary or {}
+        if not summary or not summary.get("ok"):
+            # Not measured is said, never rendered as "all good".
+            try:
+                self.banner.set_sub(
+                    "Windows did not record boot timings (needs administrator); "
+                    "impact is not measured.")
+            except Exception:
+                pass
+            return
+        last = boot_perf.format_ms(summary.get("last_ms"))
+        avg = boot_perf.format_ms(summary.get("average_ms"))
+        count = len(summary.get("boots") or [])
+        try:
+            self.banner.set_sub(
+                "Last boot %s \u00b7 average %s over %d recorded boot%s. "
+                "Impact is Windows' own measurement."
+                % (last, avg, count, "" if count == 1 else "s"))
+        except Exception:
+            pass
+        impact = summary.get("impact") or {}
+        for item in self._items:
+            hit = boot_perf.impact_for(item, impact)
+            if not hit:
+                continue
+            slot = (self._rows.get(item.get("id")) or {}).get("row")
+            if slot is None:
+                continue
+            try:
+                slot.meta.config(text="%s at boot" % boot_perf.format_ms(
+                    hit.get("ms")))
+                Tooltip(slot.meta, "Windows measured this entry adding %s to "
+                                   "startup and flagged it as a slowdown."
+                                   % boot_perf.format_ms(hit.get("ms")))
+            except Exception:
+                pass
+
+    def _publish_finding(self):
+        """Carry the enabled-startup count to Health and the Tools hub."""
+        try:
+            from app.startup_manager import publish_startup_finding
+            publish_startup_finding(self._items)
+        except Exception:
+            pass
 
     def _paint_error(self, holder, detail):
         """A failed read, shown as a failed read.
@@ -140,19 +211,20 @@ class StartupManagerDialog(ToolPage):
         short = (detail or "").strip().splitlines()[0][:140] or "unknown error"
         try:
             tk.Label(holder, text="Couldn't read your startup items.",
-                     font=(F, 10, "bold"), bg=COLORS["bg"],
+                     font=TYPE["label_large"], bg=COLORS["bg"],
                      fg=COLORS["accent_yellow"],
-                     bd=0, highlightthickness=0).pack(pady=(22, 2))
-            tk.Label(holder, text=short, font=(F, 9), bg=COLORS["bg"],
+                     bd=0, highlightthickness=0).pack(pady=(HERO_OFFSET, TEXT_NUDGE))
+            tk.Label(holder, text=short, font=TYPE["caption"], bg=COLORS["bg"],
                      fg=COLORS["subtext"], wraplength=self.body_width(28),
-                     justify="center", bd=0, highlightthickness=0).pack(pady=(0, 4))
+                     justify="center", bd=0,
+                     highlightthickness=0).pack(pady=(0, SPACE_1))
             tk.Label(holder, text="Nothing was changed.",
-                     font=(F, 9), bg=COLORS["bg"], fg=COLORS["subtext"],
+                     font=TYPE["caption"], bg=COLORS["bg"], fg=COLORS["subtext"],
                      bd=0, highlightthickness=0).pack()
             AnimatedButton(
-                holder, text="Try again", command=self._refresh,
-                bg=COLORS["surface"], fg=COLORS["text"],
-                font=(F, 9, "bold"), padx=16, pady=6).pack(pady=(12, 20))
+                holder, text="Try again",
+                command=lambda: self._refresh(force=True),
+                role="secondary", size="sm").pack(pady=(SPACE_3, SECTION_BREAK))
         except Exception:
             pass
         try:
@@ -161,54 +233,42 @@ class StartupManagerDialog(ToolPage):
             pass
 
     def _build_row(self, parent, item, admin):
-        # AUDIT D2: this dialog predates ToolShell, so its rows never got
-        # ToolRow._fit_title's ellipsis. Both labels below packed a name and
-        # a source_label (often a full command line - "C:\Program Files\...\app.exe
-        # --background") with no wraplength and no truncation, so pack sheared
-        # them MID-CHARACTER. That reads as a rendering fault rather than as
-        # truncation. Widths come from the row's own column, re-measured on
-        # <Configure>, so they follow the window instead of a literal.
-        row = tk.Frame(parent, bg=COLORS["bg"])
-        var = tk.BooleanVar(value=item["enabled"])
+        # AUDIT D2 (fixed for good here): this dialog used to hand-pack a
+        # name and a source_label - often a full command line - with no
+        # truncation, so pack sheared them MID-CHARACTER. ToolRow owns the
+        # anatomy now: leading slot for the icon, title + second line,
+        # actions slot for the switch. ToolRow._fit_title ellipsizes the name
+        # and the whole command line stays on the tooltip.
         needs_admin = item["admin_required"] and not admin
+        var = tk.BooleanVar(value=item["enabled"])
+        row = ToolRow(parent, title=item["name"], sub=item["source_label"],
+                      size="lg", leading_px=self._icon_px + 4,
+                      wrap=max(200, self.body_width(26)))
         toggle = ToggleSwitch(
-            row, variable=var,
+            row.actions, variable=var,
             command=lambda it=item, v=var: self._on_toggle(it, v))
-        toggle.pack(side="left", padx=(10, 8), pady=8)
+        toggle.pack(side="right", padx=(SPACE_2, 0))
         if needs_admin:
             try:
                 toggle.set_enabled(False)
             except Exception:
                 pass
-        # Per-app icon, between the switch and the name. Startup rows come
-        # in two shapes and both resolve: a Run value that is a command line
-        # pointing at an exe, and a Startup-folder .lnk shortcut (resolved by
-        # parsing the shell link). There was no icon here at all before.
-        icon_lbl = tk.Label(row, bg=COLORS["bg"])
-        icon_lbl.pack(side="left", padx=(0, 10), pady=8)
-        self._set_row_icon(icon_lbl, item)
-        text = tk.Frame(row, bg=COLORS["bg"])
-        text.pack(side="left", fill="x", expand=True)
-        name_row = tk.Frame(text, bg=COLORS["bg"])
-        name_row.pack(fill="x")
-        name_lbl = tk.Label(name_row, text=item["name"], font=(F, 9, "bold"),
-                            bg=COLORS["bg"], fg=COLORS["text"],
-                            anchor="w", justify="left", bd=0)
-        name_lbl.pack(side="left", fill="x", expand=True)
-        # The full text is never lost: it is the tooltip on both labels.
-        Tooltip(name_lbl, item["name"])
-        if needs_admin:
-            shield = tk.Label(name_row, text="🛡️", font=(F, 9),
-                              bg=COLORS["bg"])
-            shield.pack(side="right", padx=(6, 0))
+            shield = tk.Label(row.actions, text="🛡️", font=TYPE["caption"],
+                              bg=COLORS["bg_alt"])
+            shield.pack(side="right", padx=(SPACE_2, 0))
             Tooltip(shield, "Restart Cleaner Tool as Administrator to "
                            "change this one")
-        src_lbl = tk.Label(text, text=item["source_label"], font=(F, 9),
-                           bg=COLORS["bg"], fg=COLORS["subtext"],
-                           anchor="w", justify="left", bd=0)
-        src_lbl.pack(fill="x")
-        Tooltip(src_lbl, item["source_label"])
-        row.pack(fill="x", pady=2)
+        # Per-app icon in the row's leading slot. Startup rows come in two
+        # shapes and both resolve: a Run value that is a command line
+        # pointing at an exe, and a Startup-folder .lnk shortcut.
+        icon_lbl = tk.Label(row.leading, bg=COLORS["bg_alt"])
+        icon_lbl.pack(fill="both", expand=True)
+        self._set_row_icon(icon_lbl, item)
+        # The full text is never lost: it is the tooltip on both labels.
+        Tooltip(row.title, item["name"])
+        Tooltip(row.sub, item["source_label"])
+        row.bind_content()
+        row.pack(fill="x", pady=TEXT_NUDGE)
         self._rows[item["id"]] = {"toggle": toggle, "var": var, "row": row}
 
     def _bind_wrap(self):
@@ -289,10 +349,10 @@ class StartupManagerDialog(ToolPage):
         if self._icon_default_img is None:
             try:
                 from app.icon_resolve import generic_app_icon_ppm
-                _ppm = generic_app_icon_ppm(ICON_ROW_PX, _icon_bg)
+                _ppm = generic_app_icon_ppm(self._icon_px, _icon_bg)
                 if _ppm is None:
                     from app.icon_extract import default_icon_ppm
-                    _ppm = default_icon_ppm(ICON_ROW_PX, _icon_bg)
+                    _ppm = default_icon_ppm(self._icon_px, _icon_bg)
                 self._icon_default_img = tk.PhotoImage(data=_ppm)
             except Exception:
                 self._icon_default_img = None
@@ -325,7 +385,7 @@ class StartupManagerDialog(ToolPage):
             ppm = None
             try:
                 from app.icon_extract import icon_ppm_bytes
-                ppm = icon_ppm_bytes(spec, size=ICON_ROW_PX, bg_rgb=_icon_bg)
+                ppm = icon_ppm_bytes(spec, size=self._icon_px, bg_rgb=_icon_bg)
             except Exception:
                 ppm = None
 
@@ -367,4 +427,13 @@ class StartupManagerDialog(ToolPage):
                 var.set(not wanted)
             except Exception:
                 pass
+        else:
+            # The cached list still says the old state. Invalidate rather
+            # than re-read here: the row already paints the change, and the
+            # next tool that asks gets a real measurement.
+            facts.invalidate("system.startup")
+            # Keep this dialog's own copy honest too, so the finding reflects
+            # the switch the user just flipped instead of the pre-toggle list.
+            item["enabled"] = wanted
+            self._publish_finding()
         self._say(msg)

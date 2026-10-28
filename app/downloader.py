@@ -23,11 +23,11 @@ Design rules (user requirements + supply-chain safety):
 
 import hashlib
 import os
-import subprocess
 import tempfile
+import time
 import urllib.request
 
-from app.utils import TaskContext, TaskCancelled, run_cmd, run_cmd_checked, resolve_exe
+from app.utils import TaskContext, TaskCancelled, run_cmd, resolve_exe
 from app import capabilities as cap
 
 _UA = "CleanerTool/2.0 (component installer)"
@@ -61,6 +61,11 @@ def _download(ctx: TaskContext, url: str, dest: str, expected_size: int,
     # and is never trusted as a limit. When we have no pinned size, the cap
     # below still applies so an unknown-length body cannot fill the disk.
     ceiling = expected_size if expected_size else _MAX_UNPINNED_DOWNLOAD
+    # H-006: `timeout` is a per-SOCKET-READ timeout, so an origin that drips one
+    # byte every few seconds keeps it happy forever while the download never
+    # finishes - and the Stop button is the only way out. A wall-clock deadline
+    # caps the whole transfer.
+    deadline = time.monotonic() + timeout if timeout else None
     try:
         req = urllib.request.Request(url, headers={"User-Agent": _UA})
         with urllib.request.urlopen(req, timeout=timeout) as resp, open(dest, "wb") as f:
@@ -68,6 +73,11 @@ def _download(ctx: TaskContext, url: str, dest: str, expected_size: int,
             got = 0
             last_pct = -1
             while True:
+                if deadline is not None and time.monotonic() > deadline:
+                    raise RuntimeError(
+                        f"download took longer than {timeout}s - the "
+                        f"connection is too slow to finish it (got {got} "
+                        f"bytes so far)")
                 # audit fix: Stop button was dead for the whole download —
                 # a 100MB fetch on a slow link ignored cancel for up to
                 # 600s. Check every chunk; abort leaves a partial file the

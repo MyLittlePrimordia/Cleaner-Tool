@@ -4,11 +4,9 @@ H4. Extracted verbatim from app/gui.py (blueprint B1.2).
 """
 from __future__ import annotations
 
-import math
-import time
 import tkinter as tk
 
-from app.ui.theme import COLORS, TAB_ACCENTS, _hex_lerp, F
+from app.ui.theme import COLORS, TAB_ACCENTS, TYPE, _hex_lerp
 
 class GaugeDial(tk.Canvas):
     """Semicircular speed gauge — house custom-draw style (smooth
@@ -138,7 +136,6 @@ class GaugeDial(tk.Canvas):
         except Exception:
             return
         try:
-            import math
             w, h = self._bw, self._bh
             cx, cy = w / 2.0, h - 22.0
             radius = min(w / 2.0 - 34.0, h - 58.0)
@@ -196,7 +193,7 @@ class GaugeDial(tk.Canvas):
                 try:
                     self.create_line(x0, y0, x1, y1, fill=COLORS["subtext"], width=2)
                     lx, ly = self._point(cx, cy, radius - 42.0, f)
-                    self.create_text(lx, ly, text=f"{t}", font=(F, 9),
+                    self.create_text(lx, ly, text=f"{t}", font=TYPE["caption"],
                                      fill=COLORS["text"])
                 except Exception:
                     pass

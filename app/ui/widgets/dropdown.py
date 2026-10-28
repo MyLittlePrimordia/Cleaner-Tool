@@ -1,8 +1,8 @@
 """M3Dropdown: a rounded Material 3 "exposed dropdown" field.
 
-Stands in for ttk.Combobox (and tk.OptionMenu) so every picker in the app is
-a rounded, filled field with a drawn chevron instead of the square native
-control. It implements the small Combobox surface the app uses: textvariable,
+Stands in for the native combobox (and tk.OptionMenu) so every picker in the
+app is a rounded, filled field with a drawn chevron instead of a platform
+control. The app contains no ttk widgets at all; this is the only picker. It implements the small Combobox surface the app uses: textvariable,
 values, state, width, font, bind("<<ComboboxSelected>>"), current(), get(),
 set(), config(values=..., state=...) and widget["values"].
 
@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import tkinter as tk
 
-from app.ui.theme import (COLORS, F, _hex_lerp, _measure_font,
-                          _round_rect_points, ellipsize)
+from app.ui.theme import (
+    COLORS, RADIUS_FIELD, TYPE, _hex_lerp, _measure_font,
+    _round_rect_points, ellipsize
+)
 
 #: Horizontal room a field reserves beyond its text: the 18px left inset plus
 #: the chevron column and the gap before it. Shared by the width estimate here
@@ -44,7 +46,7 @@ def _field_px(parent, font, width, values):
 
 class M3Dropdown(tk.Canvas):
     H = 42
-    RADIUS = 14
+    RADIUS = RADIUS_FIELD
 
     def __init__(self, parent, textvariable=None, values=(), state="readonly",
                  width=20, font=None, bg=None, command=None, **_ignored):
@@ -52,7 +54,7 @@ class M3Dropdown(tk.Canvas):
             page = bg or parent["bg"]
         except Exception:
             page = COLORS["bg"]
-        self._font = font or (F, 10)
+        self._font = font or TYPE["body_medium"]
         self._values = [str(v) for v in values]
         self._enabled = state != "disabled"
         px = _field_px(parent, self._font, width, self._values)

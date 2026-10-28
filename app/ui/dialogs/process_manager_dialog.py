@@ -10,12 +10,15 @@ from __future__ import annotations
 import os
 
 import tkinter as tk
-from tkinter import ttk, messagebox
 from app.ui.base import _themed_askyesno
 from app.ui.dialogs._tool_page import ToolPage
-from app.ui.theme import (COLORS, F, ICON_ROW_PX, TAB_ACCENTS,
-                          icon_bg_rgb)
-from app.ui.widgets import AnimatedButton
+from app.ui.theme import (
+    COLORS, ICON_ROW_PX, TAB_ACCENTS, TYPE, SPACE_1, SPACE_2, SPACE_3,
+)
+from app.ui.metrics import (
+    CONTROL_GAP, GROUP_GAP, HERO_OFFSET, SECTION_BREAK, TEXT_NUDGE, TIGHT_GAP,
+)
+from app.ui.widgets import AnimatedButton, EmptyState
 
 
 class ProcessManagerDialog(ToolPage):
@@ -42,7 +45,7 @@ class ProcessManagerDialog(ToolPage):
     #: from ICON_ROW_PX so the text-unit size lands close to the real
     #: image box; reserving it is what keeps rows from reflowing when
     #: an icon arrives late (or never does).
-    _ICON_SLOT_W = 32
+    _ICON_SLOT_W = ICON_ROW_PX
 
     _TICK_MS = 3000
     _TOP_N = 80
@@ -259,7 +262,7 @@ class ProcessManagerDialog(ToolPage):
                     continue
                 try:
                     row.pack_forget()
-                    row.pack(fill="x", padx=4, pady=3)
+                    row.pack(fill="x", padx=SPACE_1, pady=TIGHT_GAP)
                 except Exception:
                     pass
         except Exception:
@@ -369,21 +372,20 @@ class ProcessManagerDialog(ToolPage):
         short = (detail or "").strip().splitlines()[0][:120] or "unknown error"
         try:
             tk.Label(holder, text="Couldn't read the running programs.",
-                     font=(F, 10, "bold"), bg=COLORS["bg"],
+                     font=TYPE["label_large"], bg=COLORS["bg"],
                      fg=COLORS["accent_yellow"],
-                     bd=0, highlightthickness=0).pack(pady=(22, 2))
-            tk.Label(holder, text=short, font=(F, 9), bg=COLORS["bg"],
+                     bd=0, highlightthickness=0).pack(pady=(HERO_OFFSET, TEXT_NUDGE))
+            tk.Label(holder, text=short, font=TYPE["caption"], bg=COLORS["bg"],
                      fg=COLORS["subtext"], wraplength=self.body_width(90),
                      justify="center",
-                     bd=0, highlightthickness=0).pack(pady=(0, 4))
+                     bd=0, highlightthickness=0).pack(pady=(0, SPACE_1))
             tk.Label(holder, text="This usually clears on its own.",
-                     font=(F, 9), bg=COLORS["bg"],
+                     font=TYPE["caption"], bg=COLORS["bg"],
                      fg=COLORS["subtext"],
                      bd=0, highlightthickness=0).pack()
             AnimatedButton(
                 holder, text="Try again", command=self._refresh_list,
-                bg=COLORS["surface"], fg=COLORS["text"],
-                font=(F, 9, "bold"), padx=16, pady=6).pack(pady=(12, 20))
+                role="secondary", size="sm").pack(pady=(SPACE_3, SECTION_BREAK))
         except Exception:
             pass
         try:
@@ -412,9 +414,14 @@ class ProcessManagerDialog(ToolPage):
         self._displayed_keys = [g.get("key") for g in groups]
         if not groups:
             try:
-                tk.Label(holder, text="Nothing running right now.",
-                         font=(F, 9), bg=COLORS["bg"],
-                         fg=COLORS["subtext"]).pack(pady=20)
+                # Same empty state as every other list (C-004), and the
+                # sentence names the CAUSE: this is a read of the process
+                # table, not a filter that matched nothing.
+                EmptyState(holder, glyph="\u25a4",
+                           text="Nothing running right now.",
+                           detail="Close a game and it will leave this list.",
+                           bg=COLORS["bg"],
+                           wrap=max(240, self.body_width(24))).pack(fill="x")
                 self._panel.refresh_scroll()
             except Exception:
                 pass
@@ -457,7 +464,10 @@ class ProcessManagerDialog(ToolPage):
                 refs["pids"] = pids
                 disp = g.get("display") or "?"
                 try:
-                    refs["btn"]._command = (
+                    # Re-point the row's own button (A-008): the group it
+                    # closes is built from the CURRENT pids, so a row that
+                    # survived a refresh must not keep closing the old set.
+                    refs["btn"].set_command(
                         lambda ps=pids, d=disp:
                         self._confirm_close_group(ps, d))
                 except Exception:
@@ -477,7 +487,7 @@ class ProcessManagerDialog(ToolPage):
         if not pids:
             return
         row = tk.Frame(parent, bg=COLORS["bg"])
-        row.pack(fill="x", padx=4, pady=3)
+        row.pack(fill="x", padx=SPACE_1, pady=TIGHT_GAP)
         # Icon placeholder. It is created EMPTY so the layout is identical
         # whether or not an icon ever arrives - a row that changes width when
         # its picture lands is far more distracting than no picture at all.
@@ -497,15 +507,15 @@ class ProcessManagerDialog(ToolPage):
         icon_box = tk.Frame(row, width=ICON_ROW_PX, height=ICON_ROW_PX,
                             bg=COLORS["bg"])
         icon_box.pack_propagate(False)
-        icon_box.pack(side="left", padx=(10, 0), pady=8)
+        icon_box.pack(side="left", padx=(GROUP_GAP, 0), pady=SPACE_2)
         icon_lbl = tk.Label(icon_box, bg=COLORS["bg"])
         icon_lbl.pack(fill="both", expand=True)
         left = tk.Frame(row, bg=COLORS["bg"])
-        left.pack(side="left", fill="x", expand=True, padx=(10, 6), pady=8)
-        name = tk.Label(left, text=disp, font=(F, 11, "bold"),
+        left.pack(side="left", fill="x", expand=True, padx=(GROUP_GAP, CONTROL_GAP), pady=SPACE_2)
+        name = tk.Label(left, text=disp, font=TYPE["card_title"],
                         bg=COLORS["bg"], fg=COLORS["text"], anchor="w")
         name.pack(fill="x")
-        detail = tk.Label(left, text=self._detail_text(group), font=(F, 9),
+        detail = tk.Label(left, text=self._detail_text(group), font=TYPE["caption"],
                           bg=COLORS["bg"], fg=COLORS["subtext"],
                           anchor="w")
         detail.pack(fill="x")
@@ -513,9 +523,8 @@ class ProcessManagerDialog(ToolPage):
             row, text="Close",
             command=lambda ps=pids,
             d=disp: self._confirm_close_group(ps, d),
-            bg=COLORS["surface"], fg=COLORS["text"],
-            font=(F, 9, "bold"), padx=14, pady=5)
-        btn.pack(side="right", padx=(0, 10), pady=8)
+            role="danger", size="sm")
+        btn.pack(side="right", padx=(0, GROUP_GAP), pady=SPACE_2)
         self._rows[key] = row
         self._row_widgets[key] = {"frame": row, "name": name,
                                   "detail": detail, "btn": btn,
@@ -590,18 +599,18 @@ class ProcessManagerDialog(ToolPage):
                     continue
                 if not todo:
                     continue
-                got = False
                 for _path in todo:
                     try:
                         from app.icon_extract import icon_ppm_bytes
-                        from app.ui.theme import ICON_ROW_PX, icon_bg_rgb
+                        from app.ui.theme import (
+                            ICON_ROW_PX, icon_bg_rgb
+                        )
                         ppm = icon_ppm_bytes(_path, size=ICON_ROW_PX,
                                              bg_rgb=icon_bg_rgb(COLORS["bg"]))
                     except Exception:
                         ppm = None
                     if ppm:
                         out.append((key, _path, ppm))
-                        got = True
                         break
                     missed.append(_path)
             for _k, _ps in pending:
@@ -681,21 +690,21 @@ class ProcessManagerDialog(ToolPage):
             pass
         if not pids:
             return
-        if len(pids) > 1:
-            title, msg = ("Close all?",
-                          f"Close all {len(pids)} {display or 'process'} "
-                          "processes?\n\nUnsaved work in those windows "
-                          "will be lost.")
-            yes = "Close all"
-        else:
-            title, msg = ("Close process?",
-                          f"Close {display or 'this process'}?\n\nUnsaved "
-                          "work in that app will be lost.")
-            yes = "Close"
+        accent = TAB_ACCENTS["Tools"]
         try:
-            ok = _themed_askyesno(
-                self._dlg, title, msg, accent=TAB_ACCENTS["Tools"],
-                yes_text=yes, no_text="Keep running")
+            if len(pids) > 1:
+                ok = _themed_askyesno(
+                    self._dlg,
+                    "Close all %d %s processes?" % (len(pids),
+                                                    display or "process"),
+                    "Unsaved work in those windows will be lost.",
+                    accent=accent, yes_text="Close all",
+                    no_text="Keep running")
+            else:
+                ok = _themed_askyesno(
+                    self._dlg, "Close %s?" % (display or "this process"),
+                    "Unsaved work in that app will be lost.",
+                    accent=accent, yes_text="Close", no_text="Keep running")
         except Exception:
             # B-008: fail SAFE. A dialog failure must not be read as consent
             # to force-kill; the old `ok = True` terminated processes unasked.

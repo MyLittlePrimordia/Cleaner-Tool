@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import tkinter as tk
 
-from app.ui.widgets.rounded_card import RoundedCard
-from tkinter import ttk, messagebox
 from app.ui.base import Tooltip
 from app.ui.dialogs._tool_page import ToolPage
-from app.ui.theme import COLORS, F, TAB_ACCENTS, _hex_lerp
-from app.ui.widgets import AnimatedProgressBar, GaugeDial
+from app.ui.theme import (
+    COLORS, EMOJI, ICON_USAGE, SPACE_2, SPACE_3, TAB_ACCENTS, TYPE, _hex_lerp,
+)
+from app.ui.metrics import CONTROL_GAP, GROUP_GAP, MEASURE_CAP, TEXT_NUDGE
+from app.ui.widgets import AnimatedProgressBar, GaugeDial, MetricStrip
 
 
 class SpeedTestDialog(ToolPage):
@@ -93,14 +94,14 @@ class SpeedTestDialog(ToolPage):
         # 530px against a 517px content zone — one scrollbar, for a dial whose
         # needle sits in the bottom third of its box anyway.
         stage = self._stage = tk.Frame(body, bg=COLORS["bg"], height=236)
-        stage.pack(fill="x", pady=(6, 0))
+        stage.pack(fill="x", pady=(CONTROL_GAP, 0))
         try:
             stage.pack_propagate(False)
         except Exception:
             pass
         self._gauge = GaugeDial(stage, accent=TAB_ACCENTS["Tools"],
                                 width=340, height=156)
-        self._big_lbl = tk.Label(stage, text="—", font=(F, 18, "bold"),
+        self._big_lbl = tk.Label(stage, text="—", font=TYPE["metric"],
                                  bg=COLORS["bg"], fg=COLORS["text"])
         self._phase_bar = AnimatedProgressBar(stage,
                                               accent=TAB_ACCENTS["Tools"])
@@ -114,7 +115,7 @@ class SpeedTestDialog(ToolPage):
         self._usage = {}
         self._usage_imgs = {}
         urow = tk.Frame(body, bg=COLORS["bg"])
-        urow.pack(fill="x", pady=(12, 0))
+        urow.pack(fill="x", pady=(SPACE_3, 0))
         for ci in range(4):
             urow.grid_columnconfigure(ci, weight=1, uniform="usecols")
         try:
@@ -134,10 +135,10 @@ class SpeedTestDialog(ToolPage):
                     _emo = _UFE.get(use, "•")
                 except Exception:
                     _emo = "•"
-                icon_lbl = tk.Label(cell, text=_emo, font=("Segoe UI Emoji", 16),
+                icon_lbl = tk.Label(cell, text=_emo, font=EMOJI["button"],
                                     bg=COLORS["bg"], fg=COLORS["text"])
             icon_lbl.pack(anchor="center")
-            dots = tk.Label(cell, text="☆☆☆☆☆", font=(F, 9, "bold"),
+            dots = tk.Label(cell, text="☆☆☆☆☆", font=TYPE["label_medium"],
                             bg=COLORS["bg"], fg=COLORS["subtext"])
             dots.pack(anchor="center")
             try:
@@ -158,15 +159,15 @@ class SpeedTestDialog(ToolPage):
         # gauge/headline above it are centered, which read as a layout
         # bug). Names the server only; the four stat cells below already
         # carry the numbers, so repeating them here was redundant.
-        self._status_lbl = tk.Label(body, text="Starting…", font=(F, 9),
+        self._status_lbl = tk.Label(body, text="Starting…", font=TYPE["caption"],
                                     bg=COLORS["bg"], fg=COLORS["subtext"],
                                     anchor="center", justify="center")
-        self._status_lbl.pack(fill="x", pady=(2, 0))
+        self._status_lbl.pack(fill="x", pady=(TEXT_NUDGE, 0))
 
         # single stats bar, no divider lines (user call): plain cells
         # on the dialog bg, even columns only.
         self._rows_body = tk.Frame(body, bg=COLORS["bg"])
-        self._rows_body.pack(fill="x", pady=(10, 0))
+        self._rows_body.pack(fill="x", pady=(GROUP_GAP, 0))
         self._build_rows()
 
         self.on_close(self._cancel_test)
@@ -180,10 +181,10 @@ class SpeedTestDialog(ToolPage):
         self._set_status("Press GO to start.")
 
     def _load_usage_icon(self, use):
-        """~28px PhotoImage for a usage cell (512px asset subsampled;
-        power-of-two factors can't hit 28 from 512, so the factor is
-        computed directly). None on any failure so the caller falls
-        back to emoji. Ref kept by the caller (anti-GC, tab pattern)."""
+        """A usage-cell PhotoImage at ICON_USAGE (512px asset subsampled;
+        power-of-two factors can't hit that size from 512, so the factor is
+        computed directly). None on any failure so the caller falls back to
+        emoji. Ref kept by the caller (anti-GC, tab pattern)."""
         try:
             from app.speed_test import USAGE_FILES as _UF
             fname = _UF.get(use)
@@ -195,7 +196,7 @@ class SpeedTestDialog(ToolPage):
                 return None
             img = tk.PhotoImage(file=path)
             w, h = img.width(), img.height()
-            f = max(1, int(round(min(w, h) / 28.0)))
+            f = max(1, int(round(min(w, h) / float(ICON_USAGE))))
             if f > 1:
                 img = img.subsample(f, f)
             self._usage_imgs[use] = img
@@ -309,10 +310,10 @@ class SpeedTestDialog(ToolPage):
                     w.pack_forget()
                 except Exception:
                     pass
-            self._big_lbl.pack(anchor="center", pady=(70, 0))
+            self._big_lbl.pack(anchor="center", pady=(MEASURE_CAP, 0))
             self._go_btn.set_enabled(True)
             if not self._go_btn.winfo_manager():
-                self._go_btn.pack(side="right", padx=(8, 0))
+                self._go_btn.pack(side="right", padx=(SPACE_2, 0))
             self._stage_mode = "go"
         except Exception:
             pass
@@ -329,7 +330,7 @@ class SpeedTestDialog(ToolPage):
                     pass
             self._gauge.pack(anchor="center")
             self._big_lbl.pack(anchor="center")
-            self._phase_bar.pack(fill="x", pady=(8, 0))
+            self._phase_bar.pack(fill="x", pady=(SPACE_2, 0))
             self._stage_mode = "gauge"
         except Exception:
             pass
@@ -382,27 +383,22 @@ class SpeedTestDialog(ToolPage):
             pass
 
     def _build_rows(self):
-        """One single stats row (user call): Ping / Download / Upload /
-        Stability evenly spaced in uniform columns — each cell stacks its
-        title over its value. _row_values keeps the leg -> value-label
-        contract so paints are untouched."""
-        for w in list(self._rows_body.winfo_children()):
-            try:
-                w.destroy()
-            except Exception:
-                pass
+        """One stats row on the shared MetricStrip (AUDIT TV-004).
+
+        This used to be four RoundedCards inside the rounded dialog - the
+        card-in-card the audit counted - and each was built separately, so
+        its label and value spacing could drift from every other tool's. The
+        strip owns the label/value hierarchy; `_row_values` still maps leg ->
+        value Label, so the live paints below did not change shape.
+        """
         self._row_values = {}
-        for ci, (leg, title) in enumerate(self.LEGS):
-            self._rows_body.grid_columnconfigure(ci, weight=1, uniform="statcols")
-            cell = RoundedCard(self._rows_body, fill=COLORS["bg_alt"],
-                               bg=COLORS["bg"], radius=16, min_height=76)
-            cell.grid(row=0, column=ci, sticky="nsew", padx=5)
-            tk.Label(cell.body, text=title, font=(F, 10),
-                     bg=COLORS["bg_alt"], fg=COLORS["subtext"]).pack(pady=(8, 0))
-            val = tk.Label(cell.body, text="…", font=(F, 14, "bold"),
-                           bg=COLORS["bg_alt"], fg=COLORS["subtext"])
-            val.pack(pady=(2, 8))
-            self._row_values[leg] = val
+        self._stat_strip = MetricStrip(
+            self._rows_body, [(leg, title) for leg, title in self.LEGS],
+            bg=COLORS["bg"], align="center", size="lg",
+            accent=TAB_ACCENTS["Tools"])
+        self._stat_strip.pack(fill="x")
+        for leg, _title in self.LEGS:
+            self._row_values[leg] = self._stat_strip.value_label(leg)
 
     def _start_test(self):
         try:
@@ -539,15 +535,17 @@ class SpeedTestDialog(ToolPage):
             return
         self._ui(self._set_status, f"Server: {server_name} · testing download…")
         self._ui(self._set_phase, "download", gen)
-        down = self._run_parallel_rounds(_st, dead, gen, direction="download",
-                                         base_url=base_url)
+        # results are painted into self._results by _paint_result; the
+        # return value is only a best-round convenience
+        self._run_parallel_rounds(_st, dead, gen, direction="download",
+                                  base_url=base_url)
         if dead():
             return
         # — upload — #
         self._ui(self._set_status, f"Server: {server_name} · testing upload…")
         self._ui(self._set_phase, "upload", gen)
-        up = self._run_parallel_rounds(_st, dead, gen, direction="upload",
-                                       base_url=base_url)
+        self._run_parallel_rounds(_st, dead, gen, direction="upload",
+                                  base_url=base_url)
         if dead():
             return
         self._ui(self._finish, False, gen)

@@ -42,10 +42,20 @@ class Cache:
                 self.data = {}
 
     def get(self, key: str):
+        """Cached results, or None. A malformed entry is a MISS, never an
+        exception: the file lives in the user's profile and a truncated or
+        hand-edited cache used to abort the whole driver scan at float()."""
         hit = self.data.get(key)
-        if hit and self._now() - float(hit[0]) < CACHE_TTL_S:
-            return hit[1]
-        return None
+        if not (isinstance(hit, list) and len(hit) == 2):
+            return None
+        try:
+            stamp = float(hit[0])
+        except (TypeError, ValueError):
+            return None
+        if self._now() - stamp >= CACHE_TTL_S:
+            return None
+        results = hit[1]
+        return results if isinstance(results, list) else None
 
     def put(self, key: str, results: list) -> None:
         self.data[key] = [self._now(), results]

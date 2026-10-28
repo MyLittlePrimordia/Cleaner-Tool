@@ -49,19 +49,17 @@ from __future__ import annotations
 import math
 import tkinter as tk
 
-from app.ui.theme import COLORS, SHAPE_M, _round_rect_points
+from app.ui.theme import COLORS, RADIUS_CARD, _round_rect_points
 
-#: One radius for the whole app. StatTile uses 10 and is the closest thing
-#: this already had to a "card", so the card radius matches it rather than
-#: inventing a second number - equal radii on adjacent surfaces is what makes
-#: two panels read as siblings.
-RADIUS = SHAPE_M   # M3 "medium" shape: 12px
+#: The card shape role. One radius for the whole card family: a panel, a
+#: list row and a tile read as siblings because they share this value.
+RADIUS = RADIUS_CARD
 
 
 class RoundedCard(tk.Canvas):
     """A rounded, hairline-bordered surface that hosts one content frame.
 
-        card = RoundedCard(parent, fill=COLORS["bg_alt"])
+        card = RoundedCard(parent, fill=COLORS["bg_alt"], radius=RADIUS_CARD)
         card.body.pack(fill="both", expand=True, padx=12, pady=6)
         card.set_fill(COLORS["surface_hover"])   # hover / selection
 
@@ -199,24 +197,6 @@ class RoundedCard(tk.Canvas):
     def fill(self):
         return self._fill
 
-    def set_outline(self, color):
-        """Turn the card into an M3 *outlined* card (or back with "")."""
-        try:
-            if color == self._outline:
-                return
-            self._outline = color or ""
-            self._drawn = None
-            self._paint()
-        except Exception:
-            pass
-
-    def restyle_body(self, **kw):
-        """Forward a bg change on the content frame (used when a caller
-        re-tints several children at once, e.g. ToolRow's hover tint)."""
-        try:
-            self.body.config(**kw)
-        except Exception:
-            pass
 
     def _descendants(self):
         """Every widget inside the content frame, recursively.

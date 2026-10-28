@@ -30,6 +30,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 
 #: The release repository the app checks. Canonical here (not in app.ui.app)
@@ -196,6 +197,21 @@ def _quiet_remove(path: str) -> None:
         pass
 
 
+#: B-004: a Stop is not a failure. This exact wording is the only thing that
+#: separates "the user pressed Stop" from "the download broke" once the result
+#: has been flattened to (ok, message), so both ends use one constant.
+CANCELLED_MESSAGE = "cancelled by user"
+
+
+class _Cancelled(Exception):
+    """Internal: the download loop saw the cancel flag."""
+
+
+def is_cancellation(message: str) -> bool:
+    """True when `message` came from a cancelled download, not a bad one."""
+    return str(message or "").strip() == CANCELLED_MESSAGE
+
+
 def download_verified(url: str, sha256: str, size: int, dest: str, *,
                       on_progress=None, cancelled=None,
                       timeout: int = 120) -> "tuple[bool, str]":
@@ -208,6 +224,14 @@ def download_verified(url: str, sha256: str, size: int, dest: str, *,
     """
     expected = int(size or 0)
     ceiling = expected if expected else _MAX_BYTES
+    # B-007: stream into a sibling `.part` and only rename it into place once
+    # the bytes are verified. Writing `dest` directly meant an interrupted or
+    # rejected download left a partial file AT the name callers read, which a
+    # crash (or a second attempt racing the first) could publish as the build.
+    part = dest + ".part"
+    # H-006: `timeout` bounds each socket read, not the transfer; a slow-drip
+    # origin could otherwise keep an update "downloading" for hours.
+    deadline = time.monotonic() + timeout if timeout else None
     try:
         folder = os.path.dirname(os.path.abspath(dest))
         os.makedirs(folder, exist_ok=True)
@@ -215,10 +239,13 @@ def download_verified(url: str, sha256: str, size: int, dest: str, *,
         h = hashlib.sha256()
         got = 0
         with urllib.request.urlopen(req, timeout=timeout) as resp, \
-                open(dest, "wb") as f:
+                open(part, "wb") as f:
             while True:
                 if cancelled is not None and cancelled():
-                    raise RuntimeError("cancelled by user")
+                    raise _Cancelled()
+                if deadline is not None and time.monotonic() > deadline:
+                    raise RuntimeError(
+                        "the download took longer than %ds" % timeout)
                 chunk = resp.read(1 << 16)
                 if not chunk:
                     break
@@ -240,11 +267,16 @@ def download_verified(url: str, sha256: str, size: int, dest: str, *,
         if h.hexdigest().lower() != parse_sha256(sha256):
             raise RuntimeError(
                 "the download did not match its published SHA-256")
-        with open(dest, "rb") as f:
+        with open(part, "rb") as f:
             if f.read(2) != _MZ:
                 raise RuntimeError("the download is not a Windows executable")
+        os.replace(part, dest)
         return True, ""
+    except _Cancelled:
+        _quiet_remove(part)
+        return False, CANCELLED_MESSAGE
     except Exception as exc:
+        _quiet_remove(part)
         _quiet_remove(dest)
         return False, str(exc) or "download failed"
 
@@ -310,10 +342,15 @@ def stage_download(url: str, sha256: str, size: int, *,
                                 cancelled=cancelled, timeout=timeout)
     if not ok:
         return False, msg
+    # B-007: the checksum is what makes the staged file "ready", so it is
+    # written the same way - temp then rename - and only after the exe exists.
+    sha_dest = dest + ".sha256"
     try:
-        with open(dest + ".sha256", "w", encoding="utf-8") as f:
+        with open(sha_dest + ".part", "w", encoding="utf-8") as f:
             f.write("%s  %s\n" % (parse_sha256(sha256), ASSET_NAME))
+        os.replace(sha_dest + ".part", sha_dest)
     except Exception as exc:
+        _quiet_remove(sha_dest + ".part")
         cleanup_staged()
         return False, "could not record the update checksum: %s" % exc
     return True, ""
@@ -322,6 +359,18 @@ def stage_download(url: str, sha256: str, size: int, *,
 # --------------------------------------------------------------------------- #
 # Swapping the running exe on exit
 # --------------------------------------------------------------------------- #
+
+def _batch_value(path: str) -> str:
+    """Escape a path for a batch `set "VAR=value"` line.
+
+    `%` starts a variable reference and `^` is the escape character, so both
+    are doubled; a literal `"` cannot appear in a valid Windows path and would
+    break out of the quoted assignment, so it is dropped. Without this, a
+    portable copy in a folder like `C:\\100% Games\\` produced a swap script
+    that expanded a bogus variable and silently failed to update.
+    """
+    return str(path or "").replace("%", "%%").replace("^", "^^").replace('"', "")
+
 
 def build_swap_script(target_exe: str, staged_exe: str,
                       relaunch: bool = True) -> str:
@@ -334,9 +383,9 @@ def build_swap_script(target_exe: str, staged_exe: str,
     """
     lines = [
         "@echo off",
-        'set "TARGET=%s"' % target_exe,
-        'set "NEW=%s"' % staged_exe,
-        'set "OLD=%s.old"' % target_exe,
+        'set "TARGET=%s"' % _batch_value(target_exe),
+        'set "NEW=%s"' % _batch_value(staged_exe),
+        'set "OLD=%s.old"' % _batch_value(target_exe),
         "set /a n=0",
         ":wait",
         "set /a n+=1",
@@ -389,5 +438,7 @@ def schedule_swap(target_exe: str, staged_exe: str, *, relaunch: bool = True,
             ["cmd", "/c", path], creationflags=flags, close_fds=True,
             cwd=os.path.dirname(os.path.abspath(path)))
     except Exception as exc:
+        # A failed launch must not leave the helper script in %TEMP% forever.
+        _quiet_remove(path)
         return False, "Could not start the updater: %s" % exc
     return True, path

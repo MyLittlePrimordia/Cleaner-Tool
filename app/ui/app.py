@@ -1,9 +1,23 @@
-"""Application: the window shell, run lifecycle, tray, and tab routing.
+"""Application: the window shell and tab routing.
 
 Extracted from app/gui.py (H14). This is the composition root — it is the
 one module allowed to know about every tab and every dialog, because it
 is what opens them. Everything below it in app/ui knows only about the
 layer beneath itself.
+
+Two subsystems that had grown inside it now live next door (audit 2026-10,
+R-001) and are composed back in as bases, so every call site kept its name:
+
+    app/ui/runflow.py       the run engine: claim, pre-flight, workers,
+                            summary, release (RunFlow)
+    app/ui/traycontrols.py  the resident tray menu (TrayControls)
+    app/ui/logsurface.py    the log buffer, status line and progress bar
+                            (LogSurface)
+
+Why bases rather than objects the window owns: both halves reach for
+`self.tabs`, `self.root`, `self._dispatch` and the drive queries on almost
+every line, so passing those in would have moved the coupling without
+removing it. The split buys one file per concern, not a new abstraction.
 
 app/gui.py remains a re-export facade over this and the other layers, so
 nothing outside the app package had to change.
@@ -19,33 +33,61 @@ import time
 
 from app.utils import resolve_asset_path
 import tkinter as tk
-from tkinter import ttk, messagebox
-from app.config import APP_NAME, WINDOW_MIN_SIZE, WINDOW_SIZE, resolve_window_size
-from app.config_persist import get_tweak_state, mark_tweak_applied, mark_tweak_reverted
+from app.config import (APP_NAME, WINDOW_SIZE, resolve_window_minimum,
+                        resolve_window_size)
+from app.config_persist import get_tweak_state
 from app.elevation import is_admin, relaunch_as_admin
 from app.runner import CancellationToken, RunState
 from app.ui.session import SessionOrchestrator, SessionState
 from app.ui.tkdispatch import TkDispatcher
-from app.runner.task_runner import invoke_task
 from app.tab_presets import PRESETS, TABS, TAB_NAMES
-from app.toast import notify_clean_complete, notify_low_space, show_toast
+from app.toast import show_toast
+from app import watch
+
+
+from app.ui.logsurface import LogSurface
+from app.ui.runflow import (  # noqa: F401 - re-exported for tests/facade
+    RunFlow, _DONE_COPY, _install_done_copy, _install_start_copy,
+    _install_task_status, _run_header_line, _run_outcome_word,
+    _run_summary_lines,
+)
+from app.ui.traycontrols import TrayControls
+
+
+#: The names this module exposes besides `Application`. The run-flow copy
+#: helpers and `_log_block` moved to their own modules (R-001) but are still
+#: imported FROM HERE by the facade and by tests, so they stay listed: that is
+#: the contract, not an accident. `__all__` also tells pyflakes these imports
+#: are deliberate re-exports rather than dead ones.
+__all__ = [
+    "Application", "RunFlow", "TrayControls", "_DONE_COPY", "_log_block",
+    "_install_done_copy", "_install_start_copy", "_install_task_status",
+    "_run_header_line", "_run_outcome_word", "_run_summary_lines",
+]
+
 from app.ui.base import (ThemedModal, Tooltip, _themed_askyesno,
                          _themed_showinfo, _themed_showerror,
                          _themed_showwarning)
-from app.ui.dialogs.scorecard_dialog import ScorecardDialog
 from app.ui.dialogs.registry import open_dialog
-from app.ui.hardware.drives import _snapshot_all_drives, _system_drive_root
-from app.ui.theme import (COLORS, F, TAB_ACCENTS, TYPE, _TAB_STATUS,
-                          _hex_lerp, _lerp, _round_rect_points)
-from app.ui.widgets import AnimatedButton, AnimatedProgressBar, ScrollableRoundedPanel
+from app.ui.theme import (
+    COLORS, ICON_CHIP, ICON_CONTROL, ICON_NAV, PAGE_GUTTER, SPACE_1, SPACE_2,
+    SPACE_3, SPACE_4, TAB_ACCENTS, TYPE, _TAB_STATUS, _hex_lerp,
+    _round_rect_points, icon_target_px, scaled_photo, ui_scale,
+)
+from app.ui.metrics import (
+    CONTROL_GAP, GROUP_GAP, HAIRLINE_NUDGE, MEASURE_CAP, TEXT_NUDGE, TIGHT_GAP,
+)
+from app.ui.widgets import (AnimatedButton, ProgressRow,
+                            ScrollableRoundedPanel, StatusLine)
 from app.ui.widgets.dropdown import M3Dropdown
 from app.ui.widgets.chrome import BorderlessChrome, _enable_dark_titlebar, _set_window_icon
-from app.utils import IS_WINDOWS, TaskCancelled, TaskContext, format_bytes
-from app.warnings import check_dangerous_combos, check_info_notices
+from app.runner.task_runner import log_block as _log_block
+from app.utils import IS_WINDOWS, format_bytes
 from app.ui.tabs.admingateframe import AdminGateFrame
 from app.ui.tabs.tasktab import TaskTab
 from app.ui.tabs.installtab import InstallTab
 from app.ui.tabs.toolstab import ToolsTab
+from app.ui.tabs.healthtab import HealthTab
 
 #: The one project this app checks for updates. Used both to query the
 #: release API and to validate the download link that comes back from it
@@ -75,17 +117,15 @@ from app.self_update import UPDATE_REPO
 #: factor. The app is intentionally stdlib-only at runtime (no PIL - see
 #: requirements.txt), so integer subsampling is the only scaler available and
 #: the constant is chosen to be reachable by it.
-TAB_ICON_PX = 36
+TAB_ICON_PX = ICON_NAV
 
-#: Vertical gap between the inline tab icon and the pill switcher it labels.
-TAB_ICON_GAP = 10
 
 #: Horizontal breathing room between neighbours in the bottom status row
 #: (privilege label, update chip, the three corner icons). DESIGN AUDIT
 #: (2026-10): the status row went from three widgets to eight in one pass,
 #: and without a single shared inset each new widget would bring its own
 #: ad-hoc padx and the row would read as unrelated clumps.
-GAP_X = 12
+GAP_X = SPACE_3
 
 #: Emoji fallbacks for the status-row shortcut glyphs (redesign 2026-10).
 #: Used ONLY when the PNG is missing or will not decode, so a packaging
@@ -95,15 +135,10 @@ _CORNER_FALLBACK = {"automaint": "🛠️", "exports": "📋"}
 #: Displayed size of a status-row glyph. The preset cards use 24; these are a
 #: little smaller because they sit in a dense strip beside the privilege
 #: label and the drive chips, and 24px there competes with the drive readout.
-STATUS_ICON_PX = 20
+STATUS_ICON_PX = ICON_CHIP
 
 
-def _status_icon_px():
-    return STATUS_ICON_PX
-
-
-
-class Application:
+class Application(LogSurface, RunFlow, TrayControls):
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(APP_NAME)
@@ -111,7 +146,13 @@ class Application:
         # why). Falls back to WINDOW_SIZE when the work area is unreadable.
         self._window_size = resolve_window_size(self.root, WINDOW_SIZE)
         self.root.geometry(self._window_size)
-        self.root.minsize(*WINDOW_MIN_SIZE)
+        # DPI-SCALED (2026-10 visual pass): geometry and minsize are in
+        # physical pixels, fonts are not. resolve_window_size scales the
+        # former; this scales the floor with it, capped at the window that
+        # actually resolved (a 200% display's work area can be shorter than
+        # the scaled 700px minimum).
+        self.root.minsize(*resolve_window_minimum(self.root,
+                                                  self._window_size))
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.configure(bg=COLORS["shell"])
         _set_window_icon(self.root)
@@ -168,6 +209,10 @@ class Application:
         # actually rely on.
         self._tray_ping_busy = False
         self._tray_speedtest_busy = False
+        # N-006: one quiet-watch tick at a time. Not a lock: a tick that finds
+        # the previous one still reading the Task Scheduler is simply skipped,
+        # and the next one is thirty seconds away.
+        self._watch_running = False
         # BUG-023: reference-counted stay-awake hold, initialised here rather
         # than conjured by getattr on first use, so the count is always a real
         # int. _set_stay_awake mutates it under _busy_lock, because the
@@ -207,7 +252,6 @@ class Application:
             log=self.log)
         self._pilot_dialog = None
 
-        self._build_style()
         if is_admin():
             self._build_main_ui()
         else:
@@ -255,34 +299,43 @@ class Application:
         self._start_single_instance_poll()
 
     def _start_single_instance_poll(self):
-        """Begin the show-event poll (see app/single_instance). A second
-        launch focuses this window instead of opening a twin. Cheap
-        (~one kernel wait per 500ms), runs for app life, never raises."""
+        """Begin the show-event watcher (see app/single_instance). A second
+        launch focuses this window instead of opening a twin. The wait runs
+        on a daemon thread, so the UI thread pays NOTHING for it (the old
+        `after(500, ...)` chain woke Tk twice a second forever); the pulse
+        is posted back through TkDispatcher, never delivered cross-thread."""
         try:
             from app import single_instance as _si
             if not _si.poll_enabled():
                 return
         except Exception:
             return
-        self._si_poll()
+        self._si_stop = threading.Event()
+        try:
+            th = threading.Thread(target=self._si_watch, daemon=True,
+                                  name="SingleInstanceWatch")
+            th.start()
+        except Exception:
+            pass
 
-    def _si_poll(self):
+    def _si_watch(self):
+        """Worker thread: block on the show-event, post the focus to Tk."""
         try:
             from app import single_instance as _si
-            if _si.check_signalled():
-                for _fn in (self.root.deiconify, self.root.lift,
-                            self.root.focus_force):
-                    try:
-                        _fn()
-                    except Exception:
-                        pass
+            _si.watch_show_event(
+                lambda: self._dispatch.post(self._si_focus),
+                self._si_stop)
         except Exception:
             pass
-        try:
-            if self.root.winfo_exists():
-                self.root.after(500, self._si_poll)
-        except Exception:
-            pass
+
+    def _si_focus(self):
+        """Tk thread: surface the window for a second launch."""
+        for _fn in (self.root.deiconify, self.root.lift,
+                    self.root.focus_force):
+            try:
+                _fn()
+            except Exception:
+                pass
 
     # ---------------- system tray (resident watchdog UI) ---------------- #
 
@@ -358,7 +411,6 @@ class Application:
                     _themed_showinfo(
                         self.root,
                         "System Tray Unavailable",
-                        "Could not create the system-tray icon.\n\n"
                         "The window will stay open so you can still use the app.\n"
                         "If this keeps happening, try restarting Explorer or the PC.",
                         accent=COLORS["accent_yellow"],
@@ -666,10 +718,9 @@ class Application:
                 return
             proceed = _themed_askyesno(
                 self.root,
-                "Task Still Running",
+                "Stop the Task and Close?",
                 "A task is still running. Closing now may leave a Windows "
-                "service stopped until you restart it manually.\n\n"
-                "Stop the task and close anyway?",
+                "service stopped until you restart it manually.",
                 accent=COLORS["accent_red"],
                 yes_text="Stop & Close",
                 no_text="Keep Running",
@@ -691,6 +742,13 @@ class Application:
             return
         try:
             self._stop_tray()
+        except Exception:
+            pass
+        # stop the single-instance watcher's blocking wait: it is a daemon
+        # thread, but leaving it holding a kernel wait object through
+        # interpreter teardown is pointless work at exit
+        try:
+            self._si_stop.set()
         except Exception:
             pass
         self._stop_disk_monitor()
@@ -716,34 +774,13 @@ class Application:
             pass
         self.root.destroy()
 
-    def _build_style(self):
-        style = ttk.Style()
-        style.theme_use("default")
-        style.configure(".", background=COLORS["bg"], foreground=COLORS["text"])
-        style.configure("TProgressbar", thickness=10, troughcolor=COLORS["surface"],
-                        background=COLORS["primary"])
-        # dark combobox + listbox (Auto Maintenance dialog)
-        style.configure("TCombobox",
-                        fieldbackground=COLORS["surface"], background=COLORS["surface"],
-                        foreground=COLORS["text"], arrowcolor=COLORS["text"],
-                        selectbackground=COLORS["surface_hover"], selectforeground=COLORS["text"],
-                        bordercolor=COLORS["hairline"], lightcolor=COLORS["surface"],
-                        darkcolor=COLORS["surface"], padding=6, arrowsize=16,
-                        relief="flat")
-        style.map("TCombobox",
-                  fieldbackground=[("readonly", COLORS["surface"]), ("disabled", COLORS["surface"])],
-                  background=[("readonly", COLORS["surface"])],
-                  # M3 outlined field: the outline turns primary on focus
-                  bordercolor=[("focus", COLORS["primary"]),
-                               ("hover", COLORS["muted"])],
-                  lightcolor=[("focus", COLORS["primary"])],
-                  darkcolor=[("focus", COLORS["primary"])],
-                  foreground=[("readonly", COLORS["text"]), ("disabled", COLORS["subtext"])])
-        self.root.option_add("*TCombobox*Listbox.background", COLORS["surface"])
-        self.root.option_add("*TCombobox*Listbox.foreground", COLORS["text"])
-        self.root.option_add("*TCombobox*Listbox.selectBackground", COLORS["secondary_container"])
-        self.root.option_add("*TCombobox*Listbox.selectForeground", COLORS["text"])
-        self.root.option_add("*TCombobox*Listbox.font", (F, 9))
+    # NOTE (2026-10): `_build_style` lived here and configured ttk's
+    # TCombobox/TProgressbar. Both widgets are gone (every picker is
+    # M3Dropdown, every progress bar is AnimatedProgressBar), so the method
+    # was styling controls no window contains. It is removed rather than
+    # left as dead theming: a ttk style in the shell is also the easiest way
+    # for the next native widget to look "close enough" to ship. The design
+    # guard (dev/tests/test_design_guard.py) now rejects ttk outright.
 
     # ---------------- main UI ---------------- #
 
@@ -768,10 +805,16 @@ class Application:
         self._build_menu()
 
         # content host: everything the app packs goes in here, leaving
-        # the top TITLE_H strip for the custom title bar
+        # the top TITLE_H strip for the custom title bar and the chrome's
+        # edge band (BorderlessChrome.PAD) for the resize grips. The host
+        # used to sit flush against the window edges, so the outer 6px of
+        # every page was covered by a grip frame — a click there started a
+        # resize instead of hitting the control under it (audit B11).
+        # BorderlessChrome.content_box() is the same arithmetic, and the
+        # chrome tests compare the two.
         host = self._content_host = tk.Frame(self.root, bg=COLORS["shell"])
-        host.place(x=0, y=BorderlessChrome.TITLE_H, relwidth=1.0,
-                   relheight=1.0, height=-BorderlessChrome.TITLE_H)
+        BorderlessChrome.place_content(host)
+        _edge = BorderlessChrome.PAD
 
         # DESIGN AUDIT (2026-10) — the toolbar band is GONE.
         #
@@ -815,19 +858,38 @@ class Application:
         # app bar carrying the destination title, then the page, then status.
         main = self._main_col = tk.Frame(host, bg=COLORS["shell"])
         main.pack(side="left", fill="both", expand=True)
+
+        # SHELL GEOMETRY (design audit L-001/L-002).
+        #
+        # The page face is inset from the shell on BOTH sides now, and every
+        # band (app bar, page, status) computes its x from the same three
+        # numbers: the panel's outer inset, the panel's corner inset, and the
+        # page gutter. Before this, the app bar started at 8px while the page
+        # started at 32px, the status row at 24px, and the page was 6px wider
+        # on the left than the right - three left edges and an off-centre
+        # page, which is the single loudest "unfinished" signal in the app.
+        _panel_inset = max(0, 12 - _edge)
+        _p_r, _p_in = 24, 8
+        _page_x = _panel_inset + _p_in + PAGE_GUTTER
+
         # Top app bar: destination title + one-line description, on the shell.
-        appbar = tk.Frame(main, bg=COLORS["shell"], height=100)
+        # Sized by its content: a fixed 100px band clipped at high DPI and
+        # spent ~40% of its height on nothing at 100%.
+        appbar = self._appbar = tk.Frame(main, bg=COLORS["shell"])
         appbar.pack(fill="x")
-        appbar.pack_propagate(False)
         titles = tk.Frame(appbar, bg=COLORS["shell"])
-        titles.pack(side="left", padx=(8, 0), pady=(8, 0), anchor="n")
+        titles.pack(side="left", padx=(_page_x, 0), pady=(GROUP_GAP, GROUP_GAP), anchor="n")
+        # The one screen title in the app. Stage 3 promoted it from 18pt
+        # regular to the semantic screen_title (18pt bold): the largest label
+        # on a page was the only heading that was not bold, so it read as a
+        # caption above the page rather than as its title.
         self._appbar_title = tk.Label(
-            titles, text=self.active_tab, font=(F, 18),
+            titles, text=self.active_tab, font=TYPE["screen_title"],
             bg=COLORS["shell"], fg=COLORS["text"], anchor="w")
         self._appbar_title.pack(anchor="w")
         self._appbar_sub = tk.Label(
             titles, text=self._TAB_SUBTITLES.get(self.active_tab, ""),
-            font=(F, 10), bg=COLORS["shell"], fg=COLORS["subtext"],
+            font=TYPE["body_medium"], bg=COLORS["shell"], fg=COLORS["subtext"],
             anchor="w")
         self._appbar_sub.pack(anchor="w")
         # The page lives in a rounded panel set into the shell (the Gmail /
@@ -835,8 +897,11 @@ class Application:
         # depth so its square corners never poke out of the rounded face.
         panel = self._panel = tk.Canvas(main, bg=COLORS["shell"],
                                         highlightthickness=0, bd=0)
-        panel.pack(fill="both", expand=True, padx=(0, 12), pady=(0, 12))
-        _p_r, _p_in = 24, 8
+        # symmetric inset: a page panel inset on one side only is what made
+        # the page column 6px off-centre before this.
+        panel.pack(fill="both", expand=True,
+                   padx=(_panel_inset, _panel_inset),
+                   pady=(0, _panel_inset))
         body = self._panel_body = tk.Frame(panel, bg=COLORS["bg"])
         _p_win = panel.create_window(_p_in, _p_in, window=body, anchor="nw")
 
@@ -853,23 +918,33 @@ class Application:
         panel.bind("<Configure>", _panel_cfg)
         self.page_container = tk.Frame(body, bg=COLORS["bg"])
         self.page_container.pack(fill="both", expand=True, padx=(0, 0),
-                                 pady=(0, 4))
+                                 pady=(0, SPACE_1))
         self.tabs = {}
-        # PERF (2026-10): Settings is built on FIRST VISIT, not at startup.
-        # It is not the default tab and its constructor is the most expensive
-        # page (~180 ms incl. three schtasks probes), so building it up front
-        # cost every launch for a screen most users open rarely. _ensure_tab
-        # materializes a lazy page exactly once; everything else keeps using
-        # self.tabs as before.
+        # PERF (2026-10, AUDIT TL-013): a page is built on FIRST VISIT unless it
+        # is the one the app opens on. Settings was the first (its constructor
+        # runs three schtasks probes), and Tools/Drivers follow for the same
+        # reason: Tools builds 19 compact rows plus 19 icon loads for a page most
+        # sessions never open, and Drivers walks the driver folders. Building
+        # those before the first paint is why the window took seconds to appear.
+        # _ensure_tab materializes a lazy page exactly once; everything else
+        # keeps using self.tabs as before. Install stays eager because its
+        # catalog is deliberately built in idle slices (and its badge/warm-scan
+        # state is set up while the page exists).
         self._tab_factories = {}
         for name in TAB_NAMES:
             if name == "Install":
                 self.tabs[name] = InstallTab(self.page_container, self)
+            elif name == "Health":
+                self.tabs[name] = HealthTab(self.page_container, self)
             elif name == "Tools":
-                self.tabs[name] = ToolsTab(self.page_container, self)
+                self._tab_factories[name] = (
+                    lambda _cls=ToolsTab:
+                    _cls(self.page_container, self))
             elif name == "Drivers":
                 from app.ui.tabs.driverstab import DriversTab
-                self.tabs[name] = DriversTab(self.page_container, self)
+                self._tab_factories[name] = (
+                    lambda _cls=DriversTab:
+                    _cls(self.page_container, self))
             elif name == "Settings":
                 from app.ui.tabs.settingstab import SettingsTab
                 self._tab_factories[name] = (
@@ -879,15 +954,30 @@ class Application:
                 self.tabs[name] = TaskTab(self.page_container, self, name)
         self._show_tab("Clean")
 
-        # Bottom: status line + details disclosure + progress + disk
+        # Bottom: status line + details disclosure + progress + disk.
+        # It lives inside the panel body, so PAGE_GUTTER puts it on the exact
+        # same column as the page above it (L-001).
         bottom = tk.Frame(body, bg=COLORS["bg"])
-        bottom.pack(fill="x", padx=16, pady=(2, 8))
+        bottom.pack(fill="x", padx=PAGE_GUTTER, pady=(TEXT_NUDGE, SPACE_2))
 
         stat_row = tk.Frame(bottom, bg=COLORS["bg"])
         stat_row.pack(fill="x")
-        self.status_lbl = tk.Label(stat_row, text="", font=(F, 10, "bold"),
-                                   bg=COLORS["bg"], fg=COLORS["subtext"], anchor="w")
-        self.status_lbl.pack(side="left")
+        # The status sentence gets its own expanding slot and never shares a
+        # line with the notification badge again. A plain Label clipped long
+        # DISM/SFC lines mid-word; StatusLine centres them while they fit and
+        # pans them when they do not (user request: no clipping, no marquee
+        # gymnastics, centred rather than left-aligned).
+        self._status_wrap = tk.Frame(stat_row, bg=COLORS["bg"])
+        self._status_wrap.pack(side="left", fill="x", expand=True)
+        # 30px, not 26: the Stop button that slots into this row during a
+        # run is 32px tall including its pady, so a shorter status line made
+        # the row grow by 4px on every run start and shove the page above it.
+        # The strip's whole reason for existing is that nothing above it
+        # moves, so its resting height already includes the run-time control.
+        self.status_lbl = StatusLine(self._status_wrap, font=TYPE["label_large"],
+                                     bg=COLORS["bg"], fg=COLORS["subtext"],
+                                     height=30)
+        self.status_lbl.pack(fill="x", expand=True, pady=(HAIRLINE_NUDGE, HAIRLINE_NUDGE))
         self._status_fade_ids = []
         # drive chips (user request): one clickable chip per local drive /
         # USB stick, color-coded by fill level; click opens it in Explorer.
@@ -902,7 +992,7 @@ class Application:
         # chips (later side="right" packs land further left). Created and
         # destroyed on red transitions — never a permanent fixture.
         self._nudge_frame = tk.Frame(stat_row, bg=COLORS["bg"])
-        self._nudge_frame.pack(side="right", padx=(8, 0))
+        self._nudge_frame.pack(side="right", padx=(SPACE_2, 0))
         self._nudge_chips: dict = {}      # letter -> {"frame", "label", "tip"}
         self._drive_was_red: dict = {}    # letter -> bool (hysteresis state)
         self._nudge_dismissed: set = set()  # session dismissals (respected)
@@ -924,7 +1014,7 @@ class Application:
         # side="right" BEFORE the drive chips above, so Tk's last-packed-
         # furthest-left rule puts it to the left of them and it can never
         # be pushed off the row by a newly discovered drive.
-        self._mode_lbl = tk.Label(stat_row, text="", font=(F, 9),
+        self._mode_lbl = tk.Label(stat_row, text="", font=TYPE["caption"],
                                   bg=COLORS["bg"], fg=COLORS["subtext"])
         self._mode_lbl.pack(side="right", padx=(0, GAP_X))
         self._refresh_mode_label()
@@ -934,7 +1024,7 @@ class Application:
         # first check - and a click opens the check (which scans at once).
         # It re-checks by itself on the schedule from Settings; that check
         # is read-only (see app/health_badge.py).
-        self._health_lbl = tk.Label(stat_row, text="", font=(F, 9, "bold"),
+        self._health_lbl = tk.Label(stat_row, text="", font=TYPE["label_medium"],
                                     bg=COLORS["bg"], fg=COLORS["subtext"],
                                     cursor="hand2")
         self._health_lbl.pack(side="right", padx=(0, GAP_X))
@@ -956,13 +1046,23 @@ class Application:
         # DECLUTTER 2026-10: a solid yellow block in the status row was the
         # loudest thing in the window for a "there is a newer build". It is
         # now a quiet yellow-on-black label like its neighbours.
-        self._update_banner_frame = tk.Frame(stat_row, bg=COLORS["bg"])
+        #
+        # MOVED AGAIN (user feedback 2026-10): packed beside the live status
+        # sentence it crowded the one place a DISM/SFC run needs room. The
+        # app bar has been empty to the right of the tab title since launch;
+        # a "there is a newer build" notice belongs there, quiet and out of
+        # the run's way.
+        self._appbar_trailing = tk.Frame(self._appbar, bg=COLORS["shell"])
+        self._appbar_trailing.pack(side="right", padx=(0, _page_x))
+        # The update notice is created below but stays hidden until needed.
+        self._update_banner_frame = tk.Frame(self._appbar_trailing,
+                                             bg=COLORS["shell"])
         _upd_img = self._status_icon("update")
         if _upd_img is not None:
             self._update_banner_icon = tk.Label(
                 self._update_banner_frame, image=_upd_img,
-                bg=COLORS["bg"], bd=0, highlightthickness=0)
-            self._update_banner_icon.pack(side="left", padx=(8, 0), pady=4)
+                bg=COLORS["shell"], bd=0, highlightthickness=0)
+            self._update_banner_icon.pack(side="left", padx=(SPACE_2, 0), pady=SPACE_1)
             _upd_text = "Update available"
         else:
             self._update_banner_icon = None
@@ -970,25 +1070,27 @@ class Application:
         self._update_banner_lbl = tk.Label(
             self._update_banner_frame,
             text=_upd_text,
-            font=(F, 9, "bold"),
-            bg=COLORS["bg"],
+            font=TYPE["label_medium"],
+            bg=COLORS["shell"],
             fg=COLORS["accent_yellow"],
             cursor="hand2", bd=0)
-        self._update_banner_lbl.pack(side="left", padx=(6, 8), pady=4)
+        self._update_banner_lbl.pack(side="left", padx=(CONTROL_GAP, SPACE_2), pady=SPACE_1)
         self._update_banner_lbl.bind("<Button-1>", lambda e: self._show_update_dialog())
-        self._update_banner_frame.pack(side="left", padx=(0, GAP_X))
         self._update_banner_frame.pack_forget()  # Hidden by default
 
-        # progress overlay (segmented animated bar) — hidden until a run
-        # starts (gamers see a clean window, not an empty progress track)
-        self.progress_bar = AnimatedProgressBar(bottom, accent=COLORS["accent_green"])
+        # progress strip — the row is ALWAYS packed and its height is
+        # reserved, so starting a run no longer grows `bottom` and shoves
+        # the page above it. Only the bar inside it appears/disappears (a
+        # blank strip is quieter than a permanent empty track).
+        self.progress_row = ProgressRow(bottom, accent=COLORS["accent_green"])
+        self.progress_row.pack(fill="x", pady=(CONTROL_GAP, TEXT_NUDGE))
+        self.progress_bar = self.progress_row.bar
         self._progress_hidden = True
 
         # Stop button — slots into the status row while a run is active
         self.cancel_btn = AnimatedButton(
             stat_row, text="✕ Stop", command=self._request_cancel,
-            bg=COLORS["surface"], fg=COLORS["accent_red"], font=(F, 9, "bold"),
-            padx=14, pady=6,
+            role="danger", size="sm",
         )
         self.cancel_btn.set_enabled(False)
 
@@ -1027,7 +1129,7 @@ class Application:
         # the widget went with the feature instead of lingering as a hook
         # nothing could reach.
         #
-        # Still a tk.Label, not an AnimatedButton: tools/smoke/tools.py
+        # Still a tk.Label, not an AnimatedButton: dev/tools/smoke/tools.py
         # asserts on `_corner_logs.cget("text")` and drives these through
         # `_corner_cmd`, so the widget type and that hook both have to
         # survive the change.
@@ -1039,7 +1141,7 @@ class Application:
             else:
                 lbl = tk.Label(stat_row,
                                text=_CORNER_FALLBACK.get(icon_key, "•"),
-                               font=(F, 12), bg=COLORS["bg"],
+                               font=TYPE["body_xlarge"], bg=COLORS["bg"],
                                fg=COLORS["subtext"],
                                cursor="hand2", bd=0, highlightthickness=0)
             # Built but NOT packed (DECLUTTER 2026-10): the "..." menu below
@@ -1066,7 +1168,7 @@ class Application:
             "exports", "Export Logs", lambda: self.export_logs())
         # DECLUTTER 2026-10 (second pass): both of these actions now live in
         # the Settings tab, so the strip carries no menu at all. The widgets
-        # are still BUILT - never packed - only because tools/smoke/tools.py
+        # are still BUILT - never packed - only because dev/tools/smoke/tools.py
         # drives their click handlers; they are not a user-facing control.
 
         self._build_log(bottom)
@@ -1081,6 +1183,29 @@ class Application:
             _notice = consume_quarantine_notice()
             if _notice:
                 self.log(f"  ! {_notice}")
+        except Exception:
+            pass
+
+        # U-006: the Quarantine bin's retention window, applied here and not
+        # when Settings saves it - shortening the window must not delete a
+        # file the instant the dropdown changes. Runs off the Tk thread
+        # because it stats and removes files; log() is thread-safe.
+        try:
+            from app import quarantine as _quarantine
+            _keep_days = _quarantine.retention_days()
+            if _keep_days:
+                def _expire_bin(days=_keep_days):
+                    try:
+                        count, freed = _quarantine.expire(days=days)
+                    except Exception:
+                        return
+                    if count:
+                        from app.utils import format_bytes
+                        self.log("  Quarantine: cleared %d file(s) older than "
+                                 "%d days (%s)." % (count, days,
+                                                    format_bytes(freed)))
+                threading.Thread(target=_expire_bin, daemon=True,
+                                 name="quarantine-expire").start()
         except Exception:
             pass
 
@@ -1159,9 +1284,9 @@ class Application:
             word, ckey = hb.badge_for(grade)
             lbl.config(text=("PC: " + word) if grade else word,
                        fg=COLORS.get(ckey, COLORS["subtext"]))
-            tip = ("PC health: %s (checked %s). Click to check and fix."
+            tip = ("PC health: %s (checked %s). Click to open Health."
                    % (word, hb.age_text(ts))) if grade else \
-                "Click to check your PC's health"
+                "Click to open Health and run a check"
             if self._health_tip is None:
                 self._health_tip = Tooltip(lbl, tip)
             else:
@@ -1266,7 +1391,7 @@ class Application:
         """Show the update notification banner."""
         try:
             if hasattr(self, '_update_banner_frame') and self._update_banner_frame.winfo_exists():
-                self._update_banner_frame.pack(side="left", padx=(0, 8))
+                self._update_banner_frame.pack(side="right")
                 self._update_info = update_info
         except Exception:
             pass
@@ -1347,6 +1472,19 @@ class Application:
                                ("Tweak", "custom"), ("Tweak", "undo")):
             page = self.tabs[tab_name]
             steps.append(lambda p=page, m=mode: p._prewarm_body(m))
+        # Preset summaries are the other body build that used to land on a
+        # click. The default preset is already built; the rest are hidden
+        # until the user picks them, so build them now, one idle step each.
+        for tab_name in ("Clean", "Repair", "Tweak"):
+            page = self.tabs.get(tab_name)
+            if page is None:
+                continue
+            for name in getattr(page, "preset_cards", {}):
+                if name == "Custom" or name == getattr(
+                        page, "_selected_preset", None):
+                    continue
+                steps.append(
+                    lambda p=page, n=name: p._prewarm_body("preset:" + n))
         steps.append(lambda: self.tabs["Install"]._start_catalog_build())
         # PERF (startup audit 2026-09): the Install page's FIRST visit
         # still costs ~900 ms because place()ing ~950 widgets maps the
@@ -1364,18 +1502,34 @@ class Application:
         # tab: geometry is computed for withdrawn-lowered windows too,
         # and _show_tab's tkraise does the one-and-only visible raise on
         # the user's first real visit.
-        def _premap_install():
-            try:
-                page = self.tabs["Install"]
-                if page.winfo_manager() != "place":
+        #
+        # PERF (2026-10, second pass): this used to pre-map ONLY Install.
+        # Every other tab therefore paid its first full geometry pass on
+        # the click, which is why the window felt slow on the first visit
+        # even after the click path itself was reduced to tkraise(). Map
+        # each built page here, underneath, one idle step each; a user's
+        # first visit is then a raise like every later visit.
+        def _premap_page(name):
+            def _do(_name=name):
+                try:
+                    page = self.tabs.get(_name)
+                    if page is None or page.winfo_manager() == "place":
+                        return
                     page.place(relx=0, rely=0, relwidth=1, relheight=1)
                     page.lower()          # lay out UNDERNEATH — never raised
                     self.root.update_idletasks()
-                    # (no re-bury loop needed anymore — lower() never
-                    # stacked the page above anything in the first place)
-            except Exception:
-                pass
-        steps.append(_premap_install)
+                except Exception:
+                    pass
+            return _do
+        # Settings is lazy by design (its constructor runs three schtasks
+        # probes). Build it during idle too, then premap it, so the one page
+        # whose first click still paid a constructor does not stand out from
+        # the rest.
+        if "Settings" not in self.tabs:
+            steps.append(lambda: self._ensure_tab("Settings"))
+        for _name in TAB_NAMES:
+            if _name in self.tabs or _name == "Settings":
+                steps.append(_premap_page(_name))
         self._idle_steps = steps
 
         def _step():
@@ -1419,39 +1573,82 @@ class Application:
         this keeps the list contract. The list now has at most one entry: the
         single path utils.resolve_asset_path found, or empty. It used to build
         candidates from `__file__`, which pointed at app/ui/assets/ once this
-        class left app/gui.py (H14) and silently loaded no icons at all.
-        GamepadDialog._load_pad_artwork also depends on this method."""
+        class left app/gui.py (H14) and silently loaded no icons at all. The
+        status-row glyphs and the tool rows are the callers."""
         found = resolve_asset_path(fname)
         return [pathlib.Path(found)] if found else []
 
     # ---------------- Material 3 navigation rail ---------------- #
 
     # The seven destinations live in a vertical M3 navigation rail on the left
-    # edge: an 88px column, each destination a 24px icon over a label, with a
-    # 56x32 secondary-container "active indicator" that grows out of the
-    # icon's centre when the destination is selected. Hover paints the 8%
-    # state layer inside the same 56x32 shape. Up/Down (and Left/Right) move
-    # between destinations from the keyboard.
+    # edge: an 88px column at 100% density, each destination an icon over a
+    # label, with a secondary-container "active indicator" that grows out of
+    # the icon's centre when the destination is selected. Hover paints the 8%
+    # state layer inside the same shape. Up/Down (and Left/Right) move between
+    # destinations from the keyboard. The column's pixel metrics are derived
+    # per display in `_rail_metrics()`: the icon grows with the display, so a
+    # fixed pill and a fixed icon-to-label offset crowded the two together
+    # (at 150% the 36px mark left ~3px above its 9pt label).
     _TAB_SUBTITLES = {
         "Clean": "Free up space by clearing junk files and caches",
         "Repair": "Fix Windows components and common problems",
         "Tweak": "Tune Windows for speed and gaming",
+        "Health": "A plain-English checkup of your whole PC",
         "Install": "Install apps, runtimes and missing components",
         "Drivers": "Keep your hardware drivers up to date",
         "Tools": "Diagnostics and everyday utilities",
         "Settings": "Customize how Cleaner Tool behaves",
     }
+    #: The rail's 100% width and top padding. Its other metrics are derived in
+    #: `_rail_metrics()` from the icon at the CURRENT display scale, because
+    #: the glyphs scale with the display while the old fixed pixel values did
+    #: not: at 150% the 24px rail icon renders at 36px, which overflowed the
+    #: fixed 32px pill and left about 3px of air above the label.
     RAIL_W = 88
-    RAIL_ITEM_H = 72          # 32 indicator + 4 gap + label + breathing room
-    RAIL_TOP = 12
-    RAIL_IND_W = 56
-    RAIL_IND_H = 32
+    RAIL_TOP = SPACE_3
+    #: Air between a destination's icon pill and its label. The label used to
+    #: be placed by its CENTRE 12px under the pill's edge, so the gap the user
+    #: actually saw was ~3px and the icon and text read as one crowded block.
+    RAIL_LABEL_GAP = SPACE_2
     SWITCH_ANIM_MS = 200
     HOVER_ANIM_MS = 120
 
+    def _rail_metrics(self):
+        """(rail_w, item_h, ind_w, ind_h, top, gap) for this display.
+
+        The pill is built AROUND the icon instead of fitting the icon into a
+        pixel pill: M3's 24px icon in a 56x32 pill is exactly SPACE_4 either
+        side and SPACE_1 above and below, so a scaled icon can never overflow
+        its own indicator. The row height then follows the pill, the label gap
+        and the label's own line height, which is what keeps an icon evenly
+        separated from ITS label at every DPI rather than only at 100%.
+        """
+        scale = ui_scale(self.root)
+        icon = icon_target_px(ICON_CONTROL, self.root)
+        ind_w = icon + 2 * SPACE_4
+        ind_h = icon + 2 * SPACE_1
+        try:
+            import tkinter.font as tkfont
+            line = int(tkfont.Font(
+                font=TYPE["label_medium"]).metrics("linespace"))
+        except Exception:
+            line = int(round(17 * scale))
+        item_h = ind_h + self.RAIL_LABEL_GAP + line + SPACE_4
+        rail_w = max(ind_w + 2 * SPACE_4, int(round(self.RAIL_W * scale)))
+        return (rail_w, item_h, ind_w, ind_h, self.RAIL_TOP,
+                self.RAIL_LABEL_GAP)
+
     def _build_tab_switch(self):
         """Build the navigation rail (replaces the old top pill switcher)."""
-        rail = tk.Frame(self._content_host, bg=COLORS["shell"], width=self.RAIL_W)
+        (rail_w, item_h, ind_w, ind_h, top_pad,
+         label_gap) = self._rail_metrics()
+        self._rail_w = rail_w
+        self._rail_item_h = item_h
+        self._rail_ind_w = ind_w
+        self._rail_ind_h = ind_h
+        self._rail_top = top_pad
+        self._rail_gap = label_gap
+        rail = tk.Frame(self._content_host, bg=COLORS["shell"], width=rail_w)
         rail.pack(side="left", fill="y")
         rail.pack_propagate(False)
         self._rail_frame = rail
@@ -1464,8 +1661,8 @@ class Application:
 
         n_tabs = len(TAB_NAMES)
         self._switch_labels = TAB_NAMES
-        self._switch_h = self.RAIL_TOP + n_tabs * self.RAIL_ITEM_H
-        self._switch_w = self.RAIL_W
+        self._switch_h = top_pad + n_tabs * item_h
+        self._switch_w = rail_w
         self._switch_pos = float(TAB_NAMES.index(self.active_tab))
         self._switch_anim = None
         self._switch_anim_after = None
@@ -1479,8 +1676,11 @@ class Application:
         self._switch_texts = []
         self._switch_icon_items = []
         self._hover_bgs = []
+        #: True while the rail owns keyboard focus. Painted as a 1px focus
+        #: ring on the active destination, the same cue a focused row uses.
+        self._kb_focus = False
 
-        self.switch = tk.Canvas(rail, width=self.RAIL_W,
+        self.switch = tk.Canvas(rail, width=rail_w,
                                 height=self._switch_h, highlightthickness=0,
                                 bd=0, bg=COLORS["shell"])
         self.switch.pack(fill="both", expand=True)
@@ -1497,42 +1697,54 @@ class Application:
         self.switch.bind("<Left>", lambda e: _step(-1))
         self.switch.bind("<Down>", lambda e: _step(1))
         self.switch.bind("<Right>", lambda e: _step(1))
-        self.switch.bind("<Return>", lambda e: None)
-        self.switch.bind("<space>", lambda e: None)
+        # Return/Space ACTIVATE the destination the rail is on. They used to
+        # be bound to `lambda e: None`: a dead binding, so the two keys every
+        # keyboard user reaches for did nothing on the app's only navigation
+        # control. Arrow keys already move and switch (the M3 tab pattern), so
+        # activation here confirms and, when a run is in flight, says why it
+        # will not switch instead of silently ignoring the key.
+        self.switch.bind("<Return>", self._on_switch_activate)
+        self.switch.bind("<space>", self._on_switch_activate)
+        self.switch.bind("<FocusIn>", lambda _e: self._set_switch_focus(True),
+                         add="+")
+        self.switch.bind("<FocusOut>", lambda _e: self._set_switch_focus(False),
+                         add="+")
 
-        cx = self.RAIL_W / 2.0
+        cx = rail_w / 2.0
         for i, name in enumerate(self._switch_labels):
-            top = self.RAIL_TOP + i * self.RAIL_ITEM_H
+            top = top_pad + i * item_h
             hov = self._canvas_round_rect(
-                self.switch, cx - self.RAIL_IND_W / 2.0, top,
-                cx + self.RAIL_IND_W / 2.0, top + self.RAIL_IND_H,
-                self.RAIL_IND_H / 2.0, fill=COLORS["shell"], outline="")
+                self.switch, cx - ind_w / 2.0, top,
+                cx + ind_w / 2.0, top + ind_h,
+                ind_h / 2.0, fill=COLORS["shell"], outline="")
             self._hover_bgs.append(hov)
             ind = self._canvas_round_rect(
-                self.switch, cx - 1, top, cx + 1, top + self.RAIL_IND_H, 1,
+                self.switch, cx - 1, top, cx + 1, top + ind_h, 1,
                 fill=COLORS["secondary_container"], outline="",
                 state="hidden")
             icon = getattr(self, "_pill_icons", {}).get(name)
             icon_id = None
             if icon is not None:
                 icon_id = self.switch.create_image(
-                    cx, top + self.RAIL_IND_H / 2.0, image=icon)
+                    cx, top + ind_h / 2.0, image=icon)
                 self._switch_icon_items.append(icon_id)
+            # anchor="n" so the gap is the SPACE between the pill's edge and
+            # the text's top, not a centre offset that changes with the font.
             text_id = self.switch.create_text(
-                cx, top + self.RAIL_IND_H + 4 + 8, text=name,
-                font=(F, 9), fill=COLORS["subtext"])
+                cx, top + ind_h + label_gap, text=name, anchor="n",
+                font=TYPE["caption"], fill=COLORS["subtext"])
             self._switch_texts.append(text_id)
             self._pill_items.append(
-                (ind, icon_id, text_id, top, top + self.RAIL_ITEM_H))
+                (ind, icon_id, text_id, top, top + item_h))
         self._paint_pills()
 
     def _rail_indicator_points(self, i, t):
-        cx = self.RAIL_W / 2.0
-        top = self.RAIL_TOP + i * self.RAIL_ITEM_H
-        half = max(1.0, (self.RAIL_IND_W / 2.0) * max(0.0, min(1.0, t)))
+        cx = self._rail_w / 2.0
+        top = self._rail_top + i * self._rail_item_h
+        half = max(1.0, (self._rail_ind_w / 2.0) * max(0.0, min(1.0, t)))
         return self._round_points(cx - half, top, cx + half,
-                                  top + self.RAIL_IND_H,
-                                  min(self.RAIL_IND_H / 2.0, half))
+                                  top + self._rail_ind_h,
+                                  min(self._rail_ind_h / 2.0, half))
 
     def _paint_pills(self):
         """Repaint indicators, hover layers and labels from current state."""
@@ -1551,11 +1763,15 @@ class Application:
                 if is_hover:
                     hov = _hex_lerp(COLORS["shell"], COLORS["text"],
                                     0.08 * self._hover_t)
-                self.switch.itemconfigure(self._hover_bgs[i], fill=hov)
+                focused = bool(self._kb_focus) and is_active
+                self.switch.itemconfigure(
+                    self._hover_bgs[i], fill=hov,
+                    outline=COLORS["text"] if focused else "",
+                    width=1 if focused else 0)
                 self.switch.itemconfigure(
                     text_id,
                     fill=COLORS["text"] if is_active else COLORS["subtext"],
-                    font=(F, 9, "bold") if is_active else (F, 9))
+                    font=TYPE["label_medium"] if is_active else TYPE["caption"])
         except Exception:
             pass
 
@@ -1563,8 +1779,8 @@ class Application:
         self._paint_pills()
 
     def _seg_at(self, y):
-        i = int((y - self.RAIL_TOP) // self.RAIL_ITEM_H)
-        if 0 <= i < len(TAB_NAMES) and y >= self.RAIL_TOP:
+        i = int((y - self._rail_top) // self._rail_item_h)
+        if 0 <= i < len(TAB_NAMES) and y >= self._rail_top:
             return i
         return None
 
@@ -1576,6 +1792,22 @@ class Application:
             except Exception:
                 pass
             self._switch_to(TAB_NAMES[seg])
+
+    def _on_switch_activate(self, _event=None):
+        """Return/Space on the rail: activate the destination it is on."""
+        seg = self._hover_seg
+        if seg is None:
+            try:
+                seg = TAB_NAMES.index(self.active_tab)
+            except ValueError:
+                return "break"
+        if 0 <= seg < len(TAB_NAMES):
+            self._switch_to(TAB_NAMES[seg])
+        return "break"
+
+    def _set_switch_focus(self, on):
+        self._kb_focus = bool(on)
+        self._paint_pills()
 
     def _on_switch_motion(self, event):
         seg = self._seg_at(event.y)
@@ -1628,6 +1860,13 @@ class Application:
             if self._busy:
                 self.set_status(
                     "Busy \u2014 wait for the current task to finish (or press \u2715 Stop).")
+            return
+        # Resolve (and, for a lazy page, build) the target BEFORE committing
+        # active_tab. The old order left the rail, app-bar title and status
+        # accent on a tab whose page had failed to construct, so Run and
+        # selection acted on a page the user could not see.
+        if self._ensure_tab(name) is None:
+            self.set_status("Could not open the %s page." % name)
             return
         old_idx = TAB_NAMES.index(self.active_tab)
         new_idx = TAB_NAMES.index(name)
@@ -1689,7 +1928,7 @@ class Application:
         ]
 
     def _load_tab_icons(self):
-        """Load one icon asset per tab, subsampled to TAB_ICON_PX.
+        """Load one icon asset per tab, scaled to TAB_ICON_PX at this DPI.
 
         Split out of _build_main_ui (DESIGN AUDIT 2026-10) so the label that
         displays them and the loading of them are not separated by a screen's
@@ -1704,7 +1943,8 @@ class Application:
         self._tab_icons: dict = {}
         self._pill_icons: dict = {}
         for _tab, _fname in (("Clean", "clean.png"), ("Repair", "repair.png"),
-                             ("Tweak", "tweak.png"), ("Install", "install.png"),
+                             ("Tweak", "tweak.png"), ("Health", "health.png"),
+                             ("Install", "install.png"),
                              ("Drivers", "drivers.png"),
                              ("Tools", "tools.png"),
                              ("Settings", "settings.png")):
@@ -1713,28 +1953,24 @@ class Application:
                     continue
                 try:
                     _img = tk.PhotoImage(file=str(_p))
-                    w, h = _img.width(), _img.height()
                     # ICON SIZE CONTRACT (switcher-jump fix 2026-09, still
                     # binding): every icon must DISPLAY at the same size or
                     # the icon label changes height per tab and shoves the
                     # whole navigation row - and everything under it - up or
                     # down. That was the "few px jump" bug report.
                     #
-                    # Assets are normalized to 72x72 on disk (verified), so the
-                    # normal path is a single subsample(2, 2). The computed
-                    # integer factor below is the defence against a stray
-                    # oversized PNG: it can never reintroduce the jump.
-                    if w > TAB_ICON_PX or h > TAB_ICON_PX:
-                        _f = 2
-                        while w // _f > TAB_ICON_PX or h // _f > TAB_ICON_PX:
-                            _f *= 2
-                        _img = _img.subsample(_f, _f)
+                    # DPI-SCALED (2026-10 visual pass): the target follows
+                    # the display, so 200% gets the asset's full 72px instead
+                    # of a 36px mark beside 30px tab labels. scaled_photo
+                    # handles ratios an integer subsample cannot (48px from
+                    # a 72px asset), and every tab still uses ONE target.
+                    _img = scaled_photo(_img,
+                                        icon_target_px(TAB_ICON_PX, self.root))
                     self._tab_icons[_tab] = _img
-                    # 24px copy shown INSIDE the pill beside the tab name
-                    # (72 / 3). Same one-source-PNG rule as above.
+                    # 24px at 100%, 48px at 200%, shown INSIDE the pill.
                     _small = tk.PhotoImage(file=str(_p))
-                    if _small.width() >= 72:
-                        _small = _small.subsample(3, 3)
+                    _small = scaled_photo(
+                        _small, icon_target_px(ICON_CONTROL, self.root))
                     self._pill_icons[_tab] = _small
                     break
                 except Exception:
@@ -1757,9 +1993,9 @@ class Application:
     def _ensure_tab(self, name):
         """Return the page for `name`, building a lazy one on first use.
 
-        Only Settings is lazy today (see _build_main_ui). Construction runs on
-        the Tk thread because it creates widgets; a failure is logged and
-        returns None so the shell can report it rather than crash.
+        Tools, Drivers and Settings are lazy (see _build_main_ui). Construction
+        runs on the Tk thread because it creates widgets; a failure is logged
+        and returns None so the shell can report it rather than crash.
         """
         page = self.tabs.get(name)
         if page is not None:
@@ -1863,6 +2099,16 @@ class Application:
                 target._refresh_tweak_pills()
             except Exception:
                 pass
+        # Pages that do work on arrival opt in here. Health deliberately does
+        # not: its check starts only when the user presses Check PC.
+        # Building the page at startup must stay cheap, so the constructor
+        # only builds widgets; the scan starts on the user's first visit.
+        _on_show = getattr(target, "on_show", None)
+        if callable(_on_show):
+            try:
+                _on_show()
+            except Exception:
+                pass
         # TEXT-002: reset the status bar to the incoming tab's own copy.
         # It used to hold one static string set once at startup, so Install
         # and Tools (no preset cards, no Run button) told the user to pick a
@@ -1877,8 +2123,10 @@ class Application:
                 self.set_status(_TAB_STATUS.get(name, ""))
             except Exception:
                 pass
-        # progress bar may not exist yet during initial build
-        if hasattr(self, "progress_bar"):
+        # progress strip may not exist yet during the initial build
+        if hasattr(self, "progress_row"):
+            self.progress_row.set_accent(TAB_ACCENTS[name])
+        elif hasattr(self, "progress_bar"):
             accent = TAB_ACCENTS[name]
             self.progress_bar._accent = accent
             self.progress_bar._draw()
@@ -1928,10 +2176,8 @@ class Application:
             img = None
             if p:
                 img = tk.PhotoImage(file=str(p))
-                w, h = img.width(), img.height()
-                if w > STATUS_ICON_PX or h > STATUS_ICON_PX:
-                    f = max(2, int(round(max(w, h) / float(STATUS_ICON_PX))))
-                    img = img.subsample(f, f)
+                img = scaled_photo(
+                    img, icon_target_px(STATUS_ICON_PX, self.root))
             self._status_icons[icon_key] = img
             return img
         except Exception:
@@ -2040,8 +2286,7 @@ class Application:
         if not relaunch_as_admin():
             _themed_showerror(
                 self.root, "Elevation Failed",
-                "Could not request administrator rights. "
-                "You can keep using Limited mode.")
+                "Nothing has changed. You can keep using Limited mode.")
             return
 
         def _wait_thread():
@@ -2059,8 +2304,8 @@ class Application:
                     try:
                         _themed_showwarning(
                             self.root, "Elevation Cancelled",
-                            "Administrator elevation was cancelled or timed out.\n\n"
-                            "If an elevated window opened, use that one and close this.")
+                            "If an elevated window opened, use that one and "
+                            "close this.\n\nOtherwise nothing has changed.")
                     except Exception:
                         pass
             # MED-014: was `self.root.after(0, _on_done)` from the waiting
@@ -2070,29 +2315,9 @@ class Application:
             self._dispatch.post(_on_done)
         threading.Thread(target=_wait_thread, daemon=True).start()
 
-    def _open_gamepad_tester(self):
-        """Opens the gamepad_tester dialog. See app/ui/dialogs/registry.py."""
-        open_dialog(self, "gamepad_tester")
-
-    def _open_mic_check(self):
-        """Opens the mic_check dialog. See app/ui/dialogs/registry.py."""
-        open_dialog(self, "mic_check")
-
     def _open_game_server_ping(self):
         """Opens the game_server_ping dialog. See app/ui/dialogs/registry.py."""
         open_dialog(self, "game_server_ping")
-
-    def _open_keyboard_tester(self):
-        """Opens the keyboard_tester dialog. See app/ui/dialogs/registry.py."""
-        open_dialog(self, "keyboard_tester")
-
-    def _open_monitor_test(self):
-        """Opens the monitor_test dialog. See app/ui/dialogs/registry.py."""
-        open_dialog(self, "monitor_test")
-
-    def _open_speaker_test(self):
-        """Opens the speaker_test dialog. See app/ui/dialogs/registry.py."""
-        open_dialog(self, "speaker_test")
 
     # ---------------- Game Night (feature 9) ---------------- #
     # One press to get the PC ready to play, one press to put it back.
@@ -2270,6 +2495,43 @@ class Application:
         """Opens the drive_toolkit dialog. See app/ui/dialogs/registry.py."""
         open_dialog(self, "drive_toolkit")
 
+    def _open_battery_report(self):
+        """Open Windows' own full battery report (N-003's card action)."""
+        try:
+            from app.health_sensors import open_battery_report
+            if not open_battery_report():
+                self.set_status("Could not open the battery report on this PC.")
+        except Exception:
+            pass
+
+    def _open_health_history(self):
+        """Opens the checkup-history dialog. See app/ui/dialogs/registry.py."""
+        open_dialog(self, "health_history")
+
+    def _open_driver_store(self):
+        """U-005: the driver-store window.
+
+        Not in app/ui/dialogs/registry.py: this one belongs to the Drivers
+        TAB (it deletes from the same store that tab installs into), so it is
+        opened through the tab when the tab exists. The fallback keeps a
+        route working from a surface that opened before the tab was built.
+        """
+        try:
+            tab = self.tabs.get("Drivers")
+        except Exception:
+            tab = None
+        try:
+            if tab is not None:
+                tab._open_store()
+                return
+            from app.ui.dialogs.driver_store_dialog import DriverStoreDialog
+            DriverStoreDialog(self.root, self).wait()
+        except Exception as exc:                        # noqa: BLE001
+            try:
+                self.log(f"! Could not open the driver store: {exc}")
+            except Exception:
+                pass
+
     def _open_startup_manager(self):
         """Opens the startup_manager dialog. See app/ui/dialogs/registry.py."""
         open_dialog(self, "startup_manager")
@@ -2278,21 +2540,21 @@ class Application:
         """Opens the uninstall_programs dialog. See app/ui/dialogs/registry.py."""
         open_dialog(self, "uninstall_programs")
 
-    def _open_webcam_test(self):
-        """Opens the webcam_test dialog. See app/ui/dialogs/registry.py."""
-        open_dialog(self, "webcam_test")
-
-    def _open_mouse_tester(self):
-        """Opens the mouse_tester dialog. See app/ui/dialogs/registry.py."""
-        open_dialog(self, "mouse_tester")
-
     def _open_pc_specs(self):
         """Opens the pc_specs dialog. See app/ui/dialogs/registry.py."""
         open_dialog(self, "pc_specs")
 
     def _open_health_report(self):
-        """Opens the health_report dialog. See app/ui/dialogs/registry.py."""
-        open_dialog(self, "health_report")
+        """Open the Health destination (2026-10: it is a tab, not a popup).
+
+        The status-row badge and anything else that used to call this keep
+        the same entry point; only the surface changed. The old dialog is
+        still exported for compatibility, but nothing routes to it.
+        """
+        try:
+            self._switch_to("Health")
+        except Exception:
+            pass
 
     def _open_network_connections(self):
         """Opens the network_connections dialog. See app/ui/dialogs/registry.py."""
@@ -2378,7 +2640,7 @@ class Application:
         self._pilot_sess.ensure_pump()
         try:
             from app.config_persist import load_config as _load
-            from app.session_pilot import (KNOWN_GAME_EXES, SessionPilot,
+            from app.session_pilot import (SessionPilot,
                                            normalize_exe)
             cfg = _load()
             watched = self._pilot_watched_fast(cfg, normalize_exe)
@@ -2576,13 +2838,21 @@ class Application:
         # close must be side-effect free. Applied tweaks stay badged
         # until Undo reverts them (said plainly in the dialog).
         try:
+            # The stay-awake hold is released by _pilot_revert, and stopping
+            # never reverts. Release it here when a session is live, or the
+            # display/sleep stay suppressed for the rest of the process (the
+            # user's PC "never sleeps" after turning Auto-Pilot off mid-game).
+            _was_active = self._pilot_state is SessionState.ACTIVE
             # H15: also cancels the pump's pending after(). Pre-H15 the
             # 50ms drain loop rescheduled itself for the rest of the app's
             # life even with the feature switched off.
             self._pilot_sess.stop()
+            if _was_active:
+                self._set_stay_awake(False)
             self.log("Game Session Auto-Pilot: stopped watching.")
-        except Exception:
-            pass
+        except Exception as exc:
+            from app.utils import log_or_swallow
+            log_or_swallow(None, "ui.pilot_stop", exc)
 
     def _pilot_refresh_watchlist(self):
         """User added/removed an .exe: rebuild the watchlist live."""
@@ -2594,14 +2864,11 @@ class Application:
         except Exception:
             pass
 
-    def _pilot_running(self) -> bool:
-        return self._pilot_sess.is_running()
-
     # ------------------------------------------------------------------ #
     # H15 forwarders. Each of these used to carry the logic; they now hand
     # off to SessionOrchestrator, which is the only thing that should own
-    # the Auto-Pilot's state. Kept as named methods because PilotDialog
-    # (and tests) call them by name.
+    # the Auto-Pilot's state. Kept as named properties because this file
+    # addresses them by name.
     # ------------------------------------------------------------------ #
     @property
     def _pilot(self):
@@ -2611,9 +2878,6 @@ class Application:
     def _pilot(self, value):
         self._pilot_sess.pilot = value
 
-    @property
-    def _pilot_evt_q(self):
-        return self._pilot_sess.queue
 
     @property
     def _pilot_applied_keys(self) -> list:
@@ -2672,26 +2936,6 @@ class Application:
             pass
         return self._modal_open()
 
-    def _pilot_ui_free(self):
-        """True when a pilot-triggered run may safely choreograph the
-        shared run UI (progress bar, tab buttons, status stream): no
-        modal dialog open AND no run in flight.
-
-        User bug report: a game launching/exiting while the Auto-Pilot
-        setup dialog (or any modal) was open made the whole app churn
-        behind the popup. Flicker fix: the detector is the open-instance
-        registry (ThemedModal.any_open), not grab_current() — a Combobox
-        popdown inside an open dialog releases the grab and would read
-        'free' at the exact moment the user is mid-dropdown."""
-        try:
-            with self._busy_lock:
-                if self._busy:
-                    return False
-        except Exception:
-            pass
-        if ThemedModal.any_open():
-            return False
-        return True
 
     def _set_stay_awake(self, on: bool):
         """SetThreadExecutionState during a game session — audit fix
@@ -2773,8 +3017,8 @@ class Application:
         runnable = list(tasks)
         if not is_admin():
             # limited mode: only what needs no admin, SILENTLY (a
-            # background trigger must never pop "Administrator Required"
-            # over someone's game — run_tasks would do exactly that)
+            # background trigger must never pop the "Skipped N Admin-Only
+            # Tasks" notice over someone's game — run_tasks would do that)
             runnable = [t for t in tasks if not t.admin_required]
         # Module-8: intent must reflect what will actually run — capturing
         # applied_keys pre-filter claimed admin tweaks the limited-mode run
@@ -2851,7 +3095,7 @@ class Application:
         # UI-freedom guard (user bug report + audit find): a revert that
         # fires while a run owns the progress UI — or while ANY modal
         # dialog is open — must not choreograph shared UI behind the
-        # user's context. Worse, run_tasks would pop a "Busy" dialog
+        # user's context. Worse, run_tasks would pop an "already running" notice
         # (possibly over a game) AND the revert would be lost. Skip with
         # an honest log line instead; Undo Tweaks restores manually and
         # the applied-badges stay truthful about what is still on.
@@ -2960,13 +3204,6 @@ class Application:
         except Exception as exc:
             _themed_showerror(self.root, "Could Not Launch", str(exc))
 
-    def _launch_settings(self, uri: str):
-        """Open a Windows Settings page via its ms-settings: URI."""
-        try:
-            os.startfile(uri)  # noqa: S606 — shell-resolved URI, not an exe
-        except Exception as exc:
-            _themed_showerror(self.root, "Could Not Open",
-                              f"Couldn't open Windows Settings:\n{exc}")
 
     # ---------------- Auto Maintenance dialog ---------------- #
 
@@ -3013,8 +3250,7 @@ class Application:
 
     def _show_schedule_dialog(self):
         from app.config_persist import load_config
-        from app.scheduler import (enable_schedule, disable_schedule,
-                                   get_schedule_status, run_auto_update)
+        from app.scheduler import (enable_schedule, disable_schedule)
 
         config = load_config()
         enabled = config.get("schedule_enabled", False)
@@ -3033,25 +3269,24 @@ class Application:
         # left + a control of the SAME size on the right, so the edges line
         # up. Only the essentials are shown; long explanations are gone.
         col = tk.Frame(modal.body, bg=COLORS["bg"])
-        col.pack(fill="x", padx=70, pady=(12, 0))
+        col.pack(fill="x", padx=MEASURE_CAP, pady=(SPACE_3, 0))
         _CTL_W, _CTL_H = 120, 34
 
         def _row():
             r = tk.Frame(col, bg=COLORS["bg"])
-            r.pack(fill="x", pady=6)
+            r.pack(fill="x", pady=CONTROL_GAP)
             return r
 
         def _toggle_row(label, initial, tip=None):
             var = tk.BooleanVar(value=bool(initial))
             r = _row()
             lbl = tk.Label(r, text=label, bg=COLORS["bg"], fg=COLORS["text"],
-                           font=(F, 11))
+                           font=TYPE["body_large"])
             lbl.pack(side="left")
             btn = AnimatedButton(
                 r, text="On" if var.get() else "Off",
                 command=lambda: var.set(not var.get()),
-                bg=COLORS["surface"], fg=COLORS["text"],
-                font=(F, 10, "bold"), width=_CTL_W, height=_CTL_H)
+                role="secondary", size="md", width=_CTL_W, height=_CTL_H)
             btn.pack(side="right")
             def _sync(*_):
                 on = var.get()
@@ -3108,12 +3343,12 @@ class Application:
             str(config.get("health_check_mode", "startup")), "At startup"))
         hc_row = _row()
         _hc_lbl = tk.Label(hc_row, text="PC Health check", bg=COLORS["bg"],
-                           fg=COLORS["text"], font=(F, 11))
+                           fg=COLORS["text"], font=TYPE["body_large"])
         _hc_lbl.pack(side="left")
         hc_menu = M3Dropdown(_holder(hc_row), textvariable=health_var,
                              values=[n for n, _k in _HC], state="readonly",
                              width=max(len(n) for n, _k in _HC) + 1,
-                             font=(F, 10))
+                             font=TYPE["body_medium"])
         hc_menu.pack(fill="both", expand=True)
         try:
             Tooltip(_hc_lbl, "How often the PC Health badge re-checks your "
@@ -3122,35 +3357,35 @@ class Application:
         except Exception:
             pass
 
-        tk.Frame(col, height=1, bg=COLORS["hairline"]).pack(fill="x", pady=(10, 6))
+        tk.Frame(col, height=1, bg=COLORS["hairline"]).pack(fill="x", pady=(GROUP_GAP, CONTROL_GAP))
 
         freq_row = _row()
         tk.Label(freq_row, text="How often", bg=COLORS["bg"], fg=COLORS["text"],
-                 font=(F, 11)).pack(side="left")
+                 font=TYPE["body_large"]).pack(side="left")
         freq_var = tk.StringVar(value=freq)
         freq_combo = M3Dropdown(_holder(freq_row), textvariable=freq_var,
                                 values=["daily", "weekly", "monthly"],
-                                state="readonly", width=9, font=(F, 10))
+                                state="readonly", width=9, font=TYPE["body_medium"])
         freq_combo.pack(fill="both", expand=True)
 
         time_row = _row()
         tk.Label(time_row, text="Time (24h)", bg=COLORS["bg"], fg=COLORS["text"],
-                 font=(F, 11)).pack(side="left")
+                 font=TYPE["body_large"]).pack(side="left")
         time_var = tk.StringVar(value=time_str)
         tk.Entry(_holder(time_row), textvariable=time_var, justify="center",
                  bg=COLORS["surface"], fg=COLORS["text"], insertbackground=COLORS["text"],
-                 font=(F, 10), bd=0, highlightthickness=1,
+                 font=TYPE["body_medium"], bd=0, highlightthickness=1,
                  highlightbackground=COLORS["hairline"],
                  highlightcolor=COLORS["accent_green"]).pack(fill="both", expand=True)
 
         total_selected = sum(len(v) for v in config.get("selected_tasks", {}).values())
         tk.Label(modal.body, text=f"Runs {total_selected} tasks from your last run",
-                 bg=COLORS["bg"], fg=COLORS["subtext"], font=(F, 9)).pack(pady=(10, 0))
+                 bg=COLORS["bg"], fg=COLORS["subtext"], font=TYPE["caption"]).pack(pady=(GROUP_GAP, 0))
 
         status_var = tk.StringVar(value="")
         tk.Label(modal.body, textvariable=status_var, bg=COLORS["bg"],
-                 fg=COLORS["accent_blue"], font=(F, 9), wraplength=440,
-                 justify="center").pack(pady=(4, 0))
+                 fg=COLORS["accent_blue"], font=TYPE["caption"], wraplength=440,
+                 justify="center").pack(pady=(SPACE_1, 0))
 
         def refresh_status():
             # F14: reconcile live schtasks state into config (external
@@ -3185,20 +3420,23 @@ class Application:
                 if ok:
                     results.append("Maintenance enabled")
                 else:
-                    _themed_showerror(dlg, "Failed", f"Could not create maintenance task:\n{msg}")
+                    _themed_showerror(dlg, "Maintenance Not Scheduled",
+                                      msg or "Windows did not say why.")
             else:
                 ok, msg = disable_schedule()
                 if ok:
                     results.append("Maintenance disabled")
                 else:
-                    _themed_showerror(dlg, "Failed", f"Could not remove maintenance task:\n{msg}")
+                    _themed_showerror(dlg, "Schedule Not Removed",
+                                      msg or "Windows did not say why.")
             # update-everything schedule (separate schtasks entry)
             if upd_var.get():
                 ok, msg = enable_schedule(freq_var.get(), time_var.get(), extra_args=["--auto-update"])
                 if ok:
                     results.append("Update Everything enabled")
                 else:
-                    _themed_showerror(dlg, "Failed", f"Could not create update task:\n{msg}")
+                    _themed_showerror(dlg, "Updates Not Scheduled",
+                                      msg or "Windows did not say why.")
             else:
                 ok, msg = disable_schedule(["--auto-update"])
                 if ok:
@@ -3274,19 +3512,19 @@ class Application:
             status_var.set("; ".join(_attn) if _attn else "Saved.")
 
         btn_frame = tk.Frame(modal.body, bg=COLORS["bg"])
-        btn_frame.pack(fill="x", padx=70, pady=(12, 16))
+        btn_frame.pack(fill="x", padx=MEASURE_CAP, pady=(SPACE_3, SPACE_4))
         # C-1 audit fix: close through the modal (scrim + bindings + closed
         # flag), not by destroying its Toplevel.
         AnimatedButton(btn_frame, text="Update Apps Now",
                        command=lambda: self._run_update_now(modal),
-                       bg=COLORS["surface"], fg=COLORS["text"], font=(F, 10),
+                       role="secondary", size="md",
                        ).pack(side="left")
         AnimatedButton(btn_frame, text="Apply", command=apply,
-                       bg=COLORS["accent_green"], fg=COLORS["black"], font=(F, 10, "bold"),
+                       role="filled", size="md", accent=COLORS["accent_green"],
                        ).pack(side="right")
         AnimatedButton(btn_frame, text="Close", command=modal.close,
-                       bg=COLORS["surface"], fg=COLORS["text"], font=(F, 10),
-                       ).pack(side="right", padx=(0, 8))
+                       role="secondary", size="md",
+                       ).pack(side="right", padx=(0, SPACE_2))
         refresh_status()
         # C-5 audit fix: enter the modal wait like every other dialog (grab +
         # wait_window). Without this the schedule dialog floated grab-less:
@@ -3397,66 +3635,58 @@ class Application:
             _os.startfile(root)
         except Exception as exc:
             _themed_showerror(self.root, "Could Not Open Drive",
-                              f"Couldn't open {root}\n\n{exc}")
+                              f"{root}\n\nWindows returned:\n{exc}")
 
-    def _show_extra_drives_menu(self):
-        """The '+N ▾' overflow menu: every drive that didn't fit inline,
-        with free space and the same color rules; click opens in Explorer."""
-        if not self._drive_extra:
-            return
-        menu = tk.Menu(self.root, tearoff=0, bg=COLORS["surface"],
-                       fg=COLORS["text"], activebackground=COLORS["surface_hover"],
-                       activeforeground=COLORS["text"], bd=0,
-                       font=(F, 9))
-        for i, (letter, root, free_gb, total_gb) in enumerate(self._drive_extra):
-            col = self._drive_fill_color(free_gb, total_gb)
-            menu.add_command(
-                label=f"{letter}:  {free_gb:.0f} GB free of {total_gb:.0f} GB",
-                command=lambda r=root: self._open_drive(r),
-            )
-            try:
-                menu.entryconfig(i, foreground=col)
-            except Exception:
-                pass
-        try:
-            menu.tk.call("tk_popup", menu, self.root.winfo_pointerx(),
-                          self.root.winfo_pointery() + 12)
-        except Exception:
-            pass
 
-    # ---------------- low-space nudge (feature 4) -------------------- #
-    # A per-drive hysteresis state machine driven by the disk-monitor
-    # tick: fire at <=5% free, clear only above 7% (a drive hovering at
-    # the boundary must not re-toast every 30s). Firing = native toast
-    # (in a thread — subprocess must never block the Tk thread) + an
-    # amber chip in the status row that opens Storage Insight. A
-    # background dry-run scan enriches the chip tooltip with a real
-    # reclaimable number when it lands; the dialog itself always
-    # re-scans live, so a stale estimate can never cause a wrong clean.
-
-    _NUDGE_FIRE_RATIO = 0.05
-    _NUDGE_CLEAR_RATIO = 0.07
+    # ------------- low-space chip + quiet watch (feature 4 / N-006) ----- #
+    # A per-drive hysteresis state machine driven by the disk-monitor tick.
+    # The threshold is the user's own `watch_free_percent` (default 10%), and
+    # an episode ends only above that plus a margin, so a drive hovering at
+    # the boundary cannot re-mark itself every 30s.
+    #
+    # Two surfaces, one number: the CHIP in the status row is this function's
+    # job (it opens Storage Insight and its tooltip carries a measured
+    # reclaimable estimate), while the NOTIFICATION is `_watch_speak`'s, since
+    # that also has to cover the health score and the schedule. Splitting them
+    # this way is what keeps a drive crossing at 10% from producing two toasts
+    # that disagree with each other.
 
     def _check_low_space(self, drives):
         """Tick entry — call with the monitor's drive list (Tk thread).
-        Pure state transitions + widget updates; the only subprocess
-        (the toast) is handed to a daemon thread."""
+
+        Pure state transitions + widget updates. The threshold is read from
+        the same settings quiet watch uses, so the amber chip and the notice
+        can never disagree about which drives count as nearly full.
+        """
         try:
             by_letter = {d[0]: d for d in drives}
         except Exception:
             return
+        try:
+            from app.config_persist import load_config
+            cfg = load_config()
+        except Exception:
+            cfg = {}
+        fire = watch.free_threshold(cfg) / 100.0
+        clear = watch.clear_threshold(cfg) / 100.0
         prev = getattr(self, "_drive_was_red", {}) or {}
         now = {}
         try:
-            for letter, (_l2, _root, free_gb, total_gb) in by_letter.items():
+            # A-? (found by dev/tests/test_watch.py): this loop used to unpack
+            # `(letter, (_l2, _root, free_gb, total_gb))` from a value that is
+            # already the flat 4-tuple, so it raised ValueError on the first
+            # drive and the outer handler swallowed it - the whole low-space
+            # state machine, chips included, had never run once. Iterate the
+            # values, which is what the month of silent logs was telling us.
+            for letter, _root, free_gb, total_gb in by_letter.values():
                 ratio = (free_gb / total_gb) if total_gb and total_gb > 0 else 1.0
                 was = prev.get(letter)
                 if was is True:
-                    is_red = ratio <= self._NUDGE_CLEAR_RATIO
+                    is_red = ratio <= clear
                     if not is_red:
                         self._hide_nudge_chip(letter)   # recovered
                 else:
-                    is_red = ratio <= self._NUDGE_FIRE_RATIO
+                    is_red = ratio <= fire
                     if is_red and letter not in getattr(self, "_nudge_dismissed", set()):
                         self._fire_low_space_nudge(letter, free_gb)
                 now[letter] = is_red
@@ -3465,7 +3695,7 @@ class Application:
                 if letter not in by_letter:
                     self._hide_nudge_chip(letter)
             # in-place free-GB refresh for visible chips (no widget churn)
-            for letter, (_l2, _root, free_gb, _t) in by_letter.items():
+            for letter, _root, free_gb, _t in by_letter.values():
                 chip = (getattr(self, "_nudge_chips", {}) or {}).get(letter)
                 if chip is not None:
                     try:
@@ -3479,16 +3709,70 @@ class Application:
             pass
 
     def _fire_low_space_nudge(self, letter, free_gb):
-        """New red episode: toast (threaded) + chip + estimate scan."""
-        try:
-            import threading as _th
-            _th.Thread(target=notify_low_space,
-                       args=(letter, float(free_gb)),
-                       daemon=True).start()
-        except Exception:
-            pass
+        """New low-space episode: the status chip and its estimate scan.
+
+        Deliberately silent. The notification belongs to `_watch_speak`, which
+        sees this same drive through the same threshold and folds it into one
+        notice with any other condition; toasting here as well would be the
+        duplicate this split exists to prevent.
+        """
         self._show_nudge_chip(letter, free_gb)
         self._ensure_nudge_estimate()
+
+    def _watch_speak(self, drives):
+        """Ask quiet watch what crossed, and say it once (N-006).
+
+        Off the Tk thread: `watch.check` may spawn the Task Scheduler query.
+        The alerts come back as data, so the copy that reaches the user is
+        written in one place (`watch.notice_text`) and logged here as well -
+        a toast that has already faded must not be the only record.
+        """
+        if getattr(self, "_watch_running", False):
+            return
+        snapshot = []
+        for d in drives or ():
+            try:
+                snapshot.append((str(d[0]), str(d[1]),
+                                 float(d[2]), float(d[3])))
+            except (IndexError, TypeError, ValueError):
+                continue
+        if not snapshot:
+            return
+        self._watch_running = True
+
+        def _work():
+            alerts = []
+            try:
+                alerts = watch.check(drives=snapshot)
+            except Exception:
+                alerts = []
+            finally:
+                self._watch_running = False
+            if alerts:
+                self._watch_announce(alerts)
+
+        try:
+            threading.Thread(target=_work, daemon=True,
+                             name="QuietWatch").start()
+        except Exception:
+            self._watch_running = False
+
+    def _watch_announce(self, alerts):
+        """ONE notification for everything this tick found, plus a log line."""
+        try:
+            text = watch.notice_text(alerts)
+        except Exception:
+            text = None
+        if text:
+            try:
+                show_toast(text[0], text[1], "long")
+            except Exception:
+                pass
+        for alert in alerts or ():
+            try:
+                self.log("Quiet watch: %s \u2014 %s" % (alert.title, alert.body))
+            except Exception:
+                pass
 
     def _nudge_chip_text(self, letter, free_gb):
         return f" ⚠ {letter}: {free_gb:.1f} GB free "
@@ -3530,17 +3814,17 @@ class Application:
                 pass
             box = tk.Frame(frame_holder, bg=COLORS["alert_amber_bg"])
             lbl = tk.Label(box, text=self._nudge_chip_text(letter, free_gb),
-                           font=(F, 9, "bold"), bg=COLORS["alert_amber_bg"],
+                           font=TYPE["label_medium"], bg=COLORS["alert_amber_bg"],
                            fg=COLORS["accent_yellow"], cursor="hand2")
-            lbl.pack(side="left", padx=(8, 2), pady=3)
+            lbl.pack(side="left", padx=(SPACE_2, TEXT_NUDGE), pady=TIGHT_GAP)
             lbl.bind("<Button-1>", lambda e: self._open_storage_insight())
             tip = Tooltip(lbl, self._nudge_tip_text(letter, free_gb, total_gb))
-            x = tk.Label(box, text="✕", font=(F, 8), bg=COLORS["alert_amber_bg"],
+            x = tk.Label(box, text="✕", font=TYPE["micro_regular"], bg=COLORS["alert_amber_bg"],
                          fg=COLORS["subtext"], cursor="hand2")
-            x.pack(side="left", padx=(0, 8))
+            x.pack(side="left", padx=(0, SPACE_2))
             x.bind("<Button-1>", lambda e, l=letter: self._dismiss_nudge(l))
             Tooltip(x, "Dismiss for this session")
-            box.pack(side="left", padx=(0, 6))
+            box.pack(side="left", padx=(0, CONTROL_GAP))
             chips[letter] = {"frame": box, "label": lbl, "tip": tip}
         except Exception:
             pass
@@ -3643,8 +3927,9 @@ class Application:
 
     def _rebuild_drive_chips(self, drives):
         """Recreate the inline chips (only when the drive set changed —
-        labels update in place otherwise). C: always inline; overflow
-        collapses into the '+N' menu chip."""
+        labels update in place otherwise). C: always inline; drives past
+        the inline cap are named in the first chip's tooltip (the '+N'
+        overflow menu went with the app-bar redesign, 2026-10 sweep)."""
         for w in self._drive_chips_frame.winfo_children():
             w.destroy()
         self._drive_chips = []
@@ -3656,9 +3941,9 @@ class Application:
             # the free-GB number changes digit count (audit minor CLS)
             lbl = tk.Label(self._drive_chips_frame,
                             text=f" {letter}: {free_gb:5.0f} GB free ",
-                            font=(F, 9, "bold"), bg=COLORS["bg"], fg=col,
+                            font=TYPE["label_medium"], bg=COLORS["bg"], fg=col,
                             cursor="hand2")
-            lbl.pack(side="left", padx=(6, 0))
+            lbl.pack(side="left", padx=(CONTROL_GAP, 0))
             lbl.bind("<Button-1>", lambda e, r=root: self._open_drive(r))
             # Storage Insight (feature 3): right-click opens the insight
             # dialog; left-click keeps the long-standing Explorer behavior
@@ -3714,6 +3999,13 @@ class Application:
                     self._check_low_space(drives)
                 except Exception:
                     pass
+                # quiet watch (N-006) rides the same tick: the drive list is
+                # already here, and the guard inside skips a tick whose
+                # predecessor is still reading the Task Scheduler
+                try:
+                    self._watch_speak(drives)
+                except Exception:
+                    pass
             except Exception:
                 pass
             try:
@@ -3759,693 +4051,15 @@ class Application:
                 pass
             self._disk_monitor_after_id = None
 
-    # ---------------- log (in-memory only, #16 simplified per user) ------- #
-    # No log window in the UI anymore — the log accumulates in memory and
-    # "Export Logs" (Settings → Data & logs) saves it to a .txt for debugging.
-
-    def _build_log(self, parent):
-        self._log_lines = []
-        self._log_lines.append("Welcome to Cleaner Tool.")
-
-    def log(self, text):
-        def _do():
-            self._log_lines.append(f"[{time.strftime('%H:%M:%S')}] {text}")
-            if len(self._log_lines) > 8000:
-                del self._log_lines[:2000]
-        try:
-            if threading.current_thread() is threading.main_thread():
-                _do()
-            else:
-                self._dispatch.post(_do)
-        except Exception:
-            pass
-
-    # keep old internal name working for close-guard message
-    def _log_full(self, text):
-        self.log(text)
-
-    def export_logs(self):
-        """Save the full in-memory log to a .txt the user picks (user
-        request: replaces the old View Details window — keeps debugging
-        possible without console clutter in the UI)."""
-        from tkinter import filedialog
-        try:
-            default_name = f"CleanerTool_Log_{time.strftime('%Y%m%d_%H%M%S')}.txt"
-            path = filedialog.asksaveasfilename(
-                parent=self.root,
-                title="Export Logs",
-                defaultextension=".txt",
-                initialfile=default_name,
-                filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
-            )
-            if not path:
-                return
-            header = (
-                f"Cleaner Tool log export\n"
-                f"Exported: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"Edition: {self._windows_edition_str()}\n"
-                f"{'=' * 60}\n"
-            )
-            # Audit 2026-10: a support bundle must include the environment
-            # and recent unhandled exceptions, not only the in-memory run
-            # log (which is empty after a crash).
-            try:
-                from app.diagnostics import diagnostics_text
-                header += "\n" + diagnostics_text() + "\n"
-            except Exception:
-                pass
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(header + "\n".join(self._log_lines) + "\n")
-                # U-001: the app writes a diagnostics trail to events.log the
-                # whole time (elevation cookie failures, swallowed ops, ...),
-                # but it was never read back. A bug report should carry it, so
-                # append the tail. Best-effort: an unreadable log is skipped.
-                try:
-                    from app.config_events import read_events
-                    events = read_events(500)
-                except Exception:
-                    events = []
-                if events:
-                    f.write("\n" + ("-" * 60) + "\n")
-                    f.write("Diagnostics \u2014 swallowed failures / event log "
-                            "(last %d)\n" % len(events))
-                    f.write(("-" * 60) + "\n")
-                    f.write("\n".join(events) + "\n")
-            # user bug: exporting mid-run overwrote the live "Running X…"
-            # status with "Log saved to …" and it never came back. When a
-            # run is active the status belongs to the run — log only.
-            if not getattr(self, "_busy", False):
-                self.set_status("Log saved: " + os.path.basename(path))
-            self.log(f"Log exported to {path}")
-        except Exception as exc:
-            _themed_showerror(self.root, "Export Failed",
-                              f"Could not save the log:\n{exc}")
-
-    def _windows_edition_str(self) -> str:
-        try:
-            import winreg
-            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
-                                r"SOFTWARE\Microsoft\Windows NT\CurrentVersion") as k:
-                product = winreg.QueryValueEx(k, "ProductName")[0]
-                display = winreg.QueryValueEx(k, "DisplayVersion")[0]
-            return f"{product} ({display})"
-        except Exception:
-            return "Windows"
-
-    # ---------------- status line (fading, #16) ---------------- #
-
-    def set_status(self, text):
-        def _do():
-            try:
-                if hasattr(self, "status_lbl") and self.status_lbl.winfo_exists():
-                    # cancel pending fades
-                    for aid in getattr(self, "_status_fade_ids", []):
-                        try:
-                            self.root.after_cancel(aid)
-                        except Exception:
-                            pass
-                    self._status_fade_ids = []
-                    self.status_lbl.config(text=text, fg=TAB_ACCENTS.get(self.active_tab, COLORS["accent_green"]))
-                    # fade back to muted after 4s (unless running)
-                    if not self._busy:
-                        aid = self.root.after(4000, lambda: self._fade_status())
-                        self._status_fade_ids.append(aid)
-            except Exception:
-                pass
-        try:
-            if threading.current_thread() is threading.main_thread():
-                _do()
-            else:
-                self._dispatch.post(_do)
-        except Exception:
-            pass
-
-    def _fade_status(self):
-        try:
-            self.status_lbl.config(fg=COLORS["subtext"])
-        except Exception:
-            pass
-
-    # ---------------- progress ---------------- #
-
-    def _ui_hop(self, fn) -> None:
-        """Marshal a callable onto the Tk thread, from either thread.
-
-        MED-014, and the reason this is not just _dispatch.post() everywhere:
-        a 0 ms `after()` timer is only ever at risk when it is scheduled from
-        a WORKER thread, because whether it fires depends on the Tk thread
-        happening to be inside Tcl's event loop when the cross-thread
-        notifier arrives. From the Tk thread it is reliable by construction.
-
-        So the worker path goes through TkDispatcher, whose delivery is
-        guaranteed, while the main-thread path keeps the historical
-        `after(0, ...)` deferral. That deferral is load-bearing: the
-        pre-flight countdown relies on that one tick, and making it inline
-        advanced the countdown enough to outrun the stop.
-        """
-        try:
-            if threading.current_thread() is threading.main_thread():
-                self.root.after(0, fn)
-            else:
-                self._dispatch.post(fn)
-        except Exception:
-            pass
-
-    def _set_progress(self, value, maximum=None):
-        def _do():
-            try:
-                # M10: `if maximum:` misrouted maximum=0 into the fraction
-                # branch (and a real value/0 would raise); be explicit.
-                if maximum is not None:
-                    self.progress_bar.set_fraction(value / maximum if maximum else 0.0)
-                else:
-                    self.progress_bar.set_fraction(value)
-            except Exception:
-                pass
-        self._ui_hop(_do)
-
-    def _stop_indeterminate(self):
-        """Turn off the shimmer and paint the full bar — ON THE TK THREAD.
-
-        F-003 fix: _run_tasks_worker used to call
-        progress_bar.set_indeterminate(False) directly from the worker
-        thread. set_indeterminate(False) does after_cancel + Canvas _draw
-        (delete/all + item creation) — real Tcl calls. Tkinter is not
-        thread-safe; the identical Install-tab path (install_selected_mixed
-        _done) was already fixed to marshal via root.after for exactly this
-        reason, but this call site never got the fix. Same shape as
-        _set_progress above: try/except only guards the shutdown race."""
-        def _do():
-            try:
-                self.progress_bar.set_indeterminate(False)
-            except Exception:
-                pass
-        self._ui_hop(_do)
-
-    # ---------------- run flow ---------------- #
-
-    @staticmethod
-    def _preflight_check(tasks):
-        """Plain-language notices before a long run: pending reboot, low
-        disk, admin rights, network (only when a task looks like it needs
-        the internet — install/repair-download tasks). Returns a list of
-        notice strings; empty = all clear. Non-blocking (ask-to-continue
-        in the caller, never a hard stop)."""
-        notices = []
-
-        # pending reboot (CBS RebootPending) — repair tasks work better after
-        try:
-            import winreg as _wr
-            with _wr.OpenKey(_wr.HKEY_LOCAL_MACHINE,
-                             r"SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending"):
-                notices.append("Windows is waiting for a restart — restarting first makes repairs more reliable.")
-        except OSError:
-            pass
-        except Exception:
-            pass
-
-        # free disk on C:
-        try:
-            import ctypes as _ct
-            free = _ct.c_ulonglong(0)
-            total = _ct.c_ulonglong(0)
-            avail = _ct.c_ulonglong(0)
-            if _ct.windll.kernel32.GetDiskFreeSpaceExW(_ct.c_wchar_p("C:\\"),
-                                                       _ct.byref(avail),
-                                                       _ct.byref(total),
-                                                       _ct.byref(free)):
-                gb = free.value / (1024 ** 3)
-                if gb < 5:
-                    notices.append(f"Only {gb:.1f} GB free on C: — cleaning needs breathing room; free up space first.")
-        except Exception:
-            pass
-
-        # admin rights when selected tasks need them (limited mode would
-        # silently skip them — better said up front)
-        if not is_admin():
-            admin_tasks = [t for t in tasks if t.admin_required]
-            if admin_tasks:
-                notices.append(f"{len(admin_tasks)} task(s) need Administrator — they'll be skipped in limited mode "
-                               "(restart the app as Administrator for the full run).")
-
-        # network when a task is an internet task (Install tab always is;
-        # repair DISM RestoreHealth downloads too; time_sync/gaming_dns/
-        # update_all/xbox_apps/store re-register also need the network —
-        # F10: the old two-pattern check let those fail mid-run offline
-        # instead of warning up front. Non-blocking notice only.
-        _net_keys = {t.key for t in tasks}
-        _needs_net = any(k.startswith("install_") for k in _net_keys) \
-                     or bool(_net_keys & {"dism_restorehealth", "time_sync",
-                                          "gaming_dns", "update_all",
-                                          "xbox_apps", "store_apps_reregister"})
-        if _needs_net:
-            try:
-                from app.downloader import has_network
-                if not has_network():
-                    notices.append("No internet connection detected — some tasks need to download files.")
-            except Exception:
-                pass
-
-        return notices
-
-    def _set_buttons_enabled(self, enabled: bool):
-        def _do():
-            try:
-                for tab in self.tabs.values():
-                    tab.set_run_enabled(enabled)
-                if getattr(self, "cancel_btn", None) is not None:
-                    self.cancel_btn.set_enabled(not enabled)
-                if not enabled:
-                    self._progress_show()
-                else:
-                    self._progress_hide()
-            except Exception:
-                pass
-        self._dispatch.post(_do)
-
-    def _progress_show(self):
-        try:
-            # bottom frame = the progress bar's own parent; pack at its top
-            self.progress_bar.pack(fill="x", pady=(6, 2))
-            self.cancel_btn.pack(side="right")
-            self._progress_hidden = False
-        except Exception:
-            pass
-
-    def _progress_hide(self):
-        try:
-            self.progress_bar.pack_forget()
-            self.cancel_btn.pack_forget()
-            self._progress_hidden = True
-        except Exception:
-            pass
-
-    @staticmethod
-    def _invoke_single_task(ctx, task, mode: str = "run", strict_ok: bool = True):
-        """Run ONE Task object (worker thread) and normalize its outcome
-        to (status, task_bytes, exc) with status in ok|skip|stop|fail.
-
-        H8/ARCH-004: the classification now lives in ONE place,
-        `app.runner.task_runner.invoke_task`, which `app.scheduler`'s
-        headless loop imports too. It used to be duplicated here and
-        mirrored (by comment) in run_auto_clean, so a new outcome or a
-        changed reading of a task's return value could land in one path and
-        be forgotten in the other — which is how six tasks managed to report
-        success while doing nothing on one path only.
-
-        This stays a thin wrapper returning the legacy tuple because both
-        call sites (the run_tasks worker and the Install Essentials worker)
-        unpack three values, and that shape is part of the tested contract.
-        See task_runner for the return-value reading and the exception map."""
-        return invoke_task(ctx, task, mode=mode, strict_ok=strict_ok).as_tuple()
-
-    def install_selected_mixed(self, apps, tasks):
-        """Install-tab runner: checked Essentials tasks FIRST (Store brings
-        winget, bundles before individual apps), then catalog apps — one
-        worker, one progress bar, fully cancelable via the Stop button
-        (install commands are registered with the cancel registry now)."""
-        # Module-8: never hold _busy_lock across a modal (ThemedModal.wait
-        # pumps a nested event loop — a worker completion or an after()
-        # callback taking the same non-reentrant lock would self-deadlock
-        # the Tk thread). Check-and-set is split: fast check under lock,
-        # modal without lock, re-check under lock before claiming.
-        with self._busy_lock:
-            _busy_now = self._busy
-        if _busy_now:
-            _themed_showinfo(self.root, "Busy",
-                             "Please wait for the current operation to finish.",
-                             accent=COLORS["accent_yellow"])
-            return
-        gen = self._claim_run()
-        if gen is None:
-            return
-
-        # Same guarantee as run_tasks: the slot is claimed but no worker
-        # exists yet, so any failure in the admin-gating dialog, the button
-        # updates or the progress setup must release it. _abort_unstarted_run
-        # explains what happened here before this guard existed.
-        try:
-            self._start_claimed_install(gen, tasks, apps)
-        except Exception as exc:                       # noqa: BLE001
-            self._abort_unstarted_run(exc)
-
-    def _start_claimed_install(self, gen, tasks, apps):
-        """The claimed-but-not-yet-started half of install_selected_mixed.
-
-        The caller must already hold the claim (PREFLIGHT) for `gen`.
-        """
-
-        # Admin gating for Essentials that need it (same rule as other tabs)
-        if not is_admin():
-            admin_blocked = [t for t in tasks if t.admin_required]
-            if admin_blocked:
-                names = ", ".join(t.label for t in admin_blocked)
-                self.log(f"Limited mode: skipping {len(admin_blocked)} admin-only installer(s): {names}")
-                tasks = [t for t in tasks if not t.admin_required]
-                if tasks or apps:
-                    _themed_showinfo(
-                        self.root, "Administrator Required",
-                        f"Skipped {len(admin_blocked)} installer(s) that need "
-                        f"admin:\n{names}\n\nContinuing with the rest.",
-                        accent=COLORS["accent_yellow"])
-            if not tasks and not apps:
-                _themed_showinfo(self.root, "Nothing to Run",
-                                 "All selected installers need Administrator rights.",
-                                 accent=COLORS["accent_yellow"])
-                self._release_run()
-                return
-
-        # H9: a Stop that arrived during pre-flight must survive into the
-        # worker. Clearing the token unconditionally here is what used to
-        # discard it — the request was recorded, then wiped before any
-        # worker existed to observe it.
-        if self._state is not RunState.CANCELLING:
-            self._cancel_requested = False
-        for tab in self.tabs.values():
-            tab.set_run_enabled(False)
-        # user bug: the bar + Stop button never appeared during install /
-        # update runs (only the tab buttons disabled) — a 10-minute
-        # `winget upgrade --all` looked dead. Show them like run_tasks does.
-        # Determinate % is impossible for winget batch runs, so indeterminate
-        # + live per-package status lines (see _live_status_ctx) is the
-        # honest signal.
-        self._progress_show()
-        self.cancel_btn.set_enabled(True)
-        self.progress_bar.set_fraction(0.0)
-        self.progress_bar.set_indeterminate(True)
-        total = len(apps) + len(tasks)
-        self.set_status(f"Installing {total} item(s)...")
-        self.log(f"===== Installing {total} selected item(s) =====")
-
-        ctx = TaskContext(
-            log=self.log, set_status=self.set_status,
-            cancelled=lambda: self._cancel_requested,
-        )
-
-        # BUG-018: _done is the ONLY thing that releases the run slot, hides
-        # the progress bar and re-enables every tab's Run button. It used to be
-        # called from exactly two places at the end of the worker, so any
-        # exception escaping the worker - including the unguarded
-        # `from app.tasks.install_tasks import ...` below - left _busy True,
-        # the bar spinning forever, Run disabled on every tab and
-        # _worker_thread non-None: an unrecoverable UI needing Task Manager.
-        # Making _done idempotent is what lets the finally backstop below call
-        # it unconditionally without double-reporting on the normal path.
-        _done_called = [False]
-
-        def _done(ok, summary, ok_n=0, fail_n=0):
-            if _done_called[0]:
-                return
-            _done_called[0] = True
-            # audit fix: this ran on the WORKER thread — set_indeterminate/
-            # set_run_enabled touch Tk widgets/Canvases, and Tkinter is not
-            # thread-safe (rare non-deterministic crashes at install end).
-            # Hop to the Tk thread first, like _set_buttons_enabled does.
-            def _ui():
-                # H10: after(0) hop scheduled after the slot was released —
-                # a newer run may own the app by the time this executes.
-                if not self._is_current(gen):
-                    return
-                self.progress_bar.set_indeterminate(False)
-                self._set_progress(1, 1)
-                self._progress_hide()
-                self.cancel_btn.set_enabled(False)
-                self._release_run(ok)
-                for tab in self.tabs.values():
-                    tab.set_run_enabled(True)
-                # installs/updates change what `winget upgrade` reports —
-                # re-scan so "Update Apps (N)" never shows a stale number.
-                try:
-                    install_tab = self.tabs.get("Install")
-                    if install_tab is not None and hasattr(install_tab, "refresh_update_count"):
-                        install_tab.refresh_update_count()
-                except Exception:
-                    pass
-                self.set_status(summary)
-                # Install results now use the same themed card language
-                # as everything else (was the last white OS box in the app)
-                _themed_showinfo(self.root, "Install Done", summary,
-                                 accent=COLORS["accent_green"])
-            self._dispatch.post(_ui)
-
-        def _worker_inner():
-            ok_n, fail_n, skipped_n, stopped = 0, 0, 0, False
-
-            def _record(task, status, exc):
-                # F2-2: same outcome contract as the run_tasks worker (via
-                # _invoke_single_task); the mapping to the install counters
-                # lives here only. A skip (nothing to do on this machine) is
-                # completed-with-skip — logged, never a failure, never wedging
-                # the summary count (the old code had no skip branch at all,
-                # silently dropping the outcome).
-                nonlocal ok_n, fail_n, skipped_n, stopped
-                if status == "ok":
-                    ok_n += 1
-                elif status == "skip":
-                    skipped_n += 1
-                    self.log(f"  (skipped) {task.label}: {exc}")
-                elif status == "fail":
-                    fail_n += 1
-                    self.log(f"  ! {task.label} failed: {exc or 'no run available'}")
-                elif status == "stop":
-                    stopped = True
-                    self.log(f"  {task.label} was cancelled: {exc}")
-
-            # 1) Essentials tasks (sequential, honest per-task errors).
-            # strict_ok=False: Essentials install tasks read boolean results
-            # as their own outcome (a False here is NOT an invented failure).
-            for task in tasks:
-                if ctx.cancelled():
-                    stopped = True
-                    break
-                self.set_status(f"Running {task.label}...")
-                self.log(f"--- {task.label} ---")
-                status, _bytes, exc = self._invoke_single_task(ctx, task, "run", strict_ok=False)
-                _record(task, status, exc)
-                if stopped:
-                    break
-            # 2) Catalog apps — per-app honesty (audit fix: the old code did
-            # ok_n += len(apps) whenever install_selected_apps didn't raise,
-            # counting failed apps as installed; the runner now reports the
-            # real per-app outcome)
-            if not stopped and apps:
-                try:
-                    # BUG-018: this import was directly above the try, so an
-                    # ImportError/AttributeError/circular-import from it
-                    # escaped the thread target and _done never ran. Inside
-                    # the try, the existing handler turns it into an honest
-                    # "all apps failed".
-                    from app.tasks.install_tasks import install_selected_apps as _runner
-                    app_ok, app_fail = _runner(ctx, apps)
-                except TaskCancelled as exc:
-                    stopped = True
-                    self.log(f"  app installs were cancelled: {exc}")
-                    app_ok, app_fail = [], []
-                except Exception as exc:
-                    # _runner raises only when EVERY app failed — count them
-                    # all as failed instead of dying with _done never called
-                    # (which wedged the UI busy with a frozen progress bar).
-                    self.log(f"  ! app installs failed: {exc}")
-                    app_ok, app_fail = [], [a["name"] for a in apps]
-                else:
-                    # A mid-batch Stop breaks the runner without raising —
-                    # report Stopped, not Complete.
-                    if ctx.cancelled():
-                        stopped = True
-                ok_n += len(app_ok)
-                fail_n += len(app_fail)
-            if stopped:
-                self.log("Stopped — remaining items were skipped.")
-                _done(False, f"Stopped: {ok_n} finished before stopping.", ok_n, fail_n)
-            else:
-                summary = f"Install complete: {ok_n} succeeded" + (f", {skipped_n} skipped" if skipped_n else "") + (f", {fail_n} failed" if fail_n else "") + "."
-                _done(True, summary, ok_n, fail_n)
-
-        def _worker():
-            # BUG-018 backstop. The work lives in _worker_inner so this wrapper
-            # can guarantee the run is always released. Anything escaping
-            # _worker_inner - an import error, a refactor-induced AttributeError,
-            # a circular import, or even SystemExit - is caught here instead of
-            # killing the thread and wedging the UI busy forever.
-            try:
-                _worker_inner()
-            except TaskCancelled as exc:
-                self.log(f"  install run was cancelled: {exc}")
-                _done(False, "Stopped before anything finished.")
-            except BaseException as exc:      # noqa: BLE001 - see above
-                # Deliberately BaseException: on a worker thread the only two
-                # sane options are report-it or wedge-the-UI, and a base
-                # exception escaping here is exactly how the wedge happened.
-                self.log(f"  ! install worker crashed: {exc!r}")
-                _done(False, f"Install failed unexpectedly: {exc}")
-            finally:
-                # Unconditional release. _done is idempotent, so on the normal
-                # path this is a no-op; if the body died without reporting,
-                # the UI is still reset and the user can try again.
-                _done(False, "Install ended without reporting a result.")
-
-        thread = threading.Thread(target=_worker, daemon=True)
-        self._mark_running(thread)
-        thread.start()
-
-    def run_tasks(self, tab_name, tasks, mode="run", quiet=False,
-                  toast_kind=None, toast_extra=None):
-        """quiet=True: pilot/headless mode — no interactive popups of any
-        kind (preflight askyesno, warnings, admin gates) and no modal
-        Scorecard at completion; the run reports via status line + toast
-        only. A modal grab_set window must never appear over a running
-        fullscreen game."""
-        all_selected = list(tasks)  # H1: capture real selection before filtering
-        if not is_admin():
-            admin_tasks = [t for t in tasks if t.admin_required]
-            if admin_tasks:
-                names = ", ".join(t.label for t in admin_tasks)
-                self.log(f"Limited mode: skipping {len(admin_tasks)} admin-only task(s): {names}")
-                tasks = [t for t in tasks if not t.admin_required]
-                if not quiet:
-                    _themed_showinfo(
-                        self.root,
-                        "Administrator Required",
-                        f"Skipped {len(admin_tasks)} admin-only task(s):\n{names}\n\n"
-                        "Running the rest in limited mode.",
-                        accent=COLORS["accent_yellow"],
-                    )
-            if not tasks:
-                if toast_kind:
-                    self._toast_async("Needs Administrator",
-                                      "Restart as Administrator to run this.")
-                if not quiet:
-                    _themed_showinfo(
-                        self.root,
-                        "Nothing to Run",
-                        "All selected tasks require Administrator rights. Restart as Administrator to run them.",
-                        accent=COLORS["accent_yellow"],
-                    )
-                return
-
-        # Module-8: same no-lock-across-modal rule as install_selected_mixed
-        # — check under lock, modal without lock, claim under lock.
-        with self._busy_lock:
-            _busy_now = self._busy
-        if _busy_now:
-            if not quiet:
-                _themed_showinfo(self.root, "Busy", "Please wait for the current operation to finish.",
-                                 accent=COLORS["accent_yellow"])
-            return
-        gen = self._claim_run()
-        if gen is None:
-            return
-
-        # Everything from here to `thread.start()` happens with the run slot
-        # claimed but NO worker alive yet. A raise anywhere in that window
-        # used to unwind past _release_run() and strand the app in PREFLIGHT
-        # permanently (busy forever, close refused) — see
-        # _abort_unstarted_run. Nothing after thread.start() can raise, so
-        # this handler can never pull the slot out from under a live worker.
-        try:
-            self._start_claimed_run(gen, tab_name, tasks, all_selected, mode,
-                                    quiet, toast_kind, toast_extra)
-        except Exception as exc:                       # noqa: BLE001
-            self._abort_unstarted_run(exc)
-
-    def _start_claimed_run(self, gen, tab_name, tasks, all_selected, mode,
-                           quiet, toast_kind, toast_extra):
-        """The claimed-but-not-yet-started half of run_tasks.
-
-        Split out so the try/except that guarantees the run slot is released
-        wraps exactly the pre-worker window and nothing else. The caller must
-        already hold the claim (PREFLIGHT) for `gen`.
-        """
-        # ---- Pre-flight checks (user request): fail fast with plain
-        # language instead of dying mid-DISM. Long-run = 5+ tasks or any
-        # task flagged long-running by the Repair tab's nature. ----
-        try:
-            preflight = self._preflight_check(tasks)
-        except Exception:
-            preflight = []
-        if preflight:
-            if quiet:
-                self.log("Pre-flight notices (quiet run): " + " | ".join(preflight))
-            else:
-                msg = "Before we start:\n\n" + "\n".join(f"  • {p}" for p in preflight)
-                if not _themed_askyesno(self.root, "Pre-flight Check", msg + "\n\nStart anyway?",
-                                        accent=COLORS["accent_yellow"]):
-                    self._release_run()
-                    return
-                self.log("Pre-flight notices: " + " | ".join(preflight))
-
-        # Blocking hazards only — FYI notes are logged, never a popup
-        # (curated presets like Deep Clean / Recommended are safe by
-        # design, so they run silent; Custom combos that truly conflict
-        # still ask here — except quiet runs, which log and continue:
-        # the pilot only ever runs its own curated preset).
-        try:
-            info_notes = check_info_notices(tasks)
-        except Exception:
-            info_notes = []
-        if info_notes:
-            for _note in dict.fromkeys(info_notes):
-                self.log(_note)
-        warnings = check_dangerous_combos(tasks)
-        if warnings:
-            warnings = list(dict.fromkeys(warnings))
-            if quiet:
-                self.log("Hazard combo (quiet run, continuing): " + " | ".join(warnings))
-            else:
-                msg = "Potentially problematic task combinations detected:\n\n" + "\n\n".join(warnings)
-                msg += "\n\nDo you want to continue?"
-                if not _themed_askyesno(self.root, "Confirm Task Combination", msg,
-                                        accent=COLORS["accent_red"]):
-                    self._release_run()
-                    return
-
-        # Save selection for scheduler (H1: run mode only, full pre-filter list)
-        # C-3 audit fix: quiet (background pilot) runs must NOT overwrite the
-        # saved selection — a game launch would otherwise silently replace the
-        # user's last manual Tweak pick with the Game Session preset, and the
-        # next scheduled --auto-clean would apply session tweaks unattended.
-        if mode == "run" and not quiet:
-            # F08: single-lock RMW.
-            try:
-                from app.config_persist import update_config as _update
-                def _mut(cfg, tab_name=tab_name, all_selected=all_selected):
-                    cfg.setdefault("selected_tasks", {})[tab_name] = [t.key for t in all_selected]
-                _update(_mut)
-            except Exception:
-                pass
-
-        # H9: a Stop that arrived during pre-flight must survive into the
-        # worker. Clearing the token unconditionally here is what used to
-        # discard it — the request was recorded, then wiped before any
-        # worker existed to observe it.
-        if self._state is not RunState.CANCELLING:
-            self._cancel_requested = False
-        self._set_buttons_enabled(False)
-        self.progress_bar.set_fraction(0.0)
-        self.progress_bar.set_indeterminate(True)
-        self.set_status(f"Starting {len(tasks)} task(s)...")
-
-        # H10: the run owns its results list. `self._run_results` still points
-        # at it (a completed run's results stay readable there), but
-        # rebinding it on the next run no longer corrupts this run's data: the
-        # worker and the deferred result card both close over the local.
-        run_results = []
-        self._run_results = run_results
-
-        thread = threading.Thread(target=self._run_tasks_worker,
-                                  args=(tab_name, tasks, mode, quiet,
-                                        toast_kind, toast_extra, gen,
-                                        run_results), daemon=True)
-        self._mark_running(thread)
-        thread.start()
-
     def _bind_global_shortcuts(self):
         """improvement-report 2.2: Ctrl+Enter runs the active tab, Escape
         stops a running task (dialogs already bind their own Escape-to-
         close — see ThemedModal — so this never conflicts, it only fires
         when the main window itself has focus), Ctrl+1..5 switches tabs,
-        Ctrl+L copies the run log. Best-effort: any failure here should
-        never block the app from starting."""
+        Ctrl+L copies the run log.
+        Best-effort: any failure here should never block the app from
+        starting.
+        """
         try:
             self.root.bind("<Control-Return>", lambda _e: self._shortcut_run())
             self.root.bind("<Control-KP_Enter>", lambda _e: self._shortcut_run())
@@ -4507,624 +4121,3 @@ class Application:
             return dict(get_tweak_state() or {})
         except Exception:
             return {}
-
-    # ------------------------------------------------------------------ #
-    # H9: run lifecycle state.
-    #
-    # RunState is now the single source of truth for "is a run active".
-    # `_busy` is a VIEW over it — the same move H1 made for
-    # `_cancel_requested` over CancellationToken — so all 37 existing
-    # read/write sites and the smoke suite keep working untouched, while the
-    # combinations the boolean could express but the engine could not act on
-    # are now either impossible or explicitly modelled:
-    #
-    #   * "busy with no worker thread" -> PREFLIGHT, a real state. That window
-    #     spans the admin gate and two modal askyesno prompts. A Stop pressed
-    #     in it used to set a cancel token no worker existed to observe, and
-    #     the run then started anyway.
-    #   * "not busy but a worker is live" -> impossible: _claim_run,
-    #     _mark_running and _release_run are the only writers, and each moves
-    #     the state and _worker_thread under one lock.
-    #
-    # Both accessors tolerate missing attributes so __init__'s own
-    # assignments cannot AttributeError regardless of statement order.
-    # ------------------------------------------------------------------ #
-    @property
-    def _busy(self) -> bool:
-        return getattr(self, "_state", RunState.IDLE).busy
-
-    @_busy.setter
-    def _busy(self, value) -> None:
-        st = getattr(self, "_state", None)
-        if st is None:
-            self._state = st = RunState.IDLE
-        if value:
-            # Never downgrade a pending cancel. `_busy = True` from a
-            # re-entrant call while a stop is in flight means "still busy",
-            # not "start over" — clearing CANCELLING here would let a run
-            # that the user already stopped keep going.
-            self._state = st if st is RunState.CANCELLING else RunState.RUNNING
-        else:
-            self._state = RunState.IDLE
-
-    def _abort_unstarted_run(self, exc):
-        """Release a claimed run slot whose worker never started.
-
-        run_tasks and install_selected_mixed both claim the single run slot
-        (PREFLIGHT) and then do a fair amount of work before a worker exists:
-        pre-flight notices, hazard-combo prompts, an admin-gating dialog, the
-        config write, the button/progress updates and the scorecard's
-        before-snapshot. Any of those can raise — a TclError on a root being
-        destroyed, a grab_set failure, a bad drive query.
-
-        Before this helper, such an exception unwound straight out of the Tk
-        callback, so _release_run() was never reached and the app stayed in
-        PREFLIGHT for the rest of the session: _busy stayed True forever and
-        _on_close refused to close the window. The user had to kill the
-        process. Both call sites now funnel failures here.
-
-        Safe to call only BEFORE _mark_running() + thread.start(): once a
-        worker owns the slot it releases it itself, and releasing underneath
-        it would report a bogus outcome.
-        """
-        try:
-            self._release_run(ok=False)
-        except Exception:
-            pass
-        try:
-            # B-0xx: if the failure happened after _start_claimed_run disabled
-            # the Run buttons and showed the progress bar (its _set_buttons_
-            # enabled(False) / progress lines run before the worker exists),
-            # nothing else re-enabled them — the app looked stuck despite the
-            # "still usable" message. _set_buttons_enabled(True) also hides the
-            # progress bar.
-            self._set_buttons_enabled(True)
-        except Exception:
-            pass
-        try:
-            self.log(f"! Could not start the run: {exc}")
-            import traceback
-            self.log(traceback.format_exc().strip())
-        except Exception:
-            pass
-        try:
-            _themed_showinfo(
-                self.root, "Could Not Start",
-                "Something went wrong before the run could start.\n\n"
-                f"{exc}\n\nThe app is still usable — see the log for details.",
-                accent=COLORS["accent_red"])
-        except Exception:
-            pass
-
-    def _claim_run(self):
-        """Take the single run slot and return this run's generation number.
-
-        Call under _busy_lock, or rely on this taking it — it never holds the
-        lock across a caller modal, because ThemedModal.wait pumps a nested
-        event loop and a worker completion taking the same non-reentrant lock
-        would self-deadlock the Tk thread.
-
-        Returns the new generation on success, or None if a run is already
-        active. The generation is what lets a late completion tell whether it
-        still owns the app (H10): a run releases the slot before scheduling
-        its result card, so a newer run can start before the older run's
-        deferred UI hop runs.
-        """
-        with self._busy_lock:
-            if self._state.busy:
-                return None
-            self._state = RunState.PREFLIGHT
-            self._run_gen += 1
-            self._current_gen = self._run_gen
-            return self._current_gen
-
-    def _is_current(self, gen) -> bool:
-        """True while `gen` is still the run that owns the app.
-
-        A worker finishing hands the slot back with _release_run BEFORE it
-        schedules its result card, toast and status hop with root.after(0).
-        Those hops are therefore not ordered against a subsequent run: by the
-        time they execute, the next run may have started, rebound
-        _run_results, and taken the progress bar. Anything deferred must ask
-        this first, or it will paint the previous run's outcome over the
-        current one's.
-        """
-        if gen is None:
-            return True          # caller opted out; behave as before
-        return gen == self._current_gen
-
-    def _mark_running(self, thread):
-        """PREFLIGHT -> RUNNING, adopting the worker thread in the same
-        critical section so the two can never disagree."""
-        with self._busy_lock:
-            self._worker_thread = thread
-            if self._state is RunState.CANCELLING:
-                return  # Stop arrived during pre-flight: stay cancelling
-            self._state = RunState.RUNNING
-
-    def _release_run(self, ok=True):
-        """End of a run: clear the worker thread and the cancel token and
-        return to IDLE, all under one lock. Replaces the three separate
-        statements that used to be able to interleave with a second run's
-        claim.
-
-        The outcome is recorded in `last_run_outcome` rather than parked in
-        self._state for two statements. Setting DONE/ERROR and then
-        immediately overwriting it with IDLE would make those two enum
-        members unobservable — a race, not a state — so they describe the last
-        run instead, where a caller can actually read them.
-        """
-        with self._busy_lock:
-            self._last_run_ok = bool(ok)
-            self._worker_thread = None
-            self._state = RunState.IDLE
-            # B-0xx: reset the cancel token INSIDE the critical section. It
-            # used to run one statement after the lock released, so a second
-            # run could claim the slot and have its Stop request wiped by this
-            # run's late reset — a Stop on the new run was silently ignored.
-            # Safe under the lock: the _cancel_requested setter does not take
-            # _busy_lock itself.
-            self._cancel_requested = False
-
-    @property
-    def last_run_outcome(self) -> "RunState | None":
-        """DONE/ERROR for the most recent run, or None if none has finished.
-        CANCELLING is deliberately not an outcome: a stopped run reports
-        through the run summary, and the state has already moved on."""
-        if not hasattr(self, "_last_run_ok"):
-            return None
-        return RunState.DONE if self._last_run_ok else RunState.ERROR
-
-    def _run_in_preflight(self) -> bool:
-        """True while a run is claimed but not yet executing. The only window
-        where a Stop request cannot be honoured by a worker, because there
-        isn't one yet."""
-        return self._state is RunState.PREFLIGHT
-
-    # ARCH-006 / H1: `_cancel_requested` is now a VIEW over the
-    # CancellationToken created in __init__, not a second piece of state.
-    # The getter/setter pair is what lets all eight existing call sites (and
-    # the smoke suite) keep reading and writing the familiar name while the
-    # token stays the single source of truth — a bare bool can no longer be
-    # flipped from a worker thread without taking the lock.
-    #
-    # Both accessors tolerate `self._cancel` being absent so that
-    # __init__'s own `self._cancel_requested = False` cannot deadlock or
-    # AttributeError regardless of statement order.
-    @property
-    def _cancel_requested(self) -> bool:
-        tok = getattr(self, "_cancel", None)
-        return bool(tok is not None and tok.is_cancelled())
-
-    @_cancel_requested.setter
-    def _cancel_requested(self, value) -> None:
-        tok = getattr(self, "_cancel", None)
-        if tok is None:
-            tok = self._cancel = CancellationToken()
-        if value:
-            tok.cancel()
-        else:
-            tok.reset()
-
-    def _request_cancel(self):
-        if not self._busy:
-            return
-        # H9: record the intent in the state, not just the token. Previously a
-        # Stop pressed during the pre-flight window set `_cancel_requested`
-        # with no worker alive to observe it, the run then started anyway, and
-        # `_cancel_requested = False` further down wiped the request before
-        # the worker could see it. CANCELLING survives that reset: the setter
-        # for `_busy` refuses to downgrade it, and _mark_running checks for
-        # it so the run never silently proceeds as if un-cancelled.
-        # read BEFORE the transition, or it is always False
-        _was_preflight = self._run_in_preflight()
-        with self._busy_lock:
-            if self._state is not RunState.CANCELLING:
-                self._state = RunState.CANCELLING
-        self._cancel_requested = True
-        if _was_preflight:
-            # No worker exists yet, so "finishing the current task" would be a
-            # lie — and logging BOTH lines is worse than either. Say the one
-            # true thing and return: the cancel token is now set, the
-            # conditional reset in run_tasks will not clear it, and
-            # _mark_running keeps the state at CANCELLING, so the run stops
-            # as soon as the worker starts.
-            self.log("Stop requested before the run started — "
-                     "nothing to interrupt.")
-            try:
-                from app.utils import cancel_current_command
-                cancel_current_command()
-            except Exception:
-                pass
-            return
-        try:
-            from app.utils import cancel_current_command
-            cancel_current_command()
-        except Exception:
-            pass
-        self.log("Stop requested — finishing the current task, then stopping.")
-
-    def _run_tasks_worker(self, tab_name, tasks, mode, quiet=False,
-                          toast_kind=None, toast_extra=None, gen=None,
-                          run_results=None):
-        verb = "Undoing" if mode == "revert" else "Running"
-        self.log(f"===== {verb} {len(tasks)} {tab_name} task(s) =====")
-
-        # Scorecard 'before' snapshot -- taken HERE, on the worker thread,
-        # not on the Tk thread before the thread was even started.
-        #
-        # This used to run in _start_claimed_run, which put up to 26
-        # GetDiskFreeSpaceExW calls on the Tk thread before and after every
-        # run. That is the exact hazard the disk monitor was moved off-thread
-        # to fix (see _start_disk_monitor): one unreachable mapped network
-        # drive stalls the UI for the length of its SMB timeout, so the app
-        # froze before the run appeared to start and again before the
-        # scorecard appeared. Measuring here is also more honest -- the
-        # reading now brackets the actual work rather than the UI setup.
-        #
-        # A failed read yields None/{} and the scorecard renders without the
-        # before/after bar. It never invents numbers.
-        try:
-            run_before_bytes = self._query_drive_free_total(_system_drive_root())
-        except Exception:
-            run_before_bytes = None
-        try:
-            run_before_drives = _snapshot_all_drives(
-                self._query_drives, self._query_drive_free_total)
-        except Exception:
-            run_before_drives = {}
-        # Still published for anything that wants to inspect the last run's
-        # baseline; the worker is the only writer and the scorecard reads the
-        # closure above, not this.
-        self._run_before_bytes = run_before_bytes
-        self._run_before_drives = run_before_drives
-        # N-002: a cheap memory / restart-flag reading, bracketed around the
-        # run exactly like the disk snapshots above (same worker thread, same
-        # fail-soft contract: an unreadable value is None and the scorecard
-        # simply omits that line rather than inventing a change).
-        try:
-            from app import benchmark as _bench
-            run_before_measure = _bench.snapshot()
-        except Exception:
-            run_before_measure = None
-        self._run_before_measure = run_before_measure
-
-        ctx = TaskContext(log=self.log, set_status=self.set_status,
-                          cancelled=lambda: self._cancel_requested)
-        # 2.5: opt-in Quarantine bin. Attached only for a real apply run; a
-        # revert restores registry tweaks and a dry_run/Storage-Insight ctx
-        # never deletes, so neither needs (or should get) a bin.
-        try:
-            from app import quarantine as _q
-            if mode != "revert" and _q.enabled():
-                ctx.quarantine = _q.Quarantine()
-        except Exception:
-            pass
-
-        total_bytes = 0
-        completed, failed = 0, 0
-        skipped_n = 0
-        cancelled = False
-        self._set_progress(0, len(tasks))
-
-        # Scorecard collectors (worker-thread writes only; the dialog
-        # builder runs on the Tk thread AFTER the worker joins its UI
-        # hop, so no lock is needed — same single-writer pattern as the
-        # existing counters above).
-        # H10: prefer the list handed in by run_tasks. Falling back to the
-        # attribute keeps the pre-H10 calling convention working, but then the
-        # list is shared with any later run.
-        if run_results is None:
-            run_results = getattr(self, "_run_results", None)
-            if run_results is None:
-                run_results = self._run_results = []
-        results = run_results
-
-        def _record(idx, task, status, task_bytes, exc):
-            # F2-1: the single place mapping the shared helper's outcome to
-            # the scorecard rows + counters + applied-tweak bookkeeping
-            # (worker-thread locals only; one result row per attempted task,
-            # same as the old inline branches).
-            nonlocal total_bytes, completed, failed, skipped_n, cancelled
-            if status == "ok":
-                completed += 1
-                total_bytes += task_bytes
-                results.append((task.label, "ok", task_bytes, None))
-                # Phase 2 (#14): keep the applied-tweak registry truthful
-                if mode == "revert":
-                    mark_tweak_reverted(task.key)
-                else:
-                    if task.revert is not None:  # it's a tweak
-                        mark_tweak_applied(task.key)
-            elif status == "skip":
-                # B5 audit fix: a skip means nothing changed on this
-                # machine — count it as completed-with-skip, log the
-                # reason, but do NOT record the tweak as applied (the
-                # '✓ Active' badge must show what is actually active).
-                skipped_n += 1
-                results.append((task.label, "skip", 0, str(exc) if exc else None))
-                self.log(f"  (skipped) {task.label}: {exc}")
-            elif status == "stop":
-                # F-2 audit fix: utils.run_cmd_checked deliberately raises
-                # TaskCancelled for a user Stop (its H6 contract) — the run
-                # was stopped, not failed; no tweak is marked applied/
-                # reverted, remaining tasks are skipped by the next
-                # iteration's cancelled() check, summary reports 'stopped'.
-                cancelled = True
-                results.append((task.label, "stop", 0, None))
-                self.log(f"  (stopped) {task.label}: {exc}")
-            else:  # "fail"
-                failed += 1
-                if exc is None:
-                    # helper reports no run/revert function on the Task
-                    reason = f"No {'revert' if mode == 'revert' else 'run'} step defined for this task"
-                    self.log(f"  ! No {'revert' if mode == 'revert' else 'run'} for '{task.label}'")
-                else:
-                    reason = str(exc)
-                    self.log(f"  ! ERROR in '{task.label}': {exc}")
-                results.append((task.label, "fail", 0, reason))
-            self._set_progress(idx + 1, len(tasks))
-
-        # BUG-018 backstop. The release of the run slot lives at the END of this
-        # function, with no top-level try/finally guarding it, so anything that
-        # escaped here left _busy True, the bar spinning, every Run button
-        # disabled and _worker_thread set forever - an unrecoverable UI needing
-        # Task Manager. Anything unexpected is caught, logged, and turned into
-        # an honest failed row so the normal summary/release path still runs.
-        crashed = None
-        try:
-            for idx, task in enumerate(tasks):
-                if ctx.cancelled():
-                    self.log("Cancelled by user — remaining tasks were skipped.")
-                    cancelled = True
-                    break
-                self.set_status(f"{verb}: {task.label}...")
-                status, task_bytes, exc = self._invoke_single_task(ctx, task, mode)
-                _record(idx, task, status, task_bytes, exc)
-        except TaskCancelled as exc:
-            cancelled = True
-            self.log(f"Run cancelled: {exc}")
-        except BaseException as exc:          # noqa: BLE001 - see above
-            # Deliberately BaseException. On a worker thread the alternatives are
-            # report-it or wedge-the-UI, and wedging the UI is the bug.
-            crashed = exc
-            self.log(f"  ! run worker crashed: {exc!r}")
-            # Every task without a row gets a 'fail' row, so the scorecard
-            # matches the task list and the counts add up instead of showing
-            # phantom successes.
-            for t in tasks[len(results):]:
-                results.append((t.label, "fail", 0, str(exc)))
-                failed += 1
-
-        # tasks never attempted (user Stop mid-run) show as 'stopped' rows
-        # so the scorecard tells the whole story. Every attempted task
-        # appended exactly one result, so len(results) == attempted count;
-        # the remainder are the never-started ones. (Only after a real
-        # stop — a completed loop leaves nothing remaining.)
-        if cancelled and len(results) < len(tasks):
-            for t in tasks[len(results):]:
-                results.append((t.label, "stop", 0, None))
-
-        # H11: applied-badge state needs no refresh — the view reads live.
-        # audit fix: cached Undo bodies hold stale "✓ Active" badges built
-        # from the PRE-run tweak_state. _clear_body_cache existed for exactly
-        # this but had zero call sites — _enter_undo only popped the 'undo'
-        # key, leaving preset/custom bodies stale after a revert. Drop all
-        # cached bodies now that the machine state has actually changed.
-        # H11: _clear_body_cache destroys widgets — marshal to the Tk
-        # thread like every other worker→UI hop (direct call mutated the
-        # cache dicts from the worker and leaked the widget handles).
-        try:
-            tweak_tab = self.tabs.get("Tweak")
-            if tweak_tab is not None:
-                self._dispatch.post(tweak_tab._clear_body_cache)
-        except Exception:
-            pass
-
-        needs_reboot = any(getattr(t, "risk", "") == "REBOOT REQUIRED" for t in tasks)
-        # B5: skipped tasks (nothing to do on this machine) get their own
-        # honest count instead of being lumped into 'succeeded'.
-        summary_core = f"{verb} {'stopped early' if cancelled else 'complete'}: {completed} succeeded"
-        if skipped_n:
-            summary_core += f", {skipped_n} skipped (nothing to change)"
-        summary_core += f", {failed} failed."
-        summary_lines = [summary_core]
-        if crashed is not None:
-            # The summary must not read as a clean completion.
-            summary_lines.append(
-                f"The run ended early: {crashed!r}. See the log for the full "
-                "error; any tasks that had already run were NOT rolled back."
-            )
-        if cancelled:
-            summary_lines.append("Remaining tasks were skipped (cancelled by user).")
-        if total_bytes > 0:
-            summary_lines.append(f"Disk space freed: {format_bytes(total_bytes)}")
-        if needs_reboot:
-            summary_lines.append("Reboot system for changes to take effect.")
-        summary = "\n".join(summary_lines)
-        self.log("=" * 48)
-        self.log(summary)
-        if needs_reboot:
-            self.log("⚠️ Reboot system for changes to take effect.")
-        self.log("=" * 48)
-
-        # F-003 fix: marshal through the Tk thread — was a direct
-        # cross-thread Canvas call (see _stop_indeterminate docstring).
-        # H10: if a newer run already owns the app, this completion is stale.
-        # Releasing the slot here would hand it back while the new run is
-        # mid-flight, and re-enabling the buttons/status would paint the old
-        # run's outcome over the new one. Drop it on the floor.
-        if not self._is_current(gen):
-            self.log("  ! stale run completion ignored (superseded by a newer run).")
-            return
-
-        self._stop_indeterminate()
-        self._set_progress(1, 1)
-        self.set_status(summary_lines[0] + (" — Reboot needed" if needs_reboot else ""))
-
-        self._release_run(ok=not cancelled)
-        self._set_buttons_enabled(True)
-
-        # Native completion toast — scheduled BEFORE the scorecard hop:
-        # _done_popup blocks in the scorecard's modal wait_window(), so
-        # any hop queued after it would only run once the user closes the
-        # dialog — useless when the app is minimized (the exact case the
-        # toast exists for: transient signal while the scorecard waits
-        # unseen behind the taskbar). Tk fires same-delay after()s in
-        # schedule order, so the toast decision always runs first. Both
-        # the state() read and the toast fire on the Tk thread; the
-        # worker only schedules. Headless scheduled runs never reach this
-        # code at all (scheduler.py runs its own path, gui not imported).
-        if toast_kind:
-            # tray-started run: always report the real outcome
-            try:
-                _tt, _tm = self._result_toast(
-                    toast_kind, toast_extra, total_bytes, completed, failed,
-                    skipped_n, cancelled)
-                self._toast_async(_tt, _tm)
-            except Exception:
-                pass
-        if not cancelled and tab_name == "Clean" and mode == "run" and not toast_kind:
-            def _toast_if_minimized():
-                # H10: scheduled with after(0) AFTER the slot was released, so
-                # a newer run may own the app by now.
-                if not self._is_current(gen):
-                    return
-                try:
-                    if self.root.state() != "iconic":
-                        return
-                    # audit minor 3: pass the failure count so the toast
-                    # copy is truthful (only claims a clean completion
-                    # when nothing failed)
-                    threading.Thread(target=notify_clean_complete,
-                                     args=(total_bytes, completed, failed, skipped_n),
-                                     daemon=True).start()
-                except Exception:
-                    pass
-            try:
-                self._dispatch.post(_toast_if_minimized)
-            except Exception:
-                pass
-
-        def _done_popup():
-            # H10: this hop is where a superseded run does its damage. The
-            # slot was released before it was scheduled, so by now another run
-            # may have rebound _run_results and taken the progress bar. Show
-            # nothing rather than a card built from someone else's data.
-            if not self._is_current(gen):
-                return
-            # Scorecard (user-approved 2026-09): the themed results card
-            # replaces the generic Done/Stopped messagebox. Built on the
-            # Tk thread with the worker's collected per-task rows; the
-            # freed-space 'after' snapshot is read HERE (the run's
-            # deletions have settled by the time this hop executes).
-            # quiet (pilot) runs skip the modal entirely — a grab_set
-            # window over a fullscreen game is hostile; toast + status
-            # line carry the outcome instead.
-            # Feature 10: remember this run BEFORE the card is built, so
-            # the 30-day sentence on the card includes it. Recorded for
-            # quiet (Auto-Pilot) runs too — they free real space — but
-            # never for Undo runs, which give space back rather than
-            # freeing it.
-            if mode == "run" and total_bytes and total_bytes > 0:
-                try:
-                    from app.config_persist import record_run
-                    record_run(total_bytes)
-                except Exception:
-                    pass
-            if quiet:
-                try:
-                    if tab_name == "Clean":
-                        self.set_status(
-                            f"Freed {format_bytes(total_bytes)}." if total_bytes
-                            else "Nothing to clean.")
-                    else:
-                        verb = "restored" if mode == "revert" else "applied"
-                        self.set_status(f"Auto-Pilot: session tweaks {verb}.")
-                except Exception:
-                    pass
-                return
-            # `after` / `after_drives` are closed over from the WORKER thread,
-            # which measured them after the last task finished. They used to be
-            # read here, on the Tk thread, which put another 26 blocking
-            # GetDiskFreeSpaceExW calls in front of the scorecard -- the same
-            # UI-freeze hazard the disk monitor was moved off-thread to avoid.
-            run_again = None
-            if (not cancelled and tab_name == "Clean" and mode == "run"):
-                # 'Clean Again' — re-run the same selection. The task list
-                # is captured by closure; in preset mode the page still
-                # holds the same preset, in custom the same toggles.
-                same_tasks = list(tasks)
-                def run_again():
-                    self.run_tasks(tab_name, same_tasks, mode="run")
-            try:
-                card = ScorecardDialog(
-                    self.root,
-                    tab_name=tab_name, mode=mode, cancelled=cancelled,
-                    # H10: `results` is this run's own list (closed over),
-                    # not self._run_results, which a newer run may have
-                    # rebound by the time this hop runs.
-                    results=list(results),
-                    total_bytes=total_bytes,
-                    before=run_before_bytes,
-                    after=after,
-                    needs_reboot=needs_reboot,
-                    on_run_again=run_again,
-                    before_drives=run_before_drives,
-                    after_drives=after_drives,
-                    measurements=(run_before_measure, after_measure),
-                )
-                card.wait()
-                # Audit fix (Auto-Maintenance discoverability): the
-                # scheduler only lives behind a small corner wrench icon —
-                # easy to never notice it exists. A one-time tip (never
-                # shown again after this) after the first successful Clean
-                # run points new users at it, without adding a permanent
-                # banner or nagging every run.
-                if (tab_name == "Clean" and mode == "run" and not cancelled
-                        and results
-                        and any(r[1] == "ok" for r in results)):
-                    self._maybe_show_automaint_tip()
-            except Exception:
-                # the scorecard must never mask a run's outcome — fall
-                # back to the old messagebox if building it fails
-                try:
-                    if cancelled:
-                        _themed_showinfo(self.root, "Stopped", summary,
-                                         accent=COLORS["accent_yellow"])
-                    else:
-                        _themed_showinfo(self.root, "Done", summary,
-                                         accent=COLORS["accent_green"])
-                except Exception:
-                    pass
-        # Scorecard 'after' snapshot -- measured HERE, on the worker thread, right
-        # after the last task finished. It used to be taken inside _done_popup
-        # on the Tk thread, which put up to 26 blocking GetDiskFreeSpaceExW
-        # calls between the run finishing and the result card appearing. One
-        # unreachable mapped network drive stalled the UI for its whole SMB
-        # timeout. A failed read degrades to "no before/after bar"; it never
-        # invents numbers.
-        try:
-            after = self._query_drive_free_total(_system_drive_root())
-        except Exception:
-            after = None
-        try:
-            after_drives = _snapshot_all_drives(
-                self._query_drives, self._query_drive_free_total)
-        except Exception:
-            after_drives = {}
-        # N-002: the matching end-of-run reading for the scorecard's
-        # before/after block. Read HERE (worker thread, after the last task)
-        # so it never touches the Tk thread.
-        try:
-            from app import benchmark as _bench
-            after_measure = _bench.snapshot()
-        except Exception:
-            after_measure = None
-
-        # Routed through the dispatcher rather than root.after(0) called from
-        # this worker thread: a cross-thread .after() can be dropped outright,
-        # and this is the one hop whose loss means the user never sees the
-        # result card. The dispatcher also stops cleanly on a destroyed root,
-        # which is what the old H6 TclError guard was there for.
-        self._dispatch.post(_done_popup)

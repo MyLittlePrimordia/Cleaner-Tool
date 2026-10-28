@@ -37,7 +37,6 @@ import subprocess
 import sys
 
 TASK_NAME = "CleanerTool_ElevatedLaunch"
-TASK_DESC = "Cleaner Tool silent elevated relaunch (opt-in: Always start as Administrator)"
 
 # Dormant trigger: a task with no fireable trigger never runs on a
 # schedule — only on explicit /Run. /SC ONCE still requires /ST, so pin
@@ -103,8 +102,10 @@ def build_run_cmd() -> "list[str]":
 
 def build_query_cmd() -> "list[str]":
     from app.utils import resolve_exe
-    return [resolve_exe("schtasks"), "/Query", "/TN", TASK_NAME,
-            "/V", "/FO", "LIST"]
+    # /XML, not /FO LIST: the LIST field labels are translated on a localized
+    # Windows, so the old parse silently reported "points elsewhere" there and
+    # auto-elevate never engaged. XML element names are locale-independent.
+    return [resolve_exe("schtasks"), "/Query", "/TN", TASK_NAME, "/XML"]
 
 
 def build_delete_cmd() -> "list[str]":
@@ -113,34 +114,46 @@ def build_delete_cmd() -> "list[str]":
 
 
 def _run(cmd) -> "tuple[bool, str]":
-    """Run one schtasks command. (ok, output). Never raises."""
-    try:
-        result = subprocess.run(
-            cmd, shell=False, capture_output=True, text=True, timeout=30,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        out = (result.stdout or "") + (result.stderr or "")
-        return result.returncode == 0, out
-    except Exception as exc:
-        return False, str(exc)
+    """Run one schtasks command. (ok, output). Never raises.
+
+    I-001: same helper as the scheduler's probes, so both sides of the elevated
+    launch agree on console-hiding, stdin and localized-output decoding.
+    """
+    from app.utils import run_capture
+    rc, out = run_capture(cmd, timeout=30)
+    return rc == 0, out
 
 
-def parse_task_run(query_output: str) -> "str | None":
-    """Extract the task's command line from `schtasks /Query /V /FO LIST`
-    output (the 'Task To Run:' row). None when absent/unparseable. Pure."""
+def parse_task_xml(xml: str) -> "tuple[str, str] | None":
+    """(Command, Arguments) from a task definition XML, or None. Pure.
+
+    Replaces the old `Task To Run:` row parse, which only worked on English
+    Windows. `None` means "cannot tell" and callers must NOT treat it as a
+    match.
+    """
+    if not xml or "<" not in (xml or ""):
+        return None
     try:
-        for line in (query_output or "").splitlines():
-            if line.strip().lower().startswith("task to run"):
-                if ":" in line:
-                    return line.split(":", 1)[1].strip()
-                return ""
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(xml)
+        command = arguments = None
+        for el in root.iter():
+            tag = el.tag.rsplit("}", 1)[-1]
+            if tag == "Command" and command is None:
+                command = (el.text or "").strip()
+            elif tag == "Arguments" and arguments is None:
+                arguments = (el.text or "").strip()
+        if not command:
+            return None
+        return command, arguments or ""
     except Exception:
-        pass
-    return None
+        return None
 
 
 def _norm_tr(tr: str) -> str:
+    """Compare command lines without quoting/whitespace/locale noise."""
     try:
-        return (tr or "").strip().strip('"').strip().lower()
+        return " ".join((tr or "").replace('"', " ").split()).lower()
     except Exception:
         return ""
 
@@ -160,11 +173,13 @@ def status() -> "tuple[bool, bool, str]":
     ok, out = _run(build_query_cmd())
     if not ok:
         return False, False, out
-    tr = parse_task_run(out)
+    got = parse_task_xml(out)
     want = current_task_run()
-    if tr is None or want is None:
+    if got is None or want is None:
         return True, False, out
-    return True, _norm_tr(tr) == _norm_tr(want), out
+    command, arguments = got
+    live = (command + " " + arguments) if command else arguments
+    return True, _norm_tr(live) == _norm_tr(want), out
 
 
 def create_task() -> "tuple[bool, str]":

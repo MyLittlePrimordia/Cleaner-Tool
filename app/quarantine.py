@@ -248,6 +248,27 @@ def _write_manifest(root: str, entries: List[dict]) -> None:
         pass
 
 
+def split_reclaimed(total_bytes: int, moved_bytes: int = 0) -> Tuple[int, int]:
+    """(actually reclaimed, moved aside) for an honest run total.
+
+    A file moved into the Quarantine bin still occupies disk. The task
+    functions count it in their own totals (they measure what left the target
+    folder), so the run-level number must subtract what was only relocated -
+    otherwise the scorecard, toast and run history report space that was
+    never freed. Clamped, and tolerant of junk input.
+    """
+    try:
+        total = max(0, int(total_bytes or 0))
+    except (TypeError, ValueError):
+        total = 0
+    try:
+        moved = max(0, int(moved_bytes or 0))
+    except (TypeError, ValueError):
+        moved = 0
+    moved = min(moved, total)
+    return total - moved, moved
+
+
 def stats(root: Optional[str] = None) -> Tuple[int, int]:
     """(file count, total bytes) currently in the bin, walked from disk so it
     stays truthful even if the manifest was lost."""
@@ -262,6 +283,180 @@ def stats(root: Optional[str] = None) -> Tuple[int, int]:
             except OSError:
                 pass
     return count, total
+
+
+def retention_days() -> int:
+    """How long the bin keeps a file, in days (0 = until the user empties it).
+
+    Validated against the schema's own set rather than trusted: a hand-edited
+    ``3650`` would otherwise mean "ten years" while Settings shows the first
+    option, which is the one shape of setting that must never guess.
+    """
+    try:
+        from app.config_persist import load_config
+        raw = load_config().get("quarantine_days", 0)
+    except Exception as exc:
+        from app.utils import log_or_swallow
+        log_or_swallow(None, "quarantine.retention_days", exc)
+        return 0
+    try:
+        from app.config_schema import QUARANTINE_DAYS
+    except Exception:
+        return 0
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw not in QUARANTINE_DAYS:
+        return 0
+    return raw
+
+
+def _bare_name(name) -> str:
+    """A stored name, or "" when it could point outside the bin."""
+    name = str(name or "")
+    if not name or name in (".", ".."):
+        return ""
+    if "/" in name or "\\" in name or ":" in name:
+        return ""
+    return name if os.path.basename(name) == name else ""
+
+
+def _entry_ts(entry: dict) -> float:
+    try:
+        return float(entry.get("ts") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def oldest_days(root: Optional[str] = None, now: Optional[float] = None) -> Optional[int]:
+    """Age of the oldest thing in the bin, in whole days (None when empty).
+
+    Reads the filesystem as well as the manifest: the Settings line has to be
+    right even when a manifest line was lost, which is the same reason
+    :func:`stats` walks the folder.
+    """
+    root = root or default_root()
+    now = time.time() if now is None else float(now)
+    stamps = [_entry_ts(e) for e in list_entries(root)]
+    files_dir = _files_dir(root)
+    try:
+        for name in os.listdir(files_dir):
+            try:
+                stamps.append(os.path.getmtime(os.path.join(files_dir, name)))
+            except OSError:
+                pass
+    except OSError:
+        pass
+    stamps = [s for s in stamps if s > 0]
+    if not stamps:
+        return None
+    return max(0, int((now - min(stamps)) // 86400))
+
+
+def expire(root: Optional[str] = None, days: Optional[int] = None,
+           now: Optional[float] = None) -> Tuple[int, int]:
+    """Delete bin entries older than the retention window. (files, bytes).
+
+    Called at launch, never mid-session: shortening the window in Settings
+    must not delete files the moment it is saved.
+
+    Only ever touches files the bin itself holds - entry names must be bare
+    filenames, exactly as in :func:`restore_all`, so a forged ``dst`` cannot
+    turn retention into a delete-anything primitive. A row with no timestamp
+    is kept (never guess an age), a file that cannot be deleted keeps its row
+    so a lock is retried next launch, and `days` 0 reads the saved setting and
+    does nothing.
+    """
+    root = root or default_root()
+    if days is None:
+        days = retention_days()
+    try:
+        days = int(days)
+    except (TypeError, ValueError):
+        days = 0
+    if days <= 0:
+        return 0, 0
+    now = time.time() if now is None else float(now)
+    cutoff = now - days * 86400
+    files_dir = _files_dir(root)
+    entries = list_entries(root)
+    kept: List[dict] = []
+    removed = 0
+    freed = 0
+    for entry in entries:
+        name = _bare_name(entry.get("dst"))
+        stamp = _entry_ts(entry)
+        if not name or not stamp or stamp >= cutoff:
+            kept.append(entry)
+            continue
+        path = os.path.join(files_dir, name)
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue                     # file already gone: drop the row
+        try:
+            os.remove(path)
+        except OSError:
+            kept.append(entry)           # locked: try again next launch
+            continue
+        removed += 1
+        freed += size
+    # Files a lost manifest line no longer accounts for: age comes from the
+    # filesystem, which is the only thing left to ask.
+    referenced = {_bare_name(e.get("dst")) for e in kept}
+    try:
+        stray = os.listdir(files_dir)
+    except OSError:
+        stray = []
+    for name in stray:
+        if name in referenced or not _bare_name(name):
+            continue
+        path = os.path.join(files_dir, name)
+        try:
+            if os.path.getmtime(path) >= cutoff:
+                continue
+            size = os.path.getsize(path)
+            os.remove(path)
+        except OSError:
+            continue
+        removed += 1
+        freed += size
+    if removed or len(kept) != len(entries):
+        _write_manifest(root, kept)
+    return removed, freed
+
+
+def _entry_is_confined(root: str, entry: dict) -> bool:
+    """True when a manifest row can be acted on without leaving the sandbox.
+
+    The manifest is a plaintext file in the user's profile that anything can
+    edit, and Restore All is a WRITE: a forged `dst` of `..\\..\\x.dll` would
+    read and write outside the bin, and a forged `src` would drop a file into
+    any folder on the machine. A row is only honoured when its stored name is
+    a bare filename inside the bin and its original path is a normal absolute
+    path that is neither inside the bin nor a protected root.
+    """
+    name = str(entry.get("dst") or "")
+    src = str(entry.get("src") or "")
+    if not name or not src:
+        return False
+    # dst: a bare filename, nothing else (no separators, no drive, no ..)
+    if name in (".", "..") or "/" in name or "\\" in name or ":" in name:
+        return False
+    if os.path.basename(name) != name:
+        return False
+    try:
+        target = os.path.normcase(os.path.abspath(src))
+        bin_root = os.path.normcase(os.path.abspath(root))
+        bin_files = os.path.normcase(os.path.abspath(_files_dir(root)))
+    except Exception:
+        return False
+    if not os.path.isabs(src):
+        return False
+    if ".." in str(src).replace("/", "\\").split("\\"):
+        return False
+    for inside in (bin_root, bin_files):
+        if target == inside or target.startswith(inside + os.sep):
+            return False
+    from app.utils import _is_protected_root
+    return not _is_protected_root(target)
 
 
 def restore_all(root: Optional[str] = None,
@@ -281,6 +476,9 @@ def restore_all(root: Optional[str] = None,
         src = e.get("src")
         name = e.get("dst")
         if not src or not name:
+            continue
+        if not _entry_is_confined(root, e):
+            failed.append(e)          # unreadable/forged row: keep it, never act
             continue
         dst = os.path.join(files_dir, name)
         if not os.path.exists(dst):

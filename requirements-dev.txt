@@ -1,0 +1,8 @@
+# Development / CI only. The app itself has ZERO third-party runtime
+# dependencies (see requirements.txt) — keep it that way.
+#
+# Floors are deliberately loose so CI picks up current releases, with a
+# major-version ceiling so a breaking release can't silently change the
+# gate. Bump these when a new major is deliberately adopted.
+pytest>=8.0,<10
+ruff>=0.6,<1

@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import datetime
 import os
-import re as _re
 import subprocess
 import sys
 
@@ -124,6 +123,16 @@ def when_plain(when) -> str:
     return ago_plain(when) or str(when or "")
 
 
+def _ps_argv(script: str) -> list:
+    """PowerShell argv from the shared runner (R-008).
+
+    Resolved inside the call on purpose: this module has no app-level imports
+    at module scope, and the runner lives under app.tasks.
+    """
+    from app.tasks.ps import ps_argv
+    return ps_argv(script, non_interactive=True)
+
+
 def _run(argv, timeout: int):
     """subprocess.run with the house conventions. Returns (rc, stdout, err)."""
     try:
@@ -160,8 +169,7 @@ def list_points(timeout: int = 25) -> dict:
     """Existing restore points, newest first. Never raises."""
     if not IS_WINDOWS:
         return {"points": [], "error": "Restore points are Windows-only."}
-    rc, out, err = _run(["powershell", "-NoProfile", "-NonInteractive",
-                         "-Command", _PS_LIST], timeout)
+    rc, out, err = _run(_ps_argv(_PS_LIST), timeout)
     if rc is None:
         return {"points": [], "error": err or "Could not read restore points."}
     if rc != 0:
@@ -264,14 +272,23 @@ def create(description: str = "Cleaner Tool - safety point",
         or "Cleaner Tool - safety point"
     from app.utils import restore_point_create_ps
     script = restore_point_create_ps(safe)
-    rc, out, err = _run(["powershell", "-NoProfile", "-NonInteractive",
-                         "-Command", script], timeout)
+    rc, out, err = _run(_ps_argv(script), timeout)
     blob = (out + err)
     low = blob.lower()
     if rc is None:
         return {"ok": False, "error": err or "Windows did not respond.",
                 "skipped": False}
 
+    # System Protection off / restore service disabled. The script prints a
+    # language-neutral token; "service cannot be started" is the localized
+    # English fallback for the same state.
+    if ("restore_disabled" in low or "servicedisabled" in low
+            or "service cannot be started" in low):
+        return {"ok": False, "skipped": False,
+                "error": "System Protection is switched off for this drive, "
+                         "so Windows cannot make restore points. Turn it on in "
+                         "Start > 'Create a restore point' > Configure > Turn "
+                         "on system protection, then try again."}
     # The 24-hour rule: a throttle is a skip, not a failure. B-056: match the
     # language-neutral RESTORE_THROTTLED token the script prints first; the
     # English phrasings remain only as a fallback for unexpected output.
@@ -313,82 +330,6 @@ def verdict_for(points: list) -> str:
     if n == 1:
         return "1 restore point, made %s." % (when or "recently")
     return "%d restore points. The newest is from %s." % (n, when or "recently")
-
-
-# --------------------------------------------------------------- extra reads
-def _to_float_num(tok: str):
-    """Parse a vssadmin number that may use '.' or ',' as the decimal mark.
-
-    Returns a float, or None when the token is not a number.
-    """
-    try:
-        if "." in tok and "," in tok:
-            # The LAST separator is the decimal point; the other is thousands.
-            dec = max(tok.rfind("."), tok.rfind(","))
-            whole = tok[:dec].replace(".", "").replace(",", "")
-            frac = tok[dec + 1:]
-            return float((whole or "0") + ("." + frac if frac else ""))
-        if "," in tok:
-            tail = len(tok) - tok.rfind(",") - 1
-            return float(tok.replace(",", ".") if 1 <= tail <= 2
-                         else tok.replace(",", ""))
-        if "." in tok:
-            tail = len(tok) - tok.rfind(".") - 1
-            return float(tok if 1 <= tail <= 2 else tok.replace(".", ""))
-        return float(tok)
-    except ValueError:
-        return None
-
-
-def space_used(timeout: int = 25) -> dict:
-    """How much disk the shadow copies are taking, best effort.
-
-    The question a user opens this tool with a full disk is often "why is
-    there no room?", and "System Restore is holding N GB" is the answer.
-    Without this the dialog can list restore points but cannot say whether
-    they are cheap or expensive, which makes "should I delete old ones?"
-    unanswerable.
-
-    `vssadmin list shadowstorage` needs administrator rights, so this
-    returns {"ok": False} on the non-elevated path and the caller simply does
-    not draw the tile. It is called on the same worker as the point listing
-    and is never allowed to fail the dialog.
-
-    Returns {"ok": bool, "bytes": int, "detail": str}.
-    """
-    if not IS_WINDOWS:
-        return {"ok": False, "bytes": 0, "detail": "Windows-only."}
-    rc, out, err = _run(["vssadmin", "list", "shadowstorage"], timeout)
-    blob = (out or "") + (err or "")
-    low = blob.lower()
-    if rc != 0 or "you don't have the correct permissions" in low:
-        return {"ok": False, "bytes": 0,
-                "detail": "Needs administrator rights."}
-    total = 0
-    found = False
-    for line in (out or "").splitlines():
-        if "used shadow copy storage space" not in line.lower():
-            continue
-        found = True
-        # B-0xx: vssadmin prints e.g. "1.234 GB". The old digit-collector
-        # stopped at the '.', so 1.234 GB was read as 1 GB and 0.9 GB as 0.
-        m = _re.search(r"[0-9][0-9.,]*[0-9]|[0-9]", line)
-        if not m:
-            continue
-        value = _to_float_num(m.group(0))
-        if value is None:
-            continue
-        unit = line.lower()
-        if "gb" in unit:
-            value *= 1024 ** 3
-        elif "mb" in unit:
-            value *= 1024 ** 2
-        elif "kb" in unit:
-            value *= 1024
-        total += int(value)
-    if not found:
-        return {"ok": False, "bytes": 0, "detail": "Windows did not say."}
-    return {"ok": True, "bytes": total, "detail": "used by restore points"}
 
 
 def open_system_protection():

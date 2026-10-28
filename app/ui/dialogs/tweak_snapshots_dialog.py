@@ -22,7 +22,8 @@ import tkinter as tk
 from tkinter import messagebox
 
 from app.ui.base import ThemedModal
-from app.ui.theme import COLORS, F, FM
+from app.ui.theme import COLORS, RADIUS_SURFACE, TYPE, SPACE_1, SPACE_2, SPACE_3
+from app.ui.metrics import CARD_BODY_INSET, GROUP_GAP, TEXT_NUDGE
 from app.ui.widgets import AnimatedButton, ScrollableRoundedPanel
 from app.ui.widgets.rounded_card import RoundedCard
 
@@ -46,9 +47,9 @@ def show_tweak_snapshots(parent, groups, on_undo, *, accent=None) -> bool:
         modal = ThemedModal(parent, title="Applied tweaks", accent=accent,
                             size=(780, 580))
         body = modal.body
-        tk.Label(body, text=_SUBTITLE, font=(F, 9), bg=COLORS["bg"],
+        tk.Label(body, text=_SUBTITLE, font=TYPE["caption"], bg=COLORS["bg"],
                  fg=COLORS["subtext"], wraplength=modal.body_width(24),
-                 justify="left").pack(fill="x", pady=(2, 8))
+                 justify="left").pack(fill="x", pady=(TEXT_NUDGE, SPACE_2))
 
         def _undo_keys(keys):
             tasks = []
@@ -73,19 +74,17 @@ def show_tweak_snapshots(parent, groups, on_undo, *, accent=None) -> bool:
 
         for g in groups:
             card = RoundedCard(inner, fill=COLORS["bg_alt"],
-                               bg=COLORS["bg"], radius=16)
-            card.pack(fill="x", pady=(0, 10))
+                               bg=COLORS["bg"], radius=RADIUS_SURFACE)
+            card.pack(fill="x", pady=(0, GROUP_GAP))
             hdr = tk.Frame(card.body, bg=COLORS["bg_alt"])
-            hdr.pack(fill="x", padx=14, pady=(10, 2))
+            hdr.pack(fill="x", padx=CARD_BODY_INSET, pady=(GROUP_GAP, TEXT_NUDGE))
             tk.Label(hdr, text=g.get("label", g.get("task", "")),
-                     font=(F, 11, "bold"), bg=COLORS["bg_alt"],
+                     font=TYPE["card_title"], bg=COLORS["bg_alt"],
                      fg=COLORS["text"], anchor="w").pack(side="left")
             AnimatedButton(
                 hdr, text="Undo",
                 command=lambda k=g.get("task"): _undo_keys([k]),
-                bg=COLORS["bg_alt"], fg=COLORS["accent_red"],
-                variant="outlined", font=(F, 9, "bold"),
-                padx=14, pady=5).pack(side="right")
+                role="danger", size="sm").pack(side="right")
 
             rows = g.get("rows") or []
             if not rows:
@@ -93,44 +92,44 @@ def show_tweak_snapshots(parent, groups, on_undo, *, accent=None) -> bool:
                     card.body,
                     text="Changes Windows settings (no registry detail "
                          "recorded).",
-                    font=(F, 9), bg=COLORS["bg_alt"], fg=COLORS["subtext"],
+                    font=TYPE["caption"], bg=COLORS["bg_alt"], fg=COLORS["subtext"],
                     anchor="w", justify="left",
                     wraplength=modal.body_width(80)
-                ).pack(fill="x", padx=14, pady=(2, 12))
+                ).pack(fill="x", padx=CARD_BODY_INSET, pady=(TEXT_NUDGE, SPACE_3))
                 continue
 
             for r in rows:
                 line = tk.Frame(card.body, bg=COLORS["bg_alt"])
-                line.pack(fill="x", padx=14, pady=(2, 0))
+                line.pack(fill="x", padx=CARD_BODY_INSET, pady=(TEXT_NUDGE, 0))
                 tk.Label(
                     line, text="%s  \u2192  %s" % (r["prior"], r["current"]),
-                    font=(F, 10), bg=COLORS["bg_alt"],
+                    font=TYPE["body_medium"], bg=COLORS["bg_alt"],
                     fg=COLORS["accent_yellow"] if r["changed"]
                     else COLORS["text"], anchor="w"
                 ).pack(side="left")
                 if r["changed"]:
-                    tk.Label(line, text="changed since", font=(F, 8),
+                    tk.Label(line, text="changed since", font=TYPE["micro_regular"],
                              bg=COLORS["bg_alt"], fg=COLORS["accent_yellow"],
-                             anchor="w").pack(side="left", padx=(8, 0))
+                             anchor="w").pack(side="left", padx=(SPACE_2, 0))
                 tk.Label(card.body,
                          text="%s\\%s\\%s" % (r["hive"], r["path"], r["name"]),
-                         font=(FM, 8), bg=COLORS["bg_alt"],
+                         font=TYPE["mono_small"], bg=COLORS["bg_alt"],
                          fg=COLORS["muted"], anchor="w"
-                         ).pack(fill="x", padx=14, pady=(0, 2))
+                         ).pack(fill="x", padx=CARD_BODY_INSET, pady=(0, TEXT_NUDGE))
             # a little breathing room under the last row of the card
             tk.Frame(card.body, bg=COLORS["bg_alt"], height=8).pack(fill="x")
 
         frow = tk.Frame(body, bg=COLORS["bg"])
-        frow.pack(fill="x", pady=(8, 4))
+        frow.pack(fill="x", pady=(SPACE_2, SPACE_1))
         AnimatedButton(
             frow, text="Undo all",
             command=lambda: _undo_keys([g.get("task") for g in groups]),
-            bg=COLORS["accent_red"], fg=COLORS["black"],
-            font=(F, 9, "bold"), padx=22, pady=7).pack(side="left")
+            role="filled", size="md", accent=COLORS["accent_red"]).pack(
+                side="left")
         AnimatedButton(
             frow, text="Close", command=modal.close,
-            bg=accent or COLORS["primary"], fg=COLORS["black"],
-            font=(F, 9, "bold"), padx=22, pady=7).pack(side="right")
+            role="filled", size="md",
+            accent=accent or COLORS["primary"]).pack(side="right")
         modal._dlg.bind("<Return>", lambda _e: modal.close())
         try:
             panel.refresh_scroll()

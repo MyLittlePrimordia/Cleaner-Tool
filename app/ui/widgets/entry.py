@@ -6,7 +6,8 @@ from __future__ import annotations
 
 import tkinter as tk
 
-from app.ui.theme import COLORS, _round_rect_points, F
+from app.ui.metrics import COMPACT_INSET, TEXT_NUDGE
+from app.ui.theme import COLORS, RADIUS_CONTROL, TYPE, _round_rect_points
 
 class RoundedEntry(tk.Frame):
     """Text entry with rounded corners (user request: filter/search boxes).
@@ -17,8 +18,8 @@ class RoundedEntry(tk.Frame):
     Entry it replaces (textvariable, binds, width all live there).
     Focus ring turns the tab accent on focus, hairline otherwise."""
 
-    RADIUS = 8      # M3 "small" shape
-    PAD_Y = 5
+    RADIUS = RADIUS_CONTROL   # the small shape role
+    PAD_Y = COMPACT_INSET
 
     def __init__(self, parent, textvariable=None, width=20, font=None,
                  entry_bg=None, accent=None, **kw):
@@ -32,9 +33,11 @@ class RoundedEntry(tk.Frame):
         self.entry = tk.Entry(self, textvariable=textvariable, width=width,
                               bg=self._fill, fg=COLORS["text"],
                               insertbackground=COLORS["text"],
-                              font=font or (F, 9), bd=0, relief="flat",
+                              font=font or TYPE["caption"], bd=0, relief="flat",
                               highlightthickness=0, **kw)
-        self.entry.pack(fill="x", padx=(self.RADIUS + 2, self.RADIUS + 2),
+        self.entry.pack(fill="x",
+                        padx=(self.RADIUS + TEXT_NUDGE,
+                              self.RADIUS + TEXT_NUDGE),
                         pady=self.PAD_Y)
         self.bind("<Configure>", lambda e: self._draw(focused=False))
         # add="+" so call-site placeholder binds (FocusIn/Out) keep working

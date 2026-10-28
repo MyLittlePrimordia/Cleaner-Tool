@@ -549,25 +549,6 @@ def gpu_list():
     return uniq
 
 
-def gpu_static_info():
-    """-> {'name', 'total_vram_bytes'} for the largest-VRAM adapter.
-
-    Backwards-compatible headline kept for existing callers/tests:
-    implemented on top of gpu_list() — identical "largest dedicated
-    memory wins" choice as before, Unknown/None when unmeasurable."""
-    try:
-        entries = gpu_list()
-    except Exception:
-        entries = []
-    if not entries:
-        return {"name": "Unknown GPU", "total_vram_bytes": None,
-                "total_vram_approx": False}
-    best = entries[0]
-    return {"name": best.get("name") or "Unknown GPU",
-            "total_vram_bytes": best.get("total_vram_bytes"),
-            "total_vram_approx": bool(best.get("total_vram_approx"))}
-
-
 # --------------------------------------------- Nvidia-only temperature -- #
 
 class NvmlTemp:
@@ -739,39 +720,6 @@ def drive_free_total(root_path):
     except Exception:
         pass
     return None
-
-
-def list_drives():
-    """[(letter, root)] for every ready logical drive, C: first.
-
-    GetLogicalDrives bitmask + a GetDiskFreeSpaceExW readiness probe
-    (empty card-reader slots answer 0 total and are skipped). Never
-    raises; [] when unreadable/non-Windows."""
-    out = []
-    if not IS_WINDOWS:
-        return out
-    try:
-        bitmask = ctypes.windll.kernel32.GetLogicalDrives()
-    except Exception:
-        return out
-    if not bitmask:
-        return out
-    try:
-        for i in range(26):
-            if not (bitmask >> i) & 1:
-                continue
-            letter = chr(ord("A") + i)
-            root = "%s:\\" % letter
-            try:
-                pair = drive_free_total(root)
-            except Exception:
-                pair = None
-            if pair and pair[1] > 0:
-                out.append((letter, root))
-    except Exception:
-        pass
-    out.sort(key=lambda d: (d[0] != "C", d[0]))
-    return out
 
 
 class DiskSampler:

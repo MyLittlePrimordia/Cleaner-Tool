@@ -8,13 +8,22 @@ from __future__ import annotations
 import threading
 
 import tkinter as tk
-from tkinter import ttk, messagebox
 from app.tab_presets import PRESETS, TABS
 from app.compat import task_supported, unsupported_reason
 from app.ui.base import Tooltip, _themed_askyesno, _themed_showinfo
-from app.ui.theme import COLORS, F, TAB_ACCENTS, _TAB_STATUS, _hex_lerp, ellipsize
+from app.ui.theme import (
+    COLORS, EMOJI, ICON_CHIP, ICON_NAV, PAGE_GUTTER, RADIUS_CARD,
+    RADIUS_SURFACE, SPACE_1, SPACE_2, SPACE_5, SURFACE_CARD, TAB_ACCENTS,
+    TYPE, _TAB_STATUS, _hex_lerp, icon_target_px, scaled_photo,
+)
+from app.ui.metrics import (
+    CARD_BODY_INSET, COMPACT_INSET, CONTROL_GAP, GROUP_GAP, HAIRLINE_NUDGE,
+    TEXT_NUDGE, TIGHT_GAP,
+)
 from app.ui.widgets import (AnimatedButton, RoundedCard,
-                            ScrollableRoundedPanel, ToggleSwitch)
+                            ScrollableRoundedPanel, ToggleSwitch,
+                            flow_columns, grid_cards)
+from app.ui.widgets.feature_card import feature_card_body
 
 #: The Tweak run-row's Undo pill label. A CONSTANT, and that is the whole
 #: point: it used to be built as an f-string carrying the applied count, and
@@ -67,6 +76,7 @@ class TaskTab(tk.Frame):
         self._anim_jobs = []          # active after() ids owned by this page
         # grid engine state: cells built once, only re-gridded afterwards
         self._cells = None            # list[(widget, task)] in stable order
+        self._cell_blocks = None      # [(group_header|None, [(cell, task)])]
         self._cell_cols = None
         self._regrid_after = None
         # body cache: built-once bodies per mode/preset (no laggy redraws)
@@ -75,10 +85,6 @@ class TaskTab(tk.Frame):
         # F3: undo rows of the last-built undo grid, for in-place badge
         # repaints (each row stores its badge handle on the widget)
         self._undo_rows = []
-        # F7: _set_all() sets this while it bulk-writes every row var, so
-        # the per-var traces skip the run-count refresh (one refresh after
-        # the loop is enough); single toggles are never suppressed.
-        self._suspend_count_refresh = False
         # TEXT-001: Application's run-in-progress gate arrives via
         # set_run_enabled() and is remembered here, so a later selection
         # change can re-apply it without Application needing to know about
@@ -95,7 +101,7 @@ class TaskTab(tk.Frame):
         # Preset card area (top) — compact padding reclaims vertical space
         # so Clean/Repair Custom grids fit WITHOUT scrolling at default size
         self.preset_area = tk.Frame(self, bg=COLORS["bg"])
-        self.preset_area.pack(fill="x", padx=26, pady=(14, 4))
+        self.preset_area.pack(fill="x", padx=PAGE_GUTTER, pady=(CARD_BODY_INSET, SPACE_1))
 
         # Summary / toggle-grid area (middle, swaps by mode)
         self.body_area = tk.Frame(self, bg=COLORS["bg"])
@@ -104,7 +110,7 @@ class TaskTab(tk.Frame):
         # squeezed out of view (user-reported clipping: a tall content
         # frame used to push the Run button off-screen).
         self.run_row = tk.Frame(self, bg=COLORS["bg"])
-        self.run_row.pack(side="bottom", fill="x", padx=26, pady=(4, 10))
+        self.run_row.pack(side="bottom", fill="x", padx=PAGE_GUTTER, pady=(SPACE_1, GROUP_GAP))
         # Tweak run-row pills (3-card symmetry, 2026-09): the entries that
         # used to be Tweak's 2nd card row live beside Run as secondary
         # pills — Check, conditional Undo, Game Session preset. Built in
@@ -112,7 +118,8 @@ class TaskTab(tk.Frame):
         self._rr_check = None
         self._rr_undo = None
         self._rr_session = None
-        self.body_area.pack(side="top", fill="both", expand=True, padx=26, pady=(4, 4))
+        self.body_area.pack(side="top", fill="both", expand=True,
+                            padx=PAGE_GUTTER, pady=(SPACE_1, SPACE_1))
 
         self._build_preset_cards()
         self._build_body()
@@ -142,7 +149,13 @@ class TaskTab(tk.Frame):
         # extra cards flow to a second row instead of shrinking the rest.
         # Every tab has exactly 3 cards (one row): Clean 2 presets + Custom,
         # Repair 2 presets + Custom, Tweak Minimal/Recommended + Custom.
-        PER_ROW = 3
+        #
+        # The exact count is MEASURED through the same helper the Tools grid
+        # uses (page.flow_columns), capped at 3: on a very narrow window a
+        # third card would ellipsize its title, so two get a row and the
+        # remainder is centred by grid_cards rather than stranded left.
+        self._preset_order = []
+        self._preset_cols = 0
         for col, name in enumerate(cards):
             # REDESIGN 2026-10: icon ASSET KEYS, not emoji glyphs.
             # These four cards were the last full-colour emoji left in the
@@ -154,7 +167,7 @@ class TaskTab(tk.Frame):
             # degrades to the old look rather than to a blank card.
             if name == "Custom":
                 blurb, icon_key = "Pick exactly what runs.", "custom"
-                color, fg = COLORS["surface"], COLORS["text"]
+                color, fg = SURFACE_CARD, COLORS["text"]
                 command = lambda: self._enter_custom()
             else:
                 blurb = self.PRESET_BLURBS.get(name, "")
@@ -165,15 +178,30 @@ class TaskTab(tk.Frame):
                             "Minimal": "minimal",
                             "Recommended": "recommended",
                             "Game Session": "gamesession"}.get(name, "")
-                color, fg = COLORS["surface"], COLORS["text"]
+                color, fg = SURFACE_CARD, COLORS["text"]
                 command = (lambda n=name: self._select_preset(n))
             card = self._make_card(self.preset_area, name, blurb, icon_key,
                                    color, fg, command, accent)
-            row, column = divmod(col, PER_ROW)
-            card.grid(row=row, column=column, sticky="nsew", padx=5, pady=4)
+            self._preset_order.append(card)
             self.preset_cards[name] = card
-        for c in range(PER_ROW):
-            self.preset_area.grid_columnconfigure(c, weight=1, uniform="cards")
+        self._regrid_presets(self.preset_area.winfo_width())
+        self.preset_area.bind("<Configure>", self._on_presets_configure,
+                              add="+")
+
+    def _on_presets_configure(self, event):
+        self._regrid_presets(getattr(event, "width", 0))
+
+    def _regrid_presets(self, width):
+        """Re-flow the three preset cards at the measured column count."""
+        width = int(width or 0)
+        if width <= 1:
+            width = 760
+        cols = flow_columns(width, max_columns=3)
+        if cols == self._preset_cols:
+            return cols
+        self._preset_cols = cols
+        grid_cards(self.preset_area, self._preset_order, cols)
+        return cols
 
     def _make_card(self, parent, title, blurb, icon_key, bg, fg, command, accent):
         # REDESIGN 2026-10: the card face is a RoundedCard, so it shares a
@@ -184,71 +212,53 @@ class TaskTab(tk.Frame):
         # min_height pins every card to the same height from the first paint,
         # so the grid can no longer start small and then jump when the blurb
         # wraps (the "third card resizes" bug).
-        outer = RoundedCard(parent, fill=bg, bg=COLORS["bg"], radius=16,
-                            min_height=168)
+        face = SURFACE_CARD
+        outer = RoundedCard(parent, fill=face, bg=COLORS["bg"],
+                            radius=RADIUS_SURFACE, min_height=144)
         inner = outer.body
-        # M3 large card, stacked: tonal icon container, title, supporting text.
-        head = tk.Frame(inner, bg=bg)
-        head.pack(fill="both", expand=True, padx=16, pady=14)
-        ICON_BOX = 52
-        icon_lbl = tk.Canvas(head, width=ICON_BOX, height=ICON_BOX, bg=bg,
-                             highlightthickness=0, bd=0)
-        icon_lbl.create_oval(0, 0, ICON_BOX - 1, ICON_BOX - 1,
-                             fill=_hex_lerp(COLORS["bg"], accent, 0.26),
-                             outline="")
         _photo = self._preset_icon_image(icon_key)
-        if _photo is not None:
-            icon_lbl.create_image(ICON_BOX // 2, ICON_BOX // 2, image=_photo)
-        else:
-            icon_lbl.create_text(ICON_BOX // 2, ICON_BOX // 2,
-                                 text=self._ICON_FALLBACK.get(icon_key, "\u2022"),
-                                 font=("Segoe UI Emoji", 18), fill=accent)
-        icon_lbl.pack(anchor="w")
-        txt = tk.Frame(head, bg=bg)
-        txt.pack(fill="x", pady=(12, 0))
-        title_lbl = tk.Label(txt, text=title, font=(F, 14, "bold"), bg=bg,
-                             fg=fg, anchor="w", bd=0)
-        title_lbl.pack(anchor="w", fill="x")
-        # height=2: always reserve two lines, so one-line and two-line blurbs
-        # give identical card heights.
-        blurb_lbl = tk.Label(txt, text=blurb, font=(F, 10), bg=bg,
-                             fg=COLORS["subtext"], anchor="nw", justify="left",
-                             bd=0, wraplength=260, height=2)
-        blurb_lbl.pack(anchor="w", fill="x", pady=(4, 0))
-        _title_full = title
+        glyph = self._ICON_FALLBACK.get(icon_key, "\u2022")
 
-        def _fit_title(_lbl=title_lbl, _full=_title_full, _head=head,
-                       _b=blurb_lbl):
+        def _click():
+            command()
+
+        def _hover(on):
+            self._card_hover(inner, outer, accent, on)
+
+        head, title_lbl, blurb_lbl, icon_lbl, _status = feature_card_body(
+            outer, title, blurb, accent, photo=_photo, glyph=glyph,
+            compact=False, face=face, click=_click, hover=_hover)
+        # The card is a keyboard target too (C-008): canvas cards used to be
+        # mouse-only despite being the primary action on the page.
+        try:
+            outer.configure(takefocus=1)
+            outer.bind("<Return>", lambda _e: command(), add="+")
+            outer.bind("<space>", lambda _e: command(), add="+")
+            outer.bind("<FocusIn>",
+                      lambda _e: self._card_hover(inner, outer, accent, True),
+                      add="+")
+            outer.bind("<FocusOut>",
+                      lambda _e: self._card_hover(inner, outer, accent, False),
+                      add="+")
+        except Exception:
+            pass
+
+        # Two tooltips, not seven (audit item 7): each one sits on the label
+        # it completes, so hovering the card padding says nothing and
+        # hovering an ellipsized title/blurb still gives the full text. The
+        # old code attached the same string to every part of the card.
+        for _w, _text in ((title_lbl, title), (blurb_lbl, blurb or title)):
             try:
-                room = _head.winfo_width() - 4
-                _lbl.config(text=ellipsize(_full, _lbl.cget("font"), room))
-                _b.config(wraplength=max(90, room))
+                Tooltip(_w, _text)
             except Exception:
                 pass
 
-        head.bind("<Configure>", lambda _e: _fit_title(), add="+")
-        head.after_idle(_fit_title)
-        if blurb:
-            # one Tooltip per card part, same text: hovering anywhere on the
-            # card shows the description (child crossings fire <Leave>, so a
-            # single container-bound tip would die at the first label edge)
-            for _w in (outer, inner, head, icon_lbl, txt, title_lbl,
-                       blurb_lbl):
-                Tooltip(_w, blurb)
-        # click + hover (add="+": card parts may carry Tooltip <Enter>/<Leave>
-        # hooks by now — plain bind() would wipe them, see _build_toggle_row)
-        for w in (outer, inner, head, icon_lbl, txt, title_lbl, blurb_lbl):
-            w.bind("<Button-1>", lambda e, c=command: c())
-            w.bind("<Enter>", lambda e, i=inner, o=outer, a=accent: self._card_hover(i, o, a, True), add="+")
-            w.bind("<Leave>", lambda e, i=inner, o=outer, a=accent: self._card_hover(i, o, a, False), add="+")
-        for child in inner.winfo_children():
-            for c in child.winfo_children() or [child]:
-                try:
-                    c.bind("<Button-1>", lambda e, c2=command: c2())
-                    c.bind("<Enter>", lambda e, i=inner, o=outer, a=accent: self._card_hover(i, o, a, True), add="+")
-                    c.bind("<Leave>", lambda e, i=inner, o=outer, a=accent: self._card_hover(i, o, a, False), add="+")
-                except Exception:
-                    pass
+        # click + hover on the container itself as well: the helper binds the
+        # inner parts, and drags that start on the rounded face still work.
+        for w in (outer, inner):
+            w.bind("<Button-1>", lambda e: command(), add="+")
+            w.bind("<Enter>", lambda e: _hover(True), add="+")
+            w.bind("<Leave>", lambda e: _hover(False), add="+")
         return outer
 
     #: Emoji fallbacks for the card icons (redesign 2026-10). Used ONLY when
@@ -264,7 +274,7 @@ class TaskTab(tk.Frame):
     #: Delivered PNG size is 48; the card renders at 24, matching the Tools
     #: icons (toolstab._build_card subsamples to <=24 too). One constant so
     #: the two icon sets cannot drift apart.
-    CARD_ICON_PX = 36
+    CARD_ICON_PX = ICON_NAV
 
     def _preset_icon_image(self, icon_key):
         """A preset icon as a PhotoImage at CARD_ICON_PX, or None.
@@ -286,28 +296,19 @@ class TaskTab(tk.Frame):
             p = resolve_asset_path("preset_icons/%s.png" % icon_key)
             if p:
                 photo = tk.PhotoImage(file=str(p))
-                w, h = photo.width(), photo.height()
-                if w > self.CARD_ICON_PX or h > self.CARD_ICON_PX:
-                    f = max(2, int(round(max(w, h) / float(self.CARD_ICON_PX))))
-                    photo = photo.subsample(f, f)
+                # Snap the asset to the DPI-aware target (theme.icon_target_px)
+                # rather than a constant: fonts scale, so an icon that stayed
+                # 36 physical px at 200% read as tiny beside its own title.
+                # scaled_photo reaches targets a bare subsample cannot (48px
+                # from the 72px asset at 200%), where rounding used to pick
+                # the 36px state and leave the mark undersized.
+                photo = scaled_photo(
+                    photo, icon_target_px(self.CARD_ICON_PX, self))
         except Exception:
             photo = None
         self._card_photos[icon_key] = photo
         return photo
 
-    def _card_icon(self, parent, icon_key, bg, accent):
-        """A card's icon: themed PNG if available, emoji if not.
-
-        Built on the same principle as ToolTab's icon loader - a missing
-        asset must never be a blank space, and a whole dialog must never
-        fail to open because one PNG could not be decoded.
-        """
-        photo = self._preset_icon_image(icon_key)
-        if photo is not None:
-            return tk.Label(parent, image=photo, bg=bg, bd=0,
-                            highlightthickness=0)
-        return tk.Label(parent, text=self._ICON_FALLBACK.get(icon_key, "•"),
-                        font=("Segoe UI Emoji", 16), bg=bg, fg=accent)
 
     def _card_hover(self, inner, outer, accent, on):
         """Animated hover for preset cards (~140 ms ease).
@@ -338,7 +339,7 @@ class TaskTab(tk.Frame):
         if not hasattr(outer, "_hov_after"):
             outer._hov_after = None
 
-        rest_fill = COLORS["surface"]
+        rest_fill = SURFACE_CARD
         hover_fill = COLORS["surface_hover"]
         rest_outline = ""     # M3 filled card: hover is a state layer only
 
@@ -388,18 +389,15 @@ class TaskTab(tk.Frame):
         # never applies anything).
         self._rr_preview = AnimatedButton(
             btns, text="Preview", command=self._tweak_preview_clicked,
-            bg=COLORS["bg"], fg=COLORS["primary"],
-            font=(F, 10, "bold"), padx=20, pady=11, variant="outlined")
+            role="outlined", size="lg")
         self._rr_preview._cmd = self._tweak_preview_clicked
         self._rr_check = AnimatedButton(
             btns, text="Check", command=self._enter_health,
-            bg=COLORS["surface"], fg=COLORS["text"],
-            font=(F, 10, "bold"), padx=20, pady=11)
+            role="secondary", size="lg")
         self._rr_check._cmd = self._enter_health
         self._rr_undo = AnimatedButton(
             btns, text=UNDO_LABEL, command=self._enter_undo,
-            bg=COLORS["surface"], fg=COLORS["accent_red"],
-            font=(F, 10, "bold"), padx=20, pady=11)
+            role="danger", size="lg")
         self._rr_undo._cmd = self._enter_undo
         # The Game Session pill carries the SAME generated icon as the preset
         # cards (redesign 2026-10). It used to inline the 🎮 emoji, which
@@ -412,9 +410,7 @@ class TaskTab(tk.Frame):
             text="Game Session" if _gs_img is not None
             else self._ICON_FALLBACK["gamesession"] + " Game Session",
             command=lambda: self._select_preset("Game Session"),
-            image=_gs_img,
-            bg=COLORS["surface"], fg=COLORS["text"],
-            font=(F, 10, "bold"), padx=20, pady=11)
+            image=_gs_img, role="secondary", size="lg")
         self._rr_session._cmd = lambda: self._select_preset("Game Session")
         self._refresh_tweak_pills()
 
@@ -482,9 +478,9 @@ class TaskTab(tk.Frame):
                     pass
             p = self._rr_preview
             p.config_text("Preview")
-            p.pack(side="left", padx=6)
+            p.pack(side="left", padx=CONTROL_GAP)
             c.config_text("Check")
-            c.pack(side="left", padx=6)
+            c.pack(side="left", padx=CONTROL_GAP)
             # Undo still hides with nothing applied - no permanently dead
             # control on screen. The grid above is what keeps Run still, so
             # the old reason for reserving a slot is gone.
@@ -492,9 +488,9 @@ class TaskTab(tk.Frame):
                 u = self._rr_undo
                 if u is not None and u.winfo_exists():
                     u.config_text(UNDO_LABEL)
-                    u.pack(side="left", padx=6)
+                    u.pack(side="left", padx=CONTROL_GAP)
             s = self._rr_session
-            s.pack(side="left", padx=6)
+            s.pack(side="left", padx=CONTROL_GAP)
         except Exception:
             pass
         self._tweak_applied = n
@@ -615,10 +611,19 @@ class TaskTab(tk.Frame):
             self._build_health_body(wrap)
         else:
             self._build_toggle_grid(wrap, mode="undo")
-        # builders refresh self.vars — remember this body's FULL grid
-        # state (F8) so a later cache hit can restore all of it
-        if self.mode != "preset":
-            self._body_vars[cache_key] = (self.vars, self._cells, self._cell_blocks)
+        # Builders refresh self.vars — remember this body's FULL grid state
+        # (F8) so a later cache hit can restore all of it.
+        #
+        # SUM-002: presets were deliberately excluded here on the assumption
+        # that only the toggle grids had cells. They do have cells — the
+        # summary chips — so switching Quick Clean -> Deep Clean -> Quick
+        # Clean left `_cells`/`_cell_blocks` pointing at the HIDDEN Deep Clean
+        # chips while the visible panel showed Quick Clean's. The panel's own
+        # resize callback then re-gridded the wrong list into it. Every body
+        # now records its grid state, whichever mode built it.
+        self._body_vars[cache_key] = (
+            self.vars, getattr(self, "_cells", None),
+            getattr(self, "_cell_blocks", None))
 
     def _clear_body_cache(self):
         """Drop cached bodies (called when tab's tasks/state change — undo
@@ -654,30 +659,50 @@ class TaskTab(tk.Frame):
             pass
 
     def _prewarm_body(self, mode: str) -> bool:
-        """F6(b): build one body (custom/undo) into the cache WITHOUT
-        showing it, so the first real click on Custom/Undo is a cache hit
-        (~2 ms) instead of a 100-450 ms first build. Runs once from
-        Application's idle pre-warm chain after the window is up; a no-op
-        when that body already exists (the user got there first and the
-        normal lazy build owns it).
+        """F6(b): build one body into the cache WITHOUT showing it, so the
+        first real click is a cache hit (~2 ms) instead of a 100-450 ms
+        first build. Runs once from Application's idle pre-warm chain after
+        the window is up; a no-op when that body already exists (the user
+        got there first and the normal lazy build owns it).
 
-        The grid builder mutates page state as it goes (self.vars,
-        _cells, _cell_blocks), so that state is snapshotted and restored —
-        only the cache entry (hidden widgets + their var dict) is kept.
-        _undo_rows is deliberately NOT restored: an undo pre-warm only
-        runs while no undo body exists, so its rows are exactly the rows
-        the next _enter_undo shows and badge-refreshes in place (F3)."""
-        if mode not in ("custom", "undo"):
+        `mode` is "custom", "undo", or "preset:<name>". Preset summaries
+        are the expensive ones on a big preset (Tweak's 27-task summary is
+        a card, a canvas and a tooltip per task), and they were the last
+        synchronous body build left on a click: switching Quick -> Deep
+        froze the window long enough for Windows to ghost it. Pre-building
+        them turns that switch into the same cheap show/hide as the others.
+
+        The builder mutates page state as it goes (mode, _selected_preset,
+        vars, _cells, _cell_blocks), so that state is snapshotted and
+        restored. Only the cache entry (hidden widgets + its state tuple) is
+        kept. _undo_rows is deliberately NOT restored: an undo pre-warm only
+        runs while no undo body exists, so its rows are exactly the rows the
+        next _enter_undo shows and badge-refreshes in place (F3).
+        """
+        preset = None
+        if mode.startswith("preset:"):
+            preset = mode.split(":", 1)[1]
+            if preset not in self.presets:
+                return False
+        elif mode not in ("custom", "undo"):
             return False
         if mode in self._body_cache:
             return False
-        saved = (self.vars,
+        saved = (self.mode, self._selected_preset, self.vars,
                  getattr(self, "_cells", None),
                  getattr(self, "_cell_blocks", None))
         try:
             wrap = tk.Frame(self.body_area, bg=COLORS["bg"])
             self._body_cache[mode] = wrap
-            self._build_toggle_grid(wrap, mode="run" if mode == "custom" else "undo")
+            if preset is not None:
+                self.mode = "preset"
+                self._selected_preset = preset
+                self._build_summary_body(wrap)
+            else:
+                self.mode = mode
+                self._selected_preset = None
+                self._build_toggle_grid(
+                    wrap, mode="run" if mode == "custom" else "undo")
             # F8: store the FULL grid state — vars alone left _cell_blocks
             # stale on the cache-hit path, which is exactly why the Custom
             # filter search box appeared dead (it filtered a hidden grid).
@@ -687,15 +712,16 @@ class TaskTab(tk.Frame):
             # refit (_fit_toggle_labels) re-wraps them to the real column
             # width the moment this body is first shown.
             wrap.pack_forget()  # never packed — stays hidden until shown
-            self.vars, self._cells, self._cell_blocks = saved
             return True
         except Exception:
             # a failed pre-warm must never crash the idle chain — drop the
             # half-built cache entry; the lazy first-click build takes over
             self._body_cache.pop(mode, None)
             self._body_vars.pop(mode, None)
-            self.vars, self._cells, self._cell_blocks = saved
             return False
+        finally:
+            self.mode, self._selected_preset, self.vars, self._cells, \
+                self._cell_blocks = saved
 
     def _build_summary_body(self, wrap):
         """Read-only plain-language summary of the selected preset (no
@@ -730,52 +756,54 @@ class TaskTab(tk.Frame):
 
         tasks = [self.task_by_key[k] for k in keys]
         cells = []
-        face = COLORS["surface"]
+        face = SURFACE_CARD
         for t in tasks:
             # Compact surface chips floating on black.
             cell = RoundedCard(panel.inner, fill=face,
-                               bg=COLORS["bg"], radius=14, min_height=34)
+                               bg=COLORS["bg"], radius=RADIUS_CARD,
+                               min_height=34)
             # M3 assist-chip leading icon: a tonal circle with a check mark
             _acc = TAB_ACCENTS[self.tab_name]
-            dot = tk.Canvas(cell.body, width=20, height=20,
+            dot = tk.Canvas(cell.body, width=ICON_CHIP, height=ICON_CHIP,
                             bg=face, highlightthickness=0)
             dot.create_oval(1, 1, 19, 19, fill=_hex_lerp(face, _acc, 0.30),
                             outline="")
             dot.create_line(6, 10, 9, 13, 14, 7, fill=_acc, width=2,
                             capstyle="round", joinstyle="round")
-            dot.pack(side="left", padx=(4, 8), anchor="center", pady=3)
+            dot.pack(side="left", padx=(SPACE_1, SPACE_2),
+                     anchor="center", pady=TIGHT_GAP)
             # bd=0 is load-bearing, not tidiness: tk.Label's DEFAULT
             # borderwidth is 1, which adds 2px to every single line. With the
             # card now sizing itself from its content, that 2px compounded
             # into 47px rows and pushed Tweak's 27-task preset into a scroll -
             # a regression this change caused. Same note as the health
             # report's cards (health_report_dialog.py, BUG-022).
-            lbl = tk.Label(cell.body, text=t.label, font=(F, 9),
+            lbl = tk.Label(cell.body, text=t.label, font=TYPE["caption"],
                            bg=face, bd=0,
                            fg=COLORS["text"], anchor="w", justify="left",
                            wraplength=150)
-            lbl.pack(side="left", anchor="w", pady=2)
+            lbl.pack(side="left", anchor="w", pady=TEXT_NUDGE)
             cell._wrap_label = lbl  # so _regrid can retarget it per column width
             Tooltip(lbl, t.description)
             # N-004: risk / build chip, matching the toggle grid.
             if not task_supported(t):
                 self._badge(cell.body, "Not for this build",
                             COLORS["accent_red"], COLORS["alert_red_bg"],
-                            unsupported_reason(t), pady=2)
+                            unsupported_reason(t), pady=TEXT_NUDGE)
             elif getattr(t, "risk", "SAFE") == "ADVANCED":
                 self._badge(cell.body, "Advanced", COLORS["accent_yellow"],
                             COLORS["alert_amber_bg"],
-                            "Advanced tweak — reversible.", pady=2)
+                            "Advanced tweak — reversible.", pady=TEXT_NUDGE)
             elif getattr(t, "risk", "SAFE") == "REBOOT REQUIRED":
                 self._badge(cell.body, "Reboot", COLORS["accent_orange"],
                             COLORS["alert_amber_bg"],
                             "Reboot Required — Windows needs a restart after "
-                            "this one.", pady=2)
+                            "this one.", pady=TEXT_NUDGE)
             elif getattr(t, "risk", "SAFE") == "DATA LOSS":
                 self._badge(cell.body, "Data loss", COLORS["accent_red"],
                             COLORS["alert_red_bg"],
                             "Deletes data that cannot be recovered. Review "
-                            "before selecting.", pady=2)
+                            "before selecting.", pady=TEXT_NUDGE)
             cells.append((cell, t))
         self._cells = cells
         self._cell_blocks = [(None, cells)]   # summary has no group headers
@@ -811,6 +839,15 @@ class TaskTab(tk.Frame):
         cells = [c for _h, bc in blocks for c in bc]
         if not cells:
             return
+        # Defence in depth for the stale-state bug above: a cell can only be
+        # gridded by the panel that owns it. Re-gridding another body's cells
+        # here is what Tk would otherwise answer with a hard TclError inside
+        # an `after` callback.
+        try:
+            if cells[0].master is not panel.inner:
+                return
+        except Exception:
+            pass
         panel.update_idletasks()
         inner_w = max(10, panel.winfo_width() - panel.INSET_X - panel.SB_W - 2)
         cols = 3
@@ -826,29 +863,42 @@ class TaskTab(tk.Frame):
         for hdr, bcells in blocks:
             if hdr is not None:
                 hdr.grid(row=r, column=0, columnspan=cols, sticky="ew",
-                         padx=6, pady=(8, 2))
+                         padx=CONTROL_GAP, pady=(SPACE_2, TEXT_NUDGE))
                 r += 1
             for i, (cell, _t) in enumerate(bcells):
                 rr, cc = divmod(i, cols)
-                cell.grid(row=r + rr, column=cc, sticky="nw", padx=6, pady=2)
+                cell.grid(row=r + rr, column=cc, sticky="nw", padx=CONTROL_GAP, pady=TEXT_NUDGE)
                 lbl = getattr(cell, "_wrap_label", None)
                 if lbl is not None:
                     try:
                         lbl.config(wraplength=wrap_w)
                     except Exception:
                         pass
-                # REDESIGN 2026-10: the cells are RoundedCards, which size
-                # themselves from their content. Retargeting a label's
-                # wraplength does NOT fire <Configure> on the body - the body
-                # is sized by the canvas window item, which did not move - so
-                # the card would keep the height it derived from the PREVIOUS
-                # wraplength (a provisional narrow one, giving two lines and a
-                # 47px row) and never shrink back. Ask each cell to re-measure.
+            r += (len(bcells) + cols - 1) // cols
+        # Re-measure the cards only AFTER every label has its final width.
+        #
+        # The cells are RoundedCards, which size themselves from their body's
+        # requested height - and that request follows `wraplength`. Changing
+        # wraplength does not recompute the request synchronously, so the old
+        # per-cell `_sync()` here re-applied the height derived from the
+        # PROVISIONAL 80px wrap the cells were built with (one line at 80px is
+        # three lines). Long presets escaped it because the scroll panel's
+        # extra geometry passes corrected them later; a short preset has no
+        # further passes, so Quick Clean's 8 chips stayed 48-95px tall while
+        # Deep Clean's 28 were 38px - the same component, two densities.
+        #
+        # One idle pass flushes every pending geometry request, then each card
+        # converges in a single `_sync()`. SUM-001.
+        try:
+            panel.inner.update_idletasks()
+        except Exception:
+            pass
+        for _hdr, bcells in blocks:
+            for cell, _t in bcells:
                 try:
                     cell._sync()
                 except Exception:
                     pass
-            r += (len(bcells) + cols - 1) // cols
         for c in range(cols):
             panel.inner.grid_columnconfigure(c, weight=1, uniform="grid")
         for c in range(cols, 6):
@@ -870,12 +920,12 @@ class TaskTab(tk.Frame):
             # explanation on hover. A banner that never changes says
             # nothing; a chip is a status, and status is what belongs there.
             banner = tk.Frame(wrap, bg=COLORS["alert_red_bg"])
-            _chip = tk.Label(banner, text="↩  Undo", font=(F, 9, "bold"),
+            _chip = tk.Label(banner, text="↩  Undo", font=TYPE["label_medium"],
                              bg=COLORS["alert_red_bg"], fg=COLORS["accent_red"],
                              anchor="w", bd=0)
-            _chip.pack(side="left", padx=10, pady=5)
+            _chip.pack(side="left", padx=GROUP_GAP, pady=COMPACT_INSET)
             Tooltip(_chip, "Pick which tweaks to put back to how they were.")
-            banner.pack(anchor="center", pady=(0, 6))
+            banner.pack(anchor="center", pady=(0, CONTROL_GAP))
 
         # User request: remove All On / All Off / hint / Filter row so the
         # scroll panel gains vertical space on Clean/Repair/Tweak Custom.
@@ -916,20 +966,20 @@ class TaskTab(tk.Frame):
             gtasks = [by_key[k] for k in _keys if k in by_key]
             if not gtasks:
                 continue
-            hdr = tk.Frame(inner_grid, bg=COLORS["surface"])
-            tk.Label(hdr, text=_title, font=(F, 10, "bold"), bg=COLORS["surface"],
-                     fg=COLORS["text"]).pack(side="left", padx=(8, 0), pady=4)
-            tk.Label(hdr, text=f"{len(gtasks)} options", font=(F, 8),
-                     bg=COLORS["surface"], fg=COLORS["subtext"]).pack(side="left", padx=6)
+            hdr = tk.Frame(inner_grid, bg=SURFACE_CARD)
+            tk.Label(hdr, text=_title, font=TYPE["label_large"], bg=SURFACE_CARD,
+                     fg=COLORS["text"]).pack(side="left", padx=(SPACE_2, 0), pady=SPACE_1)
+            tk.Label(hdr, text=f"{len(gtasks)} options", font=TYPE["micro_regular"],
+                     bg=SURFACE_CARD, fg=COLORS["subtext"]).pack(side="left", padx=CONTROL_GAP)
             hdr.grid(row=self._grid_row, column=0, columnspan=2,
-                     sticky="ew", padx=6, pady=(10, 2))
+                     sticky="ew", padx=CONTROL_GAP, pady=(GROUP_GAP, TEXT_NUDGE))
             self._grid_row += 1
             grows = []
             for i, t in enumerate(gtasks):
                 row, col = divmod(i, 2)
                 cell, _task = self._build_toggle_row(inner_grid, t, mode, state, accent, col_w)
                 cell.grid(row=self._grid_row + row, column=col,
-                          sticky="new", padx=6, pady=2)
+                          sticky="new", padx=CONTROL_GAP, pady=TEXT_NUDGE)
                 grows.append((cell, t))
             self._grid_row += (len(gtasks) + 1) // 2
             blocks.append((hdr, grows))
@@ -944,7 +994,7 @@ class TaskTab(tk.Frame):
                 row, col = divmod(i, 2)
                 cell, _task = self._build_toggle_row(inner_grid, t, mode, state, accent, col_w)
                 cell.grid(row=self._grid_row + row, column=col,
-                          sticky="new", padx=6, pady=2)
+                          sticky="new", padx=CONTROL_GAP, pady=TEXT_NUDGE)
                 grows.append((cell, t))
             self._grid_row += (len(_missing) + 1) // 2
             blocks.append((None, grows))
@@ -1005,9 +1055,9 @@ class TaskTab(tk.Frame):
 
     def _badge(self, parent, text, fg, bg, tip, pady=0):
         """A compact pill for a task's risk / build status (N-004)."""
-        lbl = tk.Label(parent, text=text, font=(F, 8, "bold"), bg=bg, fg=fg,
-                       padx=6, pady=1, bd=0, cursor="hand2")
-        lbl.pack(side="left", anchor="center", padx=(6, 0), pady=pady)
+        lbl = tk.Label(parent, text=text, font=TYPE["label_small"], bg=bg, fg=fg,
+                       padx=CONTROL_GAP, pady=HAIRLINE_NUDGE, bd=0, cursor="hand2")
+        lbl.pack(side="left", anchor="center", padx=(CONTROL_GAP, 0), pady=pady)
         if tip:
             Tooltip(lbl, tip)
         return lbl
@@ -1036,7 +1086,7 @@ class TaskTab(tk.Frame):
         inner = tk.Frame(outer, bg=face, cursor="hand2")
         inner.pack(fill="both", expand=True)
         sw = ToggleSwitch(inner, var)
-        sw.pack(side="left", anchor="center", padx=(8, 2), pady=6)
+        sw.pack(side="left", anchor="center", padx=(SPACE_2, TEXT_NUDGE), pady=CONTROL_GAP)
         if not supported:
             # N-004: a task that does not apply to this Windows build is
             # shown honestly rather than hidden, but cannot be switched on
@@ -1047,11 +1097,11 @@ class TaskTab(tk.Frame):
                 pass
         txt = tk.Frame(inner, bg=face, cursor="hand2")
         txt.pack(side="left", anchor="center", fill="both", expand=True,
-                 padx=(0, 8), pady=6)
+                 padx=(0, SPACE_2), pady=CONTROL_GAP)
         # single line: wraplength only guards ultra-long labels — most fit
         # one line at column width (switch 44 + its padx + row padx accounted)
         wrap = max(140, col_w - 44 - 10 - 16 - 12)
-        lbl = tk.Label(txt, text=t.label, font=(F, 9, "bold"), bg=face,
+        lbl = tk.Label(txt, text=t.label, font=TYPE["label_medium"], bg=face,
                        fg=(COLORS["text"] if supported else COLORS["muted"]),
                        anchor="w", justify="left",
                        wraplength=wrap, cursor="hand2")
@@ -1060,9 +1110,9 @@ class TaskTab(tk.Frame):
         outer._lbl = lbl  # dynamic one-line fit (see _fit_toggle_labels)
         extra = []
         if mode == "run" and getattr(t, "admin_required", False):
-            adm = tk.Label(txt, text="🛡️", font=("Segoe UI Emoji", 9), bg=face,
+            adm = tk.Label(txt, text="🛡️", font=EMOJI["inline"], bg=face,
                            fg=COLORS["text"], cursor="hand2")
-            adm.pack(side="left", anchor="center", padx=(6, 0))
+            adm.pack(side="left", anchor="center", padx=(CONTROL_GAP, 0))
             Tooltip(adm, "Admin Required — needs Administrator rights (skipped in limited mode)")
             extra.append(adm)
         # N-004: risk tier + Windows-build compatibility, as compact chips.
@@ -1099,10 +1149,10 @@ class TaskTab(tk.Frame):
         # _refresh_undo_badges can pack/unpack in place on later Undo
         # entries — the grid is never rebuilt just to refresh badges.
         if mode == "undo":
-            b = tk.Label(txt, text="✓ Active", font=(F, 8, "bold"),
+            b = tk.Label(txt, text="✓ Active", font=TYPE["label_small"],
                          bg=face, fg=COLORS["accent_green"], cursor="hand2")
             if t.key in state:
-                b.pack(side="left", anchor="center", padx=(6, 0))
+                b.pack(side="left", anchor="center", padx=(CONTROL_GAP, 0))
             extra.append(b)
             outer._undo_badge = b
         # Find-my-fastest-DNS entry (user-approved feature 5, 2026-09):
@@ -1116,8 +1166,8 @@ class TaskTab(tk.Frame):
             test_btn = AnimatedButton(
                 txt, text="⚡ Test", command=self._open_dns_tester,
                 bg=COLORS["surface_hover"], fg=COLORS["text"],
-                font=(F, 8), padx=8, pady=3)
-            test_btn.pack(side="left", anchor="center", padx=(6, 0))
+                size="sm")
+            test_btn.pack(side="left", anchor="center", padx=(CONTROL_GAP, 0))
             # harness marker: the generic synth-events loop must skip this
             # button (a press+release would open a live tester dialog with
             # real scan workers mid-suite); its behavior is covered by the
@@ -1175,58 +1225,44 @@ class TaskTab(tk.Frame):
         self._rr_session = None
         accent = TAB_ACCENTS[self.tab_name]
 
-        # SYMMETRY (design audit 2026-10) — the row is a 3-column grid:
+        # ONE ACTION BAR, PAGE-WIDE (C-002):
         #
-        #     [ flex ][ HERO ][ flex ]
+        #     [ flexible hint ][ secondaries ][ PRIMARY ]
         #
-        # The hero (Run, or the health pair, or Undo Selected) sits in a
-        # zero-weight middle column between two equal-weight flexible ones,
-        # so it is pinned to the exact horizontal centre of the row NO
-        # MATTER what else is present. The secondaries (Preview, and Tweak's
-        # Check / Undo / Game Session) go in the right column, centred
-        # WITHIN it, so the row's outer margins stay equal on both sides and
-        # the whole thing still reads as one symmetrical band.
+        # The primary is packed in its own zero-weight column on the far
+        # right, so a secondary appearing or disappearing can never move it -
+        # the property the old centred grid existed to protect, now aligned
+        # with every other page and every dialog footer. The flexible first
+        # column absorbs the space; the secondaries sit immediately left.
         #
-        # Why this and not the obvious alternatives:
-        #
-        #   * Packing everything into one centred group (what this used to
-        #     do) means any SECONDARY appearing or disappearing re-centres the
-        #     group, which slides Run left or right. Run is the app's
-        #     highest-frequency control; Fitts's Law says a target that moves
-        #     between attempts is a target you miss. Concretely: the Tweak
-        #     Undo pill appears whenever a tweak is applied, so every apply
-        #     and revert nudged the primary button sideways.
-        #   * Reserving a fixed-width slot for a disabled Undo also fixes the
-        #     drift, but it puts a permanently dead control on screen - and
-        #     the brief for this app is that anything which cannot justify
-        #     its presence comes off the UI. This grid needs no such slot:
-        #     the secondaries can come and go freely.
-        #
-        # Nothing else in the row changes shape, and the grid is created here
-        # rather than in _build() because the row is rebuilt on every mode
-        # switch (health and undo tear it down).
-        self.run_row.grid_columnconfigure(0, weight=1, uniform="runrow")
+        # The grid is created here rather than in _build() because the row is
+        # rebuilt on every mode switch (health and undo tear it down).
+        self.run_row.grid_columnconfigure(0, weight=1)
         self.run_row.grid_columnconfigure(1, weight=0)
-        self.run_row.grid_columnconfigure(2, weight=1, uniform="runrow")
+        self.run_row.grid_columnconfigure(2, weight=0)
 
         def _hero():
-            """A zero-weight centre cell for the primary control(s)."""
+            """The far-right cell that owns the primary control(s)."""
             f = tk.Frame(self.run_row, bg=COLORS["bg"])
-            f.grid(row=0, column=1)
+            f.grid(row=0, column=2, sticky="e")
             return f
 
         def _side():
-            """The equal-weight right cell the secondaries live in."""
+            """The cell immediately left of the primary."""
             f = tk.Frame(self.run_row, bg=COLORS["bg"])
-            f.grid(row=0, column=2)
+            f.grid(row=0, column=1, sticky="e", padx=(0, SPACE_2))
+            return f
+
+        def _hint():
+            """The flexible left cell: run hints and the reboot badge."""
+            f = tk.Frame(self.run_row, bg=COLORS["bg"])
+            f.grid(row=0, column=0, sticky="w")
             return f
 
         if self.mode == "undo":
-            label, bg, fg = "Undo Selected", COLORS["accent_red"], COLORS["black"]
             self.run_btn = AnimatedButton(
-                _hero(), text=label, command=self._run_selected,
-                bg=bg, fg=fg, font=(F, 12, "bold"), padx=36, pady=14,
-                    radius=16,
+                _hero(), text="Undo Selected", command=self._run_selected,
+                role="filled", size="lg", accent=COLORS["accent_red"],
             )
             self.run_btn.pack()
         elif self.mode == "health":
@@ -1236,20 +1272,18 @@ class TaskTab(tk.Frame):
             btns = _hero()
             self.run_btn = AnimatedButton(
                 btns, text="Check Health", command=self._check_health_async,
-                bg=accent, fg=COLORS["black"], font=(F, 12, "bold"),
-                padx=24, pady=11,
+                role="filled", size="lg", accent=accent,
             )
-            self.run_btn.pack(side="left", padx=6)
+            self.run_btn.pack(side="left", padx=CONTROL_GAP)
             n = len(getattr(self, "_health", []) or [])
             self._health_reapply_btn = AnimatedButton(
                 btns, text=f"Re-apply All ({n})" if n else "Re-apply All",
                 command=self._reapply_health_all,
-                bg=COLORS["surface"], fg=COLORS["text"],
-                font=(F, 12, "bold"), padx=24, pady=11,
+                role="secondary", size="lg",
             )
-            self._health_reapply_btn.pack(side="left", padx=6)
+            self._health_reapply_btn.pack(side="left", padx=CONTROL_GAP)
         else:
-            label, bg, fg = "Run", accent, COLORS["black"]
+            label = "Run"
             if self.tab_name == "Clean":
                 # improvement-report 2.1: Preview-Before-You-Clean — reuses
                 # the exact dry_run + measure_clean_tasks() machinery the
@@ -1262,36 +1296,32 @@ class TaskTab(tk.Frame):
                 # so Preview appearing cannot move Run.
                 self.run_btn = AnimatedButton(
                     _hero(), text=label, command=self._run_selected,
-                    bg=bg, fg=fg, font=(F, 12, "bold"), padx=36, pady=14,
-                    radius=16,
+                    role="filled", size="lg", accent=accent,
                 )
                 self.run_btn.pack()
                 side = _side()
                 self._preview_btn = AnimatedButton(
                     side, text="Preview", command=self._preview_clicked,
-                    bg=COLORS["bg"], fg=COLORS["primary"],
-                    font=(F, 12, "bold"), padx=24, pady=11,
-                    variant="outlined",
+                    role="outlined", size="lg",
                 )
                 # not packed here — _refresh_run_count shows/hides it
             elif self.tab_name == "Tweak":
                 # Tweak secondaries live BESIDE the hero (never above it), in
                 # the side column: Check + conditional Undo + Game Session
-                # preset entry, all stepped down to 10pt so Run stays the
-                # obvious money action. Because they are in their own column,
-                # any of them appearing or disappearing leaves Run pinned.
+                # preset entry. They share Run's button size now; what keeps
+                # Run the obvious money action is its fill, not a smaller
+                # type size. Because they are in their own column, any of
+                # them appearing or disappearing leaves Run pinned.
                 self.run_btn = AnimatedButton(
                     _hero(), text=label, command=self._run_selected,
-                    bg=bg, fg=fg, font=(F, 12, "bold"), padx=36, pady=14,
-                    radius=16,
+                    role="filled", size="lg", accent=accent,
                 )
                 self.run_btn.pack()
                 self._build_tweak_pills(_side())
             else:
                 self.run_btn = AnimatedButton(
                     _hero(), text=label, command=self._run_selected,
-                    bg=bg, fg=fg, font=(F, 12, "bold"), padx=36, pady=14,
-                    radius=16,
+                    role="filled", size="lg", accent=accent,
                 )
                 self.run_btn.pack()
         if self.tab_name == "Tweak" and self.mode in ("preset", "custom"):
@@ -1299,8 +1329,8 @@ class TaskTab(tk.Frame):
             # finds reboot-required tasks. An empty packed label + pady was
             # permanently shrinking the Tweak scroll area vs Clean/Repair.
             self._reboot_badge = tk.Label(
-                self.run_row, text="", font=(F, 9), bg=COLORS["bg"],
-                fg=COLORS["accent_yellow"])
+                _hint(), text="", font=TYPE["caption"], bg=COLORS["bg"],
+                fg=COLORS["accent_yellow"], anchor="w")
             # deliberately not packed here
         self._refresh_run_count()
 
@@ -1308,8 +1338,9 @@ class TaskTab(tk.Frame):
         """Estimate how much the currently checked/selected items would
         free, without deleting anything (improvement-report 2.1). Reuses
         the same dry_run ctx + measure_clean_tasks() Storage Insight
-        already uses; keys outside SCAN_ALLOWLIST honestly measure 0, so
-        the result banner says so rather than implying a false total.
+        already uses; a key outside SCAN_ALLOWLIST measures 0 because it is
+        not estimated at all, so the result banner says so rather than
+        implying a false total.
         The button only shows once something is selected (see
         _refresh_run_count), so there's nothing to prompt here — this
         guard is just a no-op safety net, not a user-facing path."""
@@ -1334,8 +1365,7 @@ class TaskTab(tk.Frame):
             try:
                 from app.storage_scan import (
                     acquire_scan, release_scan, make_measure_ctx,
-                    measure_clean_tasks, SCAN_ALLOWLIST, SCAN_EXCLUDED_NOTE,
-                    sum_measured, count_unmeasured)
+                    measure_clean_tasks, SCAN_ALLOWLIST, sum_measured)
             except Exception:
                 self.app._dispatch.post(
                     lambda: self._preview_done(None, None))
@@ -1348,23 +1378,28 @@ class TaskTab(tk.Frame):
                 ctx = make_measure_ctx(
                     set_status=lambda m: self.app._dispatch.post(
                         lambda m=m: self.app.set_status(m)))
-                sizes = measure_clean_tasks(ctx, keys)
+                refused = {}
+                sizes = measure_clean_tasks(ctx, keys, refused)
                 # MED-002: sum only what was actually measured. A category
                 # that raised is None, not 0, and one unknown category makes
                 # the whole total unknown - otherwise the Preview would
                 # quote a confidently-too-small number for something it
-                # never looked at.
-                total = sum_measured(sizes)
-                unknown = count_unmeasured(sizes)
+                # never looked at. A cleaner that DECLINED to look (Office/
+                # Steam live) is named separately: it is a known skip, so the
+                # number is still worth quoting with a "+ ?" beside it.
+                total = sum_measured(sizes, refused)
+                unknown = sum(1 for k, v in sizes.items()
+                              if v is None and k not in refused)
                 skipped = [k for k in keys if k not in SCAN_ALLOWLIST]
                 self.app._dispatch.post(
-                    lambda: self._preview_done(total, skipped, unknown))
+                    lambda: self._preview_done(total, skipped, unknown,
+                                               len(refused)))
             finally:
                 release_scan()
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _preview_done(self, total, skipped, unknown=0):
+    def _preview_done(self, total, skipped, unknown=0, refused=0):
         try:
             btn = self._preview_btn
             btn.config_text("Preview")
@@ -1388,9 +1423,13 @@ class TaskTab(tk.Frame):
                 "Storage Insight panel for detail." % (unknown or 1))
             return
         msg = f"Preview: about {format_bytes(total)} would be freed."
+        if refused:
+            msg += (f" ({refused} selected item(s) weren't measured — a cleaner "
+                    "skipped while the app it cleans was running.)")
         if skipped:
-            msg += (f" ({len(skipped)} selected item(s) — game saves/backups/bloat-removal "
-                    "and similar — aren't estimated; they don't just delete files by size.)")
+            msg += (f" ({len(skipped)} selected item(s) aren't estimated — they "
+                    "act through a service, a package or a command rather than a "
+                    "folder walk, or they only report what they find.)")
         self.app.set_status(msg)
 
     def _selection_gated(self) -> bool:
@@ -1442,8 +1481,6 @@ class TaskTab(tk.Frame):
         """Repaint 'Run (N)' / 'Undo Selected (N)' — plain label when 0.
         Health mode has its own button labels (no selection count), so it
         skips here; its Re-apply count is refreshed at run-row build."""
-        if getattr(self, "_suspend_count_refresh", False):
-            return  # F7: _set_all is coalescing — it refreshes once after
         # TEXT-001: re-apply the combined enabled state on every selection
         # change. Placed BEFORE the health early-return deliberately. Health
         # mode is never selection-gated (see _selection_gated), so this call
@@ -1477,7 +1514,7 @@ class TaskTab(tk.Frame):
                 if preview_btn.winfo_exists():
                     if self._run_count() > 0:
                         if not preview_btn.winfo_ismapped():
-                            preview_btn.pack(side="left", padx=6)
+                            preview_btn.pack(side="left", padx=CONTROL_GAP)
                     else:
                         if preview_btn.winfo_ismapped():
                             preview_btn.pack_forget()
@@ -1500,7 +1537,7 @@ class TaskTab(tk.Frame):
                         plural = "s" if n_reboot != 1 else ""
                         badge.config(text=f"🔁 {n_reboot} tweak{plural} need a reboot — one reboot covers all")
                         if not badge.winfo_ismapped():
-                            badge.pack(pady=(4, 0))
+                            badge.pack(side="left", pady=(SPACE_1, 0))
                     else:
                         badge.config(text="")
                         if badge.winfo_ismapped():
@@ -1589,34 +1626,33 @@ class TaskTab(tk.Frame):
 
         # drift banner (pack_forget keeps it hidden until drift is found)
         banner = tk.Frame(wrap, bg=COLORS["alert_amber_bg"])
-        tk.Label(banner, text="", font=(F, 10, "bold"), bg=COLORS["alert_amber_bg"],
+        tk.Label(banner, text="", font=TYPE["label_large"], bg=COLORS["alert_amber_bg"],
                  fg=COLORS["accent_yellow"]).pack(side="left", anchor="w",
-                                                  padx=10, pady=8)
+                                                  padx=GROUP_GAP, pady=SPACE_2)
         self._health_fix_btn = AnimatedButton(
             banner, text="Fix Them", command=self._fix_health_drift,
-            bg=accent, fg=COLORS["black"], font=(F, 9, "bold"),
-            padx=16, pady=6)
-        self._health_fix_btn.pack(side="right", padx=10, pady=6)
+            role="filled", size="sm", accent=accent)
+        self._health_fix_btn.pack(side="right", padx=GROUP_GAP, pady=CONTROL_GAP)
         self._health_banner = banner
         self._health_banner_lbl = banner.winfo_children()[0]
 
         head = tk.Frame(wrap, bg=COLORS["bg"])
-        head.pack(fill="x", pady=(6, 4))
+        head.pack(fill="x", pady=(CONTROL_GAP, SPACE_1))
         tk.Label(head, text=f"Your active tweaks — {len(self._health)} applied",
-                 font=(F, 11, "bold"), bg=COLORS["bg"],
+                 font=TYPE["card_title"], bg=COLORS["bg"],
                  fg=accent).pack(side="left")
         self._health_checked_lbl = tk.Label(head, text="",
-                                            font=(F, 9), bg=COLORS["bg"],
+                                            font=TYPE["caption"], bg=COLORS["bg"],
                                             fg=COLORS["subtext"])
-        self._health_checked_lbl.pack(side="left", padx=10)
+        self._health_checked_lbl.pack(side="left", padx=GROUP_GAP)
 
         panel = ScrollableRoundedPanel(wrap)
         panel.pack(fill="both", expand=True)
         if not self._health:
             tk.Label(panel.inner,
                      text="No tweaks applied yet — run a preset or pick some in Custom first.",
-                     font=(F, 10), bg=COLORS["bg_alt"],
-                     fg=COLORS["subtext"]).pack(expand=True, pady=24)
+                     font=TYPE["body_medium"], bg=COLORS["bg_alt"],
+                     fg=COLORS["subtext"]).pack(expand=True, pady=SPACE_5)
         else:
             rows = []
             for key, t, _st in self._health:
@@ -1625,7 +1661,7 @@ class TaskTab(tk.Frame):
             # same 2-across flow as the Custom grid (Install-tab density)
             for i, (cell, _t) in enumerate(rows):
                 rr, cc = divmod(i, 2)
-                cell.grid(row=rr, column=cc, sticky="new", padx=6, pady=2)
+                cell.grid(row=rr, column=cc, sticky="new", padx=CONTROL_GAP, pady=TEXT_NUDGE)
             for c in (0, 1):
                 panel.inner.grid_columnconfigure(c, weight=1, uniform="healthrows")
         self._cells = []
@@ -1645,19 +1681,19 @@ class TaskTab(tk.Frame):
         outer = tk.Frame(parent, bg=COLORS["bg_alt"])
         inner = tk.Frame(outer, bg=COLORS["bg_alt"])
         inner.pack(fill="both", expand=True)
-        dot = tk.Label(inner, text="·", font=(F, 12, "bold"),
+        dot = tk.Label(inner, text="·", font=TYPE["bullet"],
                        bg=COLORS["bg_alt"], fg=COLORS["subtext"])
-        dot.pack(side="left", anchor="center", padx=(8, 2), pady=6)
-        lbl = tk.Label(inner, text=t.label, font=(F, 9, "bold"),
+        dot.pack(side="left", anchor="center", padx=(SPACE_2, TEXT_NUDGE), pady=CONTROL_GAP)
+        lbl = tk.Label(inner, text=t.label, font=TYPE["label_medium"],
                        bg=COLORS["bg_alt"], fg=COLORS["text"],
                        anchor="w", justify="left",
                        wraplength=215)
         lbl.pack(side="left", anchor="center")
         Tooltip(lbl, t.description)
-        state = tk.Label(inner, text="applied", font=(F, 8, "bold"),
+        state = tk.Label(inner, text="applied", font=TYPE["label_small"],
                          bg=COLORS["bg_alt"], fg=COLORS["subtext"],
                          anchor="e")
-        state.pack(side="right", anchor="center", padx=(6, 8))
+        state.pack(side="right", anchor="center", padx=(CONTROL_GAP, SPACE_2))
         self._health_rows[t.key] = (outer, dot, state)
         outer._lbl = lbl
         return outer
@@ -1743,7 +1779,7 @@ class TaskTab(tk.Frame):
                 self._health_fix_btn.config_text(
                     f"Fix Them ({len(drifted)})" if drifted else "Fix Them")
                 if banner.winfo_manager() == "":
-                    banner.pack(fill="x", pady=(0, 6))
+                    banner.pack(fill="x", pady=(0, CONTROL_GAP))
             else:
                 if banner.winfo_manager() != "":
                     banner.pack_forget()
@@ -1845,7 +1881,6 @@ class TaskTab(tk.Frame):
         self._finish_health_check(res)
 
     def _finish_health_check(self, res):
-        import time as _t
         try:
             self._health_results = dict(res or {})
         except Exception:
@@ -1859,12 +1894,11 @@ class TaskTab(tk.Frame):
         except Exception:
             pass
         self._paint_health_rows()
-        if drifted:
-            try:
-                self.app.set_status(
-                    f"Tweak Health: {drifted} tweak(s) were reset — press Fix Them to restore.")
-            except Exception:
-                pass
+        # No status-line sentence here: the amber banner already says how many
+        # tweaks Windows undid and carries the Fix Them button that undoes it,
+        # and the caption above already says when it was checked. A third
+        # statement in the footer would be the same news a second time, in a
+        # line that has scrolled off with the tab by the time it is read.
 
     def _fix_health_drift(self):
         """Re-apply only the verified-drifted tweaks through the standard
@@ -1876,7 +1910,7 @@ class TaskTab(tk.Frame):
         if not drifted:
             try:
                 _themed_showinfo(self.app.root, "Nothing to Fix",
-                                 "Every checkable tweak is still active. Nothing was re-applied.",
+                                 "Every checkable tweak is still active.",
                                  accent=TAB_ACCENTS[self.tab_name])
             except Exception:
                 pass
@@ -2001,7 +2035,7 @@ class TaskTab(tk.Frame):
                     continue
                 if t.key in state:
                     if badge.winfo_manager() == "":
-                        badge.pack(side="left", anchor="center", padx=(6, 0))
+                        badge.pack(side="left", anchor="center", padx=(CONTROL_GAP, 0))
                 else:
                     if badge.winfo_manager() != "":
                         badge.pack_forget()
@@ -2037,8 +2071,8 @@ class TaskTab(tk.Frame):
                 # active card reads clearly against the pure-black canvas.
                 from app.ui.theme import _hex_lerp as _hl
                 # M3 selected card: tonal container tinted with the tab accent
-                card.set_fill(_hl(COLORS["surface"], accent, 0.24) if sel
-                              else COLORS["surface"])
+                card.set_fill(_hl(SURFACE_CARD, accent, 0.24) if sel
+                              else SURFACE_CARD)
                 card._outline = accent if sel else ""
                 try:
                     card._outline_w = 2 if sel else 1
@@ -2054,78 +2088,6 @@ class TaskTab(tk.Frame):
             except Exception:
                 pass
 
-    def _set_all(self, on: bool):
-        """F7: All On / All Off. Every var write fires its row trace, which
-        refreshed the run-count button label once PER ROW (N redundant
-        label re-measures + full canvas redraws). Suppress the per-row
-        count refresh for the loop, then refresh exactly once. Everything
-        else each row write does — the ToggleSwitch's own trace plays its
-        animation — is untouched."""
-        self._suspend_count_refresh = True
-        try:
-            for v in self.vars.values():
-                v.set(on)
-        finally:
-            self._suspend_count_refresh = False
-        self._refresh_run_count()
-
-    def _apply_toggle_filter(self, q, placeholder, mode, blocks=None, panel=None):
-        """Filter the Custom/Undo rows as the user types: hide rows whose
-        label/description doesn't match; hide empty group headers. 'All On/
-        All Off' still respect hidden rows' vars (they act on self.vars
-        directly), which is the honest behavior — hidden ≠ deselected.
-
-        F8 (user bug 2026-09-06: typing in the box changed nothing): this
-        used to read self._cell_blocks live — shared mutable state that on
-        a cache hit pointed at whatever grid was built LAST (often a
-        hidden one), so the filter happily grid_remove()d rows the user
-        couldn't see. Callers now pass THIS grid's blocks + panel; the
-        self._cell_blocks fallback stays only for legacy direct calls
-        (the smoke harness), which are single-grid and safe.
-
-        Grid mode (2-column): hidden cells use grid_remove() so their
-        grid slot (row/column) is REMEMBERED — re-showing restores the
-        exact position, and hidden rows leave no gap because grid_remove
-        collapses empty rows."""
-        q = (q or "").strip().lower()
-        show_all = (not q) or q == placeholder.lower()
-        blocks = blocks if blocks is not None else (getattr(self, "_cell_blocks", None) or [])
-        for _hdr, rows in blocks:
-            if not rows:
-                continue
-            any_visible = False
-            for _row, t in rows:
-                managed = _row.winfo_manager() == "grid"
-                if show_all or (q in t.label.lower() or q in t.description.lower()):
-                    if not managed:
-                        _row.grid()
-                    any_visible = True
-                else:
-                    if managed:
-                        _row.grid_remove()
-            if _hdr is not None:
-                hdr_managed = _hdr.winfo_manager() == "grid"
-                if show_all or any_visible:
-                    if not hdr_managed:
-                        _hdr.grid()
-                else:
-                    if hdr_managed:
-                        _hdr.grid_remove()
-        # scroll metrics only recompute in refresh_scroll(); hiding rows
-        # shrinks the inner frame — without this the thumb/offsets describe
-        # the pre-filter content (overshoot scrolling, wrong thumb size).
-        if panel is not None:
-            try:
-                panel.refresh_scroll()
-                return
-            except Exception:
-                pass
-        for w in self.body_area.winfo_children():
-            if not w.winfo_ismapped():
-                continue
-            for child in w.winfo_children():
-                if isinstance(child, ScrollableRoundedPanel):
-                    child.refresh_scroll()
 
     def set_run_enabled(self, enabled: bool):
         # TEXT-001: remember the run-in-progress gate so a later selection
@@ -2186,11 +2148,14 @@ class TaskTab(tk.Frame):
                                  "Turn on at least one tweak to undo first.",
                                  accent=COLORS["accent_yellow"])
                 return
-            if not _themed_askyesno(self, "Confirm Undo",
-                                   f"Put back {len(selected)} tweak(s) to how "
-                                   "they were before?",
-                                   accent=COLORS["accent_red"],
-                                   yes_text="Undo Them", no_text="Go Back"):
+            n_undo = len(selected)
+            suffix = "" if n_undo == 1 else "s"
+            if not _themed_askyesno(
+                    self, f"Undo {n_undo} tweak{suffix}?",
+                    "This restores the exact values recorded when each tweak "
+                    "ran.",
+                    accent=COLORS["accent_red"],
+                    yes_text="Undo Them", no_text="Go Back"):
                 return
             self.app.run_tasks(self.tab_name, selected, mode="revert")
         else:

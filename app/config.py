@@ -8,7 +8,6 @@ red = Undo. All keys from the old palette are kept so existing modules
 """
 
 APP_NAME = "Cleaner Tool"
-APP_SHORT_NAME = "Cleaner Tool"
 APP_VERSION = "2.0.0"
 
 # --------------------------------------------------------------------------
@@ -33,7 +32,12 @@ APP_VERSION = "2.0.0"
 # display.
 
 # Fallback when the work area cannot be read (headless, or a locked-down Tk).
-WINDOW_DEFAULT_SIZE = (1280, 900)
+# It is a PHYSICAL size: the fallback path does not see a display, so it can
+# never be multiplied by a density scale. It therefore carries the default
+# density itself -- 1360x960 is the old 1280x900 footprint seen through the
+# 125% UI density (app/dpi.py), so a failed work-area read still opens a
+# correctly proportioned window instead of a cramped one.
+WINDOW_DEFAULT_SIZE = (1360, 960)
 # Same value as before, kept as a string because app/gui.py re-exports it
 # and the smoke suite imports it by name.
 WINDOW_SIZE = "%dx%d" % WINDOW_DEFAULT_SIZE
@@ -41,14 +45,29 @@ WINDOW_SIZE = "%dx%d" % WINDOW_DEFAULT_SIZE
 # floor compute_window_size clamps up to, so a tiny screen still opens at
 # something usable rather than something unusable.
 WINDOW_MIN_SIZE = (980, 700)
-# Ceiling. Without one, a 4K display would open a 3000px-wide window that
-# nobody can use. This is also what decides the size on any normal display:
-# 0.78 of a 2560px work area is 1996px, well past the ceiling, so 1440p and
-# 4K both land on exactly (1280, 900) rather than scaling with the monitor.
-WINDOW_MAX_SIZE = (1280, 900)
+# Ceiling, in 96-DPI logical pixels (dpi_window_size multiplies it by the
+# display scale). Without one, a 4K display would open a 3000px-wide window
+# that nobody can use. It used to be 1280x900, i.e. the exact size of the
+# layout it caps -- so every large display rendered the same small window
+# and the extra room the display offers was never used. 1600x1000 is the
+# widest the pages are actually designed for (Install's two-column catalog
+# and Tools' three-column grid both stop growing past it) and it only binds
+# on a 4K-class work area; 1080p and 1440p are decided by the fraction.
+WINDOW_MAX_SIZE = (1600, 1000)
 # Fraction of the work area to occupy. Width is the tighter constraint on
 # the Install/Tools tab, so it is allowed to be greedier than the height.
-WINDOW_WORKAREA_FRACTION = (0.78, 0.82)
+# Raised from (0.78, 0.82) with the density step: a default that uses a fifth
+# of the screen for desktop had the shell reading as a utility panel on a
+# 1080p desktop while its pages -- which are laid out for a wide catalog
+# grid -- scrolled. 0.82/0.86 still leaves a visible desktop strip all round.
+WINDOW_WORKAREA_FRACTION = (0.82, 0.86)
+#: Desktop margin left around the default window, in physical pixels. The
+#: scaled minimum (980x700 logical) can be taller than a small screen's work
+#: area, which used to open the shell flush against the taskbar -- the one
+#: arrangement that is indistinguishable from "maximized" even though the
+#: window is not. 48px keeps the bottom edge (and the resize grip on it)
+#: reachable and the window reading as a window.
+WINDOW_WORKAREA_MARGIN = 48
 
 
 def compute_window_size(work_w, work_h, fraction=WINDOW_WORKAREA_FRACTION,
@@ -89,6 +108,85 @@ def compute_window_size(work_w, work_h, fraction=WINDOW_WORKAREA_FRACTION,
     return width, height
 
 
+def device_scale(root=None):
+    """Tk's device scale for `root`: 1.0 at 96 DPI, 2.0 at 200%.
+
+    Window and dialog geometry is in pixels, but Tk fonts are in points and
+    scale with the display. Sizing the shell from the *physical* work area
+    therefore left a 200% display with a 100%-sized window and 200%-sized
+    text: the app opened with its right column and footer off-screen. The
+    sizing rules below are expressed in 96-DPI pixels and multiplied by this.
+
+    Clamped to 1.0..3.0 for the same reason theme.ui_scale is: a nonsense
+    Tk answer must not ask for a 0-px window. Falls back to 1.0 when Tk
+    cannot answer, so a headless harness keeps its old geometry.
+    """
+    try:
+        target = root
+        if target is None:
+            import tkinter as _tk
+            target = _tk._default_root
+        if target is None:
+            return 1.0
+        scale = float(target.winfo_fpixels("1i")) / 96.0
+    except Exception:
+        return 1.0
+    if not (scale > 0):
+        return 1.0
+    return max(1.0, min(3.0, scale))
+
+
+def _usable_px(work, margin=WINDOW_WORKAREA_MARGIN):
+    """Physical pixels left after the desktop margin, never below 1.
+
+    The margin shrinks on a work area too small to give it away (a quarter of
+    the axis at most), so a degenerate 20px screen still yields a window
+    rather than a negative one.
+    """
+    try:
+        work = int(work)
+    except (TypeError, ValueError):
+        return 1
+    if work <= 0:
+        return 1
+    return max(1, work - min(int(margin), work // 4))
+
+
+def dpi_window_size(work_w, work_h, scale=1.0, **kwargs):
+    """(width, height) in physical pixels for a 96-DPI sized window.
+
+    `compute_window_size` is the layout contract: apply the work-area
+    fraction, clamp into the min/max in 96-DPI pixels. This wrapper divides
+    the physical work area by the display scale, runs that contract in
+    logical pixels, then multiplies the result back up. The result is capped
+    to the work area (less WINDOW_WORKAREA_MARGIN) because the minimum
+    (980x700 logical) can be taller than a small screen's work area -- a
+    window that hangs off the screen is worse than one 16px under its
+    declared minimum, and one that opens flush against the taskbar is worse
+    than one with a strip of desktop left around it.
+    """
+    try:
+        work_w = int(work_w)
+        work_h = int(work_h)
+    except (TypeError, ValueError):
+        return compute_window_size(work_w, work_h, **kwargs)
+    if work_w <= 0 or work_h <= 0:
+        return compute_window_size(work_w, work_h, **kwargs)
+    try:
+        scale = float(scale)
+    except (TypeError, ValueError):
+        scale = 1.0
+    if not (scale > 0):
+        scale = 1.0
+    width, height = compute_window_size(work_w / scale, work_h / scale,
+                                        **kwargs)
+    # int(), not round(): Tk's answer for 96 DPI is occasionally a hair above
+    # 96, and rounding 1280 * 1.0005 back up produced a 1281px window. A
+    # sub-pixel truncation is invisible; a one-pixel size drift is not.
+    return (min(_usable_px(work_w), max(1, int(width * scale))),
+            min(_usable_px(work_h), max(1, int(height * scale))))
+
+
 def resolve_window_size(root=None, default=None):
     """Ask Tk for the usable work area and return a "WxH" geometry string.
 
@@ -100,6 +198,10 @@ def resolve_window_size(root=None, default=None):
     screenheight because the latter includes the taskbar and the Windows
     taskbar is not always at the bottom -- a side or top taskbar would make
     the window hang off-screen.
+
+    The result is DPI-scaled: see device_scale/dpi_window_size. That is what
+    keeps a 200% display from opening a 1280x900 physical window around
+    200%-sized text.
     """
     fallback = default or WINDOW_SIZE
     try:
@@ -126,12 +228,31 @@ def resolve_window_size(root=None, default=None):
         work_h = rect.bottom - rect.top
         if work_w <= 0 or work_h <= 0:
             return fallback
-        width, height = compute_window_size(work_w, work_h)
+        width, height = dpi_window_size(work_w, work_h, device_scale(target))
         return "%dx%d" % (width, height)
     except Exception:
         # A geometry string is a convenience, never a correctness
         # requirement -- failing to compute one must not stop the app.
         return fallback
+
+
+def resolve_window_minimum(root=None, window_size=None):
+    """The physical minsize for the window, scaled like its geometry.
+
+    Tk enforces minsize in pixels. Leaving it at 980x700 physical would let
+    a 200% window shrink to half its designed logical footprint. The result
+    is capped at the window that was actually resolved, so a short work area
+    (where the scaled minimum cannot fit) still gets a resizable window.
+    """
+    try:
+        if window_size is None:
+            window_size = resolve_window_size(root)
+        win_w, win_h = (int(part) for part in str(window_size).split("x", 1))
+    except Exception:
+        win_w, win_h = WINDOW_MAX_SIZE
+    scale = device_scale(root)
+    return (min(win_w, max(1, int(round(WINDOW_MIN_SIZE[0] * scale)))),
+            min(win_h, max(1, int(round(WINDOW_MIN_SIZE[1] * scale)))))
 
 COLORS = {
     # ---------------------------------------------------------------------

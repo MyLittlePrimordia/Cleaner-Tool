@@ -40,7 +40,6 @@ WM_LBUTTONUP = 0x0202
 WM_RBUTTONUP = 0x0205
 
 NIM_ADD = 0x00000000
-NIM_MODIFY = 0x00000001
 NIM_DELETE = 0x00000002
 
 NIF_MESSAGE = 0x00000001
@@ -58,8 +57,6 @@ IMAGE_ICON = 1
 LR_LOADFROMFILE = 0x00000010
 
 _TRAY_CLASS = "CleanerToolTrayWindow"
-
-_PTR64 = None  # lazy: True on 64-bit interpreters
 
 
 def _is_windows() -> bool:
@@ -340,18 +337,6 @@ class TrayIcon:
         except Exception:
             pass
 
-    def update_tooltip(self, text) -> bool:
-        """Best-effort tooltip refresh. Returns False when no icon lives."""
-        if not self.running:
-            return False
-        try:
-            import ctypes
-            from ctypes import wintypes
-            nid = self._nid(text or self.tooltip)
-            return bool(ctypes.windll.shell32.Shell_NotifyIconW(
-                NIM_MODIFY, ctypes.byref(nid)))
-        except Exception:
-            return False
 
     # ---------------- test seam ---------------- #
 
@@ -721,7 +706,6 @@ class TrayIcon:
         try:
             import ctypes
             T = _T()
-            from ctypes import wintypes
 
             class _MSG(ctypes.Structure):
                 _fields_ = [("hwnd", T["HWND"]),

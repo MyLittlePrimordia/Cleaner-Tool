@@ -65,7 +65,7 @@ def test_the_96_dpi_contract_stops_at_the_designed_footprint():
 def test_the_default_density_raises_100_percent_but_never_overrides_125():
     """1.333 -> 1.667 on a 100% display; 1.667+ is already denser."""
     from dev.tests._tkhelpers import make_root
-    from app.dpi import MIN_TK_SCALING, apply_ui_density
+    from app.dpi import MIN_TK_SCALING, SCALING_TOLERANCE, apply_ui_density
 
     root = make_root()
     original = float(root.tk.call("tk", "scaling"))
@@ -73,13 +73,15 @@ def test_the_default_density_raises_100_percent_but_never_overrides_125():
         root.tk.call("tk", "scaling", 96.0 / 72.0)
         assert apply_ui_density(root) is True
         # Tk quantizes scaling to the display's pixel grid, so 1.667 comes back
-        # around 1.669 on a 96-DPI display rather than exactly 1.6667.
-        assert float(root.tk.call("tk", "scaling")) >= MIN_TK_SCALING
-        assert float(root.tk.call("tk", "scaling")) < MIN_TK_SCALING + 0.01
+        # 1.6647 (Tk 8.6) or 1.669 (Tk 9) rather than exactly 1.6667; the
+        # tolerance is the same one the app uses to call a scale "applied".
+        floor = MIN_TK_SCALING - SCALING_TOLERANCE
+        assert float(root.tk.call("tk", "scaling")) >= floor
+        assert float(root.tk.call("tk", "scaling")) < MIN_TK_SCALING + SCALING_TOLERANCE
         # Second call is a no-op, not a second bump.
         assert apply_ui_density(root) is False
-        assert MIN_TK_SCALING <= float(root.tk.call("tk", "scaling")) \
-            < MIN_TK_SCALING + 0.01
+        assert floor <= float(root.tk.call("tk", "scaling")) \
+            < MIN_TK_SCALING + SCALING_TOLERANCE
         # The raised floor is the 125% device scale that grows the window.
         assert 1.24 <= root.winfo_fpixels("1i") / 96.0 <= 1.26
 

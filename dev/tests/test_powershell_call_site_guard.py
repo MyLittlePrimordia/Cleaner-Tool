@@ -8,6 +8,7 @@ seen fire is a guard you cannot trust.
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
 
 import pytest
@@ -18,7 +19,17 @@ _TOOL = Path(__file__).resolve().parent.parent / "tools" / "verify_powershell_si
 def _load_tool():
     spec = importlib.util.spec_from_file_location("verify_ps_call_site", _TOOL)
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # Registered before executing, not just returned: `@dataclass` resolves a
+    # field's annotations through `sys.modules[cls.__module__]`, and a module
+    # that is only exec'd has no entry there. On Python 3.13 that is an
+    # AttributeError inside dataclasses; the suite passed locally on 3.15,
+    # where the lookup is guarded, and failed in CI on 3.13.
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(spec.name, None)
+        raise
     return module
 
 

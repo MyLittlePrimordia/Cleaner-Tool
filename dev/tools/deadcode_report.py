@@ -207,7 +207,14 @@ def report():
     # nobody reads it) and made the protocol names look called. The dev scripts
     # beside it ARE callers: the SEC-001 guard really imports
     # `tweak_introspect.scan_all_reg_specs`.
-    _self = os.path.relpath(os.path.abspath(__file__), ROOT).replace(os.sep, "/")
+    try:
+        _self = os.path.relpath(os.path.abspath(__file__),
+                                ROOT).replace(os.sep, "/")
+    except ValueError:
+        # ROOT is on another drive (a monkeypatched tmp tree on C: while the
+        # checkout is on D:, which is how the hosted runner is laid out).
+        # Nothing under ROOT can be this file, so there is nothing to exclude.
+        _self = None
     rest = [rel for rel in _files()
             if not rel.startswith("app/") and not rel.startswith("dev/tests/")
             and rel != _self]

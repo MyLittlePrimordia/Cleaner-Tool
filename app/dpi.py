@@ -67,6 +67,17 @@ _TK_SCALING_BY_PERCENT = {
 }
 
 
+#: How far Tk's read-back scale may sit from the value it was handed. Tk
+#: quantizes `tk scaling` to the display's pixel grid, and which way it lands
+#: depends on the Tk build: a 96-DPI display reads 1.6647 back for 1.6667 on
+#: Tk 8.6 and 1.669 on Tk 9. At the smallest type the app renders (9pt) the
+#: difference is a tenth of a pixel, so the two are the same scale in every
+#: way a user can see. The density FLOOR is therefore a request within this
+#: tolerance, not an exact double - which is also why a second launch pass
+#: must not rewrite a value this close.
+SCALING_TOLERANCE = 0.01
+
+
 def target_tk_scaling(choice, current):
     """Return the Tk scaling `choice` asks for, given the display's `current`.
 
@@ -119,10 +130,10 @@ def apply_ui_density(root, choice="system"):
     except Exception:
         return False
     target = target_tk_scaling(choice, current)
-    # Tk quantizes scaling to the display's pixel grid, so a repeated call can
-    # read back a thousandth off the value it was handed. Treat anything that
-    # close as already applied rather than rewriting it every launch.
-    if abs(current - target) <= 0.01:
+    # A repeated call can read back a fraction off the value it was handed
+    # (see SCALING_TOLERANCE): treat anything that close as already applied
+    # rather than rewriting it every launch.
+    if abs(current - target) <= SCALING_TOLERANCE:
         return False
     try:
         root.tk.call("tk", "scaling", target)

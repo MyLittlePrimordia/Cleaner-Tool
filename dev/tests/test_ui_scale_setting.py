@@ -96,7 +96,8 @@ def test_a_nonsense_display_scale_still_resolves():
 
 def test_an_explicit_100_can_go_below_the_default_floor():
     from dev.tests._tkhelpers import make_root
-    from app.dpi import MIN_TK_SCALING, apply_ui_density
+    from app.dpi import (MIN_TK_SCALING, SCALING_TOLERANCE,
+                         apply_ui_density)
 
     root = make_root()
     original = float(root.tk.call("tk", "scaling"))
@@ -108,9 +109,11 @@ def test_an_explicit_100_can_go_below_the_default_floor():
         assert MIN_TK_SCALING > 96 / 72      # it really is under the floor
         # Idempotent: a second launch pass does not re-write the same value.
         assert apply_ui_density(root, "100") is False
-        # And "Automatic" lifts it back to the floor.
+        # And "Automatic" lifts it back to the floor, as close as Tk's
+        # pixel-grid quantization lets it land (see SCALING_TOLERANCE).
         assert apply_ui_density(root, "system") is True
-        assert float(root.tk.call("tk", "scaling")) >= MIN_TK_SCALING - 0.001
+        assert float(root.tk.call("tk", "scaling")) >= \
+            MIN_TK_SCALING - SCALING_TOLERANCE
     finally:
         root.tk.call("tk", "scaling", original)
         root.destroy()

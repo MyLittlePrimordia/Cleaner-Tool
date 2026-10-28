@@ -588,6 +588,19 @@ def test_a_release_in_a_corner_tiles_the_quarter():
         root.destroy()
 
 
+def _animate_on(monkeypatch):
+    """Pretend Windows has animation effects on for this test.
+
+    `window_animations` defaults to "system", and a hosted Windows runner
+    ships with animation effects off, so every fade settles in the same call
+    and a mid-fade assertion reads the final frame. Pinning the OS answer
+    keeps the animated path under test on both kinds of machine; the OFF path
+    has its own test below.
+    """
+    monkeypatch.setattr(BorderlessChrome, "_os_animations",
+                        staticmethod(lambda: True))
+
+
 def _preview_fade_step(chrome):
     """Advance the preview fade by exactly one frame.
 
@@ -617,7 +630,13 @@ def test_the_snap_preview_shows_the_tile_a_release_would_take():
     """
     root = make_root()
     try:
-        root.geometry("1000x760+80+80")
+        # Sized to the desktop rather than a fixed 1000x760: a hosted runner's
+        # 1024x768 screen leaves a 1000px window flush with the right edge, so
+        # the "dragged back out of the zone" step below never leaves it.
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        tw = max(WINDOW_MIN_SIZE[0], min(1000, sw // 2))
+        th = max(WINDOW_MIN_SIZE[1], min(760, sh - 140))
+        root.geometry("%dx%d+80+80" % (tw, th))
         chrome = BorderlessChrome(root, app=object())
         try:
             root.unbind("<Map>", chrome._map_bind_id)
@@ -676,7 +695,7 @@ def test_the_snap_preview_shows_the_tile_a_release_would_take():
         # preview was. `x` differs per press: two Button-1s at the same point
         # microseconds apart are delivered as a double click, which maximizes
         chrome._hide_snap_preview()
-        root.geometry("1000x760+%d+%d" % (wa[0] + 200, wa[1] + 200))
+        root.geometry("%dx%d+%d+%d" % (tw, th, wa[0] + 200, wa[1] + 200))
         root.update()
         ax, ay = root.winfo_rootx() + 420, root.winfo_rooty() + 30
         send("Button-1", ax, ay, 420)
@@ -794,7 +813,7 @@ def test_the_snap_preview_is_translucent_click_through_and_unfocusable():
         root.destroy()
 
 
-def test_the_snap_preview_eases_in_and_out():
+def test_the_snap_preview_eases_in_and_out(monkeypatch):
     """120 ms at 16 ms a step, like the band reveal — not a pop.
 
     The preview is the one piece of chrome that appears outside the window,
@@ -803,6 +822,7 @@ def test_the_snap_preview_eases_in_and_out():
     curve: it stays mapped and thins until it is transparent, only then going
     away, so a drag that grazes an edge never flashes.
     """
+    _animate_on(monkeypatch)
     root = make_root()
     try:
         chrome = BorderlessChrome(root, app=object())
@@ -846,12 +866,13 @@ def test_the_snap_preview_eases_in_and_out():
         root.destroy()
 
 
-def test_a_preview_target_change_mid_fade_does_not_restart_it():
+def test_a_preview_target_change_mid_fade_does_not_restart_it(monkeypatch):
     """Reversing mid-fade carries on from the alpha on screen.
 
     A drag that leaves an edge and comes back does that several times a
     second; restarting the fade from either end would blink.
     """
+    _animate_on(monkeypatch)
     root = make_root()
     try:
         chrome = BorderlessChrome(root, app=object())
@@ -1123,7 +1144,12 @@ def test_the_north_grip_resizes_the_top_edge():
     root = make_root()
     try:
         # above the resize clamp (WINDOW_MIN_SIZE), or the drag is swallowed
-        root.geometry("1000x760+40+40")
+        # — and short enough to grow by 20px, which a hosted runner's 768px
+        # screen refuses for a 760px window.
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        root.geometry("%dx%d+40+40" % (
+            max(WINDOW_MIN_SIZE[0], min(1000, sw - 120)),
+            max(WINDOW_MIN_SIZE[1], min(760, sh - 140))))
         chrome = BorderlessChrome(root, app=object())
         try:
             root.unbind("<Map>", chrome._map_bind_id)
@@ -1177,7 +1203,8 @@ def test_the_band_is_shell_at_rest_and_one_tone_up_on_hover():
         root.destroy()
 
 
-def test_the_reveal_eases_in_and_back_out():
+def test_the_reveal_eases_in_and_back_out(monkeypatch):
+    _animate_on(monkeypatch)
     root = make_root()
     try:
         chrome = BorderlessChrome(root, app=object())
@@ -1216,7 +1243,8 @@ def test_the_reveal_eases_in_and_back_out():
         root.destroy()
 
 
-def test_a_target_change_mid_fade_does_not_restart_it():
+def test_a_target_change_mid_fade_does_not_restart_it(monkeypatch):
+    _animate_on(monkeypatch)
     root = make_root()
     try:
         chrome = BorderlessChrome(root, app=object())

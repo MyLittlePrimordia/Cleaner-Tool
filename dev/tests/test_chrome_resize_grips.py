@@ -630,12 +630,15 @@ def test_the_snap_preview_shows_the_tile_a_release_would_take():
     """
     root = make_root()
     try:
-        # Sized to the desktop rather than a fixed 1000x760: a hosted runner's
-        # 1024x768 screen leaves a 1000px window flush with the right edge, so
-        # the "dragged back out of the zone" step below never leaves it.
+        # Sized to the desktop rather than a fixed 1000x760, and allowed
+        # smaller than the app's 980px minimum: at 980, the 20px side zones
+        # overlap on a hosted runner's 1024x768 screen, so there is no
+        # position the window could be dragged to that is outside all of
+        # them. The snap arithmetic below still uses the real
+        # WINDOW_MIN_SIZE, which is what sizes a half and a quarter.
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-        tw = max(WINDOW_MIN_SIZE[0], min(1000, sw // 2))
-        th = max(WINDOW_MIN_SIZE[1], min(760, sh - 140))
+        tw = max(420, min(1000, sw // 2))
+        th = max(360, min(760, sh - 140))
         root.geometry("%dx%d+80+80" % (tw, th))
         chrome = BorderlessChrome(root, app=object())
         try:

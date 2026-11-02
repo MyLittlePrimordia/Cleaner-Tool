@@ -194,8 +194,9 @@ def import_setup(data):
         if not report["errors"] and not report["dropped"]:
             report["errors"].append("Nothing usable in this file.")
         return report
+    patch = dict(mutations)
     try:
-        def _mut(cfg, _m=dict(mutations)):
+        def _mut(cfg, _m=patch):
             for k, v in _m.items():
                 cfg[k] = v
         update_config(_mut)

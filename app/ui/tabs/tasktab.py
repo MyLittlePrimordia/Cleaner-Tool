@@ -6,6 +6,7 @@ opens dialogs, but never imports another tab.
 from __future__ import annotations
 
 import threading
+import time
 
 import tkinter as tk
 from app.tab_presets import PRESETS, TABS
@@ -27,6 +28,14 @@ from app.ui.widgets import (AnimatedButton, RoundedCard,
                             ScrollableRoundedPanel, ToggleSwitch,
                             flow_columns, grid_cards)
 from app.ui.widgets.feature_card import feature_card_body
+
+
+class _PWPause(Exception):
+    """Raised by a body builder when its background slice budget is
+    spent. `.data` carries the resume cursor; _prewarm_chunk re-enters
+    the builder with it and the build continues seamlessly in slices.
+    A visible (user-driven) build never raises it - self._pw_ctx is
+    None there and the budget check is skipped."""
 
 #: The Tweak run-row's Undo pill label. A CONSTANT, and that is the whole
 #: point: it used to be built as an f-string carrying the applied count, and
@@ -64,6 +73,10 @@ class TaskTab(tk.Frame):
                            "Game Mode applies — here you run them by hand.")
     }
 
+    #: Max time one background pre-warm slice may block an event
+    #: turn before pausing (aim: under one 60 fps frame).
+    _PW_BUDGET_S = 0.045
+
     def __init__(self, parent, app, tab_name):
         super().__init__(parent, bg=COLORS["bg"])
         self.app = app
@@ -90,6 +103,10 @@ class TaskTab(tk.Frame):
         # body cache: built-once bodies per mode/preset (no laggy redraws)
         self._body_cache = {}
         self._body_vars = {}
+        # in-flight background pre-warm context (None when idle): the
+        # one slice-owner that may mutate page body state between
+        # awaits; every user visit seizes the page back via _pw_abort
+        self._pw_ctx = None
         # F3: undo rows of the last-built undo grid, for in-place badge
         # repaints (each row stores its badge handle on the widget)
         self._undo_rows = []
@@ -596,6 +613,11 @@ class TaskTab(tk.Frame):
         'it still shows all the toggles'. The cache now stores the full
         (vars, cells, cell_blocks) tuple and every cache hit restores all
         three, so _cell_blocks always describes the SHOWN body."""
+        # a user visit (or mode switch) owns the page now - cancel any
+        # in-flight background pre-warm before touching body state, so
+        # the two builders can never mutate the same page concurrently
+        if getattr(self, "_pw_ctx", None) is not None:
+            self._pw_abort()
         # hide all cached bodies
         for w in self.body_area.winfo_children():
             w.pack_forget()
@@ -664,6 +686,8 @@ class TaskTab(tk.Frame):
         dict-drop-only version leaked every cached wrap as a hidden child
         of body_area on each run. Rebuilds the visible mode immediately so
         the panel never shows blank and badges reflect post-run state."""
+        if getattr(self, "_pw_ctx", None) is not None:
+            self._pw_abort()
         for wrap in list(self._body_cache.values()):
             try:
                 if wrap is not None and wrap.winfo_exists():
@@ -690,27 +714,34 @@ class TaskTab(tk.Frame):
         except Exception:
             pass
 
-    def _prewarm_body(self, mode: str) -> bool:
+    def _prewarm_body(self, mode: str):
         """F6(b): build one body into the cache WITHOUT showing it, so the
         first real click is a cache hit (~2 ms) instead of a 100-450 ms
         first build. Runs once from Application's idle pre-warm chain after
         the window is up; a no-op when that body already exists (the user
         got there first and the normal lazy build owns it).
 
-        `mode` is "custom", "undo", or "preset:<name>". Preset summaries
-        are the expensive ones on a big preset (Tweak's 27-task summary is
-        a card, a canvas and a tooltip per task), and they were the last
-        synchronous body build left on a click: switching Quick -> Deep
-        froze the window long enough for Windows to ghost it. Pre-building
-        them turns that switch into the same cheap show/hide as the others.
+        `mode` is "custom", "undo", or "preset:<name>".
+
+        Sliced (2026-11, UI audit): a big body used to build top-to-bottom
+        inside ONE idle step - 0.6-0.9 s of synchronous layout, exactly the
+        "click then wait" stall. The builder now runs under a per-slice
+        budget (self._PW_BUDGET_S) and pauses between units; returns the
+        resumable _prewarm_chunk callable while building (Application's
+        idle chain re-schedules it until done) or True/False when the body
+        finished instantly / was a no-op. The slice owning the page state
+        is self._pw_ctx; any user visit or selection change aborts it via
+        _pw_abort, restoring the page exactly as the pre-warm found it.
 
         The builder mutates page state as it goes (mode, _selected_preset,
         vars, _cells, _cell_blocks), so that state is snapshotted and
-        restored. Only the cache entry (hidden widgets + its state tuple) is
-        kept. _undo_rows is deliberately NOT restored: an undo pre-warm only
-        runs while no undo body exists, so its rows are exactly the rows the
-        next _enter_undo shows and badge-refreshes in place (F3).
+        restored. Only the cache entry (hidden widgets + its state tuple)
+        is kept. _undo_rows is deliberately NOT restored: an undo pre-warm
+        only runs while no undo body exists, so its rows are exactly the
+        rows the next _enter_undo shows and badge-refreshes in place (F3).
         """
+        if self._pw_ctx is not None:
+            self._pw_abort()
         preset = None
         if mode.startswith("preset:"):
             preset = mode.split(":", 1)[1]
@@ -726,38 +757,100 @@ class TaskTab(tk.Frame):
         try:
             wrap = tk.Frame(self.body_area, bg=COLORS["bg"])
             self._body_cache[mode] = wrap
+        except Exception:
+            return False
+        try:
             if preset is not None:
                 self.mode = "preset"
                 self._selected_preset = preset
-                self._build_summary_body(wrap)
             else:
                 self.mode = mode
                 self._selected_preset = None
-                self._build_toggle_grid(
-                    wrap, mode="run" if mode == "custom" else "undo")
-            # F8: store the FULL grid state — vars alone left _cell_blocks
-            # stale on the cache-hit path, which is exactly why the Custom
-            # filter search box appeared dead (it filtered a hidden grid).
-            self._body_vars[mode] = (self.vars, self._cells, self._cell_blocks)
-            # the hidden wrap measures ~1px wide, so labels were wrapped to
-            # the narrow fallback — the grid's own debounced <Configure>
-            # refit (_fit_toggle_labels) re-wraps them to the real column
-            # width the moment this body is first shown.
-            wrap.pack_forget()  # never packed — stays hidden until shown
-            return True
-        except Exception:
-            # a failed pre-warm must never crash the idle chain — drop the
-            # half-built cache entry; the lazy first-click build takes over
-            self._body_cache.pop(mode, None)
-            self._body_vars.pop(mode, None)
-            return False
-        finally:
+            self._pw_ctx = {"mode": mode, "preset": preset, "saved": saved,
+                            "wrap": wrap, "resume": None}
+            res = self._prewarm_chunk()
+            if res is not True and res is not False:
+                return res            # still building; chain re-schedules
+            # finished inside this first slice
             self.mode, self._selected_preset, self.vars, self._cells, \
                 self._cell_blocks = saved
+            return True
+        except Exception:
+            self._pw_abort()
+            return False
 
-    def _build_summary_body(self, wrap):
+    def _prewarm_chunk(self):
+        """One slice of an in-flight pre-warm body.
+
+        Called from Application's idle chain, which re-schedules the
+        returned callable until the body is done - the pump never self-
+        schedules, so background building stays strictly serialized with
+        the rest of the chain and every slice yields to user input. Also
+        safe to call directly as a synchronous drain.
+
+        Returns True when the body finished, the resumable callable when a
+        slice remains, or False after any failure (the lazy first-click
+        build takes over)."""
+        ctx = self._pw_ctx
+        try:
+            if ctx is None or not ctx["wrap"].winfo_exists():
+                self._pw_ctx = None
+                return False
+            mode = ctx["mode"]
+            if ctx["preset"] is not None:
+                self._build_summary_body(ctx["wrap"], resume=ctx["resume"])
+            else:
+                self._build_toggle_grid(
+                    ctx["wrap"],
+                    mode="run" if mode == "custom" else "undo",
+                    resume=ctx["resume"])
+            # _build_* returned without pausing: the body is complete. F8:
+            # store the FULL grid state - vars alone left _cell_blocks
+            # stale on the cache-hit path, which is exactly why the Custom
+            # filter search box appeared dead (it filtered a hidden grid).
+            self._body_vars[mode] = (self.vars, self._cells,
+                                     self._cell_blocks)
+            self._pw_ctx = None
+            self.mode, self._selected_preset, self.vars, self._cells, \
+                self._cell_blocks = ctx["saved"]
+            return True
+        except _PWPause as pause:
+            ctx["resume"] = pause.data
+            return self._prewarm_chunk
+        except Exception:
+            # a failed pre-warm must never crash the idle chain - drop the
+            # half-built cache entry; the lazy first-click build takes over
+            self._pw_abort()
+            return False
+
+    def _pw_abort(self):
+        """Cancel an in-flight pre-warm: drop the half-built cache entry
+        and put the page's mode/state back exactly where the pre-warm
+        found it, so whatever the user just did (a visit, a preset or
+        mode switch, a run) sees its normal synchronous builder owning
+        the page. No-op when no slice is in flight."""
+        ctx, self._pw_ctx = self._pw_ctx, None
+        if ctx is None:
+            return
+        try:
+            self._body_cache.pop(ctx["mode"], None)
+            self._body_vars.pop(ctx["mode"], None)
+        except Exception:
+            pass
+        try:
+            self.mode, self._selected_preset, self.vars, self._cells, \
+                self._cell_blocks = ctx["saved"]
+        except Exception:
+            pass
+
+    def _build_summary_body(self, wrap, resume=None):
         """Read-only plain-language summary of the selected preset (no
-        checkboxes — punch-list #13 'no checkboxes for curated tiers')."""
+        checkboxes - punch-list #13 "no checkboxes for curated tiers").
+
+        Slice-safe (2026-11 pre-warm): with self._pw_ctx set the chip loop
+        checks the slice budget after every chip and raises _PWPause with
+        a cursor; the caller re-enters with resume and continues. A user
+        build (self._pw_ctx None) runs top-to-bottom as before."""
         if self._selected_preset is None:
             # TEXT-001 / VOID-001 (design audit 2026-09-27). This used to
             # render a centered "Pick a <tab> preset above to see what it
@@ -774,28 +867,36 @@ class TaskTab(tk.Frame):
             # once a preset is chosen. That reads as deliberate margin.
             return
         keys = self.presets[self._selected_preset]
-        # User request: drop the "Preset — N tasks · blurb" header row so
-        # the scroll panel gains vertical space (card above already names it).
-        # OLED redesign: summary list floats on pure black.
-        panel = ScrollableRoundedPanel(wrap)
-        panel._fill = COLORS["bg"]
-        panel.inner.configure(bg=COLORS["bg"])
-        try:
-            panel._redraw_bg()
-        except Exception:
-            pass
-        panel.pack(fill="both", expand=True)
-
         tasks = [self.task_by_key[k] for k in keys]
-        cells = []
+        pw = self._pw_ctx
+        _t0 = time.perf_counter() if pw is not None else None
+        if resume is not None:
+            panel = resume["panel"]
+            cells = resume["cells"]
+            start = resume["i"]
+        else:
+            # User request: drop the "Preset - N tasks / blurb" header row so
+            # the scroll panel gains vertical space (card above already names
+            # it). OLED redesign: summary list floats on pure black.
+            panel = ScrollableRoundedPanel(wrap)
+            panel._fill = COLORS["bg"]
+            panel.inner.configure(bg=COLORS["bg"])
+            try:
+                panel._redraw_bg()
+            except Exception:
+                pass
+            panel.pack(fill="both", expand=True)
+            cells = []
+            start = 0
+        _acc = TAB_ACCENTS[self.tab_name]
         face = SURFACE_CARD
-        for t in tasks:
+        for i in range(start, len(tasks)):
+            t = tasks[i]
             # Compact surface chips floating on black.
             cell = RoundedCard(panel.inner, fill=face,
                                bg=COLORS["bg"], radius=RADIUS_CARD,
                                min_height=CARD_H_CHIP)
             # M3 assist-chip leading icon: a tonal circle with a check mark
-            _acc = TAB_ACCENTS[self.tab_name]
             dot = tk.Canvas(cell.body, width=ICON_CHIP, height=ICON_CHIP,
                             bg=face, highlightthickness=0)
             dot.create_oval(1, 1, 19, 19, fill=_hex_lerp(face, _acc, 0.30),
@@ -825,11 +926,11 @@ class TaskTab(tk.Frame):
             elif getattr(t, "risk", "SAFE") == "ADVANCED":
                 self._badge(cell.body, "Advanced", COLORS["accent_yellow"],
                             COLORS["alert_amber_bg"],
-                            "Advanced tweak — reversible.", pady=TEXT_NUDGE)
+                            "Advanced tweak - reversible.", pady=TEXT_NUDGE)
             elif getattr(t, "risk", "SAFE") == "REBOOT REQUIRED":
                 self._badge(cell.body, "Reboot", COLORS["accent_orange"],
                             COLORS["alert_amber_bg"],
-                            "Reboot Required — Windows needs a restart after "
+                            "Reboot Required - Windows needs a restart after "
                             "this one.", pady=TEXT_NUDGE)
             elif getattr(t, "risk", "SAFE") == "DATA LOSS":
                 self._badge(cell.body, "Data loss", COLORS["accent_red"],
@@ -837,6 +938,9 @@ class TaskTab(tk.Frame):
                             "Deletes data that cannot be recovered. Review "
                             "before selecting.", pady=TEXT_NUDGE)
             cells.append((cell, t))
+            if _t0 is not None and \
+                    time.perf_counter() - _t0 > self._PW_BUDGET_S:
+                raise _PWPause({"i": i + 1, "cells": cells, "panel": panel})
         self._cells = cells
         self._cell_blocks = [(None, cells)]   # summary has no group headers
         panel.resize_decide_cb = lambda: self._regrid(panel)
@@ -938,99 +1042,163 @@ class TaskTab(tk.Frame):
         self._cell_cols = cols
         panel.refresh_scroll()
 
-    def _build_toggle_grid(self, wrap, mode="run"):
+    def _build_toggle_grid(self, wrap, mode="run", resume=None):
         """The only place toggles appear (Phase 2 #13/#14). Custom mode =
-        pick what runs; Undo mode = pick what reverts (all default off)."""
+        pick what runs; Undo mode = pick what reverts (all default off).
+
+        Slice-safe (2026-11 pre-warm): the build is a deterministic work
+        plan regenerated identically per slice (task list, groups and grid
+        coordinates never depend on anything transient), so pausing is a
+        cursor, not a re-snapshot. With self._pw_ctx set the unit loop
+        raises _PWPause on the slice budget; a user build runs in one pass
+        exactly as before."""
         accent = TAB_ACCENTS[self.tab_name]
 
-        if mode == "undo":
-            # REDESIGN 2026-10: this was a full-width red banner reading
-            # "↩  Undo — switches pick which tweaks to put back to how they
-            # were." - twelve words of instruction, permanently on screen,
-            # explaining what checkboxes do. It is replaced by a compact
-            # state chip that says what the MODE is and carries the
-            # explanation on hover. A banner that never changes says
-            # nothing; a chip is a status, and status is what belongs there.
-            banner = tk.Frame(wrap, bg=COLORS["alert_red_bg"])
-            _chip = tk.Label(banner, text="↩  Undo", font=TYPE["label_medium"],
-                             bg=COLORS["alert_red_bg"], fg=COLORS["accent_red"],
-                             anchor="w", bd=0)
-            _chip.pack(side="left", padx=GROUP_GAP, pady=COMPACT_INSET)
-            Tooltip(_chip, "Pick which tweaks to put back to how they were.")
-            banner.pack(anchor="center", pady=(0, CONTROL_GAP))
+        if resume is not None:
+            panel = resume["panel"]
+            state = resume["state"]
+            self.vars = resume["vars"]
+            blocks = resume["blocks"]
+            cells = resume["cells"]
+            grows = resume["grows"]
+            cur_hdr = resume["hdr"]
+            self._grid_row = resume["grid_row"]
+            idx0 = resume["i"]
+        else:
+            if mode == "undo":
+                # REDESIGN 2026-10: this was a full-width red banner reading
+                # "Undo - switches pick which tweaks to put back to how they
+                # were." - twelve words of instruction, permanently on screen,
+                # explaining what checkboxes do. It is replaced by a compact
+                # state chip that says what the MODE is and carries the
+                # explanation on hover. A banner that never changes says
+                # nothing; a chip is a status, and status is what belongs there.
+                banner = tk.Frame(wrap, bg=COLORS["alert_red_bg"])
+                _chip = tk.Label(banner, text="↩  Undo",
+                                 font=TYPE["label_medium"],
+                                 bg=COLORS["alert_red_bg"],
+                                 fg=COLORS["accent_red"], anchor="w", bd=0)
+                _chip.pack(side="left", padx=GROUP_GAP, pady=COMPACT_INSET)
+                Tooltip(_chip,
+                        "Pick which tweaks to put back to how they were.")
+                banner.pack(anchor="center", pady=(0, CONTROL_GAP))
 
-        # User request: remove All On / All Off / hint / Filter row so the
-        # scroll panel gains vertical space on Clean/Repair/Tweak Custom.
-        state = (self.app.tweak_state or {}) if mode == "undo" else {}
+            # User request: remove All On / All Off / hint / Filter row so
+            # the scroll panel gains vertical space on Clean/Repair/Tweak
+            # Custom.
+            state = (self.app.tweak_state or {}) if mode == "undo" else {}
 
-        # OLED redesign: panel floats on pure black (no grey tray).
-        panel = ScrollableRoundedPanel(wrap)
-        panel._fill = COLORS["bg"]
-        panel.inner.configure(bg=COLORS["bg"])
-        try:
-            panel._redraw_bg()
-        except Exception:
-            pass
-        panel.pack(fill="both", expand=True)
-        self._grid_row = 0   # shared 2-column grid row cursor (grid mode)
+            # OLED redesign: panel floats on pure black (no grey tray).
+            panel = ScrollableRoundedPanel(wrap)
+            panel._fill = COLORS["bg"]
+            panel.inner.configure(bg=COLORS["bg"])
+            try:
+                panel._redraw_bg()
+            except Exception:
+                pass
+            panel.pack(fill="both", expand=True)
+            self._grid_row = 0   # shared 2-column grid row cursor
+            self.vars = {}
+            blocks = []   # (header_or_None, [(row_outer, task), ...])
+            cells = []
+            grows = []
+            cur_hdr = None
+            idx0 = 0
 
-        tasks = [t for t in self.tasks if (mode == "run" or t.revert is not None)]
-        self.vars = {}
+        tasks = [t for t in self.tasks
+                 if (mode == "run" or t.revert is not None)]
         # Custom grids are grouped by function (tab_presets.CUSTOM_GROUPS).
         # (User request, 2-column layout): each option is a compact single-
-        # line settings row in a TWO-COLUMN grid — Install-tab density, so
+        # line settings row in a TWO-COLUMN grid - Install-tab density, so
         # tabs with dozens of options scroll roughly half as far. Details
         # live in the hover tooltip, not inline. The whole row stays
-        # clickable — big targets, nothing truncated.
+        # clickable - big targets, nothing truncated.
         from app.tab_presets import CUSTOM_GROUPS
         by_key = {t.key: t for t in tasks}
         grouped = CUSTOM_GROUPS.get(self.tab_name, [])
-        blocks = []   # (header_or_None, [(row_outer, task), ...])
-        cells = []
-        # 2-column grid inside the panel; headers span both columns
         inner_grid = panel.inner
         # measure once: with 2 equal columns, each gets ~half the inner
         # width (minus scrollbar strip). Labels wrap to that, not a fixed
         # 560px that would clip in a column.
         inner_w = max(10, panel.winfo_width() - panel.INSET_X - panel.SB_W - 2)
         col_w = max(160, (inner_w - 24) // 2)   # 24 = grid padx total
+
+        # deterministic plan: ("hdr", row, title|None, n) means "open a group
+        # block (header widget only when title is not None)"; ("row", row,
+        # col, task) places one row; ("end",) closes the block. Regenerating
+        # this per slice reproduces the exact widget layout of a one-pass
+        # build because every coordinate derives from self.tasks + mode +
+        # CUSTOM_GROUPS - no transient state involved.
+        plan = []
         for _title, _keys in grouped:
             gtasks = [by_key[k] for k in _keys if k in by_key]
             if not gtasks:
                 continue
-            hdr = tk.Frame(inner_grid, bg=SURFACE_CARD)
-            tk.Label(hdr, text=_title, font=TYPE["label_large"], bg=SURFACE_CARD,
-                     fg=COLORS["text"]).pack(side="left", padx=(SPACE_2, 0), pady=SPACE_1)
-            tk.Label(hdr, text=f"{len(gtasks)} options", font=TYPE["micro_regular"],
-                     bg=SURFACE_CARD, fg=COLORS["subtext"]).pack(side="left", padx=CONTROL_GAP)
-            hdr.grid(row=self._grid_row, column=0, columnspan=2,
-                     sticky="ew", padx=CONTROL_GAP, pady=(GROUP_GAP, TEXT_NUDGE))
+            plan.append(("hdr", self._grid_row, _title, len(gtasks)))
             self._grid_row += 1
-            grows = []
+            _base = self._grid_row
             for i, t in enumerate(gtasks):
                 row, col = divmod(i, 2)
-                cell, _task = self._build_toggle_row(inner_grid, t, mode, state, accent, col_w)
-                cell.grid(row=self._grid_row + row, column=col,
-                          sticky="new", padx=CONTROL_GAP, pady=TEXT_NUDGE)
-                grows.append((cell, t))
+                plan.append(("row", _base + row, col, t))
             self._grid_row += (len(gtasks) + 1) // 2
-            blocks.append((hdr, grows))
-            cells.extend([(c, t) for c, t in grows])
-        # safety net (should be unreachable — tab_presets validates full
-        # coverage): any task missing from the groups still shows up.
-        _shown = {t.key for _h, grows in blocks for _c, t in grows}
+            plan.append(("end",))
+        # safety net (should be unreachable - tab_presets validates full
+        # coverage): any task missing from the groups still shows up. The
+        # original added it as a headerless block - keep exactly that shape.
+        _shown = {u[3].key for u in plan if u[0] == "row"}
         _missing = [t for t in tasks if t.key not in _shown]
         if _missing:
-            grows = []
+            plan.append(("hdr", self._grid_row, None, len(_missing)))
+            _base = self._grid_row          # no cursor advance: headerless
             for i, t in enumerate(_missing):
                 row, col = divmod(i, 2)
-                cell, _task = self._build_toggle_row(inner_grid, t, mode, state, accent, col_w)
-                cell.grid(row=self._grid_row + row, column=col,
-                          sticky="new", padx=CONTROL_GAP, pady=TEXT_NUDGE)
-                grows.append((cell, t))
+                plan.append(("row", _base + row, col, t))
             self._grid_row += (len(_missing) + 1) // 2
-            blocks.append((None, grows))
-            cells.extend([(c, t) for c, t in grows])
+            plan.append(("end",))
+
+        pw = self._pw_ctx
+        _t0 = time.perf_counter() if pw is not None else None
+        for idx in range(idx0, len(plan)):
+            u = plan[idx]
+            if u[0] == "hdr":
+                if grows:
+                    blocks.append((cur_hdr, grows))
+                    grows = []
+                cur_hdr = None
+                if u[2] is not None:
+                    hdr = tk.Frame(inner_grid, bg=SURFACE_CARD)
+                    tk.Label(hdr, text=u[2], font=TYPE["label_large"],
+                             bg=SURFACE_CARD,
+                             fg=COLORS["text"]).pack(side="left",
+                                                     padx=(SPACE_2, 0),
+                                                     pady=SPACE_1)
+                    tk.Label(hdr, text=f"{u[3]} options",
+                             font=TYPE["micro_regular"],
+                             bg=SURFACE_CARD,
+                             fg=COLORS["subtext"]).pack(
+                        side="left", padx=CONTROL_GAP)
+                    hdr.grid(row=u[1], column=0, columnspan=2,
+                             sticky="ew", padx=CONTROL_GAP,
+                             pady=(GROUP_GAP, TEXT_NUDGE))
+                    cur_hdr = hdr
+            elif u[0] == "row":
+                cell, _task = self._build_toggle_row(
+                    inner_grid, u[3], mode, state, accent, col_w)
+                cell.grid(row=u[1], column=u[2], sticky="new",
+                          padx=CONTROL_GAP, pady=TEXT_NUDGE)
+                grows.append((cell, u[3]))
+                cells.append((cell, u[3]))
+            else:                       # "end"
+                blocks.append((cur_hdr, grows))
+                grows = []
+                cur_hdr = None
+            if _t0 is not None and \
+                    time.perf_counter() - _t0 > self._PW_BUDGET_S:
+                raise _PWPause({"i": idx + 1, "panel": panel, "state": state,
+                                "vars": self.vars, "blocks": blocks,
+                                "cells": cells, "grows": grows,
+                                "hdr": cur_hdr, "grid_row": self._grid_row})
+
         self._cells = cells
         self._cell_blocks = blocks
         # F3: remember the undo grid's rows so later Undo entries can
@@ -1056,19 +1224,20 @@ class TaskTab(tk.Frame):
             def _do():
                 _fit_after["id"] = None
                 try:
-                    w = max(10, panel.winfo_width() - panel.INSET_X - panel.SB_W - 2)
+                    w = max(10, panel.winfo_width() - panel.INSET_X
+                            - panel.SB_W - 2)
                     cw = max(160, (w - 24) // 2)
-                    wrap = max(120, cw - 110)
+                    wrap_w = max(120, cw - 110)
                     for _h, _grows in blocks:
                         for _cell, _t in _grows:
                             _lbl = getattr(_cell, "_lbl", None)
                             if _lbl is not None and _lbl.winfo_exists():
-                                _lbl.config(wraplength=wrap)
+                                _lbl.config(wraplength=wrap_w)
                 except Exception:
                     pass
                 # F6(b): bodies pre-warmed hidden measure ~1px wide, so rows
                 # may have wrapped taller than they will at the real column
-                # width — after the refit above, settle the scroll metrics
+                # width - after the refit above, settle the scroll metrics
                 # on the now-true content height.
                 try:
                     panel.refresh_scroll()
@@ -1513,6 +1682,9 @@ class TaskTab(tk.Frame):
         """Repaint 'Run (N)' / 'Undo Selected (N)' — plain label when 0.
         Health mode has its own button labels (no selection count), so it
         skips here; its Re-apply count is refreshed at run-row build."""
+        # a selection change is user work - hand the page back first
+        if getattr(self, "_pw_ctx", None) is not None:
+            self._pw_abort()
         # TEXT-001: re-apply the combined enabled state on every selection
         # change. Placed BEFORE the health early-return deliberately. Health
         # mode is never selection-gated (see _selection_gated), so this call

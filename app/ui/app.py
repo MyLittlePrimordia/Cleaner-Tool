@@ -173,6 +173,21 @@ class Application(LogSurface, RunFlow, TrayControls, PilotFlow, GameNightFlow):
         # headless harness never flashes; falls back to native on failure)
         self._chrome = BorderlessChrome(root, self)
 
+        # PERF SMOOTHNESS (2026-11): idle background chains (the page
+        # pre-warm) must not fire while the user is mid-interaction - a
+        # 400-900 ms synchronous build landing between two click frames is
+        # what a "click feels dead" moment is made of. Any Motion/Key/
+        # Button/Wheel event stamps this timestamp; the pre-warm checks it
+        # (see _prewarm_should_wait) and yields until the input stream is
+        # quiet again.
+        self._ui_last_input = 0.0
+        for _seq in ("<Motion>", "<Key>", "<Button-1>", "<ButtonRelease-1>",
+                     "<MouseWheel>", "<Enter>"):
+            try:
+                self.root.bind_all(_seq, self._touch_ui_input, add="+")
+            except Exception:
+                pass
+
         # H9: RunState is the single source of truth for "is a run active".
         # `_busy` below is a read/write VIEW over it (same trick H1 used for
         # `_cancel_requested` over CancellationToken), so all 37 existing
@@ -1495,7 +1510,10 @@ class Application(LogSurface, RunFlow, TrayControls, PilotFlow, GameNightFlow):
     # ---------------- F6: idle pre-warm chain ---------------- #
 
     _PREWARM_START_MS = 900    # let the window settle + first paint finish
-    _PREWARM_STEP_GAP_MS = 250 # breathing room between monolithic builds
+    _PREWARM_STEP_GAP_MS = 40  # breathing room between small slices
+    #: Input quiets down after this much time for the pre-warm chain to
+    #: resume building a page behind the user (see _prewarm_should_wait).
+    _PREWARM_INPUT_QUIET_S = 1.2
 
     def _schedule_idle_prewarm(self):
         """F6(b)+F6(a): after startup, one idle chain (a) pre-warms the
@@ -1504,8 +1522,8 @@ class Application(LogSurface, RunFlow, TrayControls, PilotFlow, GameNightFlow):
         chunked catalog builder.
 
         Each monolithic grid build is its own step and steps are spread
-        ~250 ms apart, so a step never lands on top of user interaction
-        that arrived during the previous one. The grid steps run FIRST on
+        sliced at a small gap, so a slice never lands on top of user
+        interaction that arrived during the previous one. The grid steps run FIRST on
         purpose: they pay the one-off per-process Tk costs (font loads,
         notably the ~200 ms first Segoe UI Emoji font) so every Install
         catalog slice that follows stays well under the ~30 ms budget.
@@ -1574,8 +1592,21 @@ class Application(LogSurface, RunFlow, TrayControls, PilotFlow, GameNightFlow):
         # the rest.
         if "Settings" not in self.tabs:
             steps.append(lambda: self._ensure_tab("Settings"))
+        # Tools and Drivers stay lazy for a first-click cost (Tools measured
+        # ~150 ms of construction); pre-building them here makes their first
+        # visit a raise like every other prewarmed page - spaced by the same
+        # idle steps and the same input-aware yield as Settings.
+        for _lazy in ("Tools", "Drivers"):
+            if _lazy not in self.tabs:
+                steps.append(lambda _n=_lazy: self._ensure_tab(_n))
         for _name in TAB_NAMES:
-            if _name in self.tabs or _name == "Settings":
+            # The lazy pages built by the ensure steps above are placed inside
+            # this same chain, so their names are listed here too: premap_page
+            # tolerates a page that is not built yet (tabs.get -> None) and
+            # the list is walked in order, so each ensure ran before its
+            # premap. Missing one here is exactly why the first Tools visit
+            # kept paying ~150 ms of geometry after the chain existed.
+            if _name in self.tabs or _name in ("Settings", "Tools", "Drivers"):
                 steps.append(_premap_page(_name))
         self._idle_steps = steps
 
@@ -1595,9 +1626,17 @@ class Application(LogSurface, RunFlow, TrayControls, PilotFlow, GameNightFlow):
             if self._idle_steps:
                 step = self._idle_steps.pop(0)
                 try:
-                    step()
+                    res = step()
                 except Exception:
                     pass  # a failed pre-warm must never crash the app
+                else:
+                    # A slice-style step (a pre-warm body mid-build) returns
+                    # itself while it has more building to do: put it back at
+                    # the head so the SAME body finishes before the chain
+                    # moves on. Background work stays one-action-at-a-time
+                    # and every slice still yields to real user input.
+                    if callable(res):
+                        self._idle_steps.insert(0, res)
             if self._idle_steps:
                 try:
                     self.root.after(self._PREWARM_STEP_GAP_MS, _step)
@@ -1794,23 +1833,40 @@ class Application(LogSurface, RunFlow, TrayControls, PilotFlow, GameNightFlow):
                                   min(self._rail_ind_h / 2.0, half))
 
     def _paint_pills(self):
-        """Repaint indicators, hover layers and labels from current state."""
+        """Repaint indicators, hover layers and labels from current state.
+
+        PERF SMOOTHNESS (2026-11): the animation ticks repaint at ~60 fps,
+        but most frames leave most pills unchanged (a hover animation only
+        affects one step; a switch animation two). Tk's itemconfigure is not
+        free - a font change re-rasterises the label every call - so each
+        pill's drawn state is fingerprinted and unchanged pills are skipped.
+        One tuple compare replaces ~4 Tk calls for every idle pill at 60
+        fps; the painted RESULT is identical.
+        """
+        last = getattr(self, "_pill_last", None)
+        if last is None:
+            self._pill_last = last = {}
         try:
             for i, (ind, icon_id, text_id, y0, y1) in enumerate(
                     self._pill_items):
                 t = self._rail_t[i]
                 is_active = (TAB_NAMES[i] == self.active_tab)
                 is_hover = (self._hover_seg == i and not is_active)
-                if t > 0.02:
-                    self.switch.coords(ind, *self._rail_indicator_points(i, t))
-                    self.switch.itemconfigure(ind, state="normal")
-                else:
-                    self.switch.itemconfigure(ind, state="hidden")
                 hov = COLORS["shell"]
                 if is_hover:
                     hov = _hex_lerp(COLORS["shell"], COLORS["text"],
                                     0.08 * self._hover_t)
                 focused = bool(self._kb_focus) and is_active
+                key = (round(t, 4), is_active, is_hover, round(self._hover_t, 4),
+                       focused)
+                if last.get(i) == key:
+                    continue
+                last[i] = key
+                if t > 0.02:
+                    self.switch.coords(ind, *self._rail_indicator_points(i, t))
+                    self.switch.itemconfigure(ind, state="normal")
+                else:
+                    self.switch.itemconfigure(ind, state="hidden")
                 self.switch.itemconfigure(
                     self._hover_bgs[i], fill=hov,
                     outline=COLORS["text"] if focused else "",
@@ -2601,12 +2657,26 @@ class Application(LogSurface, RunFlow, TrayControls, PilotFlow, GameNightFlow):
         now; the grab check remains only as the registry's own fallback."""
         return ThemedModal.any_open()
 
+    def _touch_ui_input(self, _event=None):
+        """Stamp the last user-input time for _prewarm_should_wait. Bound
+        on root for every Motion/Key/Button/Wheel event; the stamp itself is
+        one float assignment, so the per-event cost is negligible."""
+        self._ui_last_input = time.monotonic()
+
     def _prewarm_should_wait(self):
         """Background chains run only when the UI is truly idle: no run
         in flight AND no popup open (a run owns the progress UI; a modal
-        owns the user's eyes — building pages behind either is churn)."""
+        owns the user's eyes — building pages behind either is churn).
+        A recent Motion/Key/Button/Wheel also counts as "busy": the user
+        is reading or pointing; a heavy synchronous build in front of
+        their next input is the smoothness bug, not the build itself."""
         try:
             if self._busy:
+                return True
+        except Exception:
+            pass
+        try:
+            if time.monotonic() - self._ui_last_input                     < self._PREWARM_INPUT_QUIET_S:
                 return True
         except Exception:
             pass

@@ -29,6 +29,15 @@ from app.ui.widgets import (
 _icon_bg = icon_bg_rgb(COLORS["bg"])
 
 
+class _CatPause(Exception):
+    """Raised by a catalog section builder when its background slice
+    budget is spent. `.data` carries the build cursor (widget handles
+    + row counters + the builder re-entry callable); _catalog_step
+    keeps the unfinished section at the head of the queue and continues
+    it next slice. Visible/harness builds never raise it - the budget
+    check is gated on the background slicing flag."""
+
+
 #: Essentials group header -> the sentence that used to be printed inline
 #: beside the title and is now the title's tooltip (redesign 2026-10).
 #: MODULE level, not a local: _build_ess_group is a method and cannot see
@@ -290,6 +299,8 @@ class InstallTab(tk.Frame):
                 lambda c=cat, ap=apps, mn=manuals: self._build_category(
                     panel.inner, c, ap, mn, accent))
 
+        self._cat_slicing = False   # inside a background slice?
+        self._cat_resume = None       # cursor of a paused section
         self._catalog_ready = False   # queue fully drained?
         self._catalog_after = None    # chained-slice after-id
         self._pending_badges = None   # installed-badge scan that landed mid-build
@@ -527,6 +538,9 @@ class InstallTab(tk.Frame):
     # ---------------- F6(a): chunked catalog build ---------------- #
 
     _CATALOG_SLICE_GAP_MS = 8   # breathing room between idle slices
+    #: Max time one background catalog slice may block an event turn
+    #: before pausing mid-section (aim: under one 60 fps frame).
+    _CAT_BUDGET_S = 0.045
 
     def _start_catalog_build(self):
         """F6(a): drain the queued catalog slices in idle time. Called by
@@ -589,46 +603,70 @@ class InstallTab(tk.Frame):
             pass
 
     def _catalog_step(self):
-        """Build one queued slice (an Essentials group or a catalog
-        category) and chain the rest on a small gap — the UI thread never
-        blocks more than the slice takes (~5-20 ms)."""
+        """Build one queued slice and chain the rest on a small gap. A
+        section may PAUSE mid-build (its own slice budget) - then it is put
+        back at the head of the queue and a continuation finishes it over
+        the following slices, so the UI thread never blocks more than the
+        budget (~45 ms). Also yields to the same input-aware idle guard as
+        Application's pre-warm: a slice is never laid under the user's next
+        click."""
         self._catalog_after = None
-        # flicker fix: registry check, not grab_current() — a Combobox
+        # flicker fix: registry check, not grab_current() - a Combobox
         # popdown inside an open dialog steals the grab while posted, which
         # made this read "no modal" and build/raise slices behind the
         # popup (the Auto-Pilot dropdown flicker).
         _modal = ThemedModal.any_open()
         if _modal:
-            # a popup is up — building/mapping slices now would churn the
+            # a popup is up - building/mapping slices now would churn the
             # main window behind it (user bug report: first-open flicker
-            # behind Auto-Pilot). Retry shortly; the queue keeps its place
-            # and _ensure_catalog_built can still cancel/drain explicitly.
+            # behind Auto-Pilot). Retry shortly; the queue keeps its
+            # place.
             try:
                 self._catalog_after = self.after(250, self._catalog_step)
             except Exception:
                 self._catalog_after = None
             return
+        try:
+            _user_busy = self.app._prewarm_should_wait()
+        except Exception:
+            _user_busy = False
+        if _user_busy:
+            # the user is pointing/clicking/typing right now (or a run or a
+            # modal owns the page): postpone instead of churning under them
+            try:
+                self._catalog_after = self.after(250, self._catalog_step_timed)
+            except Exception:
+                self._catalog_after = None
+            return
         if self._catalog_queue:
             try:
+                self._cat_slicing = True
                 self._catalog_queue.pop(0)()
+            except _CatPause:
+                # a half-built section goes back AHEAD of everything so it
+                # finishes before any other section starts
+                self._catalog_queue.insert(0, self._cat_chunk)
             except Exception as exc:
-                # honest failure: log and keep the chain alive — a widget
+                # honest failure: log and keep the chain alive - a widget
                 # build error must not take the idle loop down
                 try:
-                    self.app.log(f"Install catalog: a section failed to build: {exc}")
+                    self.app.log("Install catalog: a section failed to "
+                                 f"build: {exc}")
                 except Exception:
                     pass
+            finally:
+                self._cat_slicing = False
         if self._catalog_queue:
             # Progressive-show (2026-09): while the user is actually
             # LOOKING at this page mid-build, settle the scroll metrics
             # after each slice so the scrollbar enables the moment the real
             # content outgrows the viewport (and the offset stays clamped).
-            # Skipped while the page is hidden/covered — that pass would
+            # Skipped while the page is hidden/covered - that pass would
             # only churn the visible page; _catalog_finish still does the
             # final full refresh when the queue drains. flush=False is
             # deliberate: the full refresh's update_idletasks forced every
             # pending idle redraw of the mapped content per slice (bench:
-            # ~90-220 ms each) — the flush-free metrics pass recomputes
+            # ~90-220 ms each) - the flush-free metrics pass recomputes
             # requested sizes without painting (~1-2 ms).
             if getattr(getattr(self, "app", None), "active_tab", None) == "Install":
                 try:
@@ -643,6 +681,22 @@ class InstallTab(tk.Frame):
         else:
             self._catalog_finish()
 
+    def _cat_chunk(self):
+        """Continue a half-built catalog section from its stored cursor.
+        Raises _CatPause again while slices remain - _catalog_step handles
+        the requeue - so the unfinished section always completes before any
+        other queued section starts."""
+        self._cat_slicing = True
+        try:
+            self._cat_builder_resumed(getattr(self, "_cat_resume", None))
+        finally:
+            self._cat_slicing = False
+
+    def _cat_builder_resumed(self, resume):
+        builder = resume.get("fn") if resume else None
+        if builder is None:      # defensive: cursor lost - nothing to finish
+            return
+        builder(resume)
 
     def _catalog_finish(self):
         """F6(a): catalog fully built — drop the placeholder, then apply
@@ -1026,83 +1080,126 @@ class InstallTab(tk.Frame):
             except Exception:
                 pass
 
-    def _build_ess_group(self, parent, title, subtitle, accent, tasks):
+    def _build_ess_group(self, parent, title, subtitle, accent, tasks,
+                         resume=None):
         """One collapsible Essentials section (LTSC group or runtime group).
         Rows register into the shared self.ess_vars / self.vars pools so
         'Install Selected Apps' includes them naturally, in TASKS order.
-        Header is arrow + titles only (user request: no All/None buttons)."""
-        ess = tk.Frame(parent, bg=COLORS["bg"])
-        ess.pack(fill="x", pady=(TEXT_NUDGE, CONTROL_GAP))
-        ess_head = tk.Frame(ess, bg=COLORS["bg"])
-        ess_head.pack(fill="x")
-        _ess_title = tk.Label(ess_head, text=title, font=TYPE["label_large"],
-                              bg=COLORS["bg"], fg=accent)
-        _ess_title.pack(side="left", padx=(SPACE_2, SPACE_1), pady=COMPACT_INSET)
-        # REDESIGN 2026-10: the subtitle is a tooltip on the title now. It
-        # used to be a second, always-visible Label packed beside it, and an
-        # EMPTY one (every caller after the text purge passes "") still
-        # reserved a full line of height in the header - so the purge would
-        # have removed the words but left the gap. Not packing it at all is
-        # what actually reclaims the space.
-        _ess_sub = None
-        if subtitle:
-            _ess_sub = tk.Label(ess_head, text=subtitle, font=TYPE["micro_regular"],
-                                bg=COLORS["bg"], fg=COLORS["subtext"])
-            _ess_sub.pack(side="left")
-        _help = _GROUP_HELP.get(title)
-        if _help:
-            try:
-                Tooltip(_ess_title, _help)
-            except Exception:
-                pass
+        Header is arrow + titles only (user request: no All/None buttons).
 
-        body = tk.Frame(ess, bg=COLORS["bg"])
-        body.pack(fill="x")
-        # arrow on the RIGHT like every other Install divider (user request)
-        arrow = tk.Label(ess_head, text="▾", font=TYPE["label_large"],
-                         bg=COLORS["bg"], fg=accent, width=2)
-        arrow.pack(side="right", padx=(0, GROUP_GAP), pady=ROW_PAD)
-
-        def toggle_ess(b=body, a=arrow):
-            if b.winfo_ismapped():
-                b.pack_forget()
-                a.config(text="▸")
-            else:
-                b.pack(fill="x")
-                a.config(text="▾")
-
-        arrow.bind("<Button-1>", lambda e: toggle_ess())
-        ess_head.bind("<Button-1>", lambda e: toggle_ess())
-        # hover recolors the bar AND its labels together (user bug: only the
-        # bar changed, leaving boxed-looking text on mismatched backgrounds)
-        def _ess_hover(on, _e=None):
-            _bg = COLORS["surface_hover"] if on else COLORS["bg"]
-            try:
-                ess_head.config(bg=_bg)
-                for _w in (_ess_title, _ess_sub, arrow):
-                    _w.config(bg=_bg)
-            except Exception:
-                pass
-        ess_head.bind("<Enter>", lambda e: _ess_hover(True))
-        ess_head.bind("<Leave>", lambda e: _ess_hover(False))
-        self._ess_groups[title] = {"body": body, "arrow": arrow}
-
-        # 2-column flow, matching every catalog divider (user request).
-        # Essentials was the last divider still flowing its rows straight down
-        # one column, so the runtime groups came out about twice as tall as
-        # the categories around them and the tab read as ragged. Same
-        # construction as _build_category: per-column frames on a uniform
-        # grid, rows dealt round-robin, so the columns also line up with
-        # every other divider instead of each group picking its own widths.
+        Slice-safe (2026-11 audit): under the idle catalog builder
+        (self._cat_slicing) the row loop checks the slice budget after
+        every row and raises _CatPause with a cursor; _catalog_step
+        re-enters via the stored builder until the group completes. A
+        direct (user/harness) build runs top-to-bottom in one pass."""
+        pw = getattr(self, "_cat_slicing", False)
+        _t0 = time.perf_counter() if pw else None
         cols = self._CAT_COLUMNS
-        col_frames = []
-        for c in range(cols):
-            cf = tk.Frame(body, bg=COLORS["bg"])
-            cf.grid(row=0, column=c, sticky="nsew", padx=(CONTROL_GAP, CONTROL_GAP))
-            body.grid_columnconfigure(c, weight=1, uniform="catcols")
-            col_frames.append(cf)
+        if resume is None:
+            ess = tk.Frame(parent, bg=COLORS["bg"])
+            ess.pack(fill="x", pady=(TEXT_NUDGE, CONTROL_GAP))
+            ess_head = tk.Frame(ess, bg=COLORS["bg"])
+            ess_head.pack(fill="x")
+            _ess_title = tk.Label(ess_head, text=title,
+                                  font=TYPE["label_large"],
+                                  bg=COLORS["bg"], fg=accent)
+            _ess_title.pack(side="left", padx=(SPACE_2, SPACE_1),
+                            pady=COMPACT_INSET)
+            # REDESIGN 2026-10: the subtitle is a tooltip on the title now.
+            # It used to be a second, always-visible Label packed beside it,
+            # and an EMPTY one (every caller after the text purge passes "")
+            # still reserved a full line of height in the header - so the
+            # purge would have removed the words but left the gap. Not
+            # packing it at all is what actually reclaims the space.
+            _ess_sub = None
+            if subtitle:
+                _ess_sub = tk.Label(
+                    ess_head, text=subtitle, font=TYPE["micro_regular"],
+                    bg=COLORS["bg"], fg=COLORS["subtext"])
+                _ess_sub.pack(side="left")
+            _help = _GROUP_HELP.get(title)
+            if _help:
+                try:
+                    Tooltip(_ess_title, _help)
+                except Exception:
+                    pass
 
-        for ci, task in enumerate(tasks):
+            body = tk.Frame(ess, bg=COLORS["bg"])
+            body.pack(fill="x")
+            # arrow on the RIGHT like every other Install divider
+            arrow = tk.Label(ess_head, text="▾",
+                             font=TYPE["label_large"],
+                             bg=COLORS["bg"], fg=accent, width=2)
+            arrow.pack(side="right", padx=(0, GROUP_GAP), pady=ROW_PAD)
+
+            def toggle_ess(b=body, a=arrow):
+                if b.winfo_ismapped():
+                    b.pack_forget()
+                    a.config(text="▸")
+                else:
+                    b.pack(fill="x")
+                    a.config(text="▾")
+
+            arrow.bind("<Button-1>", lambda e: toggle_ess())
+            ess_head.bind("<Button-1>", lambda e: toggle_ess())
+            # hover recolors the bar AND its labels together (user bug: only
+            # the bar changed, leaving boxed-looking text on mismatched
+            # backgrounds)
+            def _ess_hover(on, _e=None):
+                _bg = COLORS["surface_hover"] if on else COLORS["bg"]
+                try:
+                    ess_head.config(bg=_bg)
+                    for _w in (_ess_title, _ess_sub, arrow):
+                        _w.config(bg=_bg)
+                except Exception:
+                    pass
+            ess_head.bind("<Enter>", lambda e: _ess_hover(True))
+            ess_head.bind("<Leave>", lambda e: _ess_hover(False))
+            self._ess_groups[title] = {"body": body, "arrow": arrow}
+
+            # 2-column flow, matching every catalog divider (user request).
+            # Essentials was the last divider still flowing its rows straight
+            # down one column, so the runtime groups came out about twice as
+            # tall as the categories around them and the tab read as ragged.
+            # Same construction as _build_category: per-column frames on a
+            # uniform grid, rows dealt round-robin, so the columns also line
+            # up with every other divider instead of each group picking its
+            # own widths.
+            col_frames = []
+            for c in range(cols):
+                cf = tk.Frame(body, bg=COLORS["bg"])
+                cf.grid(row=0, column=c, sticky="nsew",
+                        padx=(CONTROL_GAP, CONTROL_GAP))
+                body.grid_columnconfigure(c, weight=1, uniform="catcols")
+                col_frames.append(cf)
+
+        else:
+            ess = resume["ess"]
+            ess_head = resume["ess_head"]
+            body = resume["body"]
+            col_frames = resume["col_frames"]
+
+            def toggle_ess(b=body, a=resume["arrow"]):
+                if b.winfo_ismapped():
+                    b.pack_forget()
+                    a.config(text="▸")
+                else:
+                    b.pack(fill="x")
+                    a.config(text="▾")
+
+        def _pause(data):
+            data["fn"] = lambda r: self._build_ess_group(
+                parent, title, subtitle, accent, tasks, r)
+            raise _CatPause(data)
+
+        def row_budget(i):
+            if (_t0 is not None
+                    and time.perf_counter() - _t0 > self._CAT_BUDGET_S):
+                _pause({"ess": ess, "ess_head": ess_head, "body": body,
+                        "col_frames": col_frames, "i": i})
+
+        for ci in range(resume["i"] if resume else 0, len(tasks)):
+            task = tasks[ci]
             var = tk.BooleanVar(value=False)
             self.ess_vars[task.key] = var
             # also register in the shared vars pool so 'Install Selected
@@ -1112,14 +1209,17 @@ class InstallTab(tk.Frame):
             row = tk.Frame(col_frames[ci % cols], bg=COLORS["bg"])
             row.pack(fill="x", padx=GROUP_GAP, pady=TEXT_NUDGE)
             cb = M3Checkbutton(row, variable=var, bg=COLORS["bg"],
-                                fg=COLORS["text"], activebackground=COLORS["bg"],
-                                selectcolor=COLORS["surface"], onvalue=True, offvalue=False)
+                               fg=COLORS["text"],
+                               activebackground=COLORS["bg"],
+                               selectcolor=COLORS["surface"],
+                               onvalue=True, offvalue=False)
             cb.pack(side="left")
             # task icons (user bug: Essentials/LTSC rows never called
-            # _row_icon — same helper + filename convention as the
+            # _row_icon - same helper + filename convention as the
             # catalog/bundle rows, keyed off the task label).
             self._row_icon(row, task.label)
-            name_lbl = tk.Label(row, text=task.label, font=TYPE["label_medium"],
+            name_lbl = tk.Label(row, text=task.label,
+                                font=TYPE["label_medium"],
                                 bg=COLORS["bg"], fg=COLORS["text"],
                                 anchor="w", bd=0)
             name_lbl.pack(side="left", padx=(CONTROL_GAP, SPACE_1))
@@ -1129,15 +1229,19 @@ class InstallTab(tk.Frame):
             # Windows Codecs (AV1, VP9 + Web Media)" ended up sheared
             # mid-word while every neighbouring row was fine.
             _fit_name_to_row(name_lbl, task.label, row)
-            # admin shield only (user request: no "one-click" text — the
+            # admin shield only (user request: no "one-click" text - the
             # shield matches the Custom toggle rows)
             if getattr(task, "admin_required", False):
-                tg = tk.Label(row, text="🛡️", font=EMOJI["inline"],
-                              bg=COLORS["bg"], fg=COLORS["text"], cursor="hand2")
+                tg = tk.Label(row, text="🛡️",
+                              font=EMOJI["inline"],
+                              bg=COLORS["bg"], fg=COLORS["text"],
+                              cursor="hand2")
                 tg.pack(side="left", padx=(CONTROL_GAP, 0))
-                Tooltip(tg, "Admin Required — needs Administrator rights (skipped in limited mode)")
+                Tooltip(tg, "Admin Required - needs Administrator rights "
+                            "(skipped in limited mode)")
             Tooltip(name_lbl, task.description)
             Tooltip(cb, task.description)
+            row_budget(ci + 1)
 
     def set_run_enabled(self, enabled: bool):
         if getattr(self, "install_btn", None):
@@ -1472,23 +1576,66 @@ class InstallTab(tk.Frame):
             pass
         return None
 
-    def _build_category(self, parent, cat, apps, manuals, accent):
-        outer = tk.Frame(parent, bg=COLORS["bg"])
-        outer.pack(fill="x", pady=(CONTROL_GAP, SPACE_1))
+    def _build_category(self, parent, cat, apps, manuals, accent,
+                        resume=None):
+        """One catalog category divider. Slice-safe (2026-11 audit): under
+        the idle catalog builder the three row loops check the slice
+        budget after every row and raise _CatPause with a cursor -
+        _catalog_step re-enters via the stored builder until done. A
+        direct build runs top-to-bottom in one pass as before."""
+        pw = getattr(self, "_cat_slicing", False)
+        _t0 = time.perf_counter() if pw else None
+        cols = self._CAT_COLUMNS
+        if resume is None:
+            outer = tk.Frame(parent, bg=COLORS["bg"])
+            outer.pack(fill="x", pady=(CONTROL_GAP, SPACE_1))
 
-        header = tk.Frame(outer, bg=COLORS["bg"])
-        header.pack(fill="x")
-        # arrow on the RIGHT on every Install divider (user request)
-        arrow = tk.Label(header, text="▾", font=TYPE["label_large"], bg=COLORS["bg"],
-                         fg=accent, width=2)
-        arrow.pack(side="right", padx=(0, GROUP_GAP), pady=ROW_PAD)
-        _cat_title = tk.Label(header, text=cat, font=TYPE["card_title"], bg=COLORS["bg"],
-                              fg=accent)
-        _cat_title.pack(side="left", padx=(SPACE_3, CONTROL_GAP))
-        n_lbl = tk.Label(header, text=f"{len(apps) + len(manuals)} apps", font=TYPE["caption"],
-                         bg=COLORS["bg"], fg=COLORS["subtext"])
-        n_lbl.pack(side="left", padx=SPACE_1)
-        self._cat_count_lbls[cat] = n_lbl
+            header = tk.Frame(outer, bg=COLORS["bg"])
+            header.pack(fill="x")
+            # arrow on the RIGHT on every Install divider (user request)
+            arrow = tk.Label(header, text="▾",
+                             font=TYPE["label_large"], bg=COLORS["bg"],
+                             fg=accent, width=2)
+            arrow.pack(side="right", padx=(0, GROUP_GAP), pady=ROW_PAD)
+            _cat_title = tk.Label(header, text=cat,
+                                  font=TYPE["card_title"],
+                                  bg=COLORS["bg"], fg=accent)
+            _cat_title.pack(side="left", padx=(SPACE_3, CONTROL_GAP))
+            n_lbl = tk.Label(
+                header, text=f"{len(apps) + len(manuals)} apps",
+                font=TYPE["caption"], bg=COLORS["bg"],
+                fg=COLORS["subtext"])
+            n_lbl.pack(side="left", padx=SPACE_1)
+            self._cat_count_lbls[cat] = n_lbl
+
+            body = tk.Frame(outer, bg=COLORS["bg"])
+            body.pack(fill="x")
+            cat_rows = []   # (app_id, row) - feeds the search filter
+            col_frames = []
+            for c in range(cols):
+                cf = tk.Frame(body, bg=COLORS["bg"])
+                cf.grid(row=0, column=c, sticky="nsew",
+                        padx=(CONTROL_GAP, CONTROL_GAP))
+                body.grid_columnconfigure(c, weight=1, uniform="catcols")
+                col_frames.append(cf)
+            # register the section structure EARLY (the old code registered
+            # it at the end): mid-slice pauses must leave a valid collapsible
+            # section behind, or a header click built mid-build would raise
+            # on a missing entry.
+            self._cat_frames[cat] = (header, body, True)
+            appsi = manuali = bundlei = 0
+        else:
+            outer = resume["outer"]
+            header = resume["header"]
+            body = resume["body"]
+            col_frames = resume["col_frames"]
+            cat_rows = resume["cat_rows"]
+            _cat_title = resume["cat_title"]
+            n_lbl = resume["n_lbl"]
+            arrow = resume["arrow"]
+            appsi = resume["appsi"]
+            manuali = resume["manuali"]
+            bundlei = resume["bundlei"]
 
         def toggle_cat():
             body = self._cat_frames[cat][1]
@@ -1502,7 +1649,7 @@ class InstallTab(tk.Frame):
                 arrow.config(text="▾")
                 self._cat_frames[cat] = (self._cat_frames[cat][0], body, True)
 
-        # (user request: no All/None buttons on catalog category dividers —
+        # (user request: no All/None buttons on catalog category dividers -
         # pick apps individually; Essentials groups keep theirs)
         # hover recolors the bar AND its labels together (user bug: only the
         # bar changed, leaving boxed-looking text on mismatched backgrounds)
@@ -1514,49 +1661,37 @@ class InstallTab(tk.Frame):
                     _w.config(bg=_bg)
             except Exception:
                 pass
-        for w in (header, arrow):
-            w.bind("<Button-1>", lambda e: toggle_cat())
-            w.bind("<Enter>", lambda e: _cat_hover(True))
-            w.bind("<Leave>", lambda e: _cat_hover(False))
 
-        body = tk.Frame(outer, bg=COLORS["bg"])
-        body.pack(fill="x")
-        cat_rows = []   # (app_id, row) — feeds the search filter
-        cols = self._CAT_COLUMNS          # 2-column flow (user request)
-        col_frames = []
-        for c in range(cols):
-            cf = tk.Frame(body, bg=COLORS["bg"])
-            cf.grid(row=0, column=c, sticky="nsew", padx=(CONTROL_GAP, CONTROL_GAP))
-            body.grid_columnconfigure(c, weight=1, uniform="catcols")
-            col_frames.append(cf)
-
-        def _make_name_link(parent, text, url, tip_text, base_fg=None, bold=True):
+        def _make_name_link(parent2, text, url, tip_text, base_fg=None,
+                            bold=True):
             """Clickable app name (user design): bold like the Custom task
             names, calm text color; hover turns it hyperlink-blue +
-            underlined (click opens the primary link, 🔗 the mirror)."""
+            underlined (click opens the primary link, the mirror emoji the
+            secondary)."""
             fg = base_fg or COLORS["text"]
-            _font=TYPE["label_medium"] if bold else TYPE["caption"]
-            lbl = tk.Label(parent, text=text, font=_font,
+            _font = (TYPE["label_medium"] if bold else TYPE["caption"])
+            lbl = tk.Label(parent2, text=text, font=_font,
                            bg=COLORS["bg"], fg=fg, cursor="hand2")
 
             def _enter(_e):
-                lbl.config(font=TYPE["link"] if bold else TYPE["link_quiet"],
-                           fg=COLORS["accent_blue"])
+                lbl.config(
+                    font=(TYPE["link"] if bold else TYPE["link_quiet"]),
+                    fg=COLORS["accent_blue"])
 
             def _leave(_e):
                 lbl.config(font=_font, fg=fg)
 
             # REDESIGN 2026-10: long app names ellipsize instead of clipping.
-            # The catalog flows TWO columns per category and the longest names
-            # ("Install Microsoft Visual C++ All-in-One") are wider than half
-            # the window, so pack truncated the glyphs mid-word with no
-            # indication - which reads as a broken render rather than as a
-            # long name. The full name is already in this label's tooltip.
-            _fit_name_to_row(lbl, text, parent)
+            # The catalog flows TWO columns per category and the longest name
+            # is wider than half the window, so pack truncated the glyphs
+            # mid-word with no indication - which reads as a broken render
+            # rather than as a long name. The full name is already in this
+            # label's tooltip.
+            _fit_name_to_row(lbl, text, parent2)
 
             # Tooltip FIRST, hover binds with add="+": plain bind() replaces
-            # (this exact ordering bug is why name hover highlighting silently
-            # never worked — Tooltip's bind wiped it).
+            # (this exact ordering bug is why name hover highlighting
+            # silently never worked - Tooltip's bind wiped it).
             if tip_text:
                 Tooltip(lbl, tip_text)
             lbl.bind("<Enter>", _enter, add="+")
@@ -1564,48 +1699,73 @@ class InstallTab(tk.Frame):
             lbl.bind("<Button-1>", lambda e, u=url: self._open_url(u))
             return lbl
 
-        def _checkbox_width_spacer(parent):
+        def _checkbox_width_spacer(parent2):
             """Width-matched invisible spacer holding the checkbox's slot in
             manual-only rows, so their names align exactly with the names in
             checkbox rows (user-reported misalignment). Sized from a real
-            hidden Checkbutton — can't drift from theme/font changes the way
+            hidden Checkbutton - can't drift from theme/font changes the way
             a hardcoded pixel count would.
 
             Perf fix (2026-09-05, Install-tab lag report): this used to
             create AND destroy a real Checkbutton for every single
-            manual-only row, on every category slice — dozens of throwaway
+            manual-only row, on every category slice - dozens of throwaway
             widget creations (each a real OS window handle) during the
             idle-time catalog build, adding up to visible stutter switching
             into the tab. The probe measurement is identical every time
             (same theme/font for the whole tab lifetime), so it's now
-            computed ONCE per InstallTab and cached on self — every
+            computed ONCE per InstallTab and cached on self - every
             subsequent manual row just reuses the cached width."""
             w = getattr(self, "_cb_spacer_width", None)
             if w is None:
-                cb_probe = M3Checkbutton(parent, bg=COLORS["bg"],
-                                           selectcolor=COLORS["surface"])
+                cb_probe = M3Checkbutton(parent2, bg=COLORS["bg"],
+                                         selectcolor=COLORS["surface"])
                 w = cb_probe.winfo_reqwidth()
                 cb_probe.destroy()
                 self._cb_spacer_width = w
-            sp = tk.Frame(parent, bg=COLORS["bg"], width=w, height=1)
+            sp = tk.Frame(parent2, bg=COLORS["bg"], width=w, height=1)
             sp.pack(side="left")
             sp.pack_propagate(False)   # hold the reserved width
             return sp
 
-        for ci, app in enumerate(apps):
+        def _pause(data):
+            data["fn"] = lambda r: self._build_category(
+                parent, cat, apps, manuals, accent, r)
+            raise _CatPause(data)
+
+        def row_budget(checkpoint):
+            if (_t0 is not None
+                    and time.perf_counter() - _t0 > self._CAT_BUDGET_S):
+                _pause({
+                    "outer": outer, "header": header, "body": body,
+                    "col_frames": col_frames, "cat_rows": cat_rows,
+                    "cat_title": _cat_title, "n_lbl": n_lbl,
+                    "arrow": arrow, "appsi": appsi, "manuali": manuali,
+                    "bundlei": bundlei, **checkpoint})
+
+        if not resume:
+            for w in (header, arrow):
+                w.bind("<Button-1>", lambda e: toggle_cat())
+                w.bind("<Enter>", lambda e: _cat_hover(True))
+                w.bind("<Leave>", lambda e: _cat_hover(False))
+
+        for ci in range(appsi, len(apps)):
+            app = apps[ci]
             var = tk.BooleanVar(value=False)
             self.vars[app["id"]] = var
             self._trace_install_var(var)
             row = tk.Frame(col_frames[ci % cols], bg=COLORS["bg"])
             row.pack(fill="x", padx=SPACE_1, pady=SPACE_1)
             cb = M3Checkbutton(row, variable=var, bg=COLORS["bg"],
-                                fg=COLORS["text"], activebackground=COLORS["bg"],
-                                selectcolor=COLORS["surface"], onvalue=True, offvalue=False)
+                               fg=COLORS["text"],
+                               activebackground=COLORS["bg"],
+                               selectcolor=COLORS["surface"],
+                               onvalue=True, offvalue=False)
             cb.pack(side="left")
             self._row_icon(row, app["name"])
-            # tooltip: short description only (user request: no URLs in tips);
-            # OEM-exclusive apps append their hardware tag (user request
-            # 2026-09-06) so non-matching users are warned before installing
+            # tooltip: short description only (user request: no URLs in
+            # tips); OEM-exclusive apps append their hardware tag (user
+            # request 2026-09-06) so non-matching users are warned before
+            # installing
             tip = app["description"]
             hw = app.get("hardware", "")
             if hw:
@@ -1614,91 +1774,119 @@ class InstallTab(tk.Frame):
             name_lbl.pack(side="left", padx=(CONTROL_GAP, SPACE_1))
             if app["foss"]:
                 # sky blue, NOT the tab accent: the accent IS green here, and
-                # green is the "✓ Installed" badge's color — the two chips sat
-                # next to each other in the same green (user feedback
+                # green is the check-Installed badge's color - the two chips
+                # sat next to each other in the same green (user feedback
                 # 2026-09-06). accent_sky is the palette's designated Install
                 # alt so FOSS/Installed read as different signals at a glance.
-                foss = tk.Label(row, text="FOSS", font=TYPE["label_small"],
-                                bg=COLORS["bg"], fg=COLORS["accent_sky"])
+                foss = tk.Label(row, text="FOSS",
+                                font=TYPE["label_small"],
+                                bg=COLORS["bg"],
+                                fg=COLORS["accent_sky"])
                 foss.pack(side="left", padx=(SPACE_1, 0))
             if hw:
-                hw_lbl = tk.Label(row, text="⚠ OEM", font=TYPE["label_small"],
-                                  bg=COLORS["bg"], fg=COLORS["accent_yellow"])
-                Tooltip(hw_lbl, f"Hardware restricted — {hw}. Do not install this on other systems.")
+                hw_lbl = tk.Label(row, text="OEM",
+                                  font=TYPE["label_small"],
+                                  bg=COLORS["bg"],
+                                  fg=COLORS["accent_yellow"])
+                Tooltip(hw_lbl, "Hardware restricted - do not install this "
+                                "on other systems.")
                 hw_lbl.pack(side="left", padx=(SPACE_1, 0))
-            # mirror link (user design): 🔗 beside the name as the SECONDARY
-            # link when a verified fallback_url exists; the name stays the
-            # primary. ↗ arrows are gone entirely.
+            # mirror link (user design): the link emoji beside the name as
+            # the SECONDARY link when a verified fallback_url exists; the
+            # name stays the primary. Arrows are gone entirely.
             fallback = app.get("fallback_url", "")
             if fallback:
                 self._make_mirror_link(row, fallback)
             Tooltip(cb, tip)
             cat_rows.append((app["id"], row))
             self._app_rows[app["id"]] = row
+            appsi = ci + 1
+            row_budget({"appsi": appsi})
 
         # manual-only entries (no winget package exists): same row shape as
-        # winget apps (user design) — NO checkbox (a width-matched spacer
+        # winget apps (user design) - NO checkbox (a width-matched spacer
         # keeps names aligned with checkbox rows, user-reported fix), normal
-        # text color, name IS the link, FOSS badge when flagged, plus 🔗
-        # when a mirror exists.
-        for ci, app in enumerate(manuals):
-            row = tk.Frame(col_frames[(len(apps) + ci) % cols], bg=COLORS["bg"])
+        # text color, name IS the link, FOSS badge when flagged, plus the
+        # mirror emoji when a mirror exists.
+        for ci in range(manuali, len(manuals)):
+            app = manuals[ci]
+            row = tk.Frame(col_frames[(len(apps) + ci) % cols],
+                           bg=COLORS["bg"])
             row.pack(fill="x", padx=SPACE_1, pady=SPACE_1)
             _checkbox_width_spacer(row)
             self._row_icon(row, app["name"])
             fallback = app.get("fallback_url", "")
-            # tooltip: short description only (user request: no URLs in tips;
-            # the row has no checkbox, which already says "open the page")
+            # tooltip: short description only (user request: no URLs in
+            # tips; the row has no checkbox, which already says "open the
+            # page")
             tip = app["description"]
             if fallback:
-                tip += " (mirror available via 🔗)"
+                tip += " (mirror available)"
             name_lbl = _make_name_link(row, app["name"], app["url"], tip,
-                                        base_fg=COLORS["text"])
+                                       base_fg=COLORS["text"])
             name_lbl.pack(side="left", padx=(CONTROL_GAP, SPACE_1))
             if app["foss"]:
                 # sky blue to match the winget-row FOSS chips (green belongs
-                # to the "✓ Installed" badge alone — see _paint_installed_badges)
-                foss = tk.Label(row, text="FOSS", font=TYPE["label_small"],
-                                bg=COLORS["bg"], fg=COLORS["accent_sky"])
+                # to the check-Installed badge alone - see
+                # _paint_installed_badges)
+                foss = tk.Label(row, text="FOSS",
+                                font=TYPE["label_small"],
+                                bg=COLORS["bg"],
+                                fg=COLORS["accent_sky"])
                 foss.pack(side="left", padx=(SPACE_1, 0))
             if fallback:
                 self._make_mirror_link(row, fallback)
             cat_rows.append((app["id"], row))
+            manuali = ci + 1
+            row_budget({"manuali": manuali})
 
-        # Embedded bundle/task rows (APO + Peace GUI, APO + FluidEQ, RustDesk,
-        # FreeFileSync — anything in install_tasks.EMBEDDED_TASKS_BY_CATEGORY):
-        # full-width checkbox rows at the END of the category, below the
-        # columns. Search behavior (user request): these rows are NO LONGER
-        # exempt from the filter — typing e.g. 'rufus' must clear the page
-        # to ONLY matching apps, so they hide too unless the query matches
-        # ('peace', 'fluideq', 'rustdesk'...). Each is registered as a
-        # pseudo-app row the filter can match and hide.
-        from app.tasks.install_tasks import EMBEDDED_TASKS_BY_CATEGORY as _EMBED
-        for _bundle in _EMBED.get(cat, []):
+        # Embedded bundle/task rows (APO + Peace GUI, APO + FluidEQ,
+        # RustDesk, FreeFileSync - anything in
+        # install_tasks.EMBEDDED_TASKS_BY_CATEGORY): full-width checkbox
+        # rows at the END of the category, below the columns. Search
+        # behavior (user request): these rows are NO LONGER exempt from the
+        # filter - typing e.g. 'rufus' must clear the page to ONLY matching
+        # apps, so they hide too unless the query matches ('peace',
+        # 'fluideq', 'rustdesk'...). Each is registered as a pseudo-app row
+        # the filter can match and hide.
+        from app.tasks.install_tasks import EMBEDDED_TASKS_BY_CATEGORY \
+            as _EMBED
+        _bundles = _EMBED.get(cat, [])
+        for bj in range(bundlei, len(_bundles)):
+            _bundle = _bundles[bj]
             _bvar = tk.BooleanVar(value=False)
             self.bundle_vars[_bundle.key] = (_bvar, _bundle)
             self._trace_install_var(_bvar)
             _brow = tk.Frame(outer, bg=COLORS["bg"])
-            _brow.pack(fill="x", padx=GROUP_GAP, pady=(TEXT_NUDGE, CONTROL_GAP))
+            _brow.pack(fill="x", padx=GROUP_GAP,
+                       pady=(TEXT_NUDGE, CONTROL_GAP))
             _bcb = M3Checkbutton(_brow, variable=_bvar, bg=COLORS["bg"],
-                                   fg=COLORS["text"], activebackground=COLORS["bg"],
-                                   selectcolor=COLORS["surface"], onvalue=True, offvalue=False)
+                                 fg=COLORS["text"],
+                                 activebackground=COLORS["bg"],
+                                 selectcolor=COLORS["surface"],
+                                 onvalue=True, offvalue=False)
             _bcb.pack(side="left")
             self._row_icon(_brow, _bundle.label)
-            _blbl = tk.Label(_brow, text=_bundle.label, font=TYPE["label_medium"],
+            _blbl = tk.Label(_brow, text=_bundle.label,
+                             font=TYPE["label_medium"],
                              bg=COLORS["bg"], fg=COLORS["text"])
             _blbl.pack(side="left", padx=(CONTROL_GAP, SPACE_1))
             if _bundle.admin_required:
-                _bsh = tk.Label(_brow, text="🛡️", font=EMOJI["inline"],
-                                bg=COLORS["bg"], fg=COLORS["text"], cursor="hand2")
+                _bsh = tk.Label(_brow, text="🛡️",
+                                font=EMOJI["inline"], bg=COLORS["bg"],
+                                fg=COLORS["text"], cursor="hand2")
                 _bsh.pack(side="left", padx=(CONTROL_GAP, 0))
-                Tooltip(_bsh, "Admin Required — needs Administrator rights (skipped in limited mode)")
+                Tooltip(_bsh, "Admin Required - needs Administrator rights "
+                              "(skipped in limited mode)")
             Tooltip(_blbl, _bundle.description)
             Tooltip(_bcb, _bundle.description)
             # filter registration: searchable text from the bundle's own
             # label + description; stored on the OUTER block (its pack
             # master) so hiding one row never orphans the section logic.
-            self._bundle_rows.append((_brow, f"{_bundle.label} {_bundle.description}".lower()))
+            self._bundle_rows.append(
+                (_brow, f"{_bundle.label} {_bundle.description}".lower()))
+            bundlei = bj + 1
+            row_budget({"bundlei": bundlei})
 
         self._cat_frames[cat] = (header, body, True)
         self._cat_toggles[cat] = toggle_cat

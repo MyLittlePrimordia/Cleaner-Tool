@@ -157,6 +157,23 @@ class DriversTab(tk.Frame):
             self.bar.secondary_slot, text="Select all", command=self._toggle_all,
             role="secondary", size="md")
         self.all_btn.pack(side="right", padx=(0, SPACE_2))
+        # U-003: the way back from a bad update. Every install already
+        # exports the replaced driver AND takes a restore point, but the
+        # backup folder was only a subtitle path — visible, not usable.
+        # This opens the last backup; the tooltip names both ways back
+        # (Device Manager roll-back for one device, Safety Center for the
+        # whole PC). Enabled only once a backup from this session exists.
+        self._last_backup = ""
+        self.backup_btn = AnimatedButton(
+            self.bar.secondary_slot, text="Open driver backup",
+            command=self._open_backup, role="secondary", size="md")
+        self.backup_btn.pack(side="right", padx=(0, SPACE_2))
+        self.backup_btn.set_enabled(False)
+        Tooltip(self.backup_btn,
+                "Opens the folder with the drivers this tab replaced. "
+                "To undo one device: Device Manager > device > Driver > "
+                "Roll Back Driver. To undo everything: Safety Center > "
+                "restore point.")
 
         # The progress rail keeps its own thin line above the action bar; the
         # shared ProgressRow migration (C-004) moves it onto that component.
@@ -185,11 +202,19 @@ class DriversTab(tk.Frame):
 
     # ------------------------------------------------------------ helpers
     def _post(self, fn, *a):
+        # B-004: never after() from a worker thread (silently dropped on
+        # 3.14). Dispatcher first; Tk-thread direct call in tests; a worker
+        # with no dispatcher logs instead of vanishing.
         d = self._dispatch
         if d is not None:
             d.post(lambda: fn(*a))
-        else:                                   # tests / no dispatcher
-            self.after(1, lambda: fn(*a))
+            return
+        try:
+            import threading as _th
+            if _th.current_thread() is _th.main_thread():
+                self.after(1, lambda: fn(*a))
+        except Exception:
+            pass
 
     def _drivers_root(self) -> str:
         from app.drivers import folder
@@ -456,6 +481,20 @@ class DriversTab(tk.Frame):
         except Exception:
             self._say("Could not open the folder.", COLORS["accent_yellow"])
 
+    def _open_backup(self):
+        """U-003: open the folder holding the last replaced drivers."""
+        try:
+            folder = getattr(self, "_last_backup", "") or ""
+            if folder and os.path.isdir(folder):
+                os.startfile(folder)
+                return
+            self._say("No driver backup from this session yet — install a "
+                      "driver first. Older backups live under your Drivers "
+                      "folder.", COLORS["accent_yellow"])
+        except Exception:
+            self._say("Could not open the backup folder.",
+                      COLORS["accent_yellow"])
+
     def _open_store(self):
         """U-005: the driver store, on top of this page (modal).
 
@@ -616,6 +655,13 @@ class DriversTab(tk.Frame):
         self.header.set_title(text)
         self.header.set_sub("Old drivers were backed up to %s" %
                             result.get("backup", ""))
+        # U-003: arm the way-back button with this run's backup folder.
+        try:
+            self._last_backup = str(result.get("backup", "") or "")
+            if self._last_backup:
+                self.backup_btn.set_enabled(True)
+        except Exception:
+            pass
         installed = {d["item"]["update_id"] for d, r in zip(
             ok, result["results"]) if r["ok"]}
         self._items = [i for i in self._items

@@ -93,3 +93,35 @@ class CancellationToken:
 
     def __bool__(self) -> bool:  # allow `if token:`
         return self.is_cancelled()
+
+
+# R-006: tasks were duck-typed SimpleNamespaces (key/label/run/revert). A
+# task missing `revert` failed at runtime with "No revert/run". Typed
+# dataclass validates at import; tab_presets checks `isinstance` instead.
+try:
+    from dataclasses import dataclass as _dc, field as _field
+    from typing import Callable as _Call
+
+    @_dc
+    class Task:
+        """Typed task spec (R-006). `run`/`revert`/`measure` are callables
+        taking a TaskContext. `measure` is the read-only Preview (R-004).
+        """
+        key: str
+        label: str
+        run: _Call | None = None
+        revert: _Call | None = None
+        measure: _Call | None = None
+        risk: str = "SAFE"
+        admin_required: bool = False
+        default: bool = True
+        extra: dict = _field(default_factory=dict)
+
+        def validates(self) -> bool:
+            try:
+                from app.config import RISK_VALUES
+                return bool(self.key and self.label) and str(getattr(self, "risk", "")) in RISK_VALUES
+            except Exception:
+                return bool(getattr(self, "key", None))
+except Exception:  # pragma: no cover
+    Task = object  # type: ignore

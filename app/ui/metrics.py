@@ -63,3 +63,14 @@ INDENT = 30
 
 #: Seventy-pixel measure cap that keeps a reading column readable.
 MEASURE_CAP = 70
+
+# The empty state's rhythm (L-003). These five used to live in
+# `empty_state.METRICS` as the only component geometry outside this module, so
+# the one canvas painter that depends on them (DataTable) inherited a blind
+# spot no metrics change could reach. The names say what they measure, and
+# both painters still read the same numbers through METRICS.
+EMPTY_PAD_TOP = 28        # breathing room above the glyph
+EMPTY_GLYPH_GAP = 34      # glyph -> headline
+EMPTY_TEXT_GAP = 22       # headline -> detail
+EMPTY_DETAIL_GAP = 36     # detail -> the one action
+EMPTY_ACTION_H = 32       # the action button's height

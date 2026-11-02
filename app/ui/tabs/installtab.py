@@ -12,7 +12,8 @@ import time
 import tkinter as tk
 
 from app.ui.widgets.checkbox import M3Checkbutton
-from app.ui.base import ThemedModal, Tooltip, _themed_showinfo, _themed_showerror
+from app.ui.base import (ThemedModal, Tooltip, _themed_askyesno,
+                         _themed_showinfo, _themed_showerror)
 from app.ui.theme import (
     COLORS, EMOJI, ICON_ROW_PX, PAGE_BOTTOM, PAGE_GUTTER, SPACE_1, SPACE_2,
     TAB_ACCENTS, TYPE, ellipsize, icon_bg_rgb, SPACE_3, SPACE_5,
@@ -157,6 +158,23 @@ class InstallTab(tk.Frame):
             command=self._update_apps, role="tonal", size="md",
         )
         self.update_btn.pack(side="right", padx=(0, SPACE_2))
+        # A-002: "My Setups" is back — save the ticked apps under a name
+        # and put the set back after a reinstall. The dialog, the id
+        # machinery (profile_ids/apply_profile_ids) and the bounded schema
+        # all survived the removal of the old button; only the opener was
+        # missing, so this is the whole re-wire.
+        self.setups_btn = AnimatedButton(
+            self.bar.secondary_slot, text="My Setups…",
+            command=self._open_profiles, role="tonal", size="md",
+        )
+        self.setups_btn.pack(side="right", padx=(0, SPACE_2))
+        # N-001: the guided setup. Stages ticks + preset through this
+        # tab's own machinery, then runs the normal Install path.
+        self.wizard_btn = AnimatedButton(
+            self.bar.secondary_slot, text="New PC setup…",
+            command=self._open_setup_wizard, role="tonal", size="md",
+        )
+        self.wizard_btn.pack(side="right", padx=(0, SPACE_2))
         self._update_count = None  # None = unknown/scanning, else int
         self.install_btn = AnimatedButton(
             self.bar.primary_slot, text="Install",
@@ -169,17 +187,44 @@ class InstallTab(tk.Frame):
         self._prov_row = tk.Frame(self, bg=COLORS["bg"])
         self._prov_row.pack(side="bottom", fill="x", padx=PAGE_GUTTER,
                             pady=(0, SPACE_1))
-        # "My Setups" (feature 7) removed from the Install tab per user
-        # request — the save/restore profile button next to Install/Update
-        # wasn't needed. The 2026-10 dead-code sweep then deleted the
-        # _open_profiles() hook the removal had left behind (no caller in
-        # the app). profiles storage (config_profiles) and its dialog are
-        # still present, but nothing opens the dialog any more: bringing
-        # the feature back means a surface AND its opener.
-        # self._profiles_btn is never created, and the guard at
-        # set_run_enabled() already handles that via getattr(..., None).
+        # "My Setups" (feature 7): save/restore the ticked apps under a
+        # friendly name. The button lives on the action bar next to Update;
+        # the storage (config_profiles), dialog and id machinery behind it
+        # are unchanged.
 
         self._build_provenance()
+        # U-001: the shortcut is the real affordance; the small button above
+        # is there for mouse users and for discoverability. Bind on this tab,
+        # not bind_all, so it cannot steal Ctrl+F from another page.
+        for _seq in ("<Control-f>", "<Control-F>"):
+            try:
+                self.bind(_seq, self._on_find_key)
+            except Exception:
+                pass
+
+        # LTSC banner: this tab is where a stripped edition gets its missing
+        # pieces back, but nothing said so — a gamer on IoT LTSC saw the
+        # same tab as Pro and had to already know the Store/Xbox rows were
+        # FOR them. The banner names the detected edition and the order
+        # (top-down: Store first, it unlocks the rest). Capability-gated
+        # like everything else: an unreadable edition simply shows no banner.
+        try:
+            from app.compat import (edition_label as _ed_label,
+                                    is_ltsc_edition as _is_ltsc)
+            if _is_ltsc():
+                _ed = _ed_label() or "LTSC / stripped edition"
+                tk.Label(
+                    self,
+                    text=("%s detected — winget, the Store, Xbox and Game "
+                          "Bar are not preinstalled here. The 'LTSC Missing "
+                          "Components' section below brings them back; work "
+                          "top-down (Store first, it unlocks the rest)." % _ed),
+                    font=TYPE["label_medium"], bg=COLORS["bg"],
+                    fg=COLORS["accent_yellow"], justify="left",
+                    anchor="w").pack(fill="x", padx=PAGE_GUTTER,
+                                      pady=(0, SPACE_1))
+        except Exception:
+            pass
 
         panel = ScrollableRoundedPanel(self)
         panel.pack(fill="both", expand=True, padx=PAGE_GUTTER, pady=(SPACE_1, SPACE_1))
@@ -287,7 +332,30 @@ class InstallTab(tk.Frame):
         re-resolves each ID when the install actually runs, so a retired
         package fails at install time rather than being installed from this
         file's memory of it.
+
+        U-005: a capability line sits above it. On stripped Windows the first
+        question is "will these buttons work?", and the answer belongs on the
+        screen before the click, not in an error after it.
         """
+        self._cap_lbl = tk.Label(
+            self._prov_row, text="", font=TYPE["caption"],
+            bg=COLORS["bg"], fg=COLORS["accent_yellow"], justify="left",
+            anchor="w")
+        self._cap_lbl.pack(fill="x")
+        Tooltip(self._cap_lbl,
+                "This app can bootstrap winget from Microsoft's official "
+                "binaries. The Store task is the fallback when that fails.")
+        # U-001: findability without bringing back the permanent top search
+        # bar the user removed. The button is tiny; the shortcut is the real
+        # affordance. Both drive the catalog's existing _apply_search path.
+        try:
+            self._find_btn = AnimatedButton(
+                self._prov_row, text="Find app", command=self._open_search,
+                role="text", size="sm")
+            self._find_btn.pack(side="right", padx=(SPACE_1, 0))
+        except Exception:
+            self._find_btn = None
+
         try:
             from app.app_catalog import provenance_line
             text = provenance_line()
@@ -325,6 +393,8 @@ class InstallTab(tk.Frame):
         try:
             self._prov_row.bind("<Configure>",
                                 lambda e: _fit(e, self._scan_lbl), add="+")
+            self._prov_row.bind("<Configure>",
+                                lambda e: _fit(e, self._cap_lbl), add="+")
         except Exception:
             pass
         Tooltip(self._scan_lbl,
@@ -332,6 +402,45 @@ class InstallTab(tk.Frame):
                 "the machine. Visiting this tab re-reads it once the reading "
                 "is more than fifteen minutes old, so an app you removed "
                 "elsewhere loses its tick on the next visit.")
+        self._refresh_capability()
+
+    def _refresh_capability(self):
+        """U-005: state the winget/Store situation before a click.
+
+        The install path already bootstraps winget automatically, and Update
+        Apps uses the same gate. What was missing was the UI admitting that
+        ``has_winget`` was false: the button looked ready while the first
+        offline task was guaranteed to fail. This is deliberately a pure
+        capability read (no network probe) so it can run on the Tk thread.
+        """
+        lbl = getattr(self, "_cap_lbl", None)
+        if lbl is None:
+            return
+        try:
+            from app import capabilities as _cap
+            winget = bool(_cap.has_winget())
+            store = bool(_cap.has_store())
+        except Exception:
+            return
+        if winget:
+            try:
+                lbl.pack_forget()
+                lbl.config(text="")
+            except Exception:
+                pass
+            return
+        if store:
+            text = ("winget is missing \u2014 Install and Update will "
+                    "bootstrap it automatically on first use.")
+        else:
+            text = ("Store and winget are missing \u2014 start with the "
+                    "LTSC Missing Components section below.")
+        try:
+            lbl.config(text=text)
+            if lbl.winfo_manager() != "pack":
+                lbl.pack(fill="x")
+        except Exception:
+            pass
 
     # ---------------- A-009: the reading, and its age ---------------- #
 
@@ -385,6 +494,9 @@ class InstallTab(tk.Frame):
         """
         self.warm_scans()
         self._update_scan_note()
+        refresh = getattr(self, "_refresh_capability", None)
+        if callable(refresh):
+            refresh()
         try:
             from app.tasks.winget import INSTALLED_TTL, installed_scan_age
             stale = installed_scan_age() >= INSTALLED_TTL
@@ -877,9 +989,42 @@ class InstallTab(tk.Frame):
 
     def _update_apps(self):
         """Dedicated Update button: runs `winget upgrade --all` through the
-        standard worker flow (progress bar + Stop button)."""
+        standard worker flow (progress bar + Stop button).
+
+        A-006/U-005: the task itself bootstraps winget. Say so before the run
+        starts, so a stripped-Windows user is not surprised by a multi-minute
+        "checking for updates" pause that is really the bootstrap.
+        """
+        try:
+            from app import capabilities as _cap
+            if not _cap.has_winget():
+                self.app.set_status(
+                    "winget is missing \u2014 the update run will bootstrap it first "
+                    "(this can take a few minutes).")
+        except Exception:
+            pass
         from app.tasks.install_tasks import UPDATE_ALL_TASK
         self.app.install_selected_mixed([], [UPDATE_ALL_TASK])
+
+    def _on_find_key(self, _event=None):
+        """Ctrl+F on the Install tab opens the filter; never bubble it."""
+        self._open_search()
+        return "break"
+
+    def _open_search(self):
+        """U-001: open the keyboard-invoked catalog filter."""
+        try:
+            from app.ui.dialogs.install_search_dialog import InstallSearchDialog
+            InstallSearchDialog(self.winfo_toplevel(), self).wait()
+        except Exception as exc:                       # noqa: BLE001
+            try:
+                self.app.log("! Could not open app search: %r" % (exc,))
+            except Exception:
+                pass
+            try:
+                self.app.set_status("Could not open app search \u2014 see the log.")
+            except Exception:
+                pass
 
     def _build_ess_group(self, parent, title, subtitle, accent, tasks):
         """One collapsible Essentials section (LTSC group or runtime group).
@@ -1039,6 +1184,36 @@ class InstallTab(tk.Frame):
 
     # ---------------- My Setups (feature 7) ---------------- #
 
+    def _open_setup_wizard(self):
+        """N-001: open the guided new-PC setup over this tab."""
+        try:
+            from app.ui.dialogs.setup_wizard_dialog import (
+                SetupWizardDialog,
+            )
+            SetupWizardDialog(self.winfo_toplevel(), self.app)
+        except Exception as exc:
+            try:
+                self.app.log("! Could not open New PC setup: %r" % (exc,))
+            except Exception:
+                pass
+
+    def _open_profiles(self):
+        """A-002: open the saved-setups dialog for this tab's selection.
+
+        Failures open nothing silently no more than a dead card does — a
+        dialog that cannot open is logged on the app surface.
+        """
+        try:
+            from app.ui.dialogs.install_profiles_dialog import (
+                InstallProfilesDialog,
+            )
+            InstallProfilesDialog(self.winfo_toplevel(), self)
+        except Exception as exc:
+            try:
+                self.app.log("! Could not open My Setups: %r" % (exc,))
+            except Exception:
+                pass
+
     def profile_ids(self):
         """Current picks as stable ids for a saved setup.
 
@@ -1137,9 +1312,65 @@ class InstallTab(tk.Frame):
                              "Check some Essentials or apps to install first.",
                              accent=COLORS["accent_green"])
             return
+        self._ltsc_store_preflight(selected)
+        # Re-read: the preflight may have ticked install_store into the
+        # run, and `selected` above predates that tick.
+        selected = self.selected_apps()
         apps = [s for kind, s in selected if kind == "app"]
         tasks = [s for kind, s in selected if kind == "task"]
         self.app.install_selected_mixed(apps, tasks)
+
+    def _ltsc_store_preflight(self, selected):
+        """U-005: on a stripped edition, nudge Store-first ordering.
+
+        The banner advises top-down (Store first), but nothing enforced it:
+        a user could run the Xbox stack before the Store and meet msstore
+        failures the banner seemed to promise wouldn't happen. When the
+        selection holds LTSC-group tasks beyond Store/winget while the
+        Store is absent and unticked, offer to tick Store into this same
+        run (Essentials run in TASKS order, Store first). Advisory only —
+        "No" proceeds exactly as before. Never raises; any probe failure
+        silently skips the nudge.
+        """
+        try:
+            task_keys = {t.key for kind, t in selected if kind == "task"}
+            if "install_store" in task_keys:
+                return
+            needs = [t for kind, t in selected if kind == "task"
+                     and getattr(t, "group", "") == "LTSC Missing Components"
+                     and t.key not in ("install_store",
+                                       "install_winget_unigetui")]
+            if not needs:
+                return
+            from app import capabilities as _cap
+            if _cap.has_store():
+                return
+            from app.compat import is_ltsc_edition as _is_ltsc
+            if not _is_ltsc():
+                return
+        except Exception:
+            return
+        names = ", ".join(t.label for t in needs[:3])
+        if len(needs) > 3:
+            names += " (+%d more)" % (len(needs) - 3)
+        try:
+            add = _themed_askyesno(
+                self, "Install Microsoft Store first?",
+                "You picked %s, but the Microsoft Store is not on this "
+                "PC yet. The Store unlocks the smoothest run for the "
+                "rest — add it to this run (it installs first)?" % names,
+                accent=COLORS["accent_green"])
+        except Exception:
+            return
+        if not add:
+            return
+        try:
+            var = self.ess_vars.get("install_store")
+            if var is not None:
+                var.set(True)
+            self._refresh_install_count()
+        except Exception:
+            pass
 
     def _pad_icon_box(self, img, size):
         """Centre `img` in a `size` x `size` transparent box and return the

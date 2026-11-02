@@ -44,15 +44,23 @@ _DOT_BOX = 14
 
 
 class FindingRow(tk.Frame):
-    """A quiet row: severity dot, title + evidence, one inline action."""
+    """A quiet row: severity dot, title + evidence, one inline action.
+
+    U-004: an optional second, quieter action (`recheck_label` +
+    `on_recheck`) for rows the user can re-measure in place — the Health
+    tab's per-card Re-check. It renders beside the primary action and is
+    exposed via `recheck()` for tooltips and enable/disable.
+    """
 
     def __init__(self, parent, title="", evidence="", severity="info",
-                 action_label="", on_action=None, bg=None, wrap=0, **kw):
+                 action_label="", on_action=None, bg=None, wrap=0,
+                 recheck_label="", on_recheck=None, **kw):
         page_bg = bg or COLORS["bg"]
         super().__init__(parent, bg=page_bg, bd=0, **kw)
         self._bg = page_bg
         self._wrap = max(120, int(wrap or 0))
         self._action = None
+        self._recheck = None
 
         dot = tk.Canvas(self, width=_DOT_BOX, height=_DOT_BOX, bg=page_bg,
                         highlightthickness=0, bd=0)
@@ -80,6 +88,12 @@ class FindingRow(tk.Frame):
                 role="secondary", size="sm")
             self._action.pack(side="right", anchor="n",
                               padx=(SPACE_2, 0), pady=TEXT_NUDGE)
+        if recheck_label and on_recheck is not None:
+            self._recheck = AnimatedButton(
+                self, text=str(recheck_label), command=on_recheck,
+                role="secondary", size="sm")
+            self._recheck.pack(side="right", anchor="n",
+                               padx=(SPACE_2, 0), pady=TEXT_NUDGE)
 
         self.bind("<Configure>", self._fit, add="+")
 
@@ -100,6 +114,8 @@ class FindingRow(tk.Frame):
                 return
             reserve = (_DOT_BOX + CONTROL_GAP + SPACE_1
                        + (self._action.winfo_reqwidth() if self._action else 0)
+                       + (self._recheck.winfo_reqwidth()
+                          if self._recheck else 0)
                        + SPACE_2)
             room = max(120, width - reserve)
             if int(self.evidence_lbl.cget("wraplength")) != room:
@@ -126,3 +142,13 @@ class FindingRow(tk.Frame):
 
     def action(self):
         return self._action
+
+    def recheck(self):
+        return self._recheck
+
+    def set_recheck_enabled(self, enabled):
+        if self._recheck is not None:
+            try:
+                self._recheck.set_enabled(bool(enabled))
+            except Exception:
+                pass

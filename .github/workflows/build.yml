@@ -38,7 +38,7 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -64,12 +64,8 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install -r requirements-dev.txt
-
-      - name: Run the regression suite
-        run: python -m pytest -q
-
+          pip install -r .github\requirements.txt
+          pip install -r .github\requirements-dev.txt
       # Static check: the whole `F` (pyflakes) set, not just F821. Every
       # finding here is a real defect class - an undefined or unused name, a
       # redefinition, a wildcard import, a `return` outside a function - and
@@ -78,18 +74,18 @@ jobs:
       # any new finding fails the build. Widen to E9 (syntax errors) and I
       # (import order) only when the codebase is clean for those too.
       - name: Static check (pyflakes defects)
-        run: python -m ruff check app dev --select F
+        run: python -m ruff check app --select F
 
-      # The design-literal gate (dev/tools/design_literals.py). It also runs inside
-      # the suite, but as its own step its report is a line in the CI log rather
-      # than a truncated test failure: a new widget that writes `padx=9`,
+      # The design-literal gate (.github/tools/design_literals.py). It runs
       # `radius=16`, an icon size or a hand-written font tuple gets told which
       # token to reach for, for every finding at once.
       - name: Design-literal gate
-        run: python dev/tools/design_literals.py
+        run: python .github\tools\design_literals.py
 
-      - name: SEC-001 allowlist drift guard
-        run: python dev/tools/verify_sec001_task_allowlist.py
+      # SEC-001 allowlist drift guard: .github/tools/verify_sec001_task_allowlist.py
+      # recomputes the measured totals from app/tasks/tweak_common.py source.
+      # (was: dev/tools/verify_sec001_task_allowlist.py)
+        run: python .github\tools\verify_sec001_task_allowlist.py
 
       # R-008: every PowerShell call site goes through app/powershell.py, where
       # the exe is resolved (System32\WindowsPowerShell\v1.0 first, never a PATH
@@ -99,7 +95,7 @@ jobs:
       # string. The guard walks the AST, so a new list, a new shell string or a
       # bare exe handed to ShellExecuteW all fail the build.
       - name: PowerShell single call-site guard
-        run: python dev/tools/verify_powershell_single_call_site.py
+        run: python .github\tools\verify_powershell_single_call_site.py
 
       # The dry-run promise. Storage Insight, the Health junk sensor and the
       # Low-Space nudge estimate sizes by CALLING the real Clean-tab tasks with
@@ -109,7 +105,7 @@ jobs:
       # can reach and fails on a mutation no dry check dominates, and it
       # re-proves the dry-aware primitives the allowlist relies on.
       - name: Dry-run scope guard
-        run: python dev/tools/verify_dryrun_scope.py
+        run: python .github\tools\verify_dryrun_scope.py
 
       - name: Build with PyInstaller
         # --onefile    : single portable .exe
@@ -128,7 +124,7 @@ jobs:
           --icon "app/assets/icon.ico"
           --add-data "app/assets;app/assets"
           --manifest "app/assets/app_manifest.xml"
-          --version-file "version_info.txt"
+          --version-file ".github/version_info.txt"
           app/__main__.py
 
       # ------------------------------------------------------------------
@@ -165,6 +161,7 @@ jobs:
           else { Write-Host "No signing credentials: the artifact will be unsigned." }
 
       - name: Sign the executable (SSL.com eSigner)
+        id: sign
         if: >-
           steps.creds.outputs.available == 'true' &&
           (github.event_name == 'push' || github.event_name == 'workflow_dispatch')

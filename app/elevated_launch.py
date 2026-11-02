@@ -253,6 +253,24 @@ def selection_needs_admin(selected: dict, tabs) -> bool:
     return False
 
 
+def decide_gate(needs_admin: bool, has_selection: bool, opted_out: bool) -> bool:
+    """Pure gate triage (test seam for app/ui/app.py).
+
+    Show the Admin gate when the saved selection needs admin, or on a fresh
+    install with no saved selection where the user never opted out (so they
+    learn the choice exists). `opted_out` already accounts for auto_elevate
+    winning over remember_limited. Never raises.
+    """
+    try:
+        if bool(needs_admin):
+            return True
+        if (not bool(has_selection)) and (not bool(opted_out)):
+            return True
+        return False
+    except Exception:
+        return True
+
+
 def saved_selection_needs_admin() -> bool:
     """The Gate-skip check: does the user's saved selection contain any
     admin task? False (skip the Gate) on any read failure — failing open

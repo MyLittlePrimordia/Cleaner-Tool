@@ -653,8 +653,9 @@ class ScorecardDialog(ThemedModal):
         otherwise."""
         try:
             # H-011: the card's own read, through the one window rule.
-            from app.history import reclaimed_in
+            from app.history import reclaimed_in, window_totals
             total, runs = reclaimed_in(self._history_runs, 30)
+            _current, previous = window_totals(self._history_runs, 30)
         except Exception:
             return ""
         # One run in the window IS this run — nothing extra to say.
@@ -662,8 +663,21 @@ class ScorecardDialog(ThemedModal):
             return ""
         # "runs", not "cleans": since R-005 a Tweak/Repair/Undo run is
         # recorded too, so the count is every run in the window.
-        return ("You've freed about %s in the last 30 days, across %d runs."
+        line = ("You've freed about %s in the last 30 days, across %d runs."
                 % (format_bytes(total), runs))
+        # U-005: qualify the total only when the earlier month is a real
+        # baseline (two runs and a measured total), and only when the move is
+        # large enough to mean something. Otherwise the sentence stays as it
+        # was rather than dressing a small difference as a trend.
+        prev_total, prev_runs = previous
+        if prev_runs >= 2 and prev_total > 0:
+            if total >= prev_total * 1.25:
+                line += (" That's about %d%% more than the 30 days before."
+                         % int(round((total / float(prev_total) - 1) * 100)))
+            elif total <= prev_total * 0.8:
+                line += (" That's about %d%% less than the 30 days before."
+                         % int(round((1 - total / float(prev_total)) * 100)))
+        return line
 
     def _summary_text(self):
         """The plain-English block that Copy results puts on the clipboard."""

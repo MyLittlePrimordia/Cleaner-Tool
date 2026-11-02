@@ -56,6 +56,21 @@ def _task_name_for(extra_args=None) -> str:
     return TASK_NAME + "_" + str(extra_args[0]).lstrip("-").replace("-", "_")
 
 
+def _schedule_flag_key(extra_args=None) -> str:
+    """The config switch that belongs to one scheduled mode.
+
+    The three schedules are independent, so the generic updater must not
+    write `schedule_enabled` for every mode. Unknown extra args keep the old
+    clean-task key for compatibility; the three shipped modes are explicit.
+    """
+    first = str(extra_args[0]) if extra_args else ""
+    if first == "--auto-update":
+        return "schedule_update_enabled"
+    if first == "--auto-save-backup":
+        return "schedule_saves_enabled"
+    return "schedule_enabled"
+
+
 def _want_startup_tr(exe_override: str | None = None) -> str:
     """Expected /TR string (drift comparison)."""
     if exe_override is not None:
@@ -80,6 +95,11 @@ def _xml_exec(xml: "str | None") -> "tuple[str, str] | None":
     elsewhere") and the startup-tray drift check on every such machine.
     """
     if not xml or "<" not in (xml or ""):
+        return None
+    # H-009: input is always locally-generated `schtasks /Query /XML`, never
+    # untrusted. Still cap at 1 MB before parsing so a pathological task
+    # definition cannot become an entity-expansion DoS.
+    if len(xml) > 1024 * 1024:
         return None
     try:
         import xml.etree.ElementTree as ET
@@ -289,6 +309,15 @@ def _schedule_day_args(sched: str, today: "datetime.date | None") -> "list[str]"
     if sched == "WEEKLY":
         return ["/D", _WEEKDAY_TOKENS[today.weekday()]]
     if sched == "MONTHLY":
+        # B-007: clamping 29-31 -> 28 changes user intent silently (schtasks
+        # skips months with fewer days). Callers log the clamp; keep the
+        # clamp here so the schedule still runs every month.
+        if today.day > 28:
+            try:
+                from app.config_events import log_security_event as _log_ev
+                _log_ev("scheduler", f"Monthly schedule clamped from day {today.day} to 28 so every month runs.")
+            except Exception:
+                pass
         return ["/D", str(min(today.day, 28))]
     return []
 
@@ -499,10 +528,7 @@ def enable_schedule(frequency="weekly", time_str="03:00", extra_args=None):
                     and _xml_schedule_matches(xml, frequency, time_str) is True:
                 def _mut(extra_args=extra_args, frequency=frequency, time_str=time_str):
                     def _m(cfg):
-                        if extra_args:
-                            cfg["schedule_update_enabled"] = True
-                        else:
-                            cfg["schedule_enabled"] = True
+                        cfg[_schedule_flag_key(extra_args)] = True
                         cfg["schedule_frequency"] = frequency
                         cfg["schedule_time"] = time_str
                     return _m
@@ -523,10 +549,7 @@ def enable_schedule(frequency="weekly", time_str="03:00", extra_args=None):
             log_or_swallow(None, "scheduler.start_when_available", exc)
         # F08: single-lock RMW (was load; mutate; save with lock released).
         def _mut(cfg, extra_args=extra_args, frequency=frequency, time_str=time_str):
-            if extra_args:
-                cfg["schedule_update_enabled"] = True
-            else:
-                cfg["schedule_enabled"] = True
+            cfg[_schedule_flag_key(extra_args)] = True
             cfg["schedule_frequency"] = frequency
             cfg["schedule_time"] = time_str
         update_config(_mut)
@@ -542,10 +565,7 @@ def disable_schedule(extra_args=None):
     if rc == 0:
         # F08: single-lock RMW.
         def _mut(cfg, extra_args=extra_args):
-            if extra_args:
-                cfg["schedule_update_enabled"] = False
-            else:
-                cfg["schedule_enabled"] = False
+            cfg[_schedule_flag_key(extra_args)] = False
         update_config(_mut)
     return rc == 0, out
 
@@ -802,6 +822,63 @@ def run_auto_update():
     # stated twice in a row.
     log_block(ctx.log, summary)
     return ok, summary
+
+
+def run_auto_save_backup():
+    """Headless game-save backup for the --auto-save-backup schedule.
+
+    Reuses the exact backup task the Game Saves dialog runs, so the archive
+    layout, manifest and pruning stay one implementation. It verifies a NEW
+    archive appeared instead of trusting a task that returned normally: a
+    backup with no save files can still write an empty zip, and calling that
+    a successful backup would be a false promise of protection.
+
+    Returns (ok, summary). As with the other headless modes, the verdict is
+    written into the closing block and is the only line a scheduled run's
+    transcript needs.
+    """
+    ctx = print_context("[AUTO-SAVE]", "[AUTO-SAVE STATUS]")
+    try:
+        from app.game_saves import list_backups
+        from app.tasks.game_tasks import backup_game_saves
+    except Exception as exc:
+        summary = "Auto save backup failed: %s" % exc
+        log_block(ctx.log, summary)
+        return False, summary
+    try:
+        before = {r.get("path") for r in list_backups()}
+    except Exception:
+        before = set()
+    try:
+        backup_game_saves(ctx)
+    except Exception as exc:
+        summary = "Auto save backup failed: %s" % exc
+        log_block(ctx.log, summary)
+        return False, summary
+    try:
+        rows = [r for r in list_backups() if r.get("path") not in before]
+    except Exception:
+        rows = []
+    if not rows:
+        summary = ("Auto save backup finished, but no new archive appeared. "
+                   "Check the log above for the backup task's own verdict.")
+        log_block(ctx.log, summary)
+        return False, summary
+    newest = rows[0]
+    if not newest.get("restorable") or not newest.get("files"):
+        summary = ("Auto save backup wrote %s, but it contains no save "
+                   "files. Nothing was protected; check that your game save "
+                   "folders exist." % newest.get("name", "an archive"))
+        log_block(ctx.log, summary)
+        return False, summary
+    from app.utils import format_bytes
+    summary = ("Auto save backup complete: %d save file%s (%s) in %s "
+               "from the last backup."% (int(newest.get("files") or 0),
+                "" if int(newest.get("files") or 0) == 1 else "s",
+                format_bytes(int(newest.get("size") or 0)),
+                newest.get("name", "the backup folder")))
+    log_block(ctx.log, summary)
+    return True, summary
 
 
 def run_auto_clean(selected_tasks_by_tab):

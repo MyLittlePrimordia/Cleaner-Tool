@@ -130,7 +130,15 @@ class LogSurface:
 
     # ---------------- status line (fading, #16) ---------------- #
 
-    def set_status(self, text):
+    def set_status(self, text, hold=False):
+        """Write the one live status sentence.
+
+        `hold=True` pins the line instead of fading it after four seconds.
+        Used while waiting on the elevation handshake: that wait can last
+        the full 90 s budget, and letting the message fade would leave the
+        window silent again exactly when the user needs to know why nothing
+        has happened yet. A normal `set_status` always releases the hold.
+        """
         def _do():
             try:
                 if hasattr(self, "status_lbl") and self.status_lbl.winfo_exists():
@@ -141,9 +149,10 @@ class LogSurface:
                         except Exception:
                             pass
                     self._status_fade_ids = []
+                    self._status_hold = bool(hold)
                     self.status_lbl.config(text=text, fg=TAB_ACCENTS.get(self.active_tab, COLORS["accent_green"]))
-                    # fade back to muted after 4s (unless running)
-                    if not self._busy:
+                    # fade back to muted after 4s (unless running or held)
+                    if not hold and not self._busy:
                         aid = self.root.after(4000, lambda: self._fade_status())
                         self._status_fade_ids.append(aid)
             except Exception:
@@ -157,6 +166,10 @@ class LogSurface:
             pass
 
     def _fade_status(self):
+        # A held status outranks a fade callback queued before the hold was
+        # taken (and any callback that survives a destroyed/rebuilt widget).
+        if getattr(self, "_status_hold", False):
+            return
         try:
             self.status_lbl.config(fg=COLORS["subtext"])
         except Exception:

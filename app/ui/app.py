@@ -13,6 +13,8 @@ R-001) and are composed back in as bases, so every call site kept its name:
     app/ui/traycontrols.py  the resident tray menu (TrayControls)
     app/ui/logsurface.py    the log buffer, status line and progress bar
                             (LogSurface)
+    app/ui/pilotflow.py     the Game Session Auto-Pilot's GUI half
+                            (PilotFlow)
 
 Why bases rather than objects the window owns: both halves reach for
 `self.tabs`, `self.root`, `self._dispatch` and the drive queries on almost
@@ -38,14 +40,16 @@ from app.config import (APP_NAME, WINDOW_SIZE, resolve_window_minimum,
 from app.config_persist import get_tweak_state
 from app.elevation import is_admin, relaunch_as_admin
 from app.runner import CancellationToken, RunState
-from app.ui.session import SessionOrchestrator, SessionState
+from app.ui.session import SessionOrchestrator
 from app.ui.tkdispatch import TkDispatcher
-from app.tab_presets import PRESETS, TABS, TAB_NAMES
+from app.tab_presets import TABS, TAB_NAMES
 from app.toast import show_toast
 from app import watch
 
 
 from app.ui.logsurface import LogSurface
+from app.ui.gamenight import GameNightFlow
+from app.ui.pilotflow import PilotFlow
 from app.ui.runflow import (  # noqa: F401 - re-exported for tests/facade
     RunFlow, _DONE_COPY, _install_done_copy, _install_start_copy,
     _install_task_status, _run_header_line, _run_outcome_word,
@@ -71,7 +75,7 @@ from app.ui.base import (ThemedModal, Tooltip, _themed_askyesno,
 from app.ui.dialogs.registry import open_dialog
 from app.ui.theme import (
     COLORS, ICON_CHIP, ICON_CONTROL, ICON_NAV, PAGE_GUTTER, SPACE_1, SPACE_2,
-    SPACE_3, SPACE_4, TAB_ACCENTS, TYPE, _TAB_STATUS, _hex_lerp,
+    SPACE_3, SPACE_4, TAB_ACCENTS, TYPE, _hex_lerp,
     _round_rect_points, icon_target_px, scaled_photo, ui_scale,
 )
 from app.ui.metrics import (
@@ -97,13 +101,10 @@ from app.ui.tabs.healthtab import HealthTab
 from app.self_update import UPDATE_REPO
 
 
-# DESIGN AUDIT (2026-10): _TAB_STATUS now lives in app/ui/theme.py, next to
-# TAB_ACCENTS, and is re-exported here. It was defined twice -- once here and
-# once in theme.py, byte-identical and neither reading the other -- and it now
-# also has a second consumer (TaskTab's Tweak status line), which is exactly
-# the situation two copies drift in. theme.py is the bottom of the UI layering,
-# so both the shell (this file, re-exported for app/gui.py) and the tab pages
-# can read one table. Do NOT re-define it here: this import is the binding.
+# DESIGN AUDIT 2026-11 (G-003): the per-tab status table is gone. It held one
+# empty string per destination, so a tab WITH an entry and a tab WITHOUT one
+# were indistinguishable; the band is cleared on every switch instead (see
+# _show_tab), which is the whole of the rule.
 
 #: Displayed size of the per-tab icon that sits inline with the pill
 #: switcher. DESIGN AUDIT (2026-10): was 72px in a band of its own, which
@@ -137,8 +138,12 @@ _CORNER_FALLBACK = {"automaint": "🛠️", "exports": "📋"}
 #: label and the drive chips, and 24px there competes with the drive readout.
 STATUS_ICON_PX = ICON_CHIP
 
+#: Held status while the main window waits for UAC / the elevated copy.
+_ELEVATION_WAITING_STATUS = (
+    "Waiting for elevation… click Yes on the UAC prompt, then wait.")
 
-class Application(LogSurface, RunFlow, TrayControls):
+
+class Application(LogSurface, RunFlow, TrayControls, PilotFlow, GameNightFlow):
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(APP_NAME)
@@ -209,6 +214,12 @@ class Application(LogSurface, RunFlow, TrayControls):
         # actually rely on.
         self._tray_ping_busy = False
         self._tray_speedtest_busy = False
+        # One elevation attempt at a time. The Limited badge stays clickable
+        # while the 90 s handshake runs, and a second click used to start a
+        # second UAC prompt / a second wait thread over the first. Guard the
+        # attempt itself rather than only the badge, so the warning's Retry
+        # action is covered by the same rule.
+        self._elevation_in_flight = False
         # N-006: one quiet-watch tick at a time. Not a lock: a tick that finds
         # the previous one still reading the Task Scheduler is simply skipped,
         # and the next one is thirty seconds away.
@@ -256,22 +267,40 @@ class Application(LogSurface, RunFlow, TrayControls):
             self._build_main_ui()
         else:
             # Gate triage (auto-elevate project): the Gate only earns its
-            # screen when it can change something. remember_limited (and
-            # not auto_elevate, which wins) or a selection with no admin
-            # tasks -> straight to limited mode, no interrogation. An
-            # opted-in auto_elevate whose task is broken still shows the
-            # Gate (with its notice line) — approving once more repairs it.
+            # screen when it can change something — i.e. the saved
+            # selection actually contains admin tasks. Two answers the old
+            # order got wrong, both reported as "the prompt never shows":
+            #   * remember_limited ("Don't show this again") used to win
+            #     over everything, so a user who skipped once and later
+            #     checked admin-only repairs watched them silently skip in
+            #     limited mode. It now only skips when the selection does
+            #     NOT need admin.
+            #   * a fresh install has no saved selection, so needs_admin
+            #     is False and the Gate was skipped on first launch too —
+            #     the user never learned the choice existed. No saved
+            #     selection + no opt-out now shows the Gate once.
+            # auto_elevate wins over remember_limited on every read path.
+            # An opted-in auto_elevate whose task is broken still shows
+            # the Gate (with its notice line) — approving once more
+            # repairs it.
             _show_gate = True
             _elevate_pending = False
             try:
                 from app import elevated_launch as _el
                 from app.config_persist import load_config as _load_cfg2
                 _cfg2 = _load_cfg2()
-                if bool(_cfg2.get("remember_limited", False)) \
-                        and not bool(_cfg2.get("auto_elevate", False)):
-                    _show_gate = False
-                elif not _el.saved_selection_needs_admin():
-                    _show_gate = False
+                _needs_admin = _el.saved_selection_needs_admin()
+                _sel = _cfg2.get("selected_tasks")
+                _has_selection = isinstance(_sel, dict) and any(
+                    bool(v) for v in _sel.values())
+                _opted_out = bool(_cfg2.get("remember_limited", False)) \
+                    and not bool(_cfg2.get("auto_elevate", False))
+                # Ship-hardening: triage lives in elevated_launch.decide_gate
+                # (pure, pinned by tests) so the fresh-profile and
+                # remember_limited fixes cannot drift apart again.
+                _show_gate = _el.decide_gate(_needs_admin, _has_selection,
+                                             _opted_out)
+                if not _show_gate:
                     try:
                         _elevate_pending = bool(_cfg2.get("auto_elevate", False)) \
                             and _el.notice_for_gate() is not None
@@ -297,6 +326,25 @@ class Application(LogSurface, RunFlow, TrayControls):
         # second launch pulses our show-event instead of opening a twin —
         # surface here when it arrives. Best-effort, self-rescheduling.
         self._start_single_instance_poll()
+
+        # Elevation second handshake: the old window exits only after this
+        # arrives, so a crash between the early startup signal and a live
+        # window no longer leaves the user with nothing open. Delayed past
+        # __init__ so "ready" means the event loop is actually pumping, not
+        # just constructed; strict no-op unless this IS the elevated relaunch
+        # child (see signal_elevated_ready). Best-effort, never raises.
+        try:
+            self.root.after(2000, self._signal_elevated_ready_once)
+        except Exception:
+            pass
+
+    def _signal_elevated_ready_once(self):
+        try:
+            from app.elevation import signal_elevated_ready
+            signal_elevated_ready()
+        except Exception:
+            pass
+
 
     def _start_single_instance_poll(self):
         """Begin the show-event watcher (see app/single_instance). A second
@@ -979,6 +1027,7 @@ class Application(LogSurface, RunFlow, TrayControls):
                                      height=30)
         self.status_lbl.pack(fill="x", expand=True, pady=(HAIRLINE_NUDGE, HAIRLINE_NUDGE))
         self._status_fade_ids = []
+        self._status_hold = False
         # drive chips (user request): one clickable chip per local drive /
         # USB stick, color-coded by fill level; click opens it in Explorer.
         # Up to MAX_INLINE_CHIPS inline; the rest live behind a "+N ▾" menu.
@@ -1231,12 +1280,10 @@ class Application(LogSurface, RunFlow, TrayControls):
         # "pick a preset and press Run" on the Install and Tools tabs, which
         # have neither a preset card nor a Run button.
         #
-        # It now reads from _TAB_STATUS like every other tab switch does, so
-        # there is exactly one table and one rule. _show_tab has already run
-        # for "Clean" and set the same value, so this is now a no-op in the
-        # happy path; it is kept as an explicit initializer for the rebuild
-        # path (where _show_tab is not called) rather than left to chance.
-        self.set_status(_TAB_STATUS.get(self.active_tab, ""))
+        # The band starts empty, exactly as _show_tab leaves it on every
+        # switch. Kept as an explicit initializer for the rebuild path
+        # (where _show_tab is not called) rather than left to chance.
+        self.set_status("")
 
         # Read the real scheduler state back into config in the background.
         # Settings used to do this synchronously in its constructor.
@@ -2120,7 +2167,7 @@ class Application(LogSurface, RunFlow, TrayControls):
         # while _busy, but the initial show and any future caller may not.
         if not getattr(self, "_busy", False):
             try:
-                self.set_status(_TAB_STATUS.get(name, ""))
+                self.set_status("")
             except Exception:
                 pass
         # progress strip may not exist yet during the initial build
@@ -2207,13 +2254,11 @@ class Application(LogSurface, RunFlow, TrayControls):
         open_dialog(self, "process_manager")
 
     # ---------------- Game Session Auto-Pilot (feature 6) ---------------- #
-    # The watcher thread lives only while the GUI runs (started here on
-    # boot when enabled, stopped on close/toggle-off). Detection and
-    # state live in app/session_pilot.py (headless-tested); THESE methods
-    # are the GUI half: resolve preset tasks, call run_tasks, toast, and
-    # repaint the dialog's live line when it's open. run_tasks itself is
-    # async + thread-safe by design (worker + Tk hops), so the watcher
-    # thread only ever schedules after() hops — never touches widgets.
+    # The GUI half (watchlist build, catalog sweep, apply/revert) now lives
+    # in app/ui/pilotflow.py (PilotFlow, mixed in as a base). Detection and
+    # session state live in app/session_pilot.py, headless and tested; the
+    # orchestrator that owns the queue is app/ui/session.py. This opener is
+    # the only Pilot code left in the composition root.
 
     def _open_pilot_dialog(self):
         """Opens the pilot dialog. See app/ui/dialogs/registry.py."""
@@ -2274,7 +2319,18 @@ class Application(LogSurface, RunFlow, TrayControls):
         """Limited-mode badge click: same UAC relaunch AdminGateFrame uses,
         just reachable after that first screen is already gone. Confirms
         first — this restarts the whole app, so an accidental click must
-        not surprise anyone mid-task."""
+        not surprise anyone mid-task.
+
+        A click while an attempt is already waiting is a no-op: the first
+        attempt owns the UAC prompt and the wait thread. Re-assert the held
+        status instead of asking the confirmation question again.
+        """
+        if getattr(self, "_elevation_in_flight", False):
+            try:
+                self.set_status(_ELEVATION_WAITING_STATUS, hold=True)
+            except Exception:
+                pass
+            return
         if not _themed_askyesno(
                 self.root, "Restart as Administrator?",
                 "This closes Cleaner Tool and reopens it with "
@@ -2283,18 +2339,66 @@ class Application(LogSurface, RunFlow, TrayControls):
                 "Limited mode will then work.",
                 accent=COLORS["accent_yellow"]):
             return
-        if not relaunch_as_admin():
+        self._attempt_restart_elevated()
+
+    def _attempt_restart_elevated(self):
+        """Start one elevation attempt and watch for the new window.
+
+        Split from the badge handler so the timeout warning's Retry
+        Elevation button can go straight back to the UAC prompt. It does not
+        ask the confirmation question again: clicking Retry already
+        answered it.
+
+        The in-flight guard covers both entry points. Tk is single-threaded,
+        so setting it before the blocking `relaunch_as_admin()` call is
+        enough to make a second badge click (or a stuck Retry) a no-op.
+        """
+        if getattr(self, "_elevation_in_flight", False):
+            return
+        self._elevation_in_flight = True
+        try:
+            launched = relaunch_as_admin()
+        except Exception:
+            launched = False
+        if not launched:
+            self._elevation_in_flight = False
             _themed_showerror(
                 self.root, "Elevation Failed",
                 "Nothing has changed. You can keep using Limited mode.")
             return
 
+        # The gate has always said this while its buttons are disabled; the
+        # main window's retry path showed nothing at all. Hold it past the
+        # four-second status fade because the elevated copy can take most of
+        # the 90 s budget to unpack and open, and "nothing happened" is the
+        # exact impression that makes users retry into a second UAC prompt.
+        try:
+            self.set_status(_ELEVATION_WAITING_STATUS, hold=True)
+        except Exception:
+            pass
+
         def _wait_thread():
-            from app.elevation import wait_for_elevated_process
+            from app.elevation import (
+                _read_pending_token,
+                wait_for_elevated_process,
+                wait_for_elevated_ready,
+            )
+            expected = _read_pending_token()
             success = wait_for_elevated_process(timeout=60.0)
+            ready = bool(success) and wait_for_elevated_ready(
+                timeout=30.0, expected_token=expected)
 
             def _on_done():
-                if success:
+                # This attempt is finished, so a later badge click/Retry may
+                # start a fresh one. Release before painting either outcome:
+                # ready destroys the window, and a warning must not sit
+                # behind a stale "Waiting…".
+                self._elevation_in_flight = False
+                try:
+                    self.set_status("")
+                except Exception:
+                    pass
+                if ready:
                     try:
                         self.root.destroy()
                     except Exception:
@@ -2302,10 +2406,43 @@ class Application(LogSurface, RunFlow, TrayControls):
                     sys.exit(0)
                 else:
                     try:
-                        _themed_showwarning(
-                            self.root, "Elevation Cancelled",
-                            "If an elevated window opened, use that one and "
-                            "close this.\n\nOtherwise nothing has changed.")
+                        from app.diagnostics import (
+                            copy_startup_log_path as _copy_startup_log_path,
+                            open_startup_log as _open_startup_log,
+                            startup_log_path as _startup_log_path,
+                            startup_log_preview as _startup_log_preview,
+                        )
+                        _log = _startup_log_path()
+                        if success:
+                            _preview = _startup_log_preview()
+                            _themed_showwarning(
+                                self.root, "Elevated Window Did Not Appear",
+                                "The elevated copy started but never finished "
+                                "opening — it likely crashed on startup. "
+                                "This window was kept open so nothing is lost. "
+                                "If an elevated window is actually open, use "
+                                "that one and close this. Otherwise click "
+                                "Retry Elevation to try again, or attach this "
+                                "log when reporting the issue: " + _log,
+                                retry_text="Retry Elevation",
+                                retry_command=self._attempt_restart_elevated,
+                                secondary_text="Open Log",
+                                secondary_command=lambda: _open_startup_log(
+                                    self.root),
+                                extra_actions=[
+                                    ("Copy Path",
+                                     lambda: _copy_startup_log_path(
+                                         self.root),
+                                     "Copied")],
+                                detail_text=_preview)
+                        else:
+                            _themed_showwarning(
+                                self.root, "Elevation Cancelled",
+                                "If an elevated window opened, use that one and "
+                                "close this. Otherwise nothing has changed; "
+                                "click Retry Elevation to try again.",
+                                retry_text="Retry Elevation",
+                                retry_command=self._attempt_restart_elevated)
                     except Exception:
                         pass
             # MED-014: was `self.root.after(0, _on_done)` from the waiting
@@ -2313,170 +2450,25 @@ class Application(LogSurface, RunFlow, TrayControls):
             # completes and you are left with TWO main windows - the exact bug
             # the comment above this block claims to have fixed.
             self._dispatch.post(_on_done)
-        threading.Thread(target=_wait_thread, daemon=True).start()
+        try:
+            threading.Thread(target=_wait_thread, daemon=True).start()
+        except Exception:
+            # A failed thread start must not leave the badge permanently
+            # inert or the held status stuck on screen.
+            self._elevation_in_flight = False
+            try:
+                self.set_status("")
+            except Exception:
+                pass
+            _themed_showerror(
+                self.root, "Elevation Failed",
+                "The background wait ended before it began. "
+                "Nothing has changed.")
 
     def _open_game_server_ping(self):
         """Opens the game_server_ping dialog. See app/ui/dialogs/registry.py."""
         open_dialog(self, "game_server_ping")
 
-    # ---------------- Game Night (feature 9) ---------------- #
-    # One press to get the PC ready to play, one press to put it back.
-    # Deliberately built on the same two rules Session Pilot already
-    # proved out (see _pilot_apply / _pilot_revert):
-    #   * apply and revert go through run_tasks(), so cancel, the Admin
-    #     Gate, snapshots and applied-tweak bookkeeping all behave as
-    #     normal — there is no second code path that changes Windows
-    #   * only tweaks Game Night itself turned on are reverted at the
-    #     end. Anything the user already had applied is left alone,
-    #     because undoing it would undo their own setup, not ours
-
-    def _game_night_tasks(self):
-        """Task objects for the Game Session preset. [] if none resolve."""
-        try:
-            from app.game_night import preset_task_keys
-            keys = preset_task_keys()
-            by_key = {t.key: t for t in TABS.get("Tweak", [])}
-            return [by_key[k] for k in keys if k in by_key]
-        except Exception:
-            return []
-
-    def _game_in_progress(self):
-        """True when the Auto-Pilot watcher currently sees a game running.
-
-        Used only to decide whether the run may pop a scorecard: a modal
-        window over someone's fullscreen game is hostile, so a Game Night
-        pressed mid-session reports through the log and a toast instead."""
-        try:
-            pilot = getattr(self, "_pilot", None)
-            # active_hit is a PROPERTY on SessionPilot (the exe name, or
-            # None when idle) — calling it would raise, and the except
-            # below would quietly turn that into "no game running".
-            return bool(pilot is not None and pilot.active_hit)
-        except Exception:
-            return False
-
-    def start_game_night(self, quiet=None):
-        """Apply the Game Session preset and remember what we turned on.
-
-        quiet=None (default) preserves the old contract: a modal scorecard
-        unless a game is already in progress. The tray passes quiet=True
-        explicitly — a tray click may come from inside a game, so it never
-        risks a modal over it (one state toast instead)."""
-        tasks = self._game_night_tasks()
-        if not tasks:
-            self.set_status("Game Night: no gaming tweaks available.")
-            if quiet:
-                self._toast_async("Game Mode", "No gaming settings available.")
-            return
-        runnable = list(tasks)
-        if not is_admin():
-            # Limited mode: run what needs no admin rather than refusing
-            # outright, and say so — the session still gets most of it.
-            runnable = [t for t in tasks if not t.admin_required]
-            if len(runnable) != len(tasks):
-                self.log("Game Night: not running as Administrator — "
-                         f"applying {len(runnable)} of {len(tasks)} settings.")
-        if not runnable:
-            self.set_status("Game Night needs Administrator for these settings.")
-            if quiet:
-                self._toast_async("Game Mode needs admin",
-                                  "Restart as Administrator to turn it on.")
-            return
-        # Fresh keys only (the pilot's rule): tweaks already applied before
-        # this press stay applied when Game Night ends.
-        try:
-            before = set(get_tweak_state() or {})
-        except Exception:
-            before = set()
-        fresh = [t.key for t in runnable if t.key not in before]
-        try:
-            from app.config_persist import set_game_night
-            set_game_night(True, fresh)
-            # Stay-awake activates only once the session is actually
-            # recorded active (matches end_game_night's unconditional
-            # release below — the UI only ever calls end_game_night after
-            # a successful start, so these stay balanced).
-            self._set_stay_awake(True)
-        except Exception:
-            pass
-        # Optional background quieting — only apps the user switched on.
-        try:
-            from app.config_persist import get_game_night
-            from app.game_night import close_apps
-            chosen = get_game_night().get("close_apps") or []
-            if chosen:
-                self.log("Game Night: asking the apps you picked to close…")
-                closed = close_apps(chosen, log=self.log)
-                if closed:
-                    self.log("Game Night: closed " + ", ".join(closed) + ".")
-        except Exception:
-            pass
-        quiet = self._game_in_progress() if quiet is None else bool(quiet)
-        try:
-            self.log("===== Game Night: getting your PC ready to play =====")
-            self.run_tasks("Tweak", runnable, mode="run", quiet=quiet,
-                           toast_kind=("gm_on" if quiet else None),
-                           toast_extra={"admin_missing": len(tasks) - len(runnable)})
-        except Exception:
-            pass
-        self._refresh_pilot_dialog_manual_btn()
-
-    def end_game_night(self, quiet=None):
-        """Put back exactly the tweaks Game Night turned on.
-
-        quiet=None preserves the old auto contract; the tray passes
-        quiet=True explicitly (same no-modal-over-games rationale)."""
-        # Unconditional (covers the "already back" early-return path too):
-        # matches the single _set_stay_awake(True) in start_game_night, so
-        # the reference count stays balanced regardless of which path this
-        # takes. Only end_game_night ever calls this — never a bare
-        # decrement anywhere else for the manual session.
-        self._set_stay_awake(False)
-        try:
-            from app.config_persist import get_game_night, set_game_night
-            saved = list(get_game_night().get("keys") or [])
-        except Exception:
-            saved = []
-        if not saved:
-            try:
-                set_game_night(False)
-            except Exception:
-                pass
-            self.set_status("Game Night ended — your settings were already back.")
-            if quiet:
-                self._toast_async("Game Mode off", "Normal settings are back.")
-            return
-        # Intersect with what is STILL applied: the user may have undone
-        # some of it manually in the meantime, and reverting a tweak that
-        # is already off is both pointless and confusing in the log.
-        try:
-            current = set(get_tweak_state() or {})
-        except Exception:
-            current = set()
-        keys = [k for k in saved if k in current]
-        try:
-            by_key = {t.key: t for t in TABS.get("Tweak", [])}
-            tasks = [by_key[k] for k in keys
-                     if k in by_key and by_key[k].revert is not None]
-        except Exception:
-            tasks = []
-        try:
-            set_game_night(False)
-        except Exception:
-            pass
-        if not tasks:
-            self.set_status("Game Night ended — your settings were already back.")
-            if quiet:
-                self._toast_async("Game Mode off", "Normal settings are back.")
-            return
-        quiet = self._game_in_progress() if quiet is None else bool(quiet)
-        try:
-            self.log("===== Game Night: putting your settings back =====")
-            self.run_tasks("Tweak", tasks, mode="revert", quiet=quiet,
-                           toast_kind=("gm_off" if quiet else None))
-        except Exception:
-            pass
-        self._refresh_pilot_dialog_manual_btn()
 
     def _refresh_pilot_dialog_manual_btn(self):
         """If Auto-Pilot's dialog (where the merged Game Night controls now
@@ -2592,322 +2584,6 @@ class Application(LogSurface, RunFlow, TrayControls):
         """Opens the game_readiness dialog. See app/ui/dialogs/registry.py."""
         open_dialog(self, "game_readiness")
 
-    def _pilot_preset_tasks(self):
-        """Task objects for the configured session preset (tolerant:
-        unknown preset names / stale keys degrade to Game Session, then
-        to whatever resolves — never raise)."""
-        try:
-            from app.config_persist import load_config as _load
-            want = _load().get("session_pilot_preset", "Game Session")
-        except Exception:
-            want = "Game Session"
-        try:
-            presets = PRESETS.get("Tweak", {})
-            keys = presets.get(want) or presets.get("Game Session", [])
-            by_key = {t.key: t for t in TABS.get("Tweak", [])}
-            tasks = [by_key[k] for k in keys if k in by_key]
-            if tasks:
-                return tasks
-            return [by_key[k] for k in presets.get("Game Session", [])
-                    if k in by_key]
-        except Exception:
-            return []
-
-    def _pilot_ensure(self):
-        """(Re)build the pilot object from current config (called on
-        boot, toggle-on, and watchlist edits — cheap, idempotent).
-
-        Phase-5 watchlist assembly (3 layers):
-          1. built-in famous-title basenames (legacy contract)
-          2. user picks — full PATHS when known (path-verified matching:
-             a same-named exe in another folder never fires), bare names
-             for legacy entries
-          3. 'watch all installed games' (opt-in): every game found by
-             app.game_catalog — resolved FRESH so a newly installed game
-             is picked up on the next toggle/start, never a stale cache.
-             Unresolvable-exe games contribute their folder's plausible
-             exes as bare names (heuristic already filtered
-             redists/launchers at catalog level).
-
-        Flicker fix (user bug report): layer 3 is a DISK SWEEP and used
-        to run synchronously here — on a big library that froze the Tk
-        thread for seconds on toggle/boot. Now the pilot builds + starts
-        immediately on layers 1-2 (fast, config-only) and layer 3 merges
-        in from a worker thread (generation-guarded, see below)."""
-        # H15: the queue and its pump belong to SessionOrchestrator, which
-        # starts them idempotently and — unlike the pre-H15
-        # `_pilot_pump_started` bool — can stop them again.
-        self._pilot_sess.ensure_pump()
-        try:
-            from app.config_persist import load_config as _load
-            from app.session_pilot import (SessionPilot,
-                                           normalize_exe)
-            cfg = _load()
-            watched = self._pilot_watched_fast(cfg, normalize_exe)
-            # dedupe: a game both hand-picked AND watch-all must not
-            # double-register (set() at the pilot level handles it)
-            old = getattr(self, "_pilot", None)
-            try:
-                if old is not None:
-                    old.stop()
-            except Exception:
-                pass
-            # The watcher gets the orchestrator's queue producers directly:
-            # they are the only two methods it is allowed to call, and they
-            # do nothing but queue.put (no cross-thread Tcl, ever).
-            pilot = SessionPilot(
-                watched=watched,
-                on_apply=self._pilot_sess.post_apply,
-                on_revert=self._pilot_sess.post_revert)
-            self._pilot = pilot
-            if cfg.get("session_pilot_watch_all"):
-                self._pilot_merge_catalog(pilot)
-        except Exception:
-            pass
-
-    @staticmethod
-    def _pilot_watched_fast(cfg, normalize_exe):
-        """Layers 1-2: built-ins + user picks. Pure config, no disk —
-        safe on the Tk thread."""
-        try:
-            from app.session_pilot import KNOWN_GAME_EXES
-        except Exception:
-            return []
-        watched = list(KNOWN_GAME_EXES)
-        # user picks: paths stay paths (dir-pinned), names stay names
-        for g in cfg.get("session_pilot_games", []) or []:
-            try:
-                n = normalize_exe(g)
-                if n:
-                    watched.append(n)
-            except Exception:
-                pass
-        for pth in cfg.get("session_pilot_paths", []) or []:
-            if isinstance(pth, str) and pth.strip():
-                watched.append(pth)
-        return watched
-
-    def _pilot_merge_catalog(self, pilot):
-        """Worker-thread layer-3 sweep: enumerate installed games off the
-        Tk thread, then merge into the LIVE pilot via a Tk-thread poll.
-        Generation-guarded: if the pilot was replaced/stopped meanwhile
-        (rapid toggles, app closing), the stale result is dropped instead
-        of resurrecting dead state. A game already running when the merge
-        lands is caught by the next 15s poll.
-
-        Threading contract (measured 2026-09): worker threads NEVER call
-        Tk here — not even winfo_exists/after (a refused foreign Tk call
-        burns ~1s then raises). The worker writes a plain holder dict;
-        the poller below (Tk thread, scheduled by the caller on the Tk
-        thread) publishes."""
-        try:
-            import threading as _th
-        except Exception:
-            return
-        try:
-            seq = getattr(self, "_merge_seq", 0) + 1
-        except Exception:
-            seq = 1
-        self._merge_seq = seq
-        holder = {"done": False, "extra": []}
-
-        def _run():
-            extra = []
-            try:
-                from app.game_catalog import installed_games
-                for g in installed_games() or []:
-                    gp = (g.get("path") or "").strip()
-                    if gp:
-                        extra.append(gp)
-                        continue
-                    folder = (g.get("folder") or "").strip()
-                    try:
-                        import glob as _glob
-                        lvl1 = _glob.glob(os.path.join(folder, "*.exe"))
-                        lvl2 = _glob.glob(
-                            os.path.join(folder, "*", "*.exe"))
-                        for cand in (lvl1 + lvl2)[:6]:
-                            extra.append(os.path.basename(cand))
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            try:
-                holder["extra"] = extra
-            except Exception:
-                pass
-            try:
-                holder["done"] = True
-            except Exception:
-                pass
-
-        try:
-            _th.Thread(target=_run, daemon=True,
-                       name="PilotCatalogMerge").start()
-        except Exception:
-            return
-        try:
-            self.root.after(
-                150, lambda: self._check_merge(pilot, holder, seq))
-        except Exception:
-            pass
-
-    def _check_merge(self, pilot, holder, seq):
-        """Tk-thread poller for one catalog sweep. Drops superseded
-        results (newer ensure bumped the sequence), re-arms while the
-        sweep flies, lands exactly once."""
-        try:
-            if getattr(self, "_merge_seq", 0) != seq:
-                return              # superseded — drop silently
-        except Exception:
-            return
-        try:
-            if not self.root.winfo_exists():
-                return
-        except Exception:
-            return
-        try:
-            done = holder.get("done")
-        except Exception:
-            return
-        if not done:
-            try:
-                self.root.after(
-                    150, lambda: self._check_merge(pilot, holder, seq))
-            except Exception:
-                pass
-            return
-        self._land_catalog(pilot, holder.get("extra") or [])
-
-    def _land_catalog(self, pilot, extra):
-        """Tk thread: merge a swept catalog into the pilot IFF it is
-        still the current one (else drop — superseded or stopped)."""
-        try:
-            if not extra:
-                return
-            if getattr(self, "_pilot", None) is not pilot:
-                return
-            try:
-                from app.config_persist import load_config as _load
-                from app.session_pilot import normalize_exe
-                cfg = _load()
-            except Exception:
-                return
-            # rebuild from CURRENT config (a pick made mid-sweep must
-            # survive) + the swept layer, then swap atomically-ish
-            # (single set_watched call; a concurrent poll may use mixed
-            # tables for one tick at most — self-heals next poll)
-            watched = self._pilot_watched_fast(cfg, normalize_exe)
-            watched.extend(extra)
-            try:
-                pilot.set_watched(watched)
-            except Exception:
-                pass
-            try:
-                self.log("Game Session Auto-Pilot: installed-games "
-                         "watchlist merged.")
-            except Exception:
-                pass
-        except Exception:
-            pass
-
-    def _pilot_start(self):
-        try:
-            self._pilot_ensure()
-            if self._pilot is not None:
-                self._pilot_sess.start()
-                self.log("Game Session Auto-Pilot: watching for game launches.")
-                # one-time notice when watch-all is active (the new-config
-                # default): the auto-detection sweep is disclosed, never a
-                # surprise — and points at the exact switch that turns it off.
-                try:
-                    from app.config_persist import load_config as _lc
-                    if _lc().get("session_pilot_watch_all"):
-                        if not getattr(self, "_pilot_watchall_notice_shown", False):
-                            self._pilot_watchall_notice_shown = True
-                            self.set_status(
-                                "Auto-Pilot is watching your installed games — "
-                                "open the Auto-Pilot dialog to narrow the list.")
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    def _pilot_stop(self):
-        # Stopping NEVER reverts: the user may still be playing, and app
-        # close must be side-effect free. Applied tweaks stay badged
-        # until Undo reverts them (said plainly in the dialog).
-        try:
-            # The stay-awake hold is released by _pilot_revert, and stopping
-            # never reverts. Release it here when a session is live, or the
-            # display/sleep stay suppressed for the rest of the process (the
-            # user's PC "never sleeps" after turning Auto-Pilot off mid-game).
-            _was_active = self._pilot_state is SessionState.ACTIVE
-            # H15: also cancels the pump's pending after(). Pre-H15 the
-            # 50ms drain loop rescheduled itself for the rest of the app's
-            # life even with the feature switched off.
-            self._pilot_sess.stop()
-            if _was_active:
-                self._set_stay_awake(False)
-            self.log("Game Session Auto-Pilot: stopped watching.")
-        except Exception as exc:
-            from app.utils import log_or_swallow
-            log_or_swallow(None, "ui.pilot_stop", exc)
-
-    def _pilot_refresh_watchlist(self):
-        """User added/removed an .exe: rebuild the watchlist live."""
-        try:
-            running = self._pilot_sess.is_running()
-            self._pilot_ensure()
-            if running:
-                self._pilot_sess.start()
-        except Exception:
-            pass
-
-    # ------------------------------------------------------------------ #
-    # H15 forwarders. Each of these used to carry the logic; they now hand
-    # off to SessionOrchestrator, which is the only thing that should own
-    # the Auto-Pilot's state. Kept as named properties because this file
-    # addresses them by name.
-    # ------------------------------------------------------------------ #
-    @property
-    def _pilot(self):
-        return self._pilot_sess.pilot
-
-    @_pilot.setter
-    def _pilot(self, value):
-        self._pilot_sess.pilot = value
-
-
-    @property
-    def _pilot_applied_keys(self) -> list:
-        return self._pilot_sess.applied_keys
-
-    @_pilot_applied_keys.setter
-    def _pilot_applied_keys(self, value):
-        self._pilot_sess.applied_keys = value
-
-    @property
-    def _pilot_fresh_keys(self) -> list:
-        return self._pilot_sess.fresh_keys
-
-    @_pilot_fresh_keys.setter
-    def _pilot_fresh_keys(self, value):
-        self._pilot_sess.fresh_keys = value
-
-    @property
-    def _pilot_state(self) -> SessionState:
-        return self._pilot_sess.state
-
-    def _pilot_sink(self, text, color=None):
-        """Live line repaint for the open pilot dialog (no-op closed)."""
-        try:
-            dlg = getattr(self, "_pilot_dialog", None)
-            if dlg is not None:
-                dlg.set_live_status(text, color)
-        except Exception:
-            pass
-
     def _modal_open(self):
         """True while any themed popup is up (a dialog is open).
 
@@ -2982,200 +2658,6 @@ class Application(LogSurface, RunFlow, TrayControls):
                         ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)
                 else:
                     ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
-        except Exception:
-            pass
-
-    def _pilot_apply(self, hits):
-        """Tk thread: apply the session preset (or defer quietly if the
-        user is mid-run — the pilot retries nothing; the session simply
-        runs untweaked and the exit path no-ops via registry check)."""
-        # Stay-awake covers every path below (busy/modal/no-tasks included)
-        # — a game IS being played the moment this fires, whether or not
-        # any tweak actually landed. session_pilot.py's own state machine
-        # guarantees this fires exactly once per idle->active transition
-        # (see _poll: only when leaving "idle"), so this can never
-        # over-increment from a single session.
-        self._set_stay_awake(True)
-        try:
-            tasks = self._pilot_preset_tasks()
-        except Exception:
-            tasks = []
-        # H15: a detection IS an active session even when nothing could be
-        # applied — the user is playing, which is what the state means.
-        self._pilot_sess.note_session_active(True)
-        if not tasks:
-            return
-        busy = False
-        try:
-            with self._busy_lock:
-                busy = self._busy
-        except Exception:
-            pass
-        # flicker fix: registry check (see _pilot_ui_free) — the old
-        # grab_current() read False during any open dialog's dropdown
-        modal = ThemedModal.any_open()
-        runnable = list(tasks)
-        if not is_admin():
-            # limited mode: only what needs no admin, SILENTLY (a
-            # background trigger must never pop the "Skipped N Admin-Only
-            # Tasks" notice over someone's game — run_tasks would do that)
-            runnable = [t for t in tasks if not t.admin_required]
-        # Module-8: intent must reflect what will actually run — capturing
-        # applied_keys pre-filter claimed admin tweaks the limited-mode run
-        # never applied, leaving revert overbroad (saved only by the live
-        # registry intersection downstream).
-        try:
-            self._pilot_applied_keys = [t.key for t in runnable]
-        except Exception:
-            self._pilot_applied_keys = []
-        try:
-            # Fresh-keys only: exclude tweaks that were ALREADY applied
-            # before this session (the user may want those persistent —
-            # reverting them at session end would undo the user's own
-            # deliberate setup, not the pilot's work).
-            before = set(get_tweak_state() or {})
-        except Exception:
-            before = set()
-        try:
-            self._pilot_fresh_keys = [k for k in self._pilot_applied_keys
-                                      if k not in before]
-        except Exception:
-            self._pilot_fresh_keys = list(self._pilot_applied_keys)
-        if busy or modal or not runnable:
-            try:
-                self.log("Game Session Auto-Pilot: game detected "
-                         f"({(hits or ['?'])[0]}) but "
-                         + ("a run is active — session runs untweaked."
-                            if busy else
-                            ("a dialog is open — session runs untweaked."
-                             if modal else
-                             "no runnable tweaks in limited mode — session runs untweaked.")))
-            except Exception:
-                pass
-            return
-        try:
-            self.log(f"Game Session Auto-Pilot: applying session preset for {(hits or ['?'])[0]}.")
-            self._pilot_sink(f"🎮 {(hits or ['?'])[0]} — session active",
-                             COLORS["accent_green"])
-            try:
-                import threading as _th
-                _th.Thread(target=show_toast,
-                           args=("🎮 Game Mode ON",
-                                 "Session tweaks applied — enjoy the game. "
-                                 "They restore automatically when you quit."),
-                           daemon=True).start()
-            except Exception:
-                pass
-            self.run_tasks("Tweak", runnable, mode="run", quiet=True)
-        except Exception:
-            pass
-
-    def _pilot_revert(self):
-        """Tk thread: revert ONLY fresh session keys still marked applied
-        (registry intersection). Excluded, and therefore never touched:
-        keys the run never managed to apply (busy-skip, failure,
-        user-undone mid-session) AND keys that were already applied
-        before the session (the user's persistent setup — reverting those
-        would undo deliberate choices, not pilot work). Silent when
-        there's nothing to do."""
-        # H15: the session is over as soon as reconciliation begins; the
-        # orchestrator's state is what the dialog and the tray read.
-        self._pilot_sess.note_session_active(False)
-
-        # Release stay-awake unconditionally (before the fresh-keys early
-        # return below) — the game session is over either way, whether or
-        # not there happen to be any tweaks left to put back.
-        self._set_stay_awake(False)
-        try:
-            fresh = list(getattr(self, "_pilot_fresh_keys", []) or [])
-        except Exception:
-            fresh = []
-        if not fresh:
-            return
-        # UI-freedom guard (user bug report + audit find): a revert that
-        # fires while a run owns the progress UI — or while ANY modal
-        # dialog is open — must not choreograph shared UI behind the
-        # user's context. Worse, run_tasks would pop an "already running" notice
-        # (possibly over a game) AND the revert would be lost. Skip with
-        # an honest log line instead; Undo Tweaks restores manually and
-        # the applied-badges stay truthful about what is still on.
-        # F01: intent is preserved (keys NOT cleared) so a later exit
-        # event can still revert; keys clear only on the runnable path.
-        _busy = False
-        try:
-            with self._busy_lock:
-                _busy = self._busy
-        except Exception:
-            pass
-        # flicker fix: registry check (see _pilot_ui_free) — the old
-        # grab_current() read False during any open dialog's dropdown
-        _modal = ThemedModal.any_open()
-        if _busy or _modal:
-            try:
-                self.log("Game Session Auto-Pilot: game closed but the UI is "
-                         "occupied (" + ("a run is active" if _busy else "a dialog is open") +
-                         ") — session tweaks stay applied; Undo Tweaks restores them.")
-            except Exception:
-                pass
-            try:
-                self._pilot_sink("● Watching…", TAB_ACCENTS["Tweak"])
-            except Exception:
-                pass
-            return
-        try:
-            current = set(get_tweak_state() or {})
-        except Exception:
-            current = set()
-        keys = [k for k in fresh if k in current]
-        if not keys:
-            try:
-                self._pilot_applied_keys = []
-                self._pilot_fresh_keys = []
-            except Exception:
-                pass
-            try:
-                self.log("Game Session Auto-Pilot: session ended — settings already restored.")
-            except Exception:
-                pass
-            try:
-                self._pilot_sink("● Watching…", TAB_ACCENTS["Tweak"])
-            except Exception:
-                pass
-            return
-        try:
-            by_key = {t.key: t for t in TABS.get("Tweak", [])}
-            tasks = [by_key[k] for k in keys
-                     if k in by_key and by_key[k].revert is not None]
-        except Exception:
-            tasks = []
-        if not tasks:
-            try:
-                self._pilot_applied_keys = []
-                self._pilot_fresh_keys = []
-            except Exception:
-                pass
-            return
-        try:
-            self.log("Game Session Auto-Pilot: game closed — restoring session tweaks.")
-            self._pilot_sink("Restoring settings…", COLORS["accent_yellow"])
-            try:
-                import threading as _th
-                _th.Thread(target=show_toast,
-                           args=("Game Mode OFF",
-                                 "Session tweaks restored to your normal settings."),
-                           daemon=True).start()
-            except Exception:
-                pass
-            self.run_tasks("Tweak", tasks, mode="revert", quiet=True)
-        except Exception:
-            pass
-        try:
-            self._pilot_applied_keys = []
-            self._pilot_fresh_keys = []
-        except Exception:
-            pass
-        try:
-            self._pilot_sink("● Watching…", TAB_ACCENTS["Tweak"])
         except Exception:
             pass
 
@@ -3384,7 +2866,8 @@ class Application(LogSurface, RunFlow, TrayControls):
 
         status_var = tk.StringVar(value="")
         tk.Label(modal.body, textvariable=status_var, bg=COLORS["bg"],
-                 fg=COLORS["accent_blue"], font=TYPE["caption"], wraplength=440,
+                 fg=COLORS["accent_blue"], font=TYPE["caption"],
+                 wraplength=modal.body_width(SPACE_2),
                  justify="center").pack(pady=(SPACE_1, 0))
 
         def refresh_status():
@@ -3743,7 +3226,19 @@ class Application(LogSurface, RunFlow, TrayControls):
         def _work():
             alerts = []
             try:
-                alerts = watch.check(drives=snapshot)
+                # The sample is also the runway baseline: one free-space
+                # reading every six hours (the module enforces the gap), so
+                # a forecast exists without opening Storage Insight first.
+                try:
+                    from app import storage_runway
+                    storage_runway.record()
+                except Exception:
+                    pass
+                try:
+                    startup = watch.startup_snapshot()
+                except Exception:
+                    startup = None
+                alerts = watch.check(drives=snapshot, startup=startup)
             except Exception:
                 alerts = []
             finally:

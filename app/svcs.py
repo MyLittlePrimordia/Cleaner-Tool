@@ -567,6 +567,53 @@ def pop_undo_record() -> bool:
         return False
 
 
+def undo_change(entry: dict) -> dict:
+    """Put ONE recorded startup-type change back (U-002).
+
+    The Safety centre lists every service change with its own Undo button,
+    not just the newest one. `undo_last_change()` is the stack operation; this
+    is the same write aimed at a row the user picked, so a service three
+    entries down is recoverable without undoing everything above it.
+
+    Only the matching record is dropped, and only after `apply_change`
+    reports success. A declined UAC prompt therefore leaves the record in
+    place for a retry. Never raises.
+    """
+    if not isinstance(entry, dict):
+        return {"ok": False, "cancelled": False, "name": None,
+                "error": "That undo record is unreadable."}
+    name = entry.get("name")
+    start = entry.get("start")
+    if not name or start not in _START_TYPES:
+        return {"ok": False, "cancelled": False, "name": name,
+                "error": "The saved previous setting is unusable."}
+    res = apply_change(name, start)
+    if res.get("ok"):
+        _drop_undo_entry(name, start)
+    return res
+
+
+def _drop_undo_entry(name: str, start: str) -> bool:
+    """Remove one matching service-change record, keeping the rest."""
+    try:
+        from app.config_persist import load_config, save_config
+        cfg = load_config()
+        log = cfg.get(_UNDO_KEY)
+        if not isinstance(log, list):
+            return False
+        for i in range(len(log) - 1, -1, -1):
+            rec = log[i]
+            if (isinstance(rec, dict) and rec.get("name") == name
+                    and rec.get("start") == start):
+                del log[i]
+                cfg[_UNDO_KEY] = log
+                save_config(cfg)
+                return True
+        return False
+    except Exception:
+        return False
+
+
 def undo_last_change() -> dict:
     """Put the most recent startup-type change back.
 

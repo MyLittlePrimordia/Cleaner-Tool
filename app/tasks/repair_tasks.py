@@ -12,6 +12,9 @@ from app.utils import (
     known_folder, atomic_write_text, resolve_exe, TaskSkipped,
 )
 from app.tasks.ps import ps_argv, run_ps, run_ps_checked
+from app.tasks.progress_mirror import (
+    CHKDSK_RULES, DISM_RULES, SFC_RULES, mirror_ctx,
+)
 
 _WINDIR = os.environ.get("WINDIR", "C:\\Windows")
 
@@ -28,34 +31,50 @@ _PAUSE_NOTE = (" DISM can hold one percentage for several minutes while it "
 def repair_sfc_scan(ctx: TaskContext):
     ctx.set_status("System File Checker: verifying every protected Windows "
                    "file. Verification is the slow phase and may pause.")
-    run_cmd_checked(ctx, "sfc /scannow", timeout=1800, success_codes=(0, 1))
+    live = mirror_ctx(ctx, "SFC", SFC_RULES)
+    run_cmd_checked(live, "sfc /scannow", timeout=1800, success_codes=(0, 1))
 
 
 def repair_dism_restorehealth(ctx: TaskContext):
     ctx.set_status("DISM RestoreHealth: repairing the component store"
                    " (downloads clean files from Windows Update if needed)."
                    + _PAUSE_NOTE)
-    run_cmd_checked(ctx, "DISM /Online /Cleanup-Image /RestoreHealth", timeout=1800,
+    # LTSC honesty: stripped images may have no local source and blocked WU,
+    # so DISM can legitimately fail here — say so up front, same run flow.
+    try:
+        from app.compat import edition_label, is_ltsc_edition
+        _ed = edition_label()
+        if _ed and is_ltsc_edition():
+            ctx.log(f"  {_ed}: no local component source is expected here; "
+                    "if DISM reports it cannot find source files, that is a "
+                    "missing-source result, not a crash — check the log.")
+    except Exception:
+        pass
+    live = mirror_ctx(ctx, "DISM", DISM_RULES)
+    run_cmd_checked(live, "DISM /Online /Cleanup-Image /RestoreHealth", timeout=1800,
                     success_codes=(0, 3010))
 
 
 def repair_dism_component_cleanup(ctx: TaskContext):
     ctx.set_status("DISM cleanup: removing superseded files from the WinSxS "
                    "component store (update rollback is kept)." + _PAUSE_NOTE)
-    run_cmd_checked(ctx, "DISM /Online /Cleanup-Image /StartComponentCleanup", timeout=900,
+    live = mirror_ctx(ctx, "DISM", DISM_RULES)
+    run_cmd_checked(live, "DISM /Online /Cleanup-Image /StartComponentCleanup", timeout=900,
                     success_codes=(0, 3010))
 
 
 def repair_dism_scanhealth(ctx: TaskContext):
     ctx.set_status("DISM ScanHealth: scanning the Windows image for "
                    "corruption (read-only)." + _PAUSE_NOTE)
-    run_cmd_checked(ctx, "DISM /Online /Cleanup-Image /ScanHealth", timeout=900, success_codes=(0, 3010))
+    live = mirror_ctx(ctx, "DISM", DISM_RULES)
+    run_cmd_checked(live, "DISM /Online /Cleanup-Image /ScanHealth", timeout=900, success_codes=(0, 3010))
 
 
 def repair_dism_checkhealth(ctx: TaskContext):
     ctx.set_status("DISM CheckHealth: asking whether the image already knows "
                    "it is damaged (read-only, fast).")
-    run_cmd_checked(ctx, "DISM /Online /Cleanup-Image /CheckHealth", timeout=600, success_codes=(0, 3010))
+    live = mirror_ctx(ctx, "DISM", DISM_RULES)
+    run_cmd_checked(live, "DISM /Online /Cleanup-Image /CheckHealth", timeout=600, success_codes=(0, 3010))
 
 
 def _system_drive_spec() -> str:
@@ -115,7 +134,10 @@ def repair_chkdsk_scan(ctx: TaskContext):
         if ctx.cancelled():
             raise TaskCancelled("Disk check of %s was cancelled by user." % drive)
 
-    rc = run_cmd(ctx, ["chkdsk", drive, "/scan"], shell=False, timeout=1800)
+    # U-006: the scan pass is the long pole (up to 30 min silent) — mirror
+    # its stage percents into the strip like the DISM/SFC wrappers above.
+    live = mirror_ctx(ctx, "chkdsk", CHKDSK_RULES)
+    rc = run_cmd(live, ["chkdsk", drive, "/scan"], shell=False, timeout=1800)
     _cancel_check()
     if rc == 0:
         ctx.log("VERDICT: %s scanned clean - no filesystem errors found." % drive)
@@ -132,12 +154,12 @@ def repair_chkdsk_scan(ctx: TaskContext):
 
     ctx.log("Filesystem errors were found on %s - repairing (spot fix)..." % drive)
     ctx.set_status("Repairing filesystem errors on %s..." % drive)
-    fix_rc = run_cmd(ctx, ["chkdsk", drive, "/spotfix"], shell=False,
+    fix_rc = run_cmd(live, ["chkdsk", drive, "/spotfix"], shell=False,
                      timeout=1800)
     _cancel_check()
     if fix_rc in (0, 1):
         ctx.set_status("Re-scanning %s to confirm the repair..." % drive)
-        again = run_cmd(ctx, ["chkdsk", drive, "/scan"], shell=False,
+        again = run_cmd(live, ["chkdsk", drive, "/scan"], shell=False,
                         timeout=1800)
         _cancel_check()
         if again == 0:
@@ -413,6 +435,13 @@ def repair_search_index(ctx: TaskContext):
             else:
                 for entry in os.scandir(index_db):
                     try:
+                        # B-003: a junction planted in the index dir must never
+                        # be traversed. is_dir(follow_symlinks=False) is not
+                        # sufficient on Windows, so check the reparse bit
+                        # explicitly like the hardened delete funnel does.
+                        if _is_reparse_point(entry.path):
+                            kept += 1
+                            continue
                         if entry.is_dir(follow_symlinks=False):
                             shutil.rmtree(entry.path, ignore_errors=False)
                         else:

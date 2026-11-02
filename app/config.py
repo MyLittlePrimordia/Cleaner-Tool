@@ -319,3 +319,24 @@ RISK_REBOOT = "REBOOT REQUIRED"
 # Irreversible removal of data the user may still want (Recycle Bin, captures,
 # uninstalled apps). Distinct from ADVANCED, which is reversible.
 RISK_DATA_LOSS = "DATA LOSS"
+
+# I-008: stringly-typed risk badges invited typos that silently dropped the
+# badge ("DATA LOSS" vs "DATA_LOSS"). Enum with str() compat; the module
+# constants above stay the canonical values so `==` checks keep working.
+from enum import Enum as _Enum
+
+
+class Risk(str, _Enum):
+    """Typed task risk. `str(Risk.SAFE) == RISK_SAFE`; `Risk("SAFE")` validates."""
+    SAFE = "SAFE"
+    ADVANCED = "ADVANCED"
+    REBOOT = "REBOOT REQUIRED"
+    DATA_LOSS = "DATA LOSS"
+
+    def __str__(self) -> str:  # keep f"{Risk.SAFE}" == "SAFE"
+        return str(self.value)
+
+
+#: All valid risk strings; `risk in RISK_VALUES` replaces ad-hoc == chains.
+RISK_VALUES = frozenset((RISK_SAFE, RISK_ADVANCED, RISK_REBOOT, RISK_DATA_LOSS))
+

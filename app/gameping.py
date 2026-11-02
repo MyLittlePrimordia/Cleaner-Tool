@@ -162,12 +162,10 @@ def _valve_targets(timeout=3.0):
     not as regional relays) if the API can't be reached — e.g. no
     internet, or steampowered.com blocked on this network."""
     try:
-        import urllib.request as _ur
-        import json as _json
+        from app.http_json import get_json
         url = ("https://api.steampowered.com/ISteamDirectory/"
                "GetCMList/v1/?format=json&cellid=0")
-        with _ur.urlopen(url, timeout=timeout) as resp:
-            data = _json.loads(resp.read().decode("utf-8", "replace"))
+        data = get_json(url, timeout=timeout)
         servers = (((data or {}).get("response") or {}).get("serverlist_websockets")
                    or ((data or {}).get("response") or {}).get("serverlist") or [])
         seen_cities = set()

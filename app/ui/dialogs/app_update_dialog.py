@@ -107,7 +107,7 @@ class AppUpdateDialog(ToolPage):
             body = self._section("What's new")
             tk.Label(body, text=notes, font=TYPE["caption"], bg=COLORS["surface"],
                      fg=COLORS["text"], justify="left", anchor="w",
-                     wraplength=520).pack(fill="x", padx=SPACE_3, pady=(0, GROUP_GAP))
+                     wraplength=self.body_width(2 * SPACE_3)).pack(fill="x", padx=SPACE_3, pady=(0, GROUP_GAP))
 
         # How the automatic path works (or why it is off)
         ok, why = self_update.can_self_update()
@@ -121,7 +121,7 @@ class AppUpdateDialog(ToolPage):
             text = ("Automatic updates are not available here. %s" % why)
         tk.Label(body, text=text, font=TYPE["caption"], bg=COLORS["surface"],
                  fg=COLORS["text"] if ok else COLORS["subtext"],
-                 justify="left", anchor="w", wraplength=520).pack(
+                 justify="left", anchor="w", wraplength=self.body_width(2 * SPACE_3)).pack(
             fill="x", padx=SPACE_3, pady=(0, GROUP_GAP))
 
         # Buttons

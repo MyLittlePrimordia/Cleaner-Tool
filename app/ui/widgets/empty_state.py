@@ -18,31 +18,35 @@ which is exactly how the app ended up with six versions of this - the metrics
 live in METRICS here and BOTH painters read them. DataTable imports them in
 `_draw_empty`.
 
-Depends only on app.ui.theme.
+Depends only on app.ui.theme and app.ui.metrics.
 """
 from __future__ import annotations
 
 import tkinter as tk
 
 from app.ui.theme import COLORS, SPACE_5, TYPE, SPACE_1
-from app.ui.metrics import CARD_BODY_INSET, CONTROL_GAP
+from app.ui.metrics import (
+    CARD_BODY_INSET, CONTROL_GAP, EMPTY_ACTION_H, EMPTY_DETAIL_GAP,
+    EMPTY_GLYPH_GAP, EMPTY_PAD_TOP, EMPTY_TEXT_GAP,
+)
 
 #: The empty state's geometry, in one place.
 #:
 #: `gap_*` values are the space BETWEEN elements (glyph -> text -> detail ->
 #: action); `pad_top` is the breathing room above the glyph. DataTable offsets
 #: its canvas items by exactly these, so a table's empty state and a packed
-#: one are the same block at the same rhythm.
+#: one are the same block at the same rhythm. The values themselves are named
+#: metrics (L-003), not private numbers.
 METRICS = {
     "glyph_font": TYPE["glyph_large"],
     "text_font": TYPE["label_medium"],
     "detail_font": TYPE["micro_regular"],
-    "pad_top": 28,
-    "glyph_gap": 34,
-    "text_gap": 22,
-    "detail_gap": 36,
+    "pad_top": EMPTY_PAD_TOP,
+    "glyph_gap": EMPTY_GLYPH_GAP,
+    "text_gap": EMPTY_TEXT_GAP,
+    "detail_gap": EMPTY_DETAIL_GAP,
     "pad_x": SPACE_5,
-    "action_h": 32,
+    "action_h": EMPTY_ACTION_H,
 }
 
 
@@ -60,34 +64,32 @@ class EmptyState(tk.Frame):
 
     METRICS = METRICS
 
-    #: Fallback wrap width when the caller cannot supply one.
-    #:
-    #: REDESIGN 2026-10 (audit D3): both labels used to hardcode
-    #: wraplength=460. These six dialogs are PROPORTIONAL (720-1120px), and
-    #: ToolPage exists precisely to replace hardcoded wraplengths with
-    #: body_width(). So every empty state in every Tools popup wrapped to a
-    #: width unrelated to the window it was in: on a 1120px window the text
-    #: occupied 41% of the width and looked stranded; on a 720px window 460px
-    #: overflowed the body. A caller that knows its width should pass
-    #: wrap=self.body_width(...); this constant is only the last resort.
-    DEFAULT_WRAP = 460
-
     def __init__(self, parent, glyph="", text="", detail="", bg=None,
                  accent=None, wrap=None):
+        """`wrap` is the reading measure in px; pass body_width(...).
+
+        There used to be a `DEFAULT_WRAP = 460` fallback "for when the caller
+        cannot supply one". Every real caller supplies one, so the constant
+        had no readers - and it was the old bug itself: a 460px column on a
+        720-1120px dialog reads as stranded text, or overflows. A caller that
+        forgets now gets the frame's REAL width, and keeps it through resizes,
+        so the failure mode is gone rather than merely documented (G-002).
+        """
         self._page_bg = bg or (parent["bg"] if isinstance(
             parent, (tk.Frame, tk.Canvas)) else COLORS["bg"])
         super().__init__(parent, bg=self._page_bg, bd=0)
 
         # Tk ignores a wraplength below ~2px, and `wrap=0` means "never
-        # wrap" - so a not-yet-laid-out caller measuring 1px must fall back to
-        # the constant rather than silently disabling wrapping.
+        # wrap" - so a measure that is not laid out yet (or nonsensical) is
+        # treated as absent and resolved from the frame below.
         try:
             _wrap = int(wrap or 0)
         except Exception:
             _wrap = 0
-        if _wrap < 40:
-            _wrap = self.DEFAULT_WRAP
-        self._wrap = _wrap
+        self._fixed_wrap = _wrap if _wrap >= 40 else 0
+        self._wrap = self._fixed_wrap
+        self._text_lbl = None
+        self._detail_lbl = None
         m = METRICS
 
         if glyph:
@@ -99,16 +101,48 @@ class EmptyState(tk.Frame):
                      bg=self._page_bg, fg=accent or COLORS["muted"],
                      bd=0).pack(pady=(m["pad_top"], CONTROL_GAP))
 
-        tk.Label(self, text=str(text or ""), font=m["text_font"],
-                 bg=self._page_bg, fg=COLORS["text"], anchor="center",
-                 justify="center", wraplength=self._wrap, bd=0).pack(
-                     fill="x", padx=m["pad_x"])
+        self._text_lbl = tk.Label(
+            self, text=str(text or ""), font=m["text_font"],
+            bg=self._page_bg, fg=COLORS["text"], anchor="center",
+            justify="center", wraplength=self._wrap, bd=0)
+        self._text_lbl.pack(fill="x", padx=m["pad_x"])
 
         if detail:
-            tk.Label(self, text=str(detail), font=m["detail_font"],
-                     bg=self._page_bg, fg=COLORS["subtext"], anchor="center",
-                     justify="center", wraplength=self._wrap, bd=0).pack(
-                         fill="x", padx=m["pad_x"], pady=(SPACE_1, 0))
+            self._detail_lbl = tk.Label(
+                self, text=str(detail), font=m["detail_font"],
+                bg=self._page_bg, fg=COLORS["subtext"], anchor="center",
+                justify="center", wraplength=self._wrap, bd=0)
+            self._detail_lbl.pack(fill="x", padx=m["pad_x"],
+                                  pady=(SPACE_1, 0))
+
+        if not self._fixed_wrap:
+            # The frame is packed fill="x" by every caller, so its width IS
+            # the column the text has. Configuring a wraplength changes the
+            # frame's height, which fires this again; the room check below
+            # makes the second pass a no-op.
+            self.bind("<Configure>", self._fit_wrap, add="+")
+            self.after_idle(self._fit_wrap)
+
+    def _fit_wrap(self, event=None):
+        """Give both labels the frame's real width when no measure was passed."""
+        if self._fixed_wrap:
+            return
+        try:
+            room = (int(event.width) if event is not None
+                    else int(self.winfo_width()))
+        except Exception:
+            return
+        room -= 2 * METRICS["pad_x"]
+        if room < 40 or room == self._wrap:
+            return
+        self._wrap = room
+        for lbl in (self._text_lbl, self._detail_lbl):
+            if lbl is None:
+                continue
+            try:
+                lbl.config(wraplength=room)
+            except Exception:
+                pass
 
     def add_button(self, text, command, accent=None, **btn_kw):
         """The one next action. Returns the button, or None on failure."""

@@ -613,6 +613,57 @@ def _value_line(hive, path, name, target) -> str:
     return "  %s: %s -> %s" % (where, now, _fmt_target(target))
 
 
+def blast_radius(keys) -> dict:
+    """N-005: preset-level 'blast radius' summary for tweak keys.
+
+    Returns {"n_tasks", "n_reg_values", "n_deletes", "n_prefix_tasks",
+    "n_system_tasks", "n_opaque", "needs_reboot"} — counts, never
+    contents. `needs_reboot` comes from the task's own declared risk, not
+    the AST. A key the scanner knows nothing about counts as opaque rather
+    than zero, so the summary can never claim a preset is smaller than it
+    is. Read-only (cached AST + declared risks); never raises.
+    """
+    out = {"n_tasks": 0, "n_reg_values": 0, "n_deletes": 0,
+           "n_prefix_tasks": 0, "n_system_tasks": 0, "n_opaque": 0,
+           "needs_reboot": False}
+    try:
+        keys = list(keys or [])
+    except Exception:
+        return out
+    out["n_tasks"] = len(keys)
+    if not keys:
+        return out
+    try:
+        info = scan_tasks()
+    except Exception:
+        out["n_opaque"] = len(keys)
+        return out
+    try:
+        from app.tab_presets import TABS as _TABS
+        risks = {t.key: str(getattr(t, "risk", "") or "").upper()
+                 for t in (_TABS.get("Tweak", []) or [])}
+    except Exception:
+        risks = {}
+    for key in keys:
+        try:
+            if risks.get(str(key)) == "REBOOT REQUIRED":
+                out["needs_reboot"] = True
+            entry = info.get(key)
+            if not entry:
+                out["n_opaque"] += 1
+                continue
+            regs = entry.get("regs") or {}
+            out["n_reg_values"] += len(regs)
+            out["n_deletes"] += len(entry.get("deletes") or ())
+            if entry.get("prefix"):
+                out["n_prefix_tasks"] += 1
+            if entry.get("system"):
+                out["n_system_tasks"] += 1
+        except Exception:
+            continue
+    return out
+
+
 def preview_lines(keys) -> list[str]:
     """Human-readable 'what will change' for the given tweak keys, in order.
 

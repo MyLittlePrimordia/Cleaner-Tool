@@ -21,6 +21,8 @@ from app.ui.widgets.tooltip import Tooltip
 from app.ui.theme import (
     COLORS, FRAME_MS, ICON_CONTROL, ICON_INLINE, RADIUS_CHROME, SPACE_1, SPACE_2,
     SPACE_3, TYPE, _hex_lerp,
+    _next_transparent_color,
+    _release_transparent_color,
 )
 from app.ui.metrics import CARD_BODY_INSET, CONTROL_GAP, GROUP_GAP
 from app.utils import resolve_asset_path
@@ -210,14 +212,17 @@ class BorderlessChrome:
         root.withdraw()
         root.overrideredirect(True)
         self._apply_appwindow_style()
-        # transparent key: distinct from modal keys, never equals a real
-        # theme color (all theme colors have a channel >= 0x0D)
-        self._transkey = "#010409"
+        # The window asks the SAME dispenser the dialogs use (C-003): a
+        # literal key here could collide with a dialog stacked over the
+        # window's corner, and the invariant that no theme colour can equal a
+        # key would live only in a comment.
+        self._transkey = _next_transparent_color()
         try:
             root.attributes("-transparentcolor", self._transkey)
         except Exception:
             # no transparency support: rounded corners would show black
             # notches — keep the borderless bar but square corners
+            _release_transparent_color(self._transkey)
             self._transkey = COLORS["shell"]
         root.deiconify()
 

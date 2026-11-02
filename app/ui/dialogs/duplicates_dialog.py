@@ -25,7 +25,9 @@ from disk and still honoured by every removal - it just has no button here.
 
 Unchanged and load-bearing: every removal goes to the Recycle Bin, one copy
 of every set is always kept, protected paths are never offered, counters are
-recomputed from what is left.
+recomputed from what is left. Files Windows could not move stay listed -
+the analysis always says what the action did (N-006), never what it meant
+to do.
 """
 from __future__ import annotations
 
@@ -316,11 +318,10 @@ class DuplicatesDialog(ToolPage):
         st["wasted"] = sum(int(g.get("wasted") or 0) for g in groups)
         return st
 
-    def _drop_groups(self, digests):
-        gone = set(digests)
-        for k in ("groups", "all_groups"):
-            self._data[k] = [g for g in (self._data.get(k) or [])
-                             if g.get("digest") not in gone]
+    def _drop_shown_groups(self, alive):
+        """Keep only the shown groups that still have copies to act on."""
+        self._data["groups"] = [g for g in (self._data.get("groups") or [])
+                                if id(g) in alive]
         return self._recount()
 
     def _recycle_job(self, doomed, caption, done_cb):
@@ -353,27 +354,41 @@ class DuplicatesDialog(ToolPage):
                 "can undo all of this from the Recycle Bin." % _fmt(amount),
                 accent=TOOL_ACCENT, yes_text="Clean up", no_text="Go Back"):
             return
-        keep = {g.get("digest") for g in safe}
         self._recycle_job(doomed, "Moving files to the Recycle Bin...",
-                          lambda res, k=keep: self._land_remove(res, k))
+                          self._land_remove)
 
-    def _land_remove(self, res, keep):
+    def _land_remove(self, res):
+        from app.dupes import apply_removed
         moved = int(res.get("moved") or 0)
         self._freed += int(res.get("freed") or 0)
         self.set_busy(False)
-        self._drop_groups(keep)
+        # N-006: reconcile, don't assume. Only the copies Windows actually
+        # moved leave the analysis; anything refused, failed or not reached
+        # before Stop stays listed, with its "Frees up" recomputed from the
+        # copies still there. Claiming a full clean while files remain is
+        # exactly what the old drop-everything did.
+        still_there = apply_removed(self._data.get("all_groups"),
+                                    res.get("moved_paths"))
+        self._data["all_groups"] = still_there
+        self._drop_shown_groups({id(g) for g in still_there})
         # Cleaning can take the total below the threshold; the bus should stop
         # recommending a tool whose problem was just solved.
         self._publish_finding()
+        stuck = len(res.get("failed") or []) + len(res.get("refused") or [])
+        stuck_note = (" %s could not be moved - %s still listed."
+                      % (_plural(stuck, "file", "files"),
+                         "it is" if stuck == 1 else "they are")) if stuck else ""
         if res.get("cancelled"):
-            self.status.stop("Stopped. %s freed so far." % _fmt(self._freed),
+            self.status.stop("Stopped. %s freed so far.%s"
+                             % (_fmt(self._freed), stuck_note),
                              COLORS["accent_yellow"])
         elif not moved:
             self.status.stop(res.get("error") or "Nothing was moved.",
                              COLORS["accent_red"])
         else:
-            self.status.stop("Freed %s. Everything is in the Recycle Bin."
-                             % _fmt(self._freed), COLORS["accent_green"])
+            self.status.stop("Freed %s. Everything is in the Recycle Bin.%s"
+                             % (_fmt(self._freed), stuck_note),
+                             COLORS["accent_green"])
         self._paint_banner()
         self._render()
         self._sync_primary()

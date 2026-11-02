@@ -311,7 +311,8 @@ class SettingsTab(tk.Frame):
         except Exception:
             return
         for key, cfg_key in (("clean_schedule", "schedule_enabled"),
-                             ("update_apps", "schedule_update_enabled")):
+                             ("update_apps", "schedule_update_enabled"),
+                             ("save_backups", "schedule_saves_enabled")):
             var = self._vars.get(key)
             if var is not None:
                 try:
@@ -338,22 +339,32 @@ class SettingsTab(tk.Frame):
         Get-ScheduledTaskInfo is a PowerShell process (~300 ms); doing it here
         would stall a Settings visit the same way the old synchronous resync
         did. Only a schedule the user has switched ON is probed - an off
-        switch has no run to describe.
+        switch has no run to describe - and the note names WHICH task it
+        describes, because Save backups is now a task of its own. Before this,
+        a saves-only setup showed an empty line as if nothing were scheduled.
         """
         lbl = getattr(self, "_sched_note", None)
         if lbl is None:
             return
-        var = self._vars.get("clean_schedule")
-        try:
-            enabled = bool(var.get()) if var is not None else False
-        except Exception:
-            enabled = False
-        if not enabled:
+        modes = (("Auto Clean", "clean_schedule", None),
+                 ("App updates", "update_apps", ["--auto-update"]),
+                 ("Save backups", "save_backups", ["--auto-save-backup"]))
+        chosen = None
+        for label, key, extra in modes:
+            var = self._vars.get(key)
+            try:
+                if var is not None and bool(var.get()):
+                    chosen = (label, extra)
+                    break
+            except Exception:
+                continue
+        if chosen is None:
             try:
                 lbl.config(text="", fg=COLORS["subtext"])
             except Exception:
                 pass
             return
+        name, extra = chosen
         try:
             from app.config_persist import load_config
             freq = str(load_config().get("schedule_frequency", "weekly"))
@@ -364,7 +375,10 @@ class SettingsTab(tk.Frame):
             try:
                 from app import scheduler
                 text = scheduler.describe_schedule(
-                    scheduler.schedule_info(), frequency=freq)
+                    scheduler.schedule_info(extra), frequency=freq)
+                if isinstance(text, dict) and text.get("text"):
+                    text = dict(text)
+                    text["text"] = "%s: %s" % (name, text["text"])
             except Exception:
                 text = {}
             self._post_note(text)
@@ -428,6 +442,16 @@ class SettingsTab(tk.Frame):
         self._toggle(g, "auto_elevate", "Start as administrator",
                      bool(cfg.get("auto_elevate", False)),
                      "Approve once; later launches skip the prompt.")
+        # The Admin Gate's "Don't show this again" (remember_limited) used
+        # to be a one-way door: once checked, the prompt never came back
+        # and nothing in Settings could undo it. This is the reverse gear —
+        # stored inverted (ask = not remember_limited). Turning it back on
+        # re-shows the prompt at launch; turning it off still lets the
+        # prompt through whenever the saved selection needs admin.
+        self._toggle(g, "ask_admin_startup", "Ask for administrator on startup",
+                     not bool(cfg.get("remember_limited", False)),
+                     "Shows the Admin prompt at launch. When off, it still "
+                     "appears if your selection needs admin.")
         self._choice(g, "window_animations", "Window animations", _ANIM,
                      str(cfg.get("window_animations", "system")),
                      tip="How windows fade in and out. System follows the "
@@ -447,9 +471,14 @@ class SettingsTab(tk.Frame):
         self._toggle(m, "update_apps", "Update apps",
                      bool(cfg.get("schedule_update_enabled", False)),
                      "Runs winget upgrade on the same schedule.")
+        self._toggle(m, "save_backups", "Save backups",
+                     bool(cfg.get("schedule_saves_enabled", False)),
+                     "Backs up your game-save folders on the same schedule. "
+                     "It only creates archives; it never restores or deletes "
+                     "saves.")
         self._choice(m, "frequency", "How often", _FREQ,
                      str(cfg.get("schedule_frequency", "weekly")),
-                     tip="How often Windows runs the schedule for the two "
+                     tip="How often Windows runs the schedules for the "
                          "switches above.")
         # U-009: the field carries a consequence too - "Time" alone does not
         # say whose clock, and 03:00 on a laptop that is asleep is a run that
@@ -482,26 +511,30 @@ class SettingsTab(tk.Frame):
         self._toggle(
             w, "watch_enabled", "Let the app notify me",
             bool(cfg.get("watch_enabled", True)),
-            "One notification when something needs attention, even while the "
-            "window is closed. Off keeps every warning inside the app.")
+            "One notification when something needs attention. Off keeps "
+            "every warning inside the app.")
         self._choice(
             w, "watch_free", "Free space warning",
             _watch_choices(_WATCH_FREE, cfg.get("watch_free_percent"), "%"),
             cfg.get("watch_free_percent", 10),
-            tip="Marks a drive in the status row and says so once when it "
-                "drops below this. The warning clears only after it recovers "
-                "two points above.")
+            tip="Marks a drive and says so once below this. Clears two "
+                "points above.")
         self._choice(
             w, "watch_drop", "Health score drop",
             _watch_choices(_WATCH_DROP, cfg.get("watch_score_drop"), " points"),
             cfg.get("watch_score_drop", 8),
             tip="Says so once when a checkup scores this much lower than the "
-                "one before it, and names the sensor that moved.")
+                "one before.")
         self._toggle(
             w, "watch_missed", "Missed schedule",
             bool(cfg.get("watch_missed_run", True)),
-            "Says so once when the scheduled clean has not run for longer "
-            "than its interval, or when its last run failed.")
+            "Says so once when a scheduled task stops running or its last "
+            "run failed.")
+        self._toggle(
+            w, "watch_startup", "New startup apps",
+            bool(cfg.get("watch_startup", True)),
+            "Says so once when a program adds itself to startup. The first "
+            "check is a baseline.")
 
     def _build_drivers(self, cfg):
         d = self._section(self._cats["drivers"], "Drivers")
@@ -523,6 +556,14 @@ class SettingsTab(tk.Frame):
             anchor="w")
         self._btn(row, "Create support bundle\u2026",
                   self._create_support_bundle).pack(
+            anchor="w", pady=(SPACE_2, 0))
+        # N-002: the portable setup — ticked tasks, saved app sets, Pilot
+        # watch lists, Game Mode close lists — as one JSON file for a new
+        # PC. Machine state (snapshots, restore points) is deliberately
+        # excluded; the tweak backup in Tweaks & backup covers that half.
+        self._btn(row, "Export my setup\u2026", self._export_setup).pack(
+            anchor="w", pady=(SPACE_2, 0))
+        self._btn(row, "Import setup\u2026", self._import_setup).pack(
             anchor="w", pady=(SPACE_2, 0))
         self._btn(row, "Open data folder", self._open_data).pack(
             anchor="w", pady=(SPACE_2, 0))
@@ -578,6 +619,86 @@ class SettingsTab(tk.Frame):
             % (len(files),
                support_bundle.human_size(support_bundle.total_bytes(files)),
                path))
+
+    def _export_setup(self):
+        """N-002: write the portable choices file."""
+        from app import setup_bundle
+        try:
+            data = setup_bundle.export_setup()
+        except Exception as exc:
+            _themed_showinfo(self, "Could not build the setup",
+                             "Nothing was written.\n\n%s: %s"
+                             % (type(exc).__name__, exc))
+            return
+        from tkinter import filedialog
+        path = filedialog.asksaveasfilename(
+            parent=self.winfo_toplevel(),
+            title="Save setup file",
+            defaultextension=".json",
+            initialfile=setup_bundle.default_name(),
+            filetypes=[("JSON setup", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            setup_bundle.write(data, path)
+        except Exception as exc:
+            _themed_showinfo(self, "Could not save the setup",
+                             "Nothing was written to %s.\n\n%s: %s"
+                             % (path, type(exc).__name__, exc))
+            return
+        n_keys = len(data.get("setup") or {})
+        _themed_showinfo(
+            self, "Setup saved",
+            "%d sections in %s.\n\nCopy it to the new PC and use Import "
+            "setup there. Snapshots and restore points stay on this PC — "
+            "use Back up tweaks for those." % (n_keys, path))
+
+    def _import_setup(self):
+        """N-002: read a setup file back through validation."""
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            parent=self.winfo_toplevel(),
+            title="Open setup file",
+            filetypes=[("JSON setup", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        from app import setup_bundle
+        try:
+            data = setup_bundle.read(path)
+        except Exception as exc:
+            _themed_showinfo(self, "Could not read the setup",
+                             "Nothing was changed.\n\n%s: %s"
+                             % (type(exc).__name__, exc))
+            return
+        try:
+            report = setup_bundle.import_setup(data)
+        except Exception as exc:
+            _themed_showinfo(self, "Could not import the setup",
+                             "Nothing was changed.\n\n%s: %s"
+                             % (type(exc).__name__, exc))
+            return
+        applied = report.get("applied") or {}
+        dropped = int(report.get("dropped") or 0)
+        errors = report.get("errors") or []
+        if errors:
+            _themed_showinfo(self, "Setup not imported",
+                             "Nothing was changed.\n\n%s"
+                             % "\n".join(errors))
+            return
+        detail = ("; ".join("%s (%d)" % (k, v)
+                              for k, v in sorted(applied.items()))
+                  or "nothing new")
+        # N-002: tabs read config at build time, so ticked boxes only refresh
+        # on restart. Say so plainly instead of implying instant staging.
+        detail += ". Restart the app to see ticked tasks refresh."
+        note = "Brought back: %s." % detail
+        if dropped:
+            note += (" %d unknown entr%s skipped (from a newer version or "
+                     "a removed task)." % (dropped, "y" if dropped == 1
+                                             else "ies"))
+        _themed_showinfo(self, "Setup imported", note)
 
     def _build_tweaks(self):
         # The undo history is the one thing the user cannot get back, so it is
@@ -640,14 +761,19 @@ class SettingsTab(tk.Frame):
         step with the space actually available."""
         lbl = tk.Label(parent, text=text, font=TYPE["caption"], bg=CARD,
                        fg=COLORS["subtext"], anchor="w", justify="left",
-                       wraplength=360)
+                       wraplength=0)
         lbl.pack(fill="x", pady=pady)
         self._wrap_labels.append(lbl)
         return lbl
 
     def _row(self, card, label, tip=""):
         r = tk.Frame(card, bg=CARD)
-        r.pack(fill="x", pady=SPACE_2)
+        # SPACE_1 above and below, not SPACE_2: the General card has six rows
+        # (four switches + two dropdowns) and overflowed the 640x600 pane by
+        # 22px with 16px between rows. 8px per row still separates the list
+        # clearly and keeps every category inside the pane at the size floor
+        # (test_settings_layout::test_no_category_needs_to_scroll).
+        r.pack(fill="x", pady=SPACE_1)
         left = tk.Frame(r, bg=CARD)
         left.pack(side="left", fill="x", expand=True)
         lb = tk.Label(
@@ -660,7 +786,7 @@ class SettingsTab(tk.Frame):
             # what clipped the longest tips in the old three-column layout.
             t = tk.Label(left, text=tip, font=TYPE["caption"], bg=CARD,
                          fg=COLORS["subtext"], anchor="w", justify="left",
-                         wraplength=360)
+                         wraplength=0)
             t.pack(fill="x")
             self._wrap_labels.append(t)
         return r

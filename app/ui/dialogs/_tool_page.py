@@ -55,6 +55,8 @@ from app.ui.base import ThemedModal, Tooltip
 from app.ui.errors import explain
 from app.ui.theme import (
     COLORS, SPACE_2, STACK_GAP, TAB_ACCENTS, TYPE, _measure_font, ellipsize,
+    KIND_ROLE,
+    SURFACE_WELL,
 )
 from app.ui.metrics import COMPACT_INSET, GROUP_GAP, TEXT_NUDGE
 from app.ui.tool_scope import ToolScope, scope_for
@@ -72,15 +74,8 @@ TOOL_ACCENT = TAB_ACCENTS["Tools"]
 #: dialog underneath it.
 FOOT_SIZE = "md"
 
-#: The dialog's `kind` vocabulary, mapped onto the shared roles. "secondary"
-#: used to mean an outlined button here and a surface-filled one everywhere
-#: else; it is now the same surface button everywhere.
-KIND_ROLE = {
-    "primary": "filled",
-    "secondary": "secondary",
-    "danger": "danger",
-    "warn": "warn",
-}
+#: KIND_ROLE comes from theme: one vocabulary for page footers and modal
+#: footers alike (C-002).
 
 RAIL_H = 2
 
@@ -318,7 +313,7 @@ class StatusLine(tk.Frame):
             w = c.winfo_width()
             if w < 12:
                 return
-            c.create_rectangle(0, 0, w, RAIL_H, fill=COLORS["bg_alt"],
+            c.create_rectangle(0, 0, w, RAIL_H, fill=SURFACE_WELL,
                                outline="")
             if self._frac is not None:
                 # Determinate: the filled part IS the progress. A 0px-wide

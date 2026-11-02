@@ -34,7 +34,7 @@ import tkinter as tk
 
 from app.ui.theme import (
     COLORS, RADIUS_SURFACE, SPACE_1, SPACE_2,
-    SPACE_3, TYPE
+    SPACE_3, TYPE, CARD_H_LEAD,
 )
 from app.ui.widgets.rounded_card import RoundedCard
 
@@ -171,7 +171,7 @@ class PageLead(RoundedCard):
     """
 
     def __init__(self, parent, accent=None, fill=None, bg=None,
-                 min_height=154, with_media=False, **kw):
+                 min_height=CARD_H_LEAD, with_media=False, **kw):
         self._fill = fill or COLORS["surface"]
         self._page_bg = bg or COLORS["bg"]
         super().__init__(parent, fill=self._fill, bg=self._page_bg,
@@ -192,15 +192,15 @@ class PageLead(RoundedCard):
         self.overline_lbl.pack(fill="x", pady=(SPACE_1, 0))
         self.headline_lbl = tk.Label(
             self.info, text="", font=TYPE["headline_small"], bg=self._fill,
-            fg=COLORS["text"], anchor="w", justify="left", wraplength=480)
+            fg=COLORS["text"], anchor="w", justify="left", wraplength=0)
         self.headline_lbl.pack(fill="x")
         self.sub_lbl = tk.Label(
             self.info, text="", font=TYPE["body_medium"], bg=self._fill,
-            fg=COLORS["subtext"], anchor="w", justify="left", wraplength=480)
+            fg=COLORS["subtext"], anchor="w", justify="left", wraplength=0)
         self.sub_lbl.pack(fill="x", pady=(SPACE_1, 0))
         self.meta_lbl = tk.Label(
             self.info, text="", font=TYPE["caption"], bg=self._fill,
-            fg=COLORS["muted"], anchor="w", justify="left", wraplength=480)
+            fg=COLORS["muted"], anchor="w", justify="left", wraplength=0)
         self.meta_lbl.pack(fill="x", pady=(SPACE_2, 0))
         self._overline_base = ""
         self._glyph = ""

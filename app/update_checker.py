@@ -10,7 +10,6 @@ version-based, not hash-based.
 """
 
 import hashlib
-import json
 import os
 import re
 import sys
@@ -41,6 +40,19 @@ def parse_version(text: str) -> "tuple[int, ...] | None":
         return None
 
 
+def _release_stamp(release: dict) -> str:
+    """Newest-first tie-break key for equal version tuples (B-008).
+
+    Two releases can share a version head (a re-cut `v2.1.0` published after
+    the original). GitHub API order is newest-created first but is not a
+    contract, so compare `published_at`/`created_at` explicitly instead.
+    """
+    try:
+        return str(release.get("published_at") or release.get("created_at") or "")
+    except Exception:
+        return ""
+
+
 def _pick_release(releases) -> "dict | None":
     """The release with the HIGHEST version, else the rolling `latest` one.
 
@@ -48,9 +60,13 @@ def _pick_release(releases) -> "dict | None":
     order, which is newest-CREATED first. A backport or re-cut published after
     a newer feature release therefore shadowed it, and the check reported "up
     to date" while a newer build existed.
+    B-008: equal version heads (a re-cut) now tie-break on published_at so
+    the newest cut wins deterministically instead of whichever the API
+    returned first.
     """
     best = None
     best_key = None
+    best_stamp = ""
     latest = None
     for release in releases or []:
         if not isinstance(release, dict):
@@ -64,8 +80,9 @@ def _pick_release(releases) -> "dict | None":
         key = parse_version(tag)
         if key is None:
             continue
-        if best_key is None or key > best_key:
-            best, best_key = release, key
+        stamp = _release_stamp(release)
+        if best_key is None or key > best_key or (key == best_key and stamp > best_stamp):
+            best, best_key, best_stamp = release, key, stamp
     return best if best is not None else latest
 
 
@@ -110,20 +127,14 @@ def fetch_latest_release_info(repo: str = "owner/repo",
     try:
         # Fetch all releases and find the latest versioned one (not "latest")
         url = f"https://api.github.com/repos/{repo}/releases"
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "CleanerTool/2.0",
-                "Accept": "application/vnd.github.v3+json"
-            }
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            if resp.status == 200:
-                releases = json.loads(resp.read().decode('utf-8'))
-                # Highest version wins; the rolling "latest" is only the
-                # fallback when no versioned release exists at all.
-                return _pick_release(releases)
-            return None
+        from app.http_json import get_json
+        releases = get_json(
+            url, timeout=timeout, errors="strict",
+            headers={"User-Agent": "CleanerTool/2.0",
+                     "Accept": "application/vnd.github.v3+json"})
+        # Highest version wins; the rolling "latest" is only the
+        # fallback when no versioned release exists at all.
+        return _pick_release(releases)
     except urllib.error.HTTPError as e:
         if e.code == 404:
             # Repository or release not found

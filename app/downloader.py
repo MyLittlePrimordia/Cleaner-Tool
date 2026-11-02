@@ -21,14 +21,13 @@ Design rules (user requirements + supply-chain safety):
     raise on failure — no fake successes.
 """
 
-import hashlib
 import os
 import tempfile
-import time
 import urllib.request
 
 from app.utils import TaskContext, TaskCancelled, run_cmd, resolve_exe
 from app import capabilities as cap
+from app.download_stream import stream_to_part
 
 _UA = "CleanerTool/2.0 (component installer)"
 
@@ -65,74 +64,68 @@ def _download(ctx: TaskContext, url: str, dest: str, expected_size: int,
     # byte every few seconds keeps it happy forever while the download never
     # finishes - and the Stop button is the only way out. A wall-clock deadline
     # caps the whole transfer.
-    deadline = time.monotonic() + timeout if timeout else None
+    # H-002: stream to sibling .part + os.replace (same as self_update).
+    # A symlink at `dest` must never receive verified bytes, and an
+    # interrupted download must never leave a partial file at the name the
+    # caller executes.
+    part = str(dest) + ".part"
     try:
         req = urllib.request.Request(url, headers={"User-Agent": _UA})
-        with urllib.request.urlopen(req, timeout=timeout) as resp, open(dest, "wb") as f:
-            total = int(resp.headers.get("Content-Length") or 0)
-            got = 0
-            last_pct = -1
-            while True:
-                if deadline is not None and time.monotonic() > deadline:
-                    raise RuntimeError(
-                        f"download took longer than {timeout}s - the "
-                        f"connection is too slow to finish it (got {got} "
-                        f"bytes so far)")
-                # audit fix: Stop button was dead for the whole download —
-                # a 100MB fetch on a slow link ignored cancel for up to
-                # 600s. Check every chunk; abort leaves a partial file the
-                # except clause below removes.
-                if ctx.cancelled():
-                    raise TaskCancelled("download cancelled by user")
-                chunk = resp.read(1 << 16)
-                if not chunk:
-                    break
-                # LOW-005: stop the moment the body exceeds what we expected,
-                # BEFORE writing the offending chunk. Aborting here leaves at
-                # most ceiling bytes on disk instead of an unbounded amount.
-                if got + len(chunk) > ceiling:
-                    raise RuntimeError(
-                        f"download exceeded the expected size: already have "
-                        f"{got} bytes, ceiling is {ceiling}"
-                        + (f" (pinned {expected_size})" if expected_size
-                           else " (no pinned size; using the unpinned cap)"))
-                f.write(chunk)
-                got += len(chunk)
-                if total:
-                    pct = int(got * 100 / total)
-                    if pct >= last_pct + 10:
-                        last_pct = pct
-                        ctx.set_status(f"Downloading {label}... {pct}%")
-            if expected_size and got != expected_size:
-                raise RuntimeError(f"size mismatch: got {got}, expected {expected_size}")
+        # R-002: the stream loop lives in app.download_stream. The ceiling,
+        # deadline, cancel check and hash are unchanged; only the loop moved.
+        last_pct = [-1]
+        total = [0]
+
+        def _progress(got_now: int) -> None:
+            if not total[0]:
+                return
+            pct = int(got_now * 100 / total[0])
+            if pct >= last_pct[0] + 10:
+                last_pct[0] = pct
+                ctx.set_status(f"Downloading {label}... {pct}%")
+
+        def _cancelled() -> bool:
+            # audit fix: Stop button was dead for the whole download — check
+            # every chunk, not once per attempt.
+            return ctx.cancelled()
+
+        def _on_cancel():
+            return TaskCancelled("download cancelled by user")
+
+        def _on_chunk(got_now: int) -> None:
+            _progress(got_now)
+
+        got, actual, resp = stream_to_part(
+            req, part, ceiling=ceiling, timeout=timeout,
+            cancelled=_cancelled, on_chunk=_on_chunk, on_cancel=_on_cancel)
+        total[0] = int(resp.headers.get("Content-Length") or 0)
+        if expected_size and got != expected_size:
+            raise RuntimeError(f"size mismatch: got {got}, expected {expected_size}")
         _log(ctx, f"  downloaded {got} bytes — verifying...")
-        h = hashlib.sha256()
-        with open(dest, "rb") as f:
-            while True:
-                chunk = f.read(1 << 20)
-                if not chunk:
-                    break
-                h.update(chunk)
-        actual = h.hexdigest()
-        if actual.lower() != sha256.lower():
+        import hmac as _hmac
+        if not _hmac.compare_digest(actual.lower(), str(sha256 or "").lower()):
             raise RuntimeError(f"SHA-256 MISMATCH — refusing to run the file "
                                f"(got {actual[:16]}..., pinned {sha256[:16]}...)")
+        os.replace(part, dest)
         _log(ctx, "  signature verified (SHA-256 match).")
         return True
     except TaskCancelled:
         # H6: cancel must propagate as TaskCancelled (runner reports
         # "stopped"), not collapse into `False` → "check internet".
+        # B-002: only the .part file is ours to remove; `dest` may hold a
+        # previously verified copy.
         try:
-            if os.path.exists(dest):
-                os.remove(dest)
+            if os.path.exists(part):
+                os.remove(part)
         except OSError:
             pass
         _log(ctx, "  ! download cancelled by user.")
         raise
     except Exception as e:
+        # B-002: remove only the partial download, never `dest`.
         try:
-            if os.path.exists(dest):
-                os.remove(dest)
+            if os.path.exists(part):
+                os.remove(part)
         except OSError:
             pass
         _log(ctx, f"  ! download failed: {e}")

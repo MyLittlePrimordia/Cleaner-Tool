@@ -110,9 +110,15 @@ def open_web_url(url: str, show_error=None) -> bool:
     except Exception:
         pass
 
-    # Route 3: explicit shell open
+    # Route 3: explicit shell open. H-004: `cmd /c start` parses metachars
+    # (& | > ^), so a crafted catalog URL must never reach it unquoted. The
+    # list form + CREATE_NO_WINDOW keeps it inert; drop Route 3 entirely
+    # when the URL contains cmd metacharacters outside a plain http(s) URL.
     err = None
     try:
+        import re as _re
+        if _re.search(r'["&|<>^%]', url):
+            return _fail("That link contains characters Windows cannot open safely:\n%s" % url)
         subprocess.Popen(["cmd", "/c", "start", "", url], shell=False,
                          creationflags=getattr(subprocess,
                                                "CREATE_NO_WINDOW", 0))

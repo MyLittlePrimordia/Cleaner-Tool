@@ -47,6 +47,13 @@ def _dry(ctx: TaskContext) -> bool:
     return bool(getattr(ctx, "dry_run", False))
 
 
+def _is_preview(ctx: TaskContext) -> bool:
+    """I-006 canonical name for the read-only Preview pass. `_dry` stays as
+    the wire-level alias (dry_run flag + SCAN_ALLOWLIST + verify_dryrun_scope)
+    so existing guards keep passing; new code should read `_is_preview`."""
+    return _dry(ctx)
+
+
 def _empty_recycle_bin_native() -> bool:
     """Empty the Recycle Bin through the Shell API. Never raises.
 

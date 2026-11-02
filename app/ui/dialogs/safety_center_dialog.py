@@ -1,4 +1,4 @@
-"""SafetyCenterDialog - every safety net in one place (U-002).
+"""Safety overview - the recovery records this dialog actually owns (U-002).
 
 Answers one question: "what can I get back, and what puts it back?"
 
@@ -7,16 +7,23 @@ Answers one question: "what can I get back, and what puts it back?"
                        registry says are live       (app/tweak_center.py)
     Service changes    service start-type changes
                        with an undo record          (app/svcs.py)
+    Startup items      items this app switched off  (app/startup_manager.py)
     Driver backups     pnputil exports of drivers
                        this tool replaced           (app/drivers/folder.py)
     Quarantine         files moved aside instead
                        of deleted                   (app/quarantine.py)
 
-Each section states its state honestly - including "none" - and offers the
-single action that fits. It never runs a System Restore for you: rolling a PC
-back is destructive and Windows ships a reviewable wizard for it, which this
-dialog opens instead. Nothing here invents a count it could not read; a value
-that cannot be measured is reported as unknown, not as zero.
+The Recovery list opens from here and lists every individual record — one
+tweak, one service start type, one startup item, one quarantined file — so a
+single mistake can be put back without undoing everything recorded after it.
+Game saves and the app's own updater keep their own screens: this dialog is a
+summary of the records above, not a claim that nothing else in the app can
+recover anything. Each section states its state honestly - including "none" -
+and offers the action that fits. It never runs a System Restore for you:
+rolling a PC back is destructive and Windows ships a reviewable wizard for
+it, which this dialog opens instead. Nothing here invents a count it could
+not read; a value that cannot be measured is reported as unknown, not as
+zero.
 """
 from __future__ import annotations
 
@@ -26,6 +33,7 @@ import tkinter as tk
 from app.ui.base import _themed_askyesno
 from app.ui.dialogs._tool_page import ToolPage
 from app.ui.theme import COLORS, RADIUS_SURFACE, TYPE, SPACE_2, SPACE_3
+from app.ui.widgets.wrap import fit_wrap
 from app.ui.metrics import COMPACT_INSET, GROUP_GAP, ROW_PAD, TEXT_NUDGE
 from app.ui.widgets import AnimatedButton, RoundedCard
 
@@ -59,8 +67,10 @@ class SafetyCenterDialog(ToolPage):
         self._stop_token = [False]
         super().__init__(
             parent, title="Safety & Undo",
-            scope="Everything this app can put back, in one place. It never "
-                  "runs a System Restore for you - that is Windows' wizard.",
+            scope="Restore points, tweaks, service changes, driver backups, "
+                  "startup items and quarantined files. The Recovery list "
+                  "puts back one record at a time. It never runs a System "
+                  "Restore for you - that is Windows' wizard.",
             scroll=True)
 
         self._sections = {}
@@ -71,14 +81,35 @@ class SafetyCenterDialog(ToolPage):
             ("Undo all tweaks", self._undo_all)])
         self._build_section("services", "Service changes", [
             ("Undo last change", self._undo_last_service)])
+        self._build_section("startup", "Startup items", [
+            ("Review startup items", self._open_recovery)])
         self._build_section("drivers", "Driver backups", [
             ("Open backups folder", self._open_drivers)])
         self._build_section("quarantine", "Quarantined files", [
             ("Open quarantine folder", self._open_quarantine)])
 
         self.refresh_btn = self.add_button("Refresh", self._start)
+        self.recovery_btn = self.add_button(
+            "Recovery list…", self._open_recovery, kind="primary")
         self.on_close(self._stop)
         self._start()
+
+    def _open_recovery(self):
+        """U-002: the per-item view, one row per recoverable thing."""
+        try:
+            from app.ui.dialogs.recovery_dialog import RecoveryDialog
+            RecoveryDialog(self._dlg, self.app).wait()
+            self._start()     # the list may have put something back
+        except Exception as exc:
+            try:
+                self.app.log("! Could not open the recovery list: %r" % (exc,))
+            except Exception:
+                pass
+            try:
+                self.status.stop("Could not open the recovery list.",
+                                 COLORS["accent_red"])
+            except Exception:
+                pass
 
     # ------------------------------------------------------------- layout
     def _build_section(self, key, title, buttons):
@@ -91,8 +122,9 @@ class SafetyCenterDialog(ToolPage):
             fill="x", padx=SPACE_3, pady=(ROW_PAD, 0))
         status = tk.Label(body, text="Checking\u2026", font=TYPE["caption"],
                           bg=COLORS["surface"], fg=COLORS["subtext"],
-                          anchor="w", justify="left", wraplength=580)
+                          anchor="w", justify="left", wraplength=0)
         status.pack(fill="x", padx=SPACE_3, pady=(TEXT_NUDGE, SPACE_2))
+        fit_wrap(status, body, reserve=2 * SPACE_3)
         row = tk.Frame(body, bg=COLORS["surface"])
         row.pack(fill="x", padx=SPACE_3, pady=(0, GROUP_GAP))
         btns = {}
@@ -170,6 +202,12 @@ class SafetyCenterDialog(ToolPage):
         except Exception:
             out["svc_undo"] = []
         try:
+            from app.config_persist import get_startup_disabled
+            out["startup"] = [r for r in get_startup_disabled()
+                              if isinstance(r, dict) and r.get("name")]
+        except Exception:
+            out["startup"] = []
+        try:
             from app.drivers import folder as _df
             root = _df.configured()
             out["drivers_root"] = root
@@ -244,6 +282,23 @@ class SafetyCenterDialog(ToolPage):
             rtext += " System Protection is OFF."
         elif pstate == "limited":
             rtext += " System Protection is on for some drives only."
+        # N-005: what this app changed in the day before the newest point.
+        # The ledger supplies the facts; nothing is restored to answer it.
+        if pts:
+            try:
+                from app import restorepts as _rp, window_changes
+                stamp = _rp._parse_stamp(pts[0].get("when"))
+                if stamp is not None:
+                    end = stamp.timestamp()
+                    hits = window_changes.changes_between(end - 86400, end)
+                    if hits:
+                        rtext += (" %d app %s recorded in the 24 hours "
+                                  "before it." % (
+                                      len(hits),
+                                      "change" if len(hits) == 1
+                                      else "changes"))
+            except Exception:
+                pass
         self._set("restore", rtext)
         self._enable("restore", "Create restore point", not self._busy)
         self._enable("restore", "Open System Restore", not self._busy)
@@ -263,6 +318,15 @@ class SafetyCenterDialog(ToolPage):
                       len(svc), _plural(len(svc), "change"))
                   if svc else "No service start-type changes recorded.")
         self._enable("services", "Undo last change", bool(svc))
+
+        # -- startup items ------------------------------------------------- #
+        startup = self._data.get("startup") or []
+        self._set("startup",
+                  "%d startup %s switched off and held by this app." % (
+                      len(startup), _plural(len(startup), "item"))
+                  if startup else
+                  "No startup item has been switched off by this app.")
+        self._enable("startup", "Review startup items", bool(startup))
 
         # -- driver backups ------------------------------------------------ #
         dcount, dbytes = self._data.get("drivers") or (0, 0)

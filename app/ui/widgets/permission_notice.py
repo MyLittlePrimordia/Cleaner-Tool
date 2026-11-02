@@ -70,7 +70,7 @@ class PermissionNotice(RoundedCard):
         self.reason_lbl = tk.Label(
             self._col, text=str(reason or _REASON), font=TYPE["caption"],
             bg=fill, fg=COLORS["subtext"], anchor="w", justify="left",
-            wraplength=420, bd=0)
+            wraplength=0, bd=0)
         self.reason_lbl.pack(fill="x", pady=(SPACE_2, 0))
 
         # The disclosure is created hidden; it appears only after a refusal,
@@ -81,7 +81,7 @@ class PermissionNotice(RoundedCard):
         self._why_text = tk.Label(
             self._col, text="", font=TYPE["caption"], bg=fill,
             fg=COLORS["muted"], anchor="w", justify="left",
-            wraplength=420, bd=0)
+            wraplength=0, bd=0)
         self._why_link.bind("<Button-1>", lambda _e: self._toggle_why())
 
         self._action = None
@@ -96,11 +96,21 @@ class PermissionNotice(RoundedCard):
         self._col.bind("<Configure>", self._fit, add="+")
 
     def _fit(self, event=None):
+        """Both wrapped labels follow the text column, not a pixel guess.
+
+        `_why_text` kept a hardcoded 420 even after the reason above it began
+        tracking the real width, so the disclosure a refusal adds wrapped at a
+        different column from the sentence that asked for it (L-001).
+        """
         try:
             width = int(event.width) if event is not None else int(
                 self._col.winfo_width())
-            if width > 40 and int(self.reason_lbl.cget("wraplength")) != width:
-                self.reason_lbl.config(wraplength=width)
+            room = width - SPACE_2
+            if room <= 80:
+                return
+            for lbl in (self.reason_lbl, self._why_text):
+                if int(lbl.cget("wraplength") or 0) != room:
+                    lbl.config(wraplength=room)
         except Exception:
             pass
 

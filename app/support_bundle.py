@@ -251,13 +251,19 @@ def total_bytes(files) -> int:
 
 
 def human_size(count: int) -> str:
-    size = float(count)
-    if size < 1024:
-        return "%d B" % int(size)
-    size /= 1024.0
-    if size < 1024:
-        return "%.1f KB" % size
-    return "%.1f MB" % (size / 1024.0)
+    # I-007: single byte-formatter. Delegates to utils.format_bytes so the
+    # bundle preview and run logs never disagree by 0.1 MB again.
+    try:
+        from app.utils import format_bytes as _fmt
+        return _fmt(int(count))
+    except Exception:
+        size = float(count)
+        if size < 1024:
+            return "%d B" % int(size)
+        size /= 1024.0
+        if size < 1024:
+            return "%.1f KB" % size
+        return "%.1f MB" % (size / 1024.0)
 
 
 def default_name(now=None) -> str:
@@ -267,7 +273,12 @@ def default_name(now=None) -> str:
 
 
 def write(files, path: str) -> str:
-    """Write the zip. Returns `path`; raises if the file cannot be written."""
+    """Write the zip. Returns `path`; raises if the file cannot be written.
+
+    H-001: symlink-safe — refuses a reparse point at `path` and writes via
+    sibling .part + os.replace so a crash never leaves a half-zip at the
+    name the dialog promised.
+    """
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
         for item in files:
@@ -275,6 +286,21 @@ def write(files, path: str) -> str:
     directory = os.path.dirname(os.path.abspath(path))
     if directory:
         os.makedirs(directory, exist_ok=True)
-    with open(path, "wb") as handle:
+    try:
+        from app.delete_safety import _is_reparse_point as _is_rp
+        # Only an EXISTING entry can redirect the write. `_is_reparse_point`
+        # fails closed (True) for a path that does not exist yet, which made
+        # every first-time export refuse itself; a missing path is safe here
+        # because the zip lands via a sibling .part + os.replace, so a
+        # pre-planted link is replaced, never followed.
+        if os.path.lexists(str(path)) and _is_rp(path):
+            raise OSError(f"refusing to write through reparse point: {path}")
+    except OSError:
+        raise
+    except Exception:
+        pass
+    part = str(path) + ".part"
+    with open(part, "wb") as handle:
         handle.write(buffer.getvalue())
+    os.replace(part, path)
     return path

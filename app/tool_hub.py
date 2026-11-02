@@ -1,8 +1,10 @@
 """What the Tools hub knows about YOU: what you opened, what needs attention.
 
-AUDIT TV-001 (2026-10). Twenty-six equal cards in historical order is a
-catalogue, not a hub: there is no memory of what the user actually uses, and
-nothing on the page connects the PC's own state to a tool that can act on it.
+AUDIT TV-001 (2026-10) replaced the old catalogue: twenty-six equal cards in
+historical order had no memory of what the user actually uses, and nothing on
+the page connected the PC's own state to a tool that can act on it. The hub is
+now nineteen cards in four job groups, with recommendations and recency above
+them.
 
 This module is the Tk-free half of the hub:
 

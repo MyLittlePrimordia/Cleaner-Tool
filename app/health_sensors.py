@@ -664,18 +664,26 @@ def open_battery_report() -> bool:
     N-003's action for the Battery card: the health line summarises one number,
     and this is where the per-cycle history and design data live. Read-only
     apart from the report file itself. Never raises.
+    B-010/H-003: the old fixed %TEMP% name was predictable (symlink plant)
+    and unbounded reads risked memory blowup. Uses mkstemp + size cap now.
     """
     import os
     import tempfile
 
     from app.utils import resolve_exe, run_capture
 
-    path = os.path.join(tempfile.gettempdir(),
-                        "cleaner_tool_battery_report.html")
+    fd, path = tempfile.mkstemp(prefix="ct_battery_", suffix=".html")
     try:
+        os.close(fd)
         rc, _out = run_capture(
             [resolve_exe("powercfg"), "/batteryreport", "/output", path],
             timeout=45)
+        # H-003: refuse absurd outputs before handing to the shell.
+        try:
+            if os.path.getsize(path) > 8 * 1024 * 1024:
+                return False
+        except OSError:
+            pass
         if rc != 0 or not os.path.isfile(path):
             return False
         import ctypes

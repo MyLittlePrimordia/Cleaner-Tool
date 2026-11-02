@@ -14,8 +14,11 @@ from app.ui.base import Tooltip, _themed_askyesno, _themed_showinfo
 from app.ui.theme import (
     COLORS, EMOJI, ICON_CHIP, ICON_NAV, PAGE_GUTTER, RADIUS_CARD,
     RADIUS_SURFACE, SPACE_1, SPACE_2, SPACE_5, SURFACE_CARD, TAB_ACCENTS,
-    TYPE, _TAB_STATUS, _hex_lerp, icon_target_px, scaled_photo,
+    TYPE, _hex_lerp, icon_target_px, scaled_photo,
+    CARD_H_CHIP,
+    CARD_H_LEAD,
 )
+from app.ui.widgets.wrap import fit_wrap
 from app.ui.metrics import (
     CARD_BODY_INSET, COMPACT_INSET, CONTROL_GAP, GROUP_GAP, HAIRLINE_NUDGE,
     TEXT_NUDGE, TIGHT_GAP,
@@ -53,7 +56,12 @@ class TaskTab(tk.Frame):
         "Deep Repair": "Full fix stack — 30+ minutes.",
         "Minimal": "Safe speed basics, no risk.",
         "Recommended": "Best all-round setup + privacy.",
-        "Game Session": "Max power for one play session.",
+        # U-002: name the twin. This preset IS the set Game Mode applies
+        # (Pilot dialog manual session, tray switch) — the only difference
+        # is who starts it and what closes it. Saying so stops users
+        # treating them as competing features.
+        "Game Session": ("Max power for one play session. Same tweaks "
+                           "Game Mode applies — here you run them by hand.")
     }
 
     def __init__(self, parent, app, tab_name):
@@ -182,6 +190,16 @@ class TaskTab(tk.Frame):
                 command = (lambda n=name: self._select_preset(n))
             card = self._make_card(self.preset_area, name, blurb, icon_key,
                                    color, fg, command, accent)
+            # N-005: Tweak presets show their blast radius on hover — N
+            # tweaks, M registry values, reboot or not — generated from
+            # the same scan the Preview dialog uses, so the two agree.
+            if self.tab_name == "Tweak" and name in self.presets:
+                try:
+                    tip = _preset_blast_tip(self.presets[name])
+                    if tip:
+                        Tooltip(card, tip)
+                except Exception:
+                    pass
             self._preset_order.append(card)
             self.preset_cards[name] = card
         self._regrid_presets(self.preset_area.winfo_width())
@@ -214,7 +232,7 @@ class TaskTab(tk.Frame):
         # wraps (the "third card resizes" bug).
         face = SURFACE_CARD
         outer = RoundedCard(parent, fill=face, bg=COLORS["bg"],
-                            radius=RADIUS_SURFACE, min_height=144)
+                            radius=RADIUS_SURFACE, min_height=CARD_H_LEAD)
         inner = outer.body
         _photo = self._preset_icon_image(icon_key)
         glyph = self._ICON_FALLBACK.get(icon_key, "\u2022")
@@ -518,7 +536,7 @@ class TaskTab(tk.Frame):
             # because "1 tweaks applied" is the kind of thing that ships.
             n_word = "tweak" if n == 1 else "tweaks"
             app.set_status(("%d %s applied." % (n, n_word)) if n
-                           else _TAB_STATUS.get("Tweak", ""))
+                           else "")
         except Exception:
             pass
 
@@ -534,14 +552,28 @@ class TaskTab(tk.Frame):
         if not selected:
             return
         keys = [t.key for t in selected]
+        # N-005: the simulator header -- one honest blast-radius sentence
+        # above the per-value detail, from the same cached AST the tooltips
+        # use, so the counts can never drift from what Run would touch.
+        header = []
         try:
-            from app.tweak_introspect import preview_lines
+            from app.tweak_introspect import blast_radius, preview_lines
+            b = blast_radius(keys)
+            n = int(b.get("n_tasks") or 0)
+            if n:
+                summary = _preset_blast_tip(keys) or ("%d tweak%s." % (
+                    n, "" if n == 1 else "s"))
+                header = [summary, ""]
             lines = preview_lines(keys)
         except Exception:
-            lines = []
+            try:
+                from app.tweak_introspect import preview_lines
+                lines = preview_lines(keys)
+            except Exception:
+                lines = []
         try:
             from app.ui.dialogs.tweak_preview_dialog import show_tweak_preview
-            show_tweak_preview(self.app.root, lines)
+            show_tweak_preview(self.app.root, list(header) + list(lines or []))
         except Exception:
             pass
 
@@ -736,8 +768,8 @@ class TaskTab(tk.Frame):
             # floating in the middle of the ~330px it expands into read as a
             # hole in the layout / a page that failed to load.
             #
-            # The status bar is now the single source of truth and is
-            # per-tab correct (_TAB_STATUS, applied in Application._show_tab),
+            # The status bar is now the single source of truth; a tab
+            # switch clears it in Application._show_tab,
             # so the body just reserves the space the task grid will occupy
             # once a preset is chosen. That reads as deliberate margin.
             return
@@ -761,7 +793,7 @@ class TaskTab(tk.Frame):
             # Compact surface chips floating on black.
             cell = RoundedCard(panel.inner, fill=face,
                                bg=COLORS["bg"], radius=RADIUS_CARD,
-                               min_height=34)
+                               min_height=CARD_H_CHIP)
             # M3 assist-chip leading icon: a tonal circle with a check mark
             _acc = TAB_ACCENTS[self.tab_name]
             dot = tk.Canvas(cell.body, width=ICON_CHIP, height=ICON_CHIP,
@@ -781,7 +813,7 @@ class TaskTab(tk.Frame):
             lbl = tk.Label(cell.body, text=t.label, font=TYPE["caption"],
                            bg=face, bd=0,
                            fg=COLORS["text"], anchor="w", justify="left",
-                           wraplength=150)
+                           wraplength=0)
             lbl.pack(side="left", anchor="w", pady=TEXT_NUDGE)
             cell._wrap_label = lbl  # so _regrid can retarget it per column width
             Tooltip(lbl, t.description)
@@ -1687,13 +1719,19 @@ class TaskTab(tk.Frame):
         lbl = tk.Label(inner, text=t.label, font=TYPE["label_medium"],
                        bg=COLORS["bg_alt"], fg=COLORS["text"],
                        anchor="w", justify="left",
-                       wraplength=215)
+                       wraplength=0)
         lbl.pack(side="left", anchor="center")
         Tooltip(lbl, t.description)
         state = tk.Label(inner, text="applied", font=TYPE["label_small"],
                          bg=COLORS["bg_alt"], fg=COLORS["subtext"],
                          anchor="e")
         state.pack(side="right", anchor="center", padx=(CONTROL_GAP, SPACE_2))
+        # The row holds a dot on the left and a state pill on the right;
+        # whatever is between them is the label's column, at any scale
+        # (L-001). Both are packed by now, so their widths are real.
+        fit_wrap(lbl, inner, reserve=lambda: (
+            dot.winfo_reqwidth() + state.winfo_reqwidth()
+            + 3 * SPACE_2 + CONTROL_GAP))
         self._health_rows[t.key] = (outer, dot, state)
         outer._lbl = lbl
         return outer
@@ -2165,6 +2203,20 @@ class TaskTab(tk.Frame):
                                  "Pick a preset or turn some switches on first.",
                                  accent=COLORS["accent_yellow"])
                 return
+            # N-001: two tweaks that write the same registry value cannot both
+            # win. Say so before anything runs, and let the user decide.
+            try:
+                from app import tweak_conflicts
+                clashes = tweak_conflicts.conflicts(
+                    [getattr(t, "key", "") for t in selected])
+            except Exception:
+                clashes = []
+            if clashes and not _themed_askyesno(
+                    self, "Run tweaks that touch the same value?",
+                    tweak_conflicts.describe(clashes),
+                    accent=COLORS["accent_yellow"],
+                    yes_text="Run Anyway", no_text="Go Back"):
+                return
             self.app.run_tasks(self.tab_name, selected, mode="run")
 
     def _open_dns_tester(self):
@@ -2174,3 +2226,47 @@ class TaskTab(tk.Frame):
             self.app._open_dns_tester()
         except Exception:
             pass
+
+def _preset_blast_tip(keys) -> str:
+    """N-005: one-line blast radius for a Tweak preset card's tooltip.
+
+    Counts come from `tweak_introspect.blast_radius` (cached AST + declared
+    risks), so the line can never drift from what the tasks touch. ""
+    when nothing is known — a missing tooltip beats a wrong one.
+    """
+    try:
+        from app.tweak_introspect import blast_radius
+        b = blast_radius(keys)
+    except Exception:
+        return ""
+    try:
+        n = int(b.get("n_tasks") or 0)
+    except Exception:
+        return ""
+    if n <= 0:
+        return ""
+    bits = ["%d tweak%s" % (n, "" if n == 1 else "s")]
+    try:
+        rv = int(b.get("n_reg_values") or 0) + int(b.get("n_deletes") or 0)
+    except Exception:
+        rv = 0
+    if rv:
+        bits.append("%d registry value%s" % (rv, "" if rv == 1 else "s"))
+    try:
+        if int(b.get("n_system_tasks") or 0):
+            bits.append("services/power settings")
+        if int(b.get("n_prefix_tasks") or 0):
+            bits.append("per-device settings")
+        if int(b.get("n_opaque") or 0):
+            bits.append("%d change settings outside the registry"
+                        % int(b.get("n_opaque")))
+    except Exception:
+        pass
+    text = "Changes " + ", ".join(bits)
+    try:
+        if b.get("needs_reboot"):
+            text += " — reboot needed"
+        text += ". All reversible from Undo."
+    except Exception:
+        pass
+    return text

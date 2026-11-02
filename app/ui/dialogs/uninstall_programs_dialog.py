@@ -1141,14 +1141,35 @@ class UninstallProgramsDialog(ToolPage):
                     else:
                         failed += 1
                 elif p.startswith("SHORTCUT::"):
+                    # B-002: the old code counted a missing shortcut as
+                    # "removed" and deleted with bare os.remove (no reparse
+                    # / protected-root guard). Refuse unsafe targets and
+                    # count already-gone separately so the summary is honest.
+                    _sp = p[len("SHORTCUT::"):]
                     try:
-                        os.remove(p[len("SHORTCUT::"):])
+                        # `is_safe_to_delete` lives in app.infra.fs_safe; the
+                        # old import named delete_safety, which does not export
+                        # it, so EVERY shortcut deletion failed on ImportError.
+                        from app.infra.fs_safe import is_safe_to_delete as _safe
+                        if not _safe(_sp):
+                            # `_safe` is False for two different things: an
+                            # unsafe target (junction/protected root) and a
+                            # path that simply is not there. Only the first
+                            # is a failure; a missing shortcut falls through
+                            # to the remove below, whose FileNotFoundError
+                            # branch counts it as already gone.
+                            if os.path.lexists(_sp):
+                                failed += 1
+                                continue
+                        os.remove(_sp)
+                        removed += 1
                     except FileNotFoundError:
                         # Already gone (usually the uninstaller removed it):
                         # the leftover is not there, so there is nothing to
                         # report as failed either.
-                        pass
-                    removed += 1
+                        removed += 1
+                    except OSError:
+                        failed += 1
                 else:
                     got = clean_folder_contents(ctx, p, remove_root=True)
                     freed += got

@@ -8,6 +8,7 @@ about any other dialog except where noted.
 from __future__ import annotations
 
 import os
+import time
 
 import tkinter as tk
 
@@ -20,6 +21,7 @@ from app.ui.theme import (
     COLORS, ICON_ROW_PX, RADIUS_SURFACE, TAB_ACCENTS, TYPE, _hex_lerp,
     _measure_font, ellipsize, icon_bg_rgb, SPACE_1, SPACE_2,
 )
+from app.ui.widgets.wrap import fit_wrap
 from app.ui.metrics import (
     CARD_BODY_INSET, COMPACT_INSET, CONTROL_GAP, GROUP_GAP, HAIRLINE_NUDGE,
     PAGE_INSET, TEXT_NUDGE,
@@ -45,6 +47,41 @@ def _scan_installed_games():
         return installed_games()
     except Exception:
         return []
+
+
+def _duration_text(seconds) -> str:
+    """A session length in plain words: 0m, 42m, 1h 07m, 2h 00m.
+
+    Pure so the timer label and the End recap can be tested without a Tk
+    loop. Negative or unreadable input becomes "" rather than "0m": a
+    session with no trustworthy start time must not claim it just began.
+    """
+    if seconds is None:
+        return ""
+    try:
+        secs = int(max(0, float(seconds)))
+    except (TypeError, ValueError, OverflowError):
+        return ""
+    if secs < 60:
+        return "%dm" % (secs // 60)
+    mins = secs // 60
+    if mins < 60:
+        return "%dm" % mins
+    return "%dh %02dm" % (mins // 60, mins % 60)
+
+
+def _started_text(started_at) -> str:
+    """The local clock time a session started, or "" when unreadable."""
+    try:
+        stamp = float(started_at or 0)
+    except (TypeError, ValueError, OverflowError):
+        return ""
+    if stamp <= 0:
+        return ""
+    try:
+        return time.strftime("%H:%M", time.localtime(stamp))
+    except (OverflowError, OSError, ValueError):
+        return ""
 
 
 # The Game Mode close list knows each app only by PROCESS NAME — that is all
@@ -448,7 +485,19 @@ class PilotDialog(ToolPage):
                  text="Game Mode",
                  font=TYPE["subtitle"], bg=CARD, fg=COLORS["text"],
                  justify="left", anchor="w").pack(
-                     fill="x", pady=(0, CONTROL_GAP))
+                     fill="x", pady=(0, TEXT_NUDGE))
+        # U-002: name the twin from this side too. A user who found the
+        # Tweak tab's Game Session preset should recognize this button as
+        # the same tweaks started by hand (plus optional app-closing),
+        # not a second, competing gaming mode.
+        _lbl = tk.Label(
+            p3,
+            text="Same tweaks as the Tweak tab's Game Session preset, "
+                 "started now. End puts back exactly what it changed.",
+            font=TYPE["caption"], bg=CARD, fg=COLORS["subtext"],
+            justify="left", anchor="w", wraplength=0)
+        _lbl.pack(fill="x", pady=(0, CONTROL_GAP))
+        fit_wrap(_lbl, p3)
         try:
             from app.game_night import CLOSEABLE_APPS as _CLOSEABLE_APPS
             from app.config_persist import get_game_night as _get_gn
@@ -514,6 +563,15 @@ class PilotDialog(ToolPage):
             mbrow, text="", command=self._toggle_manual_session,
             role="filled", size="md", accent=COLORS["accent_green"])
         self._manual_btn.pack(side="left")
+        # N: a session that started hours ago should say so. The duration is
+        # read from the same persisted start stamp the recap uses, so the
+        # live line and the "after" line can never disagree.
+        self._session_after = None
+        self._last_recap = self._saved_recap()
+        self._session_lbl = tk.Label(
+            p3, text="", font=TYPE["caption"], bg=CARD,
+            fg=COLORS["subtext"], justify="left", anchor="w")
+        self._session_lbl.pack(fill="x", pady=(TEXT_NUDGE, 0))
         self._refresh_manual_btn()
 
         # honesty footer + Done
@@ -529,11 +587,13 @@ class PilotDialog(ToolPage):
         # REDESIGN 2026-10: the footer is the shared ToolPage one — Done is
         # its one primary action and the live pilot readout is the StatusLine
         # on the left.
+        # N-003: the profile editor lives where the games already are.
+        self.add_button("Profiles", self._open_profiles, kind="secondary")
         self.add_button("Done", self.close, kind="primary")
 
         # register for live watcher status, then paint current state;
-        # closing unregisters (base close hook)
-        self.on_close(self._unregister)
+        # closing unregisters and stops the session clock (base close hook)
+        self.on_close(self._close_cleanup)
         try:
             app._pilot_dialog = self
         except Exception:
@@ -544,6 +604,103 @@ class PilotDialog(ToolPage):
         try:
             if getattr(self.app, "_pilot_dialog", None) is self:
                 self.app._pilot_dialog = None
+        except Exception:
+            pass
+
+    def _close_cleanup(self):
+        self._cancel_session_timer()
+        self._unregister()
+
+    # ---- session clock / recap ----------------------------------------- #
+
+    def _session_started(self) -> float:
+        try:
+            from app.config_persist import get_game_night
+            return float(get_game_night().get("started_at") or 0)
+        except Exception:
+            return 0.0
+
+    def _saved_recap(self) -> str:
+        """The newest stored session as a sentence (A-001).
+
+        Read from the config ledger, not from this dialog's memory, so the
+        recap survives closing the window - which is what "keeps a short
+        recap" has to mean. Only facts the end path recorded are said: the
+        duration and how many tweaks were on. Whether each one was put back
+        is not claimed here, because the ledger does not know.
+        """
+        try:
+            from app.config_persist import get_game_sessions
+            rows = get_game_sessions()
+            if not rows:
+                return ""
+            row = rows[-1]
+            secs = int(row.get("d") or 0)
+            if secs <= 0:
+                return ""
+            keys = row.get("k") or []
+            text = "Last session: %s on, %d tweak%s applied" % (
+                _duration_text(secs), len(keys),
+                "" if len(keys) == 1 else "s")
+            failed = int(row.get("f") or 0)
+            if failed:
+                text += ", %d could not be put back" % failed
+            return text + "."
+        except Exception:
+            return ""
+
+    def _paint_session(self):
+        """Live duration line, or the last recap when nothing is running."""
+        try:
+            if self._active_manual():
+                started = self._session_started()
+                if started > 0:
+                    elapsed = _duration_text(time.time() - started)
+                    clock = _started_text(started)
+                    text = ("Game Mode has been on for %s%s." % (
+                        elapsed, (" \u00b7 started %s" % clock) if clock else ""))
+                else:
+                    text = ("Game Mode is on, but this session's start time "
+                            "was not recorded.")
+                color = COLORS["accent_green"]
+            elif self._last_recap:
+                text = self._last_recap
+                color = COLORS["subtext"]
+            else:
+                text = "No Game Mode session is running."
+                color = COLORS["muted"]
+            self._session_lbl.config(text=text, fg=color)
+        except Exception:
+            pass
+
+    def _ensure_session_timer(self):
+        if self._session_after is not None:
+            return
+        try:
+            self._session_after = self._dlg.after(1000, self._session_tick)
+        except Exception:
+            self._session_after = None
+
+    def _cancel_session_timer(self):
+        aid = getattr(self, "_session_after", None)
+        self._session_after = None
+        if aid is not None:
+            try:
+                self._dlg.after_cancel(aid)
+            except Exception:
+                pass
+
+    def _session_tick(self):
+        self._session_after = None
+        try:
+            if not self._dlg.winfo_exists():
+                return
+        except Exception:
+            return
+        self._paint_session()
+        try:
+            if self._active_manual():
+                self._ensure_session_timer()
         except Exception:
             pass
 
@@ -1320,22 +1477,49 @@ class PilotDialog(ToolPage):
                 self._manual_btn.set_style(
                     bg=COLORS["accent_green"], fg=COLORS["black"],
                     hover_bg=_hex_lerp(COLORS["accent_green"], "#FFFFFF", 0.08))
+                self._ensure_session_timer()
             else:
                 self._manual_btn.config_text("Game Mode: Off")
                 self._manual_btn.set_style(
                     bg=COLORS["surface"], fg=COLORS["text"],
                     hover_bg=_hex_lerp(COLORS["surface"], "#FFFFFF", 0.08))
+                self._cancel_session_timer()
+            self._paint_session()
         except Exception:
             pass
 
     def _toggle_manual_session(self):
         try:
             if self._active_manual():
+                started = self._session_started()
+                try:
+                    elapsed = (_duration_text(time.time() - started)
+                               if started > 0 else "")
+                except Exception:
+                    elapsed = ""
+                try:
+                    from app.config_persist import get_game_night
+                    keys = list(get_game_night().get("keys") or [])
+                except Exception:
+                    keys = []
                 self.app.end_game_night()
-                self.set_live_status("Game Mode off", COLORS["accent_green"])
+                # A-001: write the session to the ledger, not just to this
+                # dialog, so the recap survives closing the window.
+                try:
+                    from app.config_persist import record_game_session
+                    record_game_session(started, keys)
+                except Exception:
+                    pass
+                self._last_recap = self._saved_recap() or (
+                    "Last session: %s on." % elapsed if elapsed else "")
+                self.set_live_status(
+                    ("Game Mode off after %s \u2014 putting your settings "
+                     "back." % elapsed) if elapsed else "Game Mode off",
+                    COLORS["accent_green"])
             else:
                 if not self._confirm_game_mode():
                     return
+                self._last_recap = ""
                 self.app.start_game_night()
                 # AUDIT B2: the outcome was going to self.log() - the HIDDEN
                 # app log - so an unelevated user was told nothing while the
@@ -1403,17 +1587,55 @@ class PilotDialog(ToolPage):
             self.set_live_status("Every Game Mode setting is already on.",
                                  COLORS["accent_yellow"])
             return False
-        names = []
+        # A-005: the preview must describe the run that will actually happen.
+        # Unelevated Game Mode filters out admin-only tasks, so listing them
+        # as "changes now" is a promise the run cannot keep. Show the runnable
+        # subset and mark the rest as needing Administrator.
+        try:
+            from app.elevation import is_admin
+            elevated = bool(is_admin())
+        except Exception:
+            elevated = False
+        runnable = []
+        needs_admin = []
         for k in keys:
             try:
-                names.append("- %s" % by_key[k].label)
+                task = by_key[k]
             except Exception:
-                names.append("- %s" % k)
-        body = ("Game Mode changes these %d system settings:\n\n%s\n\n"
+                continue
+            if getattr(task, "admin_required", False) and not elevated:
+                needs_admin.append(task)
+            else:
+                runnable.append(task)
+        if not runnable:
+            self.set_live_status(
+                "Every remaining Game Mode setting needs Administrator. "
+                "Restart as Administrator and try again.",
+                COLORS["accent_yellow"])
+            return False
+
+        def _label(task):
+            try:
+                return task.label
+            except Exception:
+                return getattr(task, "key", "?")
+
+        names = ["- %s" % _label(t) for t in runnable]
+        body = ("Game Mode changes these %d system settings now:\n\n%s\n\n"
                 "They stay until you press End, even if you close this app."
-                % (len(keys), "\n".join(names[:14])))
+                % (len(runnable), "\n".join(names[:14])))
         if len(names) > 14:
             body += "\n- and %d more" % (len(names) - 14)
+        if needs_admin:
+            admin_names = ["- %s" % _label(t) for t in needs_admin]
+            body += ("\n\n%d setting%s need%s Administrator and will be "
+                     "skipped this time:\n%s"
+                     % (len(needs_admin),
+                        "" if len(needs_admin) == 1 else "s",
+                        "s" if len(needs_admin) == 1 else "",
+                        "\n".join(admin_names[:8])))
+            if len(admin_names) > 8:
+                body += "\n- and %d more" % (len(admin_names) - 8)
         try:
             # Module-level import, so the harness can patch it. With a late
             # `from app.ui.base import _themed_askyesno` INSIDE this method
@@ -1423,7 +1645,9 @@ class PilotDialog(ToolPage):
             return _themed_askyesno(
                 self._dlg, "Turn Game Mode on?", body,
                 accent=TAB_ACCENTS["Tweak"],
-                yes_text="Turn it on", no_text="Go Back")
+                yes_text=("Turn on %d now" % len(runnable)
+                          if needs_admin else "Turn it on"),
+                no_text="Go Back")
         except Exception:
             # A prompt that cannot build must not silently apply 12 tweaks.
             return False
@@ -1468,3 +1692,12 @@ class PilotDialog(ToolPage):
             self.status.stop(text, color or COLORS["subtext"])
         except Exception:
             pass
+
+
+    def _open_profiles(self):
+        """N-003: edit the tweak set each game starts with."""
+        try:
+            from app.ui.dialogs.game_profiles_dialog import open_from
+        except Exception:
+            return
+        open_from(self.app, self)

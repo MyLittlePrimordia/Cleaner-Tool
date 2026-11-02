@@ -12,6 +12,7 @@ Supports running as a script (app/__main__.py) or as a module (-m).
 Headless flags (no window):
   --auto-clean          run the saved Clean/Repair selection now
   --auto-update         run "Update Everything" now
+  --auto-save-backup    back up game saves now
   --plan [--json]       read-only preview of what the Clean tasks would
                         reclaim; --json prints a machine-readable report.
                         (--dry-run is accepted as an alias; in the GUI the
@@ -22,6 +23,21 @@ import sys
 import pathlib
 import os
 import tempfile
+
+# I-010: frozen pythonw has sys.stderr=None; every startup print must go
+# through _safe_print (file log always, stderr only when usable), never a
+# bare print() that raises out of the handler it was meant to observe.
+def _safe_print(*a, **k):
+    try:
+        import sys as _s
+        _s.stderr  # noqa
+        stream = _s.stderr
+        if stream is None:
+            return
+        print(*a, **k, file=stream)
+    except Exception:
+        pass
+
 
 # Early logging to capture startup issues
 def _early_log(msg):
@@ -64,7 +80,8 @@ _enable_dpi_awareness()
 _early_log("DPI awareness enabled")
 
 from app.config_persist import load_config  # noqa: E402
-from app.scheduler import run_auto_clean, run_auto_update  # noqa: E402
+from app.scheduler import (run_auto_clean, run_auto_save_backup,  # noqa: E402
+                           run_auto_update)
 _early_log("Config and scheduler modules imported")
 # M16: gui (4785-line Tk import) used to load even for headless
 # --auto-clean/--auto-update runs that never create a window. Import it
@@ -79,13 +96,13 @@ if sys.platform.startswith("win"):
     try:
         from app.elevation import signal_elevated_startup
         _early_log("About to call signal_elevated_startup")
-        print("[__main__ module] Calling signal_elevated_startup", file=sys.stderr)
+        _safe_print("[__main__ module] Calling signal_elevated_startup")
         signal_elevated_startup()
         _early_log("signal_elevated_startup completed")
-        print("[__main__ module] signal_elevated_startup completed", file=sys.stderr)
+        _safe_print("[__main__ module] signal_elevated_startup completed")
     except Exception as exc:
         _early_log(f"signal_elevated_startup exception: {exc}")
-        print(f"[__main__ module] signal_elevated_startup exception: {exc}", file=sys.stderr)
+        _safe_print(f"[__main__ module] signal_elevated_startup exception: {exc}")
         pass
 
 
@@ -186,6 +203,8 @@ def _run_dry_run(as_json: bool) -> int:
         print(f"  {t['key']:<24} {label}")
     if total is None:
         print("  Total: unknown (some targets could not be measured)")
+        # B-001: measuring nothing is not success for automation callers.
+        return 1 if targets else 0
     else:
         note = (f" ({declined} target(s) not measured)" if declined else "")
         print(f"  Total reclaimable: about {format_bytes(total)}{note}")
@@ -195,8 +214,23 @@ def _run_dry_run(as_json: bool) -> int:
 def main():
     _early_log("main() function called")
     if not sys.platform.startswith("win"):
-        print("This application is designed for Windows only.")
-        return
+        # B-001: a non-Windows launch did nothing but exited 0, so automation
+        # could not tell "did nothing" from success. Exit non-zero.
+        try:
+            print("This application is designed for Windows only.")
+        except Exception:
+            pass
+        sys.exit(2)
+
+    # Housekeeping: clear CleanerTool_*.tmp/.part files a previous crash left
+    # in %TEMP%. Best-effort and only our own prefix; this is the caller
+    # `app.infra.rendezvous.sweep_stale` was written for (it was otherwise
+    # dead code, caught by the dead-code gate).
+    try:
+        from app.infra.rendezvous import sweep_stale as _sweep_stale
+        _early_log(f"Stale temp sweep removed {_sweep_stale()}")
+    except Exception as exc:
+        _early_log(f"Stale temp sweep skipped: {exc}")
 
     # N-005: headless read-only plan. Handled before --auto-clean so a
     # combined invocation (`--plan --auto-clean`) stays read-only.
@@ -210,7 +244,8 @@ def main():
     # `if` won). Run both in order when combined.
     want_clean = "--auto-clean" in sys.argv
     want_update = "--auto-update" in sys.argv
-    if want_clean or want_update:
+    want_saves = "--auto-save-backup" in sys.argv
+    if want_clean or want_update or want_saves:
         code = 0
         # The summary is not echoed here: both headless entry points log their
         # verdict inside the closing block (the same rule / verdict / rule a
@@ -224,6 +259,9 @@ def main():
         if want_update:
             success, _summary = run_auto_update()
             code |= 0 if success else 1
+        if want_saves:
+            success, _summary = run_auto_save_backup()
+            code |= 0 if success else 1
         sys.exit(code)
 
     # Single instance (tray/auto-elevate foundation): normal GUI launches
@@ -236,11 +274,11 @@ def main():
         from app import single_instance as _si
         _early_log("Single instance module imported")
         if _si.is_elevation_child():
-            print("[__main__] Elevation child detected, claiming mutex in background", file=sys.stderr)
+            _safe_print("[__main__] Elevation child detected, claiming mutex in background")
             _early_log("Elevation child detected, claiming mutex in background")
             _si.claim_in_background()
         elif _si.should_enforce():
-            print("[__main__] Single instance enforcement active", file=sys.stderr)
+            _safe_print("[__main__] Single instance enforcement active")
             _early_log("Single instance enforcement active")
             _owner = _si.acquire()
             if _owner is None:
@@ -249,7 +287,7 @@ def main():
                     _si.signal_existing()
                 except Exception:
                     pass
-                print("Cleaner Tool is already running.")
+                _safe_print("Cleaner Tool is already running.")
                 # headsup for double-clickers with no visible window (tray-
                 # hidden first copy): best-effort, never raises, then exit.
                 try:
@@ -281,9 +319,9 @@ def main():
                 and "--no-elevate-handoff" not in sys.argv
                 and not _si2.is_elevation_child()
                 and not _si2.is_headless_run()):
-            print("[__main__] Checking auto-elevate handoff", file=sys.stderr)
+            _safe_print("[__main__] Checking auto-elevate handoff")
             _ready, _why = _el.handoff_ready()
-            print(f"[__main__] Handoff ready={_ready}, why={_why}", file=sys.stderr)
+            _safe_print(f"[__main__] Handoff ready={_ready}, why={_why}")
             if _ready:
                 try:
                     _si2.release(_owner)
@@ -291,7 +329,7 @@ def main():
                     pass
                 _owner = None
                 _ok, _msg = _el.run_task()
-                print(f"[__main__] Handoff run_task ok={_ok}, msg={_msg}", file=sys.stderr)
+                _safe_print(f"[__main__] Handoff run_task ok={_ok}, msg={_msg}")
                 if _ok:
                     return
                 try:
@@ -307,7 +345,7 @@ def main():
                 except Exception:
                     pass
     except Exception as exc:
-        print(f"[__main__] Auto-elevate handoff exception: {exc}", file=sys.stderr)
+        _safe_print(f"[__main__] Auto-elevate handoff exception: {exc}")
         pass
 
     # Reconciler (elevated only, off-thread so startup never waits on

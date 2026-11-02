@@ -13,6 +13,7 @@ import tkinter as tk
 from app.ui.widgets.checkbox import M3Checkbutton
 from app.elevation import relaunch_as_admin
 from app.ui.theme import COLORS, EMOJI, TYPE, SPACE_1, SPACE_2, SPACE_3
+from app.ui.widgets.wrap import fit_wrap
 from app.ui.metrics import CONTROL_GAP, GROUP_GAP, PAGE_INSET, SECTION_BREAK
 from app.ui.widgets import AnimatedButton
 from app.ui.tkdispatch import TkDispatcher
@@ -79,9 +80,11 @@ class AdminGateFrame(tk.Frame):
             _notice = None
         if _notice:
             try:
-                tk.Label(wrapper, text=_notice, font=TYPE["caption"],
-                         bg=COLORS["bg"], fg=COLORS["accent_yellow"],
-                         wraplength=420, justify="center").pack(pady=(SPACE_3, 0))
+                _n = tk.Label(wrapper, text=_notice, font=TYPE["caption"],
+                              bg=COLORS["bg"], fg=COLORS["accent_yellow"],
+                              wraplength=0, justify="center")
+                _n.pack(pady=(SPACE_3, 0))
+                fit_wrap(_n, wrapper, reserve=2 * SECTION_BREAK)
             except Exception:
                 pass
         for _text, _var in (
@@ -93,14 +96,16 @@ class AdminGateFrame(tk.Frame):
                  self._remember_limited_var)):
             try:
                 _pady = (10 if _var is self._auto_elevate_var else 2, 0)
-                M3Checkbutton(wrapper, text=_text, variable=_var,
-                               font=TYPE["caption"], bg=COLORS["bg"], fg=COLORS["subtext"],
-                               selectcolor=COLORS["surface"],
-                               activebackground=COLORS["bg"],
-                               activeforeground=COLORS["text"],
-                               anchor="w", justify="left",
-                               wraplength=420).pack(fill="x", pady=_pady,
-                                                    padx=SECTION_BREAK)
+                _cb = M3Checkbutton(
+                    wrapper, text=_text, variable=_var,
+                    font=TYPE["caption"], bg=COLORS["bg"],
+                    fg=COLORS["subtext"],
+                    selectcolor=COLORS["surface"],
+                    activebackground=COLORS["bg"],
+                    activeforeground=COLORS["text"],
+                    anchor="w", justify="left", wraplength=0)
+                _cb.pack(fill="x", pady=_pady, padx=SECTION_BREAK)
+                fit_wrap(_cb, wrapper, reserve=2 * SECTION_BREAK)
             except Exception:
                 pass
 
@@ -127,7 +132,9 @@ class AdminGateFrame(tk.Frame):
                               "folder from Defender:\n%s\n\nNothing else in it is "
                               "scanned. Remove that exclusion?" % _stale),
                         font=TYPE["caption"], bg=COLORS["bg"], fg=COLORS["accent_yellow"],
-                        wraplength=420, justify="left")
+                        wraplength=0, justify="left")
+                    fit_wrap(self._stale_notice_label, wrapper,
+                             reserve=2 * SECTION_BREAK)
                     self._stale_notice_label.pack(pady=(SPACE_3, SPACE_1), padx=SECTION_BREAK)
 
                     def _do_remove(_p=_stale):
@@ -332,8 +339,17 @@ class AdminGateFrame(tk.Frame):
             _disp.start()
 
             def _wait_thread():
-                from app.elevation import wait_for_elevated_process
+                from app.elevation import (
+                    _read_pending_token,
+                    wait_for_elevated_process,
+                    wait_for_elevated_ready,
+                )
+                # Capture BEFORE the liveness wait: its success path clears
+                # the pending token file the ready check verifies against.
+                expected = _read_pending_token()
                 success = wait_for_elevated_process(timeout=60.0)
+                ready = bool(success) and wait_for_elevated_ready(
+                    timeout=30.0, expected_token=expected)
 
                 def _on_done():
                     # the hand-back is arriving; this pump has done its job
@@ -341,7 +357,7 @@ class AdminGateFrame(tk.Frame):
                         _disp.stop()
                     except Exception:
                         pass
-                    if success:
+                    if ready:
                         try:
                             self.root.destroy()
                         except Exception:
@@ -358,10 +374,45 @@ class AdminGateFrame(tk.Frame):
                         # window is often already running (old bug created
                         # two main windows). Let the user decide.
                         try:
-                            _themed_showwarning(
-                                self, "Elevation Cancelled",
-                                "If an elevated window opened, use that one and close this.\n"
-                                "Otherwise click 'Continue Without Admin' to proceed in limited mode.")
+                            from app.diagnostics import (
+                                copy_startup_log_path as _copy_startup_log_path,
+                                open_startup_log as _open_startup_log,
+                                startup_log_path as _startup_log_path,
+                                startup_log_preview as _startup_log_preview,
+                            )
+                            _log = _startup_log_path()
+                            if success:
+                                _preview = _startup_log_preview()
+                                _themed_showwarning(
+                                    self, "Elevated Window Did Not Appear",
+                                    "The elevated copy started but never "
+                                    "finished opening — it likely crashed on "
+                                    "startup. This window was kept open so "
+                                    "nothing is lost. If an elevated "
+                                    "window is actually open, use that one "
+                                    "and close this. Otherwise click "
+                                    "Retry Elevation to try again, or "
+                                    "Continue Without Admin for limited "
+                                    "mode, and attach this log when "
+                                    "reporting the issue: " + _log,
+                                    retry_text="Retry Elevation",
+                                    retry_command=self._restart_elevated,
+                                    secondary_text="Open Log",
+                                    secondary_command=lambda: _open_startup_log(
+                                        self),
+                                    extra_actions=[
+                                        ("Copy Path",
+                                         lambda: _copy_startup_log_path(self),
+                                         "Copied")],
+                                    detail_text=_preview)
+                            else:
+                                _themed_showwarning(
+                                    self, "Elevation Cancelled",
+                                    "If an elevated window opened, use that one and close this. "
+                                    "Otherwise click Retry Elevation to try again, "
+                                    "or Continue Without Admin to proceed in limited mode.",
+                                    retry_text="Retry Elevation",
+                                    retry_command=self._restart_elevated)
                         except Exception:
                             pass
 

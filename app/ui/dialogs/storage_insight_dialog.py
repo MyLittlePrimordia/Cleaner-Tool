@@ -19,12 +19,20 @@ from app.ui.hardware.drives import _system_drive_root
 from app.ui.theme import (
     COLORS, F, RADIUS_SURFACE, TAB_ACCENTS, TYPE, _measure_font, SPACE_1, SPACE_2,
     SPACE_3,
+    CARD_H_BAND,
 )
+from app.ui.widgets.wrap import fit_wrap
 from app.ui.metrics import (
     CARD_BODY_INSET, CONTROL_GAP, GROUP_GAP, LABEL_GAP, TEXT_NUDGE, TIGHT_GAP,
 )
 from app.ui.widgets import AnimatedButton, ScrollableRoundedPanel, ToggleSwitch
 from app.utils import format_bytes
+
+
+def _log_storage(msg, exc=None):
+    """Surface a storage-scan failure in the run log (never raises)."""
+    from app.utils import log_or_swallow
+    log_or_swallow(None, "storage_insight: " + msg, exc)
 
 
 class StorageInsightDialog(ToolPage):
@@ -158,6 +166,19 @@ class StorageInsightDialog(ToolPage):
         right.grid(row=0, column=1, sticky="new", padx=(CONTROL_GAP, 0))
         tk.Label(right, text="Biggest games", font=TYPE["label_large"],
                  bg=COLORS["bg"], fg=COLORS["text"]).pack(anchor="w", pady=(0, SPACE_1))
+        # N: a real free-space trend from samples the app already takes while
+        # the window is open. It says "collecting" until two readings span
+        # half a day, so a fresh install cannot show a made-up countdown.
+        self._runway_lbl = tk.Label(
+            right, text="Runway: collecting a baseline\u2026",
+            font=TYPE["caption"], bg=COLORS["bg"], fg=COLORS["subtext"],
+            anchor="w", justify="left")
+        self._runway_lbl.pack(fill="x", pady=(0, SPACE_1))
+        Tooltip(self._runway_lbl,
+                "Built from free-space readings taken every six hours while "
+                "the app is open. A forecast appears after at least two "
+                "readings span half a day; until then it says so instead of "
+                "guessing.")
         self._games_body = tk.Frame(right, bg=COLORS["bg"])
         self._games_body.pack(fill="x")
 
@@ -260,7 +281,7 @@ class StorageInsightDialog(ToolPage):
             self._cat_sizes[title] = None
             self._cat_unknown[title] = 0
             outer = RoundedCard(self._junk_body, fill=COLORS["bg_alt"],
-                                bg=COLORS["bg"], radius=RADIUS_SURFACE, min_height=54)
+                                bg=COLORS["bg"], radius=RADIUS_SURFACE, min_height=CARD_H_BAND)
             inner = outer.body
             ToggleSwitch(inner, var).pack(side="left", anchor="center",
                                           padx=(SPACE_3, CONTROL_GAP), pady=LABEL_GAP)
@@ -349,6 +370,37 @@ class StorageInsightDialog(ToolPage):
         Tk thread, which keeps single-update() smoke checks working."""
         self._dispatch.post(lambda: fn(*args))
 
+    def _paint_runway(self, infos):
+        """One line: the system drive's forecast, or the honest missing state.
+
+        Extra drives stay in the tooltip rather than turning a caption into a
+        paragraph. The dialog is about the drive people are trying to make
+        room on; C: is the one the status row and health card also watch.
+        """
+        try:
+            from app import storage_runway
+        except Exception:
+            return
+        infos = [i for i in (infos or ()) if isinstance(i, dict)]
+        if not infos:
+            try:
+                self._runway_lbl.config(
+                    text="Runway: no reading yet.",
+                    fg=COLORS["subtext"])
+            except Exception:
+                pass
+            return
+        target = next((i for i in infos if i.get("letter") == "C"), infos[0])
+        try:
+            text = storage_runway.describe(target)
+            color = (COLORS["accent_yellow"]
+                     if target.get("state") == "forecast"
+                     and (target.get("days") or 0) < 14
+                     else COLORS["subtext"])
+            self._runway_lbl.config(text="Runway \u00b7 " + text, fg=color)
+        except Exception:
+            pass
+
     def _start_scan(self):
         # stop any in-flight scan, then reset rows to pending
         try:
@@ -397,6 +449,17 @@ class StorageInsightDialog(ToolPage):
             except Exception:
                 return True
 
+        # N: take the runway sample here as well as on the Quiet Watch tick.
+        # Opening this dialog is the moment the user is asking about space, so
+        # it should not wait for an unrelated background tick to start a
+        # baseline. record() is a no-op inside its six-hour window.
+        try:
+            from app import storage_runway
+            storage_runway.record()
+            self._ui(self._paint_runway, storage_runway.summaries())
+        except Exception as exc:
+            _log_storage("runway sample failed", exc)
+
         try:
             from app.storage_scan import (
    SCAN_CATEGORIES, acquire_scan, category_members, release_scan,
@@ -435,7 +498,8 @@ class StorageInsightDialog(ToolPage):
                 refused = {}
                 try:
                     sizes = measure_clean_tasks(ctx, keys, refused)
-                except Exception:
+                except Exception as exc:
+                    _log_storage(f"measure '{title}' failed", exc)
                     sizes = {}
                 if dead():
                     return
@@ -482,8 +546,8 @@ class StorageInsightDialog(ToolPage):
                 # of None would be a claim the walk cannot make.
                 try:
                     publish_junk_finding(grand, total_cats, len(declined))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _log_storage("publish junk finding failed", exc)
         finally:
             release_scan()
         # phase 2: game libraries (read-only sizing) - no count to show, so
@@ -496,7 +560,8 @@ class StorageInsightDialog(ToolPage):
                 cancelled=dead,
                 on_game=lambda n: self._ui(self._set_scan_status,
                                            f"Sizing {n}…"))
-        except Exception:
+        except Exception as exc:
+            _log_storage("game library sizing failed", exc)
             games = []
         if dead():
             return
@@ -622,16 +687,31 @@ class StorageInsightDialog(ToolPage):
             tk.Label(self._games_body, text="No game libraries detected on this PC.",
                      font=TYPE["label_medium"], bg=COLORS["bg"],
                      fg=COLORS["text"]).pack(anchor="w", pady=(CONTROL_GAP, TEXT_NUDGE))
-            tk.Label(self._games_body,
-                     text="Custom or portable installs outside a launcher's "
-                          "library folder won't show up here.",
-                     font=TYPE["caption"], bg=COLORS["bg"], fg=COLORS["subtext"],
-                     wraplength=320, justify="left").pack(anchor="w")
+            _lbl = tk.Label(
+                self._games_body,
+                text="Custom or portable installs outside a launcher's "
+                     "library folder won't show up here.",
+                font=TYPE["caption"], bg=COLORS["bg"],
+                fg=COLORS["subtext"], wraplength=0, justify="left")
+            _lbl.pack(anchor="w")
+            fit_wrap(_lbl, self._games_body)
             return
+        # N-003: library mover audit -- one honest sentence per game about
+        # whether it CAN move (Steam's own mover) vs reinstall-only. Read-only:
+        # the audit is a pure function of the measured rows, so the caption
+        # and the per-row tips can never disagree with the sizes above.
+        try:
+            from app import library_move as _lm
+            _audit = {r.get("path"): r for r in _lm.audit(self._games)
+                      if isinstance(r, dict)}
+            _audit_line = _lm.summary(list(_audit.values()))
+        except Exception:
+            _audit = {}
+            _audit_line = ""
         shown = self._games[:self._MAX_GAMES]
         for g in shown:
             outer = RoundedCard(self._games_body, fill=COLORS["bg_alt"],
-                                bg=COLORS["bg"], radius=RADIUS_SURFACE, min_height=54)
+                                bg=COLORS["bg"], radius=RADIUS_SURFACE, min_height=CARD_H_BAND)
             inner = outer.body
             drive_lbl = tk.Label(inner, text=g.get("drive", ""),
                                  font=TYPE["label_medium"],
@@ -646,8 +726,15 @@ class StorageInsightDialog(ToolPage):
                            anchor="w", justify="left")
             lbl.pack(side="left", anchor="center")
             try:
-                Tooltip(lbl, f"{g.get('name', '?')}\n{g.get('launcher', '')} — {g.get('path', '')}\n"
-                             "Read-only: uninstall from its launcher.")
+                _tip = (f"{g.get('name', '?')}\n{g.get('launcher', '')} — {g.get('path', '')}\n"
+                        "Read-only: uninstall from its launcher.")
+                try:
+                    _how = (_audit.get(g.get("path", "")) or {}).get("how")
+                except Exception:
+                    _how = ""
+                if _how:
+                    _tip += f"\n{_how}"
+                Tooltip(lbl, _tip)
             except Exception:
                 pass
             open_btn = AnimatedButton(
@@ -700,6 +787,16 @@ class StorageInsightDialog(ToolPage):
             except Exception:
                 pass
             outer.pack(fill="x", pady=TIGHT_GAP)
+        if _audit_line:
+            try:
+                _lbl = tk.Label(
+                    self._games_body, text="Can it move? " + _audit_line,
+                    font=TYPE["caption"], bg=COLORS["bg"],
+                    fg=COLORS["subtext"], wraplength=0, justify="left")
+                _lbl.pack(anchor="w", pady=(SPACE_1, 0))
+                fit_wrap(_lbl, self._games_body)
+            except Exception:
+                pass
         rest = self._games[self._MAX_GAMES:]
         if rest:
             tk.Label(self._games_body,

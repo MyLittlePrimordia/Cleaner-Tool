@@ -41,6 +41,17 @@ def _ensure_winget(ctx: TaskContext) -> None:
     """winget gate for every installer below. On stripped Windows (LTSC)
     winget itself is missing — try the automatic LTSC bootstrapper first
     (user-provided engine); only if that fails, point at the Store task."""
+    # LTSC context line: on a stripped edition the missing winget is
+    # EXPECTED, not a broken PC — say so, so the bootstrap log reads as a
+    # plan instead of an error. Never gates anything (probe may fail).
+    try:
+        from app.compat import edition_label, is_ltsc_edition
+        _ed = edition_label()
+        if _ed and is_ltsc_edition():
+            ctx.log(f"  {_ed}: winget is not preinstalled on this edition — "
+                    "bootstrapping it automatically.")
+    except Exception:
+        pass
     if cap.has_winget():
         return
     if ensure_winget_installed(ctx):
@@ -238,6 +249,14 @@ def install_microsoft_store(ctx: TaskContext):
     if cap.has_store():
         ctx.log("Microsoft Store already installed — nothing to do.")
         return
+    try:
+        from app.compat import edition_label, is_ltsc_edition
+        _ed2 = edition_label()
+        if _ed2 and is_ltsc_edition():
+            ctx.log(f"  {_ed2}: the Store is stripped by design here — "
+                    "wsreset -i reinstalls it (slow, needs internet).")
+    except Exception:
+        pass
     ctx.set_status("Installing Microsoft Store (can take 5-10 minutes)...")
     run_cmd_checked(ctx, "wsreset -i", timeout=900, success_codes=(0,))
     cap.invalidate_caches()
@@ -727,8 +746,12 @@ def _download_binary(ctx: TaskContext, url: str, dest: str, label: str, min_byte
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
     })
+    # B-002 / R-002: stream to a sibling .part and only move it onto `dest`
+    # after every check passes. A failed or stopped download then never leaves
+    # a file at `dest`, and the cleanup below removes only the .part.
+    part_path = dest + ".part"
     try:
-        with _urllib.urlopen(req, timeout=600) as resp, open(dest, "wb") as f:
+        with _urllib.urlopen(req, timeout=600) as resp, open(part_path, "wb") as f:
             ctype = (resp.headers.get("Content-Type") or "").lower()
             if "text/html" in ctype:
                 raise RuntimeError("server returned an HTML page, not a file "
@@ -760,21 +783,21 @@ def _download_binary(ctx: TaskContext, url: str, dest: str, label: str, min_byte
         # same partial-file cleanup as failures, but keep the 'stopped'
         # classification — do not wrap it into a RuntimeError
         try:
-            if os.path.exists(dest):
-                os.remove(dest)
+            if os.path.exists(part_path):
+                os.remove(part_path)
         except OSError:
             pass
         raise
     except Exception as exc:
         try:
-            if os.path.exists(dest):
-                os.remove(dest)
+            if os.path.exists(part_path):
+                os.remove(part_path)
         except OSError:
             pass
         raise RuntimeError(f"download failed for {label}: {exc}")
     try:
-        size = os.path.getsize(dest)
-        with open(dest, "rb") as f:
+        size = os.path.getsize(part_path)
+        with open(part_path, "rb") as f:
             magic = f.read(2)
     except OSError as exc:
         raise RuntimeError(f"could not read downloaded {label}: {exc}")
@@ -786,16 +809,18 @@ def _download_binary(ctx: TaskContext, url: str, dest: str, label: str, min_byte
         expected_magic = b"MZ"
     if size < min_bytes or magic != expected_magic[:2]:
         try:
-            os.remove(dest)
+            os.remove(part_path)
         except OSError:
             pass
         raise RuntimeError(
             f"{label} failed verification (size {size}, magic {magic!r}) — "
             f"not a real installer, refusing to run it.")
-    # F-004b: pinned integrity gate — raises (and the caller's finally
-    # removes the partial file) on any mismatch, BEFORE execution.
+    # F-004b: pinned integrity gate — raises (and the .part is removed by the
+    # cleanup in the caller) on any mismatch, BEFORE execution.
     if part is not None:
-        _verify_download_integrity(ctx, dest, label, part)
+        _verify_download_integrity(ctx, part_path, label, part)
+    # every check passed: only now does the file take its final name
+    os.replace(part_path, dest)
 
 
 def _apo_engine_present() -> bool:
@@ -918,15 +943,13 @@ def _resolve_github_latest_asset(ctx: TaskContext, repo: str, asset_pattern: str
     a first-party gate that self-heals on every release (verified live:
     rustdesk 1.4.9 ships sha256 digests per asset). None on failure, with
     honest log lines (caller decides whether to raise or fall back)."""
-    import json as _json
-    import urllib.request as _urllib
     url = f"https://api.github.com/repos/{repo}/releases/latest"
     ctx.log(f"  resolving latest {label} from {repo} (GitHub API)...")
-    req = _urllib.Request(url, headers={"User-Agent": _ELECTRON_YML_UA,
-                                        "Accept": "application/vnd.github+json"})
+    from app.http_json import get_json
     try:
-        with _urllib.urlopen(req, timeout=30) as resp:
-            data = _json.loads(resp.read().decode("utf-8", "replace"))
+        data = get_json(url, timeout=30,
+                        headers={"User-Agent": _ELECTRON_YML_UA,
+                                 "Accept": "application/vnd.github+json"})
     except Exception as exc:
         ctx.log(f"  ! GitHub API resolve failed for {repo}: {exc}")
         return None

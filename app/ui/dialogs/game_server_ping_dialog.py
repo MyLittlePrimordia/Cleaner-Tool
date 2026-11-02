@@ -16,6 +16,7 @@ from app.ui.widgets.dropdown import M3Dropdown
 from app.ui.dialogs._tool_page import ToolPage
 from app.ui.theme import (
     COLORS, RADIUS_SURFACE, TAB_ACCENTS, TYPE, SPACE_1, SPACE_2, SPACE_4,
+    CARD_H_ROW,
 )
 from app.ui.metrics import CARD_BODY_INSET, GROUP_GAP, TIGHT_GAP
 from app.ui.base import Tooltip
@@ -365,7 +366,7 @@ class GameServerPingDialog(ToolPage):
         for key, title, _kind, _host, _port in targets:
             try:
                 row = _Row(self._rows_body, fill=COLORS["bg_alt"],
-                           bg=COLORS["bg"], radius=RADIUS_SURFACE, min_height=48)
+                           bg=COLORS["bg"], radius=RADIUS_SURFACE, min_height=CARD_H_ROW)
                 row.pack(fill="x", pady=TIGHT_GAP)
                 rb = row.body
                 tk.Label(rb, text=title, font=TYPE["card_title"],
@@ -486,8 +487,16 @@ class GameServerPingDialog(ToolPage):
                     slot["ms"].config(text="no reply", fg=COLORS["subtext"])
                 else:
                     word, good = _gp.verdict(avg)
+                    _trend = ""
+                    try:
+                        from app import latency_history
+                        latency_history.record("game:%s" % key, avg)
+                        _trend = latency_history.spark("game:%s" % key)
+                    except Exception:
+                        _trend = ""
                     slot["ms"].config(
-                        text=f"{avg:.0f} ms · {word}",
+                        text=(f"{avg:.0f} ms · {word}"
+                              + (" · " + _trend if _trend else "")),
                         fg=COLORS["accent_green"] if good else (
                             COLORS["accent_yellow"] if (avg or 0) < 100
                             else COLORS["accent_red"]))

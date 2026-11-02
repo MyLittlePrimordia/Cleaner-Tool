@@ -263,8 +263,16 @@ class DriverStoreDialog(ToolPage):
                 no_text="Go Back"):
             return
 
+        n_pkgs = len(chosen)
         self.set_busy(True)
-        self.status.start("Waiting for the administrator prompt…")
+        # U-006: the old line named only the UAC wait, then sat unchanged
+        # through the whole multi-minute elevated export+remove — after the
+        # prompt was long accepted it still read as if nothing had started.
+        # One line now names both phases honestly (no per-package feed: the
+        # single elevated call returns its transcript only when done).
+        self.status.start("Waiting for the administrator prompt, then "
+                          "exporting & removing %d package%s…"
+                          % (n_pkgs, "" if n_pkgs == 1 else "s"))
 
         def work():
             from app.drivers import store

@@ -410,6 +410,49 @@ def promote_keeper(group: dict, path: str) -> bool:
     return True
 
 
+def apply_removed(groups, moved) -> list:
+    """Groups as they stand after `moved` paths went to the Recycle Bin.
+
+    N-006: the analysis must say what the action did. The batch button used
+    to drop every group it had touched, so files Windows refused (locked,
+    protected, cancelled mid-batch) vanished from the list while still on
+    disk - "Nothing to clean up" next to files that were never cleaned.
+
+    Each group is updated IN PLACE (the dialog's expanded rows hold these
+    same dicts) and groups with nothing left to dedupe fall out:
+
+    * moved copies are removed and `wasted` is recomputed from the copies
+      still there, so the promised byte count can only go down by what
+      actually went;
+    * a group of one is not a duplicate set, so it is dropped;
+    * if the keeper is somehow among the moved (it never is: the keeper is
+      never sent), the first remaining copy becomes the keeper, because
+      "one copy of every set is always kept" is not negotiable.
+
+    Returns the groups that still have copies to act on.
+    """
+    gone = set(moved or ())
+    out = []
+    for g in groups or ():
+        if not isinstance(g, dict):
+            continue
+        copies = [c for c in (g.get("copies") or [])
+                  if not isinstance(c, dict) or c.get("path") not in gone]
+        if len(copies) < 2:
+            continue
+        g["copies"] = copies
+        try:
+            size = int(g.get("size") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        g["wasted"] = max(0, size * (len(copies) - 1))
+        if not any(c.get("keep") for c in copies):
+            copies[0]["keep"] = True
+            g["keep"] = copies[0].get("path")
+        out.append(g)
+    return out
+
+
 # ------------------------------------------------------- never-delete list
 _CONFIG_KEY = "duplicate_protected_paths"
 
@@ -518,18 +561,20 @@ def recycle(paths, timeout: int = 60, protected=None, should_stop=None,
     """
     paths = [p for p in (paths or []) if p]
     if not paths:
-        return {"ok": True, "moved": 0, "refused": [], "failed": [],
-                "freed": 0, "protected": 0, "cancelled": False}
+        return {"ok": True, "moved": 0, "moved_paths": [], "refused": [],
+                "failed": [], "freed": 0, "protected": 0,
+                "cancelled": False}
     if not IS_WINDOWS:
-        return {"ok": False, "moved": 0, "refused": [], "failed": paths,
-                "freed": 0, "error": "Recycle Bin is Windows-only.",
+        return {"ok": False, "moved": 0, "moved_paths": [], "refused": [],
+                "failed": paths, "freed": 0,
+                "error": "Recycle Bin is Windows-only.",
                 "cancelled": False}
 
     if protected is None:
         protected = load_protected()
     norm = normalise_protected(protected)
 
-    refused, failed, moved, freed = [], [], 0, 0
+    refused, failed, moved_list, freed = [], [], [], 0
     n_protected = 0
     cancelled = False
     for _i, p in enumerate(paths):
@@ -557,7 +602,7 @@ def recycle(paths, timeout: int = 60, protected=None, should_stop=None,
         except OSError:
             pass
         if _recycle_one(p):
-            moved += 1
+            moved_list.append(p)
         else:
             failed.append(p)
 
@@ -571,7 +616,19 @@ def recycle(paths, timeout: int = 60, protected=None, should_stop=None,
     # `ok` deliberately ignores `cancelled`: the files that DID move moved
     # successfully, and cancelling is not a failure. `cancelled` carries that
     # half of the story so the caller can report both.
-    return {"ok": not failed, "moved": moved, "refused": refused,
+    # OUTSIDE the loop. This return was once indented one level too deep, so
+    # it fired after the FIRST file and the function then returned None for
+    # every multi-file call. A single-file call still passed, which is
+    # exactly why that survived: every earlier test moved one file at a time.
+    #
+    # N-006: `moved_paths` names what actually went, so the caller can
+    # reconcile its analysis with the action instead of assuming the batch
+    # was all-or-nothing. `ok` deliberately ignores `cancelled`: the files
+    # that DID move moved successfully, and cancelling is not a failure.
+    # `cancelled` carries that half of the story so the caller can report
+    # both.
+    return {"ok": not failed, "moved": len(moved_list),
+            "moved_paths": moved_list, "refused": refused,
             "failed": failed, "freed": freed, "protected": n_protected,
             "cancelled": cancelled,
             "error": None if not failed else

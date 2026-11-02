@@ -152,6 +152,52 @@ def reclaimed_since(days: int = 30) -> Tuple[int, int]:
         return 0, 0
 
 
+def _entry_time(entry) -> float:
+    """A stored entry's timestamp, or 0 for anything malformed."""
+    try:
+        return float(entry.get("t", 0) or 0)
+    except (TypeError, ValueError, AttributeError):
+        return 0.0
+
+
+def window_totals(entries, days: int = 30):
+    """((bytes, runs) in the last ``days``), ((bytes, runs) in the ``days``
+    before that).
+
+    U-005: the 30-day total had no baseline, so a normal month and an
+    unusually good one read the same. Both windows use the same cutoff as
+    `reclaimed_in`, and both are computed from the SAME `now`, so the
+    comparison can never disagree with the total it qualifies.
+    """
+    try:
+        days = max(1, int(days))
+        now = _time.time()
+        cutoff = now - days * 86400
+        earlier = now - 2 * days * 86400
+    except (TypeError, ValueError):
+        return (0, 0), (0, 0)
+
+    def total(items):
+        amount = 0
+        for entry in items:
+            try:
+                amount += int(entry.get("b", 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                continue
+        return amount, len(items)
+
+    current, previous = [], []
+    for entry in entries or ():
+        if not isinstance(entry, dict):
+            continue
+        when = _entry_time(entry)
+        if when >= cutoff:
+            current.append(entry)
+        elif earlier <= when < cutoff:
+            previous.append(entry)
+    return total(current), total(previous)
+
+
 def deltas(entries) -> list:
     """Each entry's byte change against the previous run of the SAME kind.
 

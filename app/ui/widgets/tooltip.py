@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import tkinter as tk
 
-from app.ui.theme import COLORS, TYPE
+from app.ui.theme import COLORS, TYPE, TIP_WRAP, scaled_px
 from app.ui.metrics import GROUP_GAP, LABEL_GAP
 
 
@@ -120,7 +120,8 @@ class Tooltip:
             # NOT hairline: that is a border colour, and a #242424 tooltip\n            # window on a true-black canvas is a barely-visible smudge that\n            # happens to contain the text. A tooltip is a raised surface - it\n            # gets the surface tier, with hairline as its own edge.\n            tw.configure(bg=COLORS["surface"])
             cls._shared_label = tk.Label(
                 tw, text="", bg=COLORS["surface"], fg=COLORS["text"],
-                font=TYPE["caption"], justify="left", wraplength=420,
+                font=TYPE["caption"], justify="left",
+                wraplength=scaled_px(TIP_WRAP, tw),
                 padx=GROUP_GAP, pady=LABEL_GAP, bd=0,
             )
             cls._shared_label.pack()

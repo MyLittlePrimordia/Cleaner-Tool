@@ -767,13 +767,28 @@ def _themed_askyesno(parent, title: str, message: str, accent: str = None,
 
 
 def _themed_notice(parent, title: str, message: str, accent: str,
-                   ok_text: str, fallback) -> None:
+                   ok_text: str, fallback, secondary_text: str = None,
+                   secondary_command=None, extra_actions=None,
+                   retry_text: str = None, retry_command=None,
+                   detail_text: str = None) -> None:
     """Dark-themed one-button notice (in-app modal, ThemedModal chrome).
 
     Shared body of the info / warning / error prompts: they differ only in
     accent colour and the native `fallback` used when the themed window
     itself cannot be built. Keeping one implementation means the three read
     identically on screen and cannot drift apart.
+
+    `secondary_text` / `secondary_command` add one neutral action beside OK
+    (used by the elevation warning's "Open Log"); `extra_actions` adds any
+    number more as `(text, command, done_text)` triples. A command that
+    returns True relabels its button to `done_text` (used by "Copy Path" to
+    become "Copied"). `retry_text` / `retry_command` add the warning's
+    "Retry Elevation" action, which CLOSES the notice before retrying:
+    the retry opens a fresh UAC prompt and possibly another warning, and
+    either would otherwise be stacked behind this modal's grab. `detail_text`
+    renders a compact monospace block under the message (the elevation
+    warning's startup-log tail). Without these the notice is exactly the
+    one-button prompt it has always been.
     """
     try:
         _TM = globals().get("ThemedModal")
@@ -786,11 +801,53 @@ def _themed_notice(parent, title: str, message: str, accent: str,
         tk.Label(body, text=message, font=TYPE["caption"], bg=COLORS["bg"],
                  fg=COLORS["text"], wraplength=modal.body_width(28),
                  justify="left").pack(fill="x", pady=(SPACE_2, GROUP_GAP))
+        if detail_text:
+            tk.Label(body, text=detail_text, font=TYPE["mono_small"],
+                     bg=COLORS["bg_alt"], fg=COLORS["subtext"],
+                     wraplength=modal.body_width(24), justify="left",
+                     anchor="w", padx=SPACE_2, pady=SPACE_2).pack(
+                         fill="x", pady=(0, GROUP_GAP))
         brow = tk.Frame(body, bg=COLORS["bg"])
         brow.pack(fill="x", pady=(TEXT_NUDGE, SPACE_2))
         AnimatedButton(brow, text=ok_text, command=modal.close,
                        role="filled", size="md", accent=accent).pack(
                            side="right")
+
+        def _add_action(text, command, done_text=None, close_first=False):
+            button = None
+
+            def _run():
+                if close_first:
+                    # A retry's UAC prompt and any follow-up warning must
+                    # not appear behind this modal's grab.
+                    try:
+                        modal.close()
+                    except Exception:
+                        pass
+                try:
+                    done = command()
+                except Exception:
+                    return
+                # A closed notice has no button left to relabel.
+                if done and done_text and not close_first:
+                    button.config_text(done_text)
+
+            button = AnimatedButton(brow, text=text, command=_run,
+                                    role="secondary", size="md")
+            button.pack(side="right", padx=(0, SPACE_2))
+            return button
+
+        if retry_text and retry_command:
+            _add_action(retry_text, retry_command, close_first=True)
+        if secondary_text and secondary_command:
+            _add_action(secondary_text, secondary_command)
+        for action in extra_actions or ():
+            try:
+                text, command, done_text = action
+            except (TypeError, ValueError):
+                continue
+            if text and command:
+                _add_action(text, command, done_text)
         modal._dlg.bind("<Return>", lambda _e: modal.close())
         modal.wait()
     except Exception:
@@ -809,15 +866,32 @@ def _themed_showinfo(parent, title: str, message: str, accent: str = None,
 
 
 def _themed_showwarning(parent, title: str, message: str, accent: str = None,
-                        ok_text: str = "OK") -> None:
+                        ok_text: str = "OK", secondary_text: str = None,
+                        secondary_command=None, extra_actions=None,
+                        retry_text: str = None, retry_command=None,
+                        detail_text: str = None) -> None:
     """Dark-themed warning dialog (yellow accent).
 
     Yellow matches the confirm prompt, so "something needs your attention"
-    reads the same everywhere in the app.
+    reads the same everywhere in the app. Optional actions and detail text
+    are forwarded only when supplied; existing callers and their native
+    fallback keep the one-button shape. `retry_text` / `retry_command` add a
+    retry action that dismisses this warning before it runs.
     """
+    extra = {}
+    if secondary_text and secondary_command:
+        extra = {"secondary_text": secondary_text,
+                 "secondary_command": secondary_command}
+    if extra_actions:
+        extra["extra_actions"] = extra_actions
+    if retry_text and retry_command:
+        extra["retry_text"] = retry_text
+        extra["retry_command"] = retry_command
+    if detail_text:
+        extra["detail_text"] = detail_text
     _themed_notice(parent, title, message,
                    accent or COLORS["accent_yellow"], ok_text,
-                   messagebox.showwarning)
+                   messagebox.showwarning, **extra)
 
 
 def _themed_showerror(parent, title: str, message: str, accent: str = None,

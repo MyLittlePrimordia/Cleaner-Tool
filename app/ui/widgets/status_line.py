@@ -188,10 +188,20 @@ class StatusLine(tk.Canvas):
             pass
 
     def _schedule(self):
+        # I-004: 33ms (~30fps) marquee kept the Tk loop hot on battery even
+        # when the window was withdrawn. 100ms is visually identical for a
+        # status marquee and cuts wakeups 3x; withdrawn windows cancel.
         if self._job is not None:
             return
         try:
-            self._job = self.after(33, self._tick)
+            try:
+                _root = getattr(self, "winfo_toplevel", lambda: None)()
+                if _root is not None and str(getattr(_root, "state", lambda: "")()) in ("withdrawn", "iconic"):
+                    self._job = None
+                    return
+            except Exception:
+                pass
+            self._job = self.after(100, self._tick)
         except Exception:
             self._job = None
 

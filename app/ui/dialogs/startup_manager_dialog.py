@@ -168,11 +168,26 @@ class StartupManagerDialog(ToolPage):
         last = boot_perf.format_ms(summary.get("last_ms"))
         avg = boot_perf.format_ms(summary.get("average_ms"))
         count = len(summary.get("boots") or [])
-        try:
-            self.banner.set_sub(
-                "Last boot %s \u00b7 average %s over %d recorded boot%s. "
+        line = ("Last boot %s \u00b7 average %s over %d recorded boot%s. "
                 "Impact is Windows' own measurement."
                 % (last, avg, count, "" if count == 1 else "s"))
+        # U-004: a single boot time is a snapshot; the question a disable
+        # decision raises is whether the NEXT boot moved. Two measured boots
+        # can answer that as a fact, with no claim about what caused it.
+        rows = summary.get("boots") or []
+        if len(rows) >= 2:
+            try:
+                delta = int(rows[0]["boot_ms"]) - int(rows[1]["boot_ms"])
+                if abs(delta) >= 1000:
+                    line = ("Last boot %s, %.1f s %s than the boot before. "
+                            "Average %s over %d recorded boot%s."
+                            % (last, abs(delta) / 1000.0,
+                               "faster" if delta < 0 else "slower",
+                               avg, count, "" if count == 1 else "s"))
+            except (KeyError, TypeError, ValueError):
+                pass
+        try:
+            self.banner.set_sub(line)
         except Exception:
             pass
         impact = summary.get("impact") or {}

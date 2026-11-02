@@ -24,6 +24,7 @@ import json
 import os
 import sys
 import threading
+import time
 
 # H2/H3: path resolution and the event log now live in leaf modules, and are
 # re-exported here so every existing importer
@@ -101,12 +102,14 @@ def _degraded_message() -> str:
             % (_config_degraded_reason or "an I/O error"))
 
 DEFAULT_CONFIG = {
+    "game_profiles": {},
     "schedule_enabled": False,
     # H7: this key was written by app/scheduler.py and read by the Auto
     # Maintenance dialog, but was never declared here — so it was never
     # defaulted and never validated, and a hand-edited "yes" rendered the
     # dialog's update checkbox as ON. Two features, one scheduled task each.
     "schedule_update_enabled": False,
+    "schedule_saves_enabled": False,
     "schedule_frequency": "weekly",  # daily, weekly, monthly
     "schedule_time": "03:00",
     # PC Health badge (2026-10): when to re-check automatically, and the
@@ -129,6 +132,7 @@ DEFAULT_CONFIG = {
     "watch_free_percent": 10,
     "watch_score_drop": 8,
     "watch_missed_run": True,
+    "watch_startup": True,
     # The findings bus (AUDIT TX-002): what a tool measured that still needs
     # acting on, so the Health tab and the Tools hub can quote it without
     # re-measuring. Bounded by config_schema.INSIGHTS_MAX and filtered by age
@@ -205,6 +209,7 @@ DEFAULT_CONFIG = {
     # Survives a restart on purpose: closing the app mid-session must not
     # strand the machine in game settings with no way back.
     "game_night_active": False,
+    "game_night_started_at": 0.0,
     "game_night_keys": [],
     "game_night_close_apps": [],
     # Apps the user added themselves to the close list (Add app in Auto-Pilot):
@@ -212,6 +217,11 @@ DEFAULT_CONFIG = {
     # an entry the user unticked stays visible in the dialog instead of
     # disappearing.
     "game_night_custom_apps": [],
+    # A-001: finished Game Mode sessions, newest last. Bounded like the run
+    # ledger: enough for a recap and a month of habits, not telemetry.
+    "game_sessions": [],
+    # N-004: bounded latency samples per ping target, for the trend line.
+    "latency_history": {},
     # Startup Manager: items the user has disabled, enough data to put
     # each one back exactly as it was. Registry items store {source,
     # name, command, value_type}; Startup-folder items store {source,
@@ -699,14 +709,10 @@ def _prune_stale_config_temps(max_age_s: int = 3600) -> int:
     return removed
 
 
-# H-009: in-process guard + reentrancy counter for the cross-process lock.
-_config_file_lock_guard = threading.RLock()
-_config_file_lock_depth = 0
-
-
 @contextlib.contextmanager
 def _config_file_lock():
     """Cross-process advisory lock around the load-mutate-save window (H-009).
+    R-002: delegates to app.infra.filelock.locked (single owner).
 
     _config_lock only serialises threads inside one process. The GUI and a
     headless --auto-clean/--auto-update process (deliberately exempt from
@@ -718,47 +724,13 @@ def _config_file_lock():
     Reentrant within a process: update_config() holds this while calling
     save_config(), which would otherwise deadlock re-locking the same byte.
     """
-    global _config_file_lock_depth
-    with _config_file_lock_guard:
-        if _config_file_lock_depth > 0:
-            _config_file_lock_depth += 1
-            try:
-                yield
-            finally:
-                _config_file_lock_depth -= 1
-            return
-        handle = None
-        locked = False
-        try:
-            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-            lock_path = CONFIG_FILE.with_name(CONFIG_FILE.name + ".lock")
-            handle = open(lock_path, "a+")
-            if sys.platform.startswith("win"):
-                import msvcrt
-                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-            locked = True
-        except Exception:
-            # A locking failure must never block config I/O. The unique temp
-            # name + atomic os.replace still keep each individual write safe;
-            # only the cross-process lost-update window is left unguarded.
-            locked = False
-        _config_file_lock_depth = 1
-        try:
-            yield
-        finally:
-            _config_file_lock_depth = 0
-            if handle is not None:
-                try:
-                    if locked and sys.platform.startswith("win"):
-                        import msvcrt
-                        handle.seek(0)
-                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-                except Exception:
-                    pass
-                try:
-                    handle.close()
-                except Exception:
-                    pass
+    # R-002: single owner lives in app.infra.filelock; this stays as a thin
+    # wrapper so every existing caller keeps working unchanged. Fail-open
+    # semantics are preserved (a lock failure never blocks settings I/O).
+    from app.infra.filelock import locked as _file_locked
+    lock_path = CONFIG_FILE.with_name(CONFIG_FILE.name + ".lock")
+    with _file_locked(lock_path, warn_key="config"):
+        yield
 
 
 #: I-009: the temp sweep is a directory enumeration, and it used to run on
@@ -931,32 +903,65 @@ def mark_tip_seen(tip_id: str) -> None:
 # --------------------------------------------------------------------------- #
 
 def get_game_night() -> dict:
-    """{"active": bool, "keys": [str], "close_apps": [str],
-    "custom_apps": [str]} — custom_apps being the user's own picks (exe
-    names), which the close list references as `custom:<name>` keys."""
+    """{"active": bool, "started_at": epoch seconds, "keys": [str],
+    "close_apps": [str], "custom_apps": [str]} — custom_apps being the
+    user's own picks (exe names), which the close list references as
+    `custom:<name>` keys. `started_at` is 0 when no session is running; it
+    is what lets the dialog show a live duration and a recap on End."""
     try:
         cfg = load_config()
+        try:
+            started = float(cfg.get("game_night_started_at") or 0)
+        except (TypeError, ValueError, OverflowError):
+            started = 0.0
         return {
             "active": bool(cfg.get("game_night_active", False)),
+            "started_at": started if started > 0 else 0.0,
             "keys": list(cfg.get("game_night_keys", []) or []),
             "close_apps": list(cfg.get("game_night_close_apps", []) or []),
             "custom_apps": list(cfg.get("game_night_custom_apps", []) or []),
         }
     except Exception:
-        return {"active": False, "keys": [], "close_apps": [],
-                "custom_apps": []}
+        return {"active": False, "started_at": 0.0, "keys": [],
+                "close_apps": [], "custom_apps": []}
 
 
-def set_game_night(active: bool, keys=None) -> None:
+def set_game_night(active: bool, keys=None, started_at=None) -> None:
     """Record that Game Night started (with the keys it turned on) or
-    ended. Single-lock RMW, same contract as mark_tweak_applied."""
+    ended. Single-lock RMW, same contract as mark_tweak_applied.
+
+    `started_at` defaults to now on start and 0 on end. Passing it
+    explicitly is for tests and for a caller that already stamped the start;
+    an existing nonzero stamp is preserved on start so a UI refresh cannot
+    restart the clock.
+    """
     try:
         want = bool(active)
         klist = [str(k) for k in (keys or []) if str(k).strip()][:200]
 
         def _mut(cfg):
+            was_active = bool(cfg.get("game_night_active"))
             cfg["game_night_active"] = want
-            cfg["game_night_keys"] = klist if want else []
+            if not want:
+                cfg["game_night_started_at"] = 0.0
+                cfg["game_night_keys"] = []
+                return
+            previous = started_at
+            if previous is None:
+                # Preserve a stamp only for a session that is ALREADY active.
+                # A leftover stamp beside active=False is stale config, not a
+                # session to continue, and trusting it would show a duration
+                # that started days ago.
+                previous = 0.0
+                if was_active:
+                    try:
+                        previous = float(cfg.get("game_night_started_at") or 0)
+                    except (TypeError, ValueError, OverflowError):
+                        previous = 0.0
+            cfg["game_night_started_at"] = (float(previous)
+                                            if previous and previous > 0
+                                            else time.time())
+            cfg["game_night_keys"] = klist
 
         update_config(_mut)
     except Exception:
@@ -988,3 +993,47 @@ def set_game_night_custom_apps(names) -> None:
             lambda cfg: cfg.__setitem__("game_night_custom_apps", cleaned))
     except Exception:
         pass
+
+def record_game_session(started, keys=None, restored=0, failed=0,
+                        note="") -> None:
+    """Append one finished Game Mode session to the bounded ledger.
+
+    A-001: the recap was a string on the dialog, so "keeps a short recap" was
+    true only until the window closed. This records what the app can defend:
+    when it started, how long it ran and which tweaks were on. The duration is
+    clamped at 0, never invented, and a ledger row is dropped by the schema if
+    it cannot carry a real start and length.
+    """
+    try:
+        ended = time.time()
+        try:
+            start = float(started or 0)
+        except (TypeError, ValueError, OverflowError):
+            start = 0.0
+        duration = int(max(0, ended - start)) if start > 0 else 0
+        klist = [str(k) for k in (keys or []) if str(k).strip()][:200]
+
+        def _mut(cfg):
+            rows = cfg.get("game_sessions")
+            if not isinstance(rows, list):
+                rows = []
+            rows.append({
+                "t": ended, "d": duration, "k": klist,
+                "r": max(0, int(restored or 0)),
+                "f": max(0, int(failed or 0)),
+                "n": " ".join(str(note or "").split())[:120],
+            })
+            cfg["game_sessions"] = rows[-20:]
+
+        update_config(_mut)
+    except Exception:
+        pass
+
+
+def get_game_sessions() -> list:
+    """The stored session rows, newest last. Never raises."""
+    try:
+        rows = load_config().get("game_sessions")
+        return list(rows) if isinstance(rows, list) else []
+    except Exception:
+        return []

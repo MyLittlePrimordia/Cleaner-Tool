@@ -30,8 +30,10 @@ import os
 import subprocess
 import sys
 import tempfile
-import time
+import urllib.parse
 import urllib.request
+
+from app.download_stream import stream_to_part
 
 #: The release repository the app checks. Canonical here (not in app.ui.app)
 #: so both the GUI and this module can name it without an upward import.
@@ -47,6 +49,9 @@ _UA = "CleanerTool/2.0 (self-update)"
 #: Sanity bounds. The real gate is the SHA-256; these only stop a wrong
 #: response (an HTML error page, a multi-GB body) from being written at all.
 _MIN_BYTES = 1 * 1024 * 1024
+#: H-004: hosts update artifacts may be fetched from.
+_UPDATE_HOSTS = ("github.com", "objects.githubusercontent.com",
+                 "github-releases.githubusercontent.com")
 _MAX_BYTES = 400 * 1024 * 1024
 _MZ = b"MZ"
 
@@ -151,6 +156,8 @@ def parse_sha256(text: str) -> str:
 
 def fetch_sha256(url: str, timeout: int = 20, max_bytes: int = 4096) -> str:
     """Download a ``.sha256`` file and parse it. "" on any failure."""
+    if not _allowed_update_url(url):
+        return ""
     try:
         req = urllib.request.Request(url, headers={"User-Agent": _UA})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -212,6 +219,17 @@ def is_cancellation(message: str) -> bool:
     return str(message or "").strip() == CANCELLED_MESSAGE
 
 
+def _allowed_update_url(url: str) -> bool:
+    """H-004: only fetch update artifacts from GitHub's release hosts."""
+    try:
+        u = urllib.parse.urlparse(url)
+    except Exception:
+        return False
+    host = (u.hostname or "").lower()
+    return u.scheme == "https" and any(
+        host == h or host.endswith("." + h) for h in _UPDATE_HOSTS)
+
+
 def download_verified(url: str, sha256: str, size: int, dest: str, *,
                       on_progress=None, cancelled=None,
                       timeout: int = 120) -> "tuple[bool, str]":
@@ -222,6 +240,8 @@ def download_verified(url: str, sha256: str, size: int, dest: str, *,
     Mirrors app.downloader._download's guarantees without needing a
     TaskContext, so it can be exercised directly.
     """
+    if not _allowed_update_url(url):
+        return False, "the update URL is not a GitHub release host - refused"
     expected = int(size or 0)
     ceiling = expected if expected else _MAX_BYTES
     # B-007: stream into a sibling `.part` and only rename it into place once
@@ -229,42 +249,37 @@ def download_verified(url: str, sha256: str, size: int, dest: str, *,
     # rejected download left a partial file AT the name callers read, which a
     # crash (or a second attempt racing the first) could publish as the build.
     part = dest + ".part"
-    # H-006: `timeout` bounds each socket read, not the transfer; a slow-drip
-    # origin could otherwise keep an update "downloading" for hours.
-    deadline = time.monotonic() + timeout if timeout else None
     try:
         folder = os.path.dirname(os.path.abspath(dest))
         os.makedirs(folder, exist_ok=True)
         req = urllib.request.Request(url, headers={"User-Agent": _UA})
-        h = hashlib.sha256()
-        got = 0
-        with urllib.request.urlopen(req, timeout=timeout) as resp, \
-                open(part, "wb") as f:
-            while True:
-                if cancelled is not None and cancelled():
-                    raise _Cancelled()
-                if deadline is not None and time.monotonic() > deadline:
-                    raise RuntimeError(
-                        "the download took longer than %ds" % timeout)
-                chunk = resp.read(1 << 16)
-                if not chunk:
-                    break
-                if got + len(chunk) > ceiling:
-                    raise RuntimeError("the download is larger than expected")
-                f.write(chunk)
-                h.update(chunk)
-                got += len(chunk)
-                if on_progress is not None:
-                    try:
-                        on_progress(got, expected)
-                    except Exception:
-                        pass
+
+        def _on_chunk(got_now: int) -> None:
+            if on_progress is None:
+                return
+            try:
+                on_progress(got_now, expected)
+            except Exception as exc:
+                # H-003: a broken progress UI must not abort the
+                # download, but the error should still leave a trace.
+                from app.utils import log_or_swallow
+                log_or_swallow(None, "self_update: progress callback", exc)
+
+        # R-002: the stream loop (ceiling, H-006 deadline, cancel check,
+        # hash) lives in app.download_stream. Size, magic and host checks
+        # stay here.
+        got, digest, _resp = stream_to_part(
+            req, part, ceiling=ceiling, timeout=timeout,
+            cancelled=cancelled, on_chunk=_on_chunk,
+            on_cancel=_Cancelled)
         if expected and got != expected:
             raise RuntimeError("size mismatch (got %d, expected %d)"
                                % (got, expected))
         if got < _MIN_BYTES:
             raise RuntimeError("the download is too small to be the app")
-        if h.hexdigest().lower() != parse_sha256(sha256):
+        # H-008: constant-time compare on the security gate.
+        import hmac as _hmac
+        if not _hmac.compare_digest(digest.lower(), parse_sha256(sha256)):
             raise RuntimeError(
                 "the download did not match its published SHA-256")
         with open(part, "rb") as f:
@@ -276,8 +291,10 @@ def download_verified(url: str, sha256: str, size: int, dest: str, *,
         _quiet_remove(part)
         return False, CANCELLED_MESSAGE
     except Exception as exc:
+        # B-002: `dest` is only written by the os.replace above, after every
+        # check passed, so a failed attempt never owns a file at `dest`.
+        # Removing it here could delete a previously verified copy.
         _quiet_remove(part)
-        _quiet_remove(dest)
         return False, str(exc) or "download failed"
 
 
@@ -322,7 +339,8 @@ def staged_ready() -> str:
     if not expected:
         return ""
     try:
-        return exe if _hash_file(exe).lower() == expected else ""
+        import hmac as _hmac2
+        return exe if _hmac2.compare_digest(_hash_file(exe).lower(), expected) else ""
     except Exception:
         return ""
 
@@ -405,6 +423,9 @@ def build_swap_script(target_exe: str, staged_exe: str,
         "goto quit",
         ":rollback",
         'move /y "%OLD%" "%TARGET%" >nul 2>&1',
+        # B-003: the old exe was already closed for the swap, so bring it
+        # back, otherwise a failed update leaves the user with nothing running.
+        ('start "" "%TARGET%"' if relaunch else "rem no relaunch requested"),
         ":quit",
         'del "%~f0" >nul 2>&1',
     ]

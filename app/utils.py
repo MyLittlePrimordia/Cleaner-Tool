@@ -237,6 +237,15 @@ def _get_any_proc():
         for p in _current_procs.values():
             if p is not None and p.poll() is None:
                 return p
+    # R-005: ProcHandle owns one Popen + kill_tree for new code; consult it
+    # as a fallback so a handle-tracked proc is still stoppable here.
+    try:
+        from app.proc_handle import ProcHandle
+        handle = ProcHandle.any_live()
+        if handle is not None:
+            return handle.proc
+    except Exception:
+        pass
     return None
 
 
@@ -671,7 +680,14 @@ def run_cmd(ctx: TaskContext, command, shell: bool = False, timeout: Optional[in
 
             def _reader():
                 try:
-                    for raw_line in proc.stdout:  # type: ignore[union-attr]
+                    # B-005: proc.stdout can be None when the pipe failed to
+                    # open (handle exhaustion). Iterating None raised TypeError,
+                    # was swallowed, sent EOF, and the outer wait lost its
+                    # cancel/timeout bound. Fail to EOF explicitly instead.
+                    _out = proc.stdout
+                    if _out is None:
+                        return
+                    for raw_line in _out:
                         q.put(raw_line)
                 except Exception:
                     pass

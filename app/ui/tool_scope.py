@@ -93,7 +93,23 @@ TOOL_SCOPES = {
         reads="Files in one category"),
     # N-002: read-only until a step is picked; a Clean step then uses the
     # normal Clean-tab engine, so its own confirmation and scorecard apply.
+    # N-003: read-only list. Saving writes a name + exe + the keys already
+    # ticked on the Tweak tab; "Use now" hands off to the normal Game
+    # Night engine, which owns the changes and their snapshots.
+    "GameProfilesDialog": ToolScope(
+        reads="Saved game profiles",
+        changes="Saves a name, exe and key list",
+        reversible="Yes — Delete removes it",
+        undoable=True),
     "ReclaimPlanDialog": ToolScope(
+        reads="Measured reclaim plan",
+        changes="Runs the step you pick",
+        reversible="Only with Quarantine",
+        destructive=True),
+
+    # N-002: the guide only orders the same plan; the step it hands off to
+    # owns the change (and its undo), exactly like the plan dialog.
+    "ReclaimGuideDialog": ToolScope(
         reads="Measured reclaim plan",
         changes="Runs the step you pick",
         reversible="Only with Quarantine",
@@ -157,6 +173,11 @@ TOOL_SCOPES = {
     "SafetyCenterDialog": ToolScope(
         reads="Every safety net",
         changes="Runs the undo you pick",
+        reversible="Yes — it is the undo",
+        undoable=True),
+    "RecoveryDialog": ToolScope(
+        reads="Recovery records",
+        changes="Puts back one item",
         reversible="Yes — it is the undo",
         undoable=True),
 

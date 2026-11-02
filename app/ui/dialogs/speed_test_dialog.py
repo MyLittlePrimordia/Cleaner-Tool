@@ -675,6 +675,14 @@ class SpeedTestDialog(ToolPage):
         if _gen is not None and _gen != getattr(self, "_scan_gen", _gen):
             return
         self._results[leg] = value
+        # N-004: keep the measured leg for the trend too. Only a real
+        # number is recorded; an unreachable leg stays absent, never 0.
+        try:
+            from app import latency_history
+            if leg in ("ping", "download", "upload") and value is not None:
+                latency_history.record("speed:%s" % leg, value)
+        except Exception:
+            pass
         try:
             self._paint_usage(finished=False)
         except Exception:
@@ -685,6 +693,13 @@ class SpeedTestDialog(ToolPage):
             if lbl is not None and lbl.winfo_exists():
                 if leg == "ping":
                     txt = _fp(value)
+                    try:
+                        from app import latency_history
+                        _spark = latency_history.spark("speed:ping")
+                        if _spark:
+                            txt += " · " + _spark
+                    except Exception:
+                        pass
                 elif leg == "stability":
                     # value is a (jitter_ms|None, loss_pct|None) pair —
                     # honest Nones read "—", never a fake 0.

@@ -121,12 +121,14 @@ def is_admin() -> bool:
 
 def _get_elevation_cookie_path() -> str:
     """Get path to a temporary file used for elevation coordination."""
-    return os.path.join(tempfile.gettempdir(), "CleanerTool_elevation_cookie")
+    from app.infra.rendezvous import temp_path
+    return temp_path("CleanerTool_elevation_cookie")
 
 
 def _get_elevation_token_path() -> str:
     """Path storing the expected random token for the pending elevation."""
-    return os.path.join(tempfile.gettempdir(), "CleanerTool_elevation_token")
+    from app.infra.rendezvous import temp_path
+    return temp_path("CleanerTool_elevation_token")
 
 
 def _exclusive_write(path: str, data: str) -> None:
@@ -136,16 +138,22 @@ def _exclusive_write(path: str, data: str) -> None:
     then create exclusively (O_CREAT|O_EXCL). On failure we raise so the
     caller aborts the handshake and falls through to a normal (unelevated)
     launch — never follow a raced-in link via open(path, "w")."""
+    # R-007: the exclusive-create primitive lives in
+    # app.infra.rendezvous; keep the icacls tightening here.
+    from app.infra.rendezvous import exclusive_write as _rendezvous_write
+    _rendezvous_write(path, data)
+    # H-005: 0o600 is a no-op on Windows ACLs; the token file stays
+    # same-user readable. Accepted by design (128-bit unguessable token,
+    # single-use, verified + cleared on first use), but tighten when icacls
+    # is available so only the owner can read it.
     try:
-        os.unlink(path)
-    except OSError:
+        import subprocess as _sp
+        _sp.run(["icacls", path, "/inheritance:r", "/grant:r",
+                 f"{os.environ.get('USERNAME', '')}:F"],
+                capture_output=True, timeout=10,
+                creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0))
+    except Exception:
         pass
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    fd = os.open(path, flags, 0o600)
-    try:
-        os.write(fd, data.encode("utf-8"))
-    finally:
-        os.close(fd)
 
 
 def _write_elevation_cookie(pid: int, token: str = "") -> None:
@@ -214,6 +222,122 @@ def _clear_pending_token() -> None:
         pass        # nothing pending — the normal case, not worth a trail
     except Exception as exc:
         _log_or_swallow_fallback("could not clear pending elevation token", exc)
+
+
+def _get_elevation_ready_path() -> str:
+    """Second-handshake cookie: the elevated copy writes this only after its
+    main window is built and its event loop is alive.
+
+    Why two cookies: the liveness cookie (`signal_elevated_startup`) is
+    written before the GUI is built. The old window used to exit on liveness
+    alone, so an elevated copy that crashed between signaling and showing
+    its window left the user with NO window at all ("clicked Restart as
+    Admin and everything closed"). The old window now exits only after this
+    ready cookie arrives; a crash in between leaves it open with the log
+    path instead of exiting blindly.
+    """
+    from app.infra.rendezvous import temp_path
+    return temp_path("CleanerTool_elevation_ready")
+
+
+def _write_elevation_ready(pid: int, token: str) -> None:
+    try:
+        _exclusive_write(_get_elevation_ready_path(), f"{pid}:{token}")
+    except Exception as exc:
+        _log_or_swallow_fallback("could not write elevation ready cookie", exc)
+
+
+def _read_elevation_ready() -> tuple[int | None, str]:
+    try:
+        # H-001: same no-follow rule as the other handshake readers.
+        raw = read_text_no_follow(_get_elevation_ready_path()).strip()
+        if ":" in raw:
+            pid_s, token = raw.split(":", 1)
+            return int(pid_s.strip()), token.strip()
+        return int(raw), ""
+    except FileNotFoundError:
+        return None, ""
+    except Exception as exc:
+        _log_or_swallow_fallback("could not read elevation ready cookie", exc)
+        return None, ""
+
+
+def _clear_elevation_ready() -> None:
+    try:
+        os.remove(_get_elevation_ready_path())
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        _log_or_swallow_fallback("could not clear elevation ready cookie", exc)
+
+
+def signal_elevated_ready() -> None:
+    """Elevated child: announce the main window is up (second handshake).
+
+    Strict on purpose: only a process carrying this launch's
+    --elevation-token= AND running elevated may write it (no pending-file
+    fallback — a stale pending file plus an ordinary admin launch must
+    never fake a ready). Never raises.
+    """
+    token = ""
+    try:
+        for arg in sys.argv:
+            if str(arg).startswith("--elevation-token="):
+                token = str(arg).split("=", 1)[1]
+                break
+    except Exception:
+        return
+    if not token:
+        return
+    try:
+        if not is_admin():
+            _log_or_swallow_fallback(
+                "signal_elevated_ready: not admin, cannot signal")
+            return
+    except Exception as exc:
+        _log_or_swallow_fallback(
+            "signal_elevated_ready: admin check failed", exc)
+        return
+    _write_elevation_ready(os.getpid(), token)
+
+
+def _wait_for_elevated_ready(timeout: float = 30.0,
+                             expected_token: str | None = None) -> bool:
+    """Wait for the elevated copy's ready cookie (window actually up).
+
+    `expected_token` should be captured BEFORE the liveness wait — the
+    liveness success path clears the pending token file. Falls back to
+    reading it when not supplied. Clears the ready file on success and on
+    give-up (a stale ready must never satisfy a later relaunch).
+    """
+    if not expected_token:
+        try:
+            expected_token = _read_pending_token()
+        except Exception:
+            expected_token = None
+    if not expected_token:
+        _log_or_swallow_fallback(
+            "wait_for_elevated_ready: no expected token, cannot verify")
+        return False
+    start_time = time.monotonic()
+    while time.monotonic() - start_time < timeout:
+        pid, token = _read_elevation_ready()
+        if pid is not None:
+            if token != expected_token:
+                _log_once("ready-token",
+                          "wait_for_elevated_ready: token mismatch")
+            else:
+                _clear_elevation_ready()
+                _log_or_swallow_fallback(
+                    f"wait_for_elevated_ready: elevated window up (pid {pid})")
+                return True
+        try:
+            time.sleep(0.5)
+        except Exception:
+            return False
+    _log_or_swallow_fallback("wait_for_elevated_ready: timed out")
+    _clear_elevation_ready()
+    return False
 
 
 def _get_own_exe_name() -> str:
@@ -417,6 +541,7 @@ def _wait_for_elevated_process(timeout: float = 60.0) -> bool:
     _log_or_swallow_fallback("_wait_for_elevated_process: timed out")
     _clear_pending_token()
     _clear_elevation_cookie()
+    _clear_elevation_ready()
     try:
         from app.config_persist import log_security_event
         log_security_event("elevation", "Elevation timed out or was cancelled.")
@@ -439,6 +564,7 @@ def relaunch_as_admin() -> bool:
         import secrets
         _clear_elevation_cookie()  # Clear any stale cookie
         _clear_pending_token()
+        _clear_elevation_ready()
         token = secrets.token_hex(16)
         _write_pending_token(token)
 
@@ -492,6 +618,7 @@ def relaunch_as_admin() -> bool:
         if result.returncode != 0:
             _log_or_swallow_fallback(f"relaunch_as_admin: PowerShell failed with rc={result.returncode}, stderr={result.stderr}")
             _clear_pending_token()
+            _clear_elevation_ready()
             return False
 
         _log_or_swallow_fallback("relaunch_as_admin: PowerShell succeeded")
@@ -500,6 +627,7 @@ def relaunch_as_admin() -> bool:
         _log_or_swallow_fallback("relaunch_as_admin: exception", exc)
         try:
             _clear_pending_token()
+            _clear_elevation_ready()
         except Exception as exc2:
             # `_clear_pending_token` swallows its own errors, so this only
             # fires if it is ever changed not to. Still worth a trail: a token
@@ -516,6 +644,18 @@ def wait_for_elevated_process(timeout: float = 60.0) -> bool:
     Returns True if the elevated process started successfully.
     """
     return _wait_for_elevated_process(timeout)
+
+
+def wait_for_elevated_ready(timeout: float = 30.0,
+                            expected_token: str | None = None) -> bool:
+    """Wait for the elevated copy's window-up signal.
+
+    Call after wait_for_elevated_process() succeeds. `expected_token` must
+    be captured before the liveness wait (it clears the pending file).
+    Returns True only when the elevated window is confirmed up — callers
+    must stay open (not exit) on False.
+    """
+    return _wait_for_elevated_ready(timeout, expected_token)
 
 
 def signal_elevated_startup() -> None:

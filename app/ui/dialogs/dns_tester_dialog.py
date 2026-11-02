@@ -15,9 +15,16 @@ from app.ui.base import Tooltip, _themed_askyesno
 from app.ui.dialogs._tool_page import ToolPage
 from app.ui.theme import (
     COLORS, RADIUS_SURFACE, TAB_ACCENTS, TYPE, _hex_lerp, SPACE_1, SPACE_2, SPACE_3,
+    CARD_H_ROW,
 )
 from app.ui.metrics import CARD_BODY_INSET, CONTROL_GAP, GROUP_GAP, ROW_PAD, TIGHT_GAP
 from app.ui.widgets import AnimatedButton, AnimatedProgressBar
+
+
+def _log_dns(msg, exc=None):
+    """Surface a DNS-dialog action failure in the run log (never raises)."""
+    from app.utils import log_or_swallow
+    log_or_swallow(None, "dns_tester: " + msg, exc)
 
 
 class _PickRow(RoundedCard):
@@ -80,11 +87,13 @@ class DnsTesterDialog(ToolPage):
         body = self.content
 
         # F09: honest methodology — TCP:53 handshake ranking (stdlib-only),
-        # a good proxy for, but not a real UDP DNS query.
+        # a good proxy for, but not a real UDP DNS query. The caveat is
+        # VISIBLE, not just in this comment: the tool makes a recommendation,
+        # so the user has to know what the number actually measures.
         self.banner.set_state("\u26A1", TAB_ACCENTS["Tweak"])
         self.banner.set_title("Pick the fastest DNS for your connection")
-        self.banner.set_sub("Tests each server over your connection, "
-                            "then ranks them.")
+        self.banner.set_sub("Ranked by TCP:53 handshake latency \u2014 a proxy "
+                            "for DNS speed, not a UDP query benchmark.")
 
         # progress (indeterminate — probe count is known but per-probe
         # latency isn't; the honest signal is rows landing below)
@@ -268,7 +277,9 @@ class DnsTesterDialog(ToolPage):
                 return
             try:
                 ms = time_resolver(ip, cancelled=lambda: dead())
-            except Exception:
+            except Exception as exc:
+                # a dead resolver is an expected "no answer"; log the error only
+                _log_dns(f"probe {ip} failed", exc)
                 ms = None
             if dead():
                 return
@@ -308,7 +319,7 @@ class DnsTesterDialog(ToolPage):
         """Build one server row (shared by the built-in list and a
         user-added Custom entry) and register it in self._row_widgets."""
         row = _PickRow(self._rows_body, fill=COLORS["bg_alt"],
-                       bg=COLORS["bg"], radius=RADIUS_SURFACE, min_height=44)
+                       bg=COLORS["bg"], radius=RADIUS_SURFACE, min_height=CARD_H_ROW)
         rb = row.body
         try:
             _pri, _sec = self._pair_for(ip)
@@ -596,12 +607,14 @@ class DnsTesterDialog(ToolPage):
             if not winner or self._results.get(winner) is None:
                 return
             primary, secondary = self._pair_for(winner)
-        except Exception:
+        except Exception as exc:
+            _log_dns("apply: pair lookup failed", exc)
             return
         try:
             from app.tab_presets import TABS as _TABS
             task = next(t for t in _TABS.get("Tweak", []) if t.key == "gaming_dns")
-        except Exception:
+        except Exception as exc:
+            _log_dns("apply: gaming_dns task not found", exc)
             return
         # REDESIGN 2026-10: this had no confirmation, and the comment above
         # argued one was unnecessary because "the status line + the highlighted
@@ -641,13 +654,14 @@ class DnsTesterDialog(ToolPage):
                 return _apply(ctx, servers=(_w, _s))
 
             winner_task = _dc.replace(task, run=_run)
-        except Exception:
+        except Exception as exc:
+            _log_dns("apply: task build failed", exc)
             return
         self.close()
         try:
             self.app.run_tasks("Tweak", [winner_task], mode="run")
-        except Exception:
-            pass
+        except Exception as exc:
+            _log_dns("apply: run_tasks failed", exc)
 
     def _restore_default(self):
         """Close, then run the REAL gaming_dns revert through the
@@ -666,5 +680,5 @@ class DnsTesterDialog(ToolPage):
         self.close()
         try:
             self.app.run_tasks("Tweak", [task], mode="revert")
-        except Exception:
-            pass
+        except Exception as exc:
+            _log_dns("restore: run_tasks failed", exc)

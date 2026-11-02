@@ -39,6 +39,8 @@ from app.ui.theme import (
     SPACE_3,
     TAB_ACCENTS,
     TYPE,
+    CARD_H_BAND,
+    CARD_H_NOTE,
 )
 from app.ui.widgets import (
     AnimatedButton,
@@ -225,6 +227,42 @@ def _sensor_titles():
         return {}
 
 
+#: U-004: the closed loop's two ends. A sensor that graded C/D/F on the
+#: previous ledger point and A/B now counts as fixed — "?" never counts
+#: either way (an unmeasured sensor is not a fix and not a regression).
+_FIXED_FROM = ("C", "D", "F")
+_FIXED_TO = ("A", "B")
+
+
+def _fixed_since_last(prev_f, cards):
+    """[(key, prev_grade)] fixed since the previous ledger point.
+
+    Pure (test seam): `prev_f` is the previous point's sensor->grade map,
+    `cards` the current key->card map. Only keys present in BOTH with a
+    bad-then-good grade move are reported — a sensor the current scan did
+    not measure says nothing, never "fixed".
+    """
+    fixed = []
+    try:
+        prev = dict(prev_f or {})
+    except Exception:
+        return []
+    for key, card in (cards or {}).items():
+        try:
+            now = str((card or {}).get("grade") or "?").upper()
+        except Exception:
+            continue
+        if now not in _FIXED_TO:
+            continue
+        try:
+            was = str(prev.get(key) or "?").upper()
+        except Exception:
+            continue
+        if was in _FIXED_FROM:
+            fixed.append((key, was))
+    return fixed
+
+
 #: A care target is not a destination. These are the screens that own the
 #: same fix; the Health page never runs a repair itself.
 _CARE_ROUTE = {
@@ -261,7 +299,7 @@ class HealthTab(tk.Frame):
 
     def _build(self):
         self._lead = lead = PageLead(
-            self, accent=ACCENT, fill=COLORS["surface"], min_height=154,
+            self, accent=ACCENT, fill=COLORS["surface"],
             with_media=True)
         lead.pack(fill="x", padx=PAGE_GUTTER, pady=(PAGE_TOP, SPACE_1))
 
@@ -335,7 +373,7 @@ class HealthTab(tk.Frame):
         same disclosure-card behaviour the Tools tiles use.
         """
         card = RoundedCard(self, fill=COLORS["surface"], bg=COLORS["bg"],
-                           radius=RADIUS_CARD, min_height=56)
+                           radius=RADIUS_CARD, min_height=CARD_H_BAND)
         self._trend_card = card
         body = tk.Frame(card.body, bg=COLORS["surface"])
         body.pack(fill="x", padx=CARD_BODY_INSET, pady=COMPACT_INSET)
@@ -505,13 +543,21 @@ class HealthTab(tk.Frame):
         classic dropped-callback race. Bind the arguments in the closure
         instead, and keep the fallback for a stub app in tests.
         """
+        # B-004: worker-thread after() can be silently dropped on 3.14, so
+        # the dispatcher is the ONLY worker path. The after() fallback ran
+        # on the wrong thread and hid the failure; keep it for Tk-thread
+        # callers only (identified by running on the main thread).
         try:
             self.app._dispatch.post(fn)
             return
         except Exception:
             pass
         try:
-            self.after(0, fn)
+            import threading as _th
+            if _th.current_thread() is _th.main_thread():
+                self.after(0, fn)
+            # else: dropped callback would have been silent before; the
+            # dispatcher failure above is already logged by TkDispatcher.
         except Exception:
             pass
 
@@ -550,8 +596,20 @@ class HealthTab(tk.Frame):
         summary = health_model.summarize(self._cards)
         grade = summary.get("grade") or "?"
         if grade in health_model.GRADE_POINTS:
+            # U-004: persist per-sensor grades with the point — without them
+            # the ledger knows the score fell but never which sensor moved,
+            # and the fixed-since-last-check loop has nothing to compare.
+            # (quick_check already does this; the Health tab's own scan did
+            # not, so a tab scan erased the evidence a background checkup
+            # had stored.)
             try:
-                health_badge.record(grade, score=summary.get("score"))
+                from app.health_history import findings_from_cards
+                _findings = findings_from_cards(self._cards)
+            except Exception:
+                _findings = None
+            try:
+                health_badge.record(grade, score=summary.get("score"),
+                                    findings=_findings)
             except Exception:
                 pass
             try:
@@ -749,6 +807,10 @@ class HealthTab(tk.Frame):
         # sensor pass must not hide "172 duplicate files" from a tool run.
         self._paint_tool_findings(scanning,
                                  budget=max(0, self.MAX_ROWS - len(priorities)))
+        # U-004: the closed loop lands last — after the problems, the proof
+        # that an earlier problem is gone. Outside the five-row budget: a
+        # fix must never push a live finding off the list.
+        self._paint_fixed(scanning)
         if unknown:
             self._unknown_line(unknown)
 
@@ -781,6 +843,131 @@ class HealthTab(tk.Frame):
             except Exception:
                 pass
 
+    def _previous_findings(self):
+        """Per-sensor grades of the checkup before the current one.
+
+        When the just-finished scan already recorded itself, the last point
+        is this scan and the comparison is against the one before it;
+        otherwise (mid-scan, or a stale ledger) the last point is the
+        comparison. {} when there is nothing to compare against — the
+        fixed section then stays hidden rather than guessing.
+        """
+        try:
+            import time as _time
+            points = health_history.entries() or []
+        except Exception:
+            return {}
+        if not points:
+            return {}
+        try:
+            last = points[-1] or {}
+            fresh = (_time.time() - float(last.get("t") or 0)) < 600
+        except Exception:
+            fresh = False
+        if fresh and len(points) >= 2:
+            prev = points[-2] or {}
+        elif not fresh:
+            prev = last
+        else:
+            return {}
+        f = prev.get("f")
+        try:
+            return dict(f) if isinstance(f, dict) else {}
+        except Exception:
+            return {}
+
+    def _paint_fixed(self, scanning):
+        """U-004: sensors that were C/D/F last checkup and grade A/B now.
+
+        Skipped mid-scan: partial cards would flicker the list as sensors
+        land. A fixed row needs no action — the fix already happened — so
+        it renders green with the before/after as its evidence.
+        """
+        if scanning or not self._cards:
+            return
+        prev = self._previous_findings()
+        if not prev:
+            return
+        fixed = _fixed_since_last(prev, self._cards)
+        if not fixed:
+            return
+        tk.Label(self._issue_area, text="FIXED SINCE LAST CHECK",
+                 font=TYPE["section"], bg=COLORS["bg"],
+                 fg=COLORS["subtext"], anchor="w").pack(
+                     fill="x", padx=SPACE_1, pady=(SPACE_3, 0))
+        for key, was in fixed:
+            card = self._cards.get(key) or {}
+            title = str(card.get("headline")
+                          or _sensor_titles().get(key) or key)
+            now = str(card.get("grade") or "?")
+            row = FindingRow(
+                self._issue_area, title=title,
+                evidence="Was %s, now reads %s — the fix held." % (was, now),
+                severity="ok", wrap=640)
+            row.pack(fill="x", padx=SPACE_1, pady=(SPACE_1, 0))
+
+    def _recheck_sensor(self, key):
+        """U-004: re-run one sensor in place, without a full Check PC.
+
+        Runs the single spec on a worker (slow sensors join bounded, like
+        the full scan) and lands the fresh card into the current set. A
+        full scan in progress wins — a lone re-check must not interleave
+        with it. Never raises out of the button.
+        """
+        if self._scanning:
+            return
+        try:
+            from app.health_scan import SENSORS, run_health_scan
+            spec = next((s for s in SENSORS if s[0] == key), None)
+            if spec is None:
+                return
+        except Exception:
+            return
+        rechecking = getattr(self, "_rechecking", None)
+        if rechecking is None:
+            rechecking = self._rechecking = set()
+        if key in rechecking:
+            return
+        rechecking.add(key)
+        self._render()
+        seq = self._scan_seq
+
+        def worker():
+            card = None
+            try:
+                from app.utils import TaskContext
+                ctx = TaskContext(log=lambda _m: None,
+                                  set_status=lambda _m: None,
+                                  cancelled=lambda: False)
+                cards = run_health_scan(ctx, on_card=None, sensors=[spec])
+                card = (cards or {}).get(key)
+            except Exception:
+                card = None
+            self._post(lambda: self._land_recheck(seq, key, card))
+
+        try:
+            import threading as _th
+            _th.Thread(target=worker, daemon=True,
+                       name="HealthRecheck").start()
+        except Exception:
+            rechecking.discard(key)
+
+    def _land_recheck(self, seq, key, card):
+        try:
+            rechecking = getattr(self, "_rechecking", None)
+            if rechecking is not None:
+                rechecking.discard(key)
+        except Exception:
+            pass
+        if seq != self._scan_seq or self._scanning:
+            return
+        if card is not None:
+            self._cards[key] = card
+        try:
+            self._render()
+        except Exception:
+            pass
+
     def _finding_row(self, key, card, grade):
         title = str(card.get("headline") or _sensor_titles().get(key) or key)
         detail = str(card.get("detail") or "").strip()
@@ -788,19 +975,31 @@ class HealthTab(tk.Frame):
         evidence = "  ".join(x for x in (detail, note) if x)
         action = health_model.action_for(key, grade)
         target, label = self._action_for(action)
+        # U-004: every sensor row can re-measure itself — the fix the user
+        # applied elsewhere is one click from proof, without a full scan.
+        rechecking = getattr(self, "_rechecking", None) or set()
         row = FindingRow(
             self._issue_area, title=title, evidence=evidence,
             severity="bad" if grade in ("D", "F") else "warn",
             action_label=label if target else "",
             on_action=(lambda t=target: self._route(t)) if target else None,
+            recheck_label="Re-check",
+            on_recheck=(lambda k=key: self._recheck_sensor(k)),
             wrap=640)
         row.pack(fill="x", padx=SPACE_1, pady=(SPACE_1, 0))
+        if key in rechecking:
+            row.set_recheck_enabled(False)
         if target:
             try:
                 Tooltip(row.action(), "Opens the screen where you decide "
                                       "what to do. Nothing changes here.")
             except Exception:
                 pass
+        try:
+            if row.recheck() is not None:
+                Tooltip(row.recheck(), "Re-runs just this check, right now.")
+        except Exception:
+            pass
         return row
 
     @staticmethod
@@ -861,7 +1060,7 @@ class HealthTab(tk.Frame):
     def _empty_row(self, title, detail):
         card = RoundedCard(self._issue_area, fill=COLORS["surface"],
                            bg=COLORS["bg"], radius=RADIUS_CARD,
-                           min_height=72)
+                           min_height=CARD_H_NOTE)
         card.pack(fill="x", pady=(0, SPACE_2))
         body = tk.Frame(card.body, bg=COLORS["surface"])
         body.pack(fill="both", expand=True, padx=CARD_BODY_INSET, pady=SPACE_3)

@@ -51,6 +51,7 @@ class ReclaimPlanDialog(ToolPage):
             self.banner.set_sub("%d step%s, biggest first."
                                 % (len(steps), "" if len(steps) == 1 else "s"))
 
+        self.add_button("Guide me", self._open_guide, kind="secondary")
         self.add_button("Close", self.close, kind="primary")
 
         if not steps:
@@ -111,6 +112,20 @@ class ReclaimPlanDialog(ToolPage):
         self.close()
         try:
             open_route(self.app, target)
+        except Exception:
+            pass
+
+    def _open_guide(self):
+        """N-002: walk this same plan one step at a time."""
+        plan = self._plan
+        try:
+            from app.ui.dialogs.reclaim_guide_dialog import ReclaimGuideDialog
+            parent = self.app.root
+        except Exception:
+            return
+        self.close()
+        try:
+            ReclaimGuideDialog(parent, self.app, plan).wait()
         except Exception:
             pass
 

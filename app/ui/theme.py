@@ -59,37 +59,23 @@ GRADE_COLORS = {
     "?": COLORS["muted"],
 }
 
-# DESIGN AUDIT (2026-10): this module used to carry its OWN copy of
-# `_TAB_STATUS`, byte-identical to the one in app/ui/app.py, and nothing
-# imported it -- app/gui.py re-exported the app.py original. Two tables keyed
-# by tab name that must agree is exactly the kind of duplication that drifts,
-# so ONE copy now lives here, at the bottom of the layering, where both the
-# app shell (app/ui/app.py, which re-exports it for app/gui.py) and the tab
-# pages (app/ui/tabs/tasktab.py) can read it without either importing the
-# other. Importing it from app/ui/app.py instead would be a cycle: the shell
-# already imports TaskTab.
-#
-# Keyed by tab name, exactly like TAB_ACCENTS above, so the two per-tab
-# presentation tables sit together and cannot drift out of sync.
-#
-# TEXT-002 (design audit 2026-09-27): per-tab status-bar copy. Before this,
-# the shell set ONE static string at startup ("Ready. Pick a preset and press
-# Run.") and never re-evaluated it per tab, so the Install and Tools tabs --
-# which have no preset cards and no Run button -- instructed the user to
-# perform an action that does not exist on screen. Resolved on every tab
-# switch in Application._show_tab.
-# DECLUTTER 2026-10: the idle hints are empty. "Pick a preset to begin." sat
-# in the most-watched strip of the window on every launch, next to four other
-# things, to say what the preset cards already say by being the only thing on
-# the page. The row now speaks only when something is happening or has just
-# happened. The table stays (one key per tab) so callers need not change.
-_TAB_STATUS = {
-    "Clean": "",
-    "Repair": "",
-    "Tweak": "",
-    "Install": "",
-    "Tools": "",
-    "Health": "",
+# DESIGN AUDIT 2026-11 (G-003): the per-tab status table is gone. It held
+# one empty string per destination and was still consulted on every tab
+# switch, so a tab WITH an entry and a tab WITHOUT one were
+# indistinguishable - a table that could not be wrong, only incomplete.
+# The band is cleared on a switch now, and that one rule lives in
+# Application._show_tab.
+
+#: Footer `kind` -> the shared button role (C-002). ONE table: `ToolPage`
+#: and `ModalFooter` both read it, so a "quiet" or "text" action cannot
+#: render as two different buttons depending on which surface it is on.
+KIND_ROLE = {
+    "primary": "filled",
+    "secondary": "secondary",
+    "danger": "danger",
+    "warn": "warn",
+    "text": "text",
+    "quiet": "secondary",
 }
 
 F = FONT_FAMILY
@@ -134,10 +120,12 @@ RADIUS_FIELD = SHAPE_S
 # shares the job (DESIGN G-002).
 # ---------------------------------------------------------------------------
 SURFACE_CARD = COLORS["bg_alt"]
-#: A recessed reading surface (log wells, progress tracks). The palette has
-#: no darker container than the page, so a well is the page with the hairline
-#: outline the owning widget draws; the name keeps that intent explicit.
-SURFACE_WELL = COLORS["bg"]
+#: A recessed reading surface (log wells, progress tracks). One tonal step
+#: ABOVE the page - the palette already names `bg_widget` for exactly this
+#: job - so a well reads as its own container instead of as a gap where the
+#: page colour happens to end. (G-001: the role used to alias `bg`, which
+#: left the palette key that names a well with no reader at all.)
+SURFACE_WELL = COLORS["bg_widget"]
 #: The tonal container a selected row/field paints with.
 SURFACE_SELECTED = COLORS["secondary_container"]
 
@@ -202,6 +190,22 @@ ICON_CARD_TOOL = 40
 ICON_USAGE = 28
 
 
+# Card heights (px). The same discipline as the icon and type ladders: a
+# surface's height is a ROLE, not a number chosen per dialog. Before this
+# the app carried nine values (34...200) across ten call sites, so two
+# sibling cards could differ by 10px for no expressed reason and no page
+# could be retuned at once (L-002). Heights only ever GREW into a rung.
+CARD_H_CHIP = 34      # a checkbox/pill-sized tile (task chips)
+CARD_H_ROW = 48       # one list row: a name plus one supporting line
+CARD_H_BAND = 56      # a control band or a two-line summary card
+CARD_H_NOTE = 72      # a short note card: a title plus one detail line
+CARD_H_LEAD = 154     # a page lead card (PageLead's own default)
+CARD_H_HERO = 200     # a navigation column or a hero panel
+
+#: The reading measure of a floating surface (a tooltip) that has no body
+#: to be measured from. Scale it with `scaled_px` - unlike a font, a pixel
+#: measure does not grow with the display.
+TIP_WRAP = 420
 # Frame period (ms) for the animated controls. It is the one tempo the app
 # paints at; a widget that needs to count time derives its ticks from this
 # rather than inventing a second clock (DESIGN G-006).
@@ -505,6 +509,22 @@ def icon_target_px(base_px, widget=None):
         base = int(base_px)
     except (TypeError, ValueError):
         base = 24
+    return max(1, int(round(base * ui_scale(widget))))
+
+
+def scaled_px(value, widget=None):
+    """A design pixel measure scaled to the display, exactly like a font.
+
+    Tk scales points; it does not scale a number written in pixels. This is
+    for the few measures that have no container to be measured from - a
+    tooltip's reading column, for instance. Geometry that HAS a container
+    must use `ThemedModal.body_width()` or the container's real width, not
+    this; scaling a stale column width would just make the old bug bigger.
+    """
+    try:
+        base = int(value)
+    except (TypeError, ValueError):
+        return 0
     return max(1, int(round(base * ui_scale(widget))))
 
 

@@ -14,10 +14,15 @@ the same width and the same height; a group with three cards leaves one cell
 empty rather than stretching its card wider than its neighbours, which is the
 asymmetry a "card grid" stops looking like a grid over.
 
-The whole catalogue fits the page at the minimum window without a scroll
-panel (tests pin this): four groups of cards, no wrapper band, and a card
-height set by its 40px icon rather than by how long its description happens
-to be.
+Above the grid sit the two hub surfaces (A-001/U-001): a "Recommended for
+this PC" band driven by `tool_hub.recommendations()` (evidence-captioned,
+hidden when the PC is healthy) and a Recent strip driven by the recency list
+`tool_hub.remember()` already stored on every card open. Both route through
+`app.routes.open_route`, so a recommendation lands on the screen that owns
+the fix. The whole catalogue fits the page at the minimum window without a
+scroll panel (tests pin this): four groups of cards, no wrapper band, and a
+card height set by its 40px icon rather than by how long its description
+happens to be.
 """
 from __future__ import annotations
 
@@ -34,7 +39,7 @@ from app.ui.theme import (
     icon_target_px,
     scaled_photo,
 )
-from app.ui.widgets import ToolCard, grid_cards
+from app.ui.widgets import AnimatedButton, ToolCard, grid_cards
 from app.utils import resolve_asset_path
 
 #: Cards are grouped by the job the user is doing, not by the history of
@@ -104,7 +109,6 @@ class ToolsTab(tk.Frame):
     """The one destination for everything that is not a run."""
 
     _CARDS = _CARDS
-    _FIX_CARDS = ()
     _GROUPS = _GROUPS
 
     def __init__(self, parent, app):
@@ -125,8 +129,19 @@ class ToolsTab(tk.Frame):
         page.pack(fill="both", expand=True, padx=PAGE_GUTTER,
                   pady=(SPACE_1, SPACE_1))
 
+        # Hub surfaces: recommendations first (the answer to "where do I
+        # look"), then recency. Both are empty-height when they have nothing
+        # to say, so a healthy PC with no history sees the plain catalogue.
+        self._reco_frame = tk.Frame(page, bg=COLORS["bg"])
+        self._reco_frame.pack(fill="x", pady=(0, SPACE_1))
+        self._recent_frame = tk.Frame(page, bg=COLORS["bg"])
+        self._recent_frame.pack(fill="x", pady=(0, SPACE_1))
+        self._first_section = None
+
         for index, (title, keys) in enumerate(_GROUPS):
             section = tk.Frame(page, bg=COLORS["bg"])
+            if index == 0:
+                self._first_section = section
             # The first heading sits against the page's own top inset; the
             # rest get one gap, so the four sections read as four blocks
             # rather than as one list with bold lines in it.
@@ -149,6 +164,212 @@ class ToolsTab(tk.Frame):
         # After the grid exists: a badge mounted on a card that is not packed
         # yet would be laid out against a zero-width parent and never redraw.
         self._refresh_badges()
+        self._refresh_hub()
+        # The catalogue must fit the band the shell gives a page. A Recent
+        # strip is real content (it appears after opening any tool) and adds
+        # ~31px, which overflows the 852x477 minimum band; recommendations
+        # can add more. The strip is the least important surface, so it is
+        # the one that yields at that size and returns when there is room.
+        # Measured from REAL geometry, not winfo_reqheight: before the tab is
+        # mapped the cards still request ~1px, so a build-time measurement
+        # reports the strip as free. The idle pass after a Configure sees the
+        # laid-out cards and their true bottom edge.
+        self.bind("<Configure>",
+                  lambda _e: self.after_idle(self._fit_hub), add="+")
+        try:
+            self.after_idle(self._fit_hub)
+        except Exception:
+            pass
+
+    def _refresh_hub(self):
+        """A-001/U-001: render the hub engine — recommendations + recency.
+
+        Recommendations are facts with evidence ("C: is 8% free"), never
+        generic tips; an empty engine renders nothing, so a healthy PC gets
+        no band rather than three arbitrary cards. Every row opens through
+        `app.routes` (the screen that owns the fix), falling back to the
+        card's own mount when a tool key has no route. The Recent strip
+        reads the list `_mount` already stored — previously written on every
+        click and never shown anywhere.
+        """
+        for frame in (getattr(self, "_reco_frame", None),
+                      getattr(self, "_recent_frame", None)):
+            if frame is None:
+                continue
+            for child in frame.winfo_children():
+                try:
+                    child.destroy()
+                except Exception:
+                    pass
+        try:
+            from app import tool_hub
+            recs = tool_hub.recommendations()
+        except Exception:
+            recs = []
+        for key, reason, grade in recs or []:
+            self._hub_row(key, reason, grade)
+        try:
+            keys = [k for k in tool_hub.recent(limit=5)
+                    if k in self._meta]
+        except Exception:
+            keys = []
+        self._recent_keys = keys
+        self._recent_shrinking = False
+        self._recent_hidden = False
+        self._render_recent(5)
+        if keys:
+            try:
+                if not self._recent_frame.winfo_manager():
+                    self._recent_frame.pack(
+                        fill="x", pady=(0, SPACE_1),
+                        before=getattr(self, "_first_section", None))
+            except Exception:
+                pass
+
+    def _render_recent(self, limit):
+        """Draw the RECENT strip with at most `limit` chips (U-001).
+
+        U-001: when the page band was short, the whole strip was dropped, so
+        the user's own habits were the first thing lost. One chip is still a
+        shortcut, so the strip compacts to two before it yields entirely.
+        """
+        frame = getattr(self, "_recent_frame", None)
+        if frame is None:
+            return False
+        for child in frame.winfo_children():
+            try:
+                child.destroy()
+            except Exception:
+                pass
+        keys = [k for k in getattr(self, "_recent_keys", [])
+                if k in self._meta][:limit]
+        self._recent_limit = len(keys)
+        if not keys:
+            return False
+        try:
+            tk.Label(frame, text="RECENT", font=TYPE["section"],
+                     bg=COLORS["bg"], fg=COLORS["subtext"],
+                     anchor="w").pack(side="left", padx=(0, SPACE_1))
+        except Exception:
+            pass
+        for key in keys:
+            title = self._meta[key]["title"]
+            try:
+                AnimatedButton(
+                    frame, text=title,
+                    command=lambda k=key: self._mount(k),
+                    role="tonal", size="sm").pack(
+                        side="left", padx=(0, SPACE_1))
+            except Exception:
+                pass
+        return True
+
+    def _fit_hub(self, event=None):
+        """Hide the Recent strip when the page band cannot hold it.
+
+        Measured, not a fixed breakpoint: `_hub_full_need` is the requested
+        height with the strip packed (the strip's children are built), so a
+        larger DPI, a longer recent list or extra recommendation rows all
+        move the threshold with the content. Packing it back `before` the
+        first section keeps the original order when the window grows.
+        """
+        recent = getattr(self, "_recent_frame", None)
+        if recent is None or not recent.winfo_children():
+            return
+        # The first idle pass can run before the packer has given the cards
+        # their real height. Forcing idle layout here is what makes the
+        # measurement true in that pass; the flag stops the Configure this
+        # produces from re-entering the same measurement.
+        if getattr(self, "_hub_fitting", False):
+            return
+        self._hub_fitting = True
+        try:
+            self.update_idletasks()
+            try:
+                avail = int(getattr(event, "height", 0) or self.winfo_height())
+            except Exception:
+                return
+            if avail <= 1:
+                return
+            if recent.winfo_manager():
+                try:
+                    bottom = max(card.winfo_rooty() + card.winfo_height()
+                                 for card in self._cards.values()) \
+                        - self.winfo_rooty()
+                except Exception:
+                    return
+                if bottom > avail:
+                    # Remember how tall the catalogue wanted to be (with
+                    # the strip); growing back past it can show it again.
+                    self._hub_full_need = max(bottom, avail)
+                    # U-001: compact the strip before dropping it. Two chips
+                    # still answer "where was I", and the next idle pass
+                    # measures whether even that fits.
+                    if (self._recent_limit > 2
+                            and not getattr(self, "_recent_shrinking", False)):
+                        self._recent_shrinking = True
+                        self._render_recent(2)
+                        try:
+                            self.after_idle(self._fit_hub)
+                        except Exception:
+                            pass
+                        return
+                    recent.pack_forget()
+                    self._recent_hidden = True
+            elif avail >= int(getattr(self, "_hub_full_need", 0) or 0):
+                try:
+                    if getattr(self, "_recent_limit", 0) < 5:
+                        self._recent_shrinking = False
+                        self._render_recent(5)
+                    self._recent_hidden = False
+                    recent.pack(fill="x", pady=(0, SPACE_1),
+                                before=getattr(self, "_first_section", None))
+                except Exception:
+                    pass
+        finally:
+            self._hub_fitting = False
+
+    def _hub_row(self, key, reason, grade):
+        """One recommendation row: severity dot, evidence, Open button."""
+        meta = self._meta.get(key, {})
+        title = meta.get("title", key)
+        tone = (COLORS["accent_red"] if grade == "F"
+                else COLORS["accent_yellow"])
+        try:
+            row = tk.Frame(self._reco_frame, bg=COLORS["bg"])
+            row.pack(fill="x", pady=(0, SPACE_1))
+            tk.Label(row, text="\u25cf", font=TYPE["label_medium"],
+                     bg=COLORS["bg"], fg=tone).pack(side="left")
+            tk.Label(row, text="%s — %s" % (title, reason),
+                     font=TYPE["label_medium"], bg=COLORS["bg"],
+                     fg=COLORS["text"], anchor="w",
+                     justify="left").pack(side="left", fill="x", expand=True,
+                                          padx=(SPACE_1, SPACE_1))
+            AnimatedButton(row, text="Open",
+                           command=lambda k=key: self._open_recommended(k),
+                           role="tonal", size="sm").pack(side="right")
+        except Exception:
+            pass
+
+    def _open_recommended(self, key):
+        """Open a recommendation through the routes table (owned screen).
+
+        Falls back to the card mount when the key has no route, and records
+        the open in recency either way — a recommendation acted on is still
+        a recent tool.
+        """
+        try:
+            from app import routes as _routes
+            if _routes.open_route(self.app, key):
+                try:
+                    from app import tool_hub
+                    tool_hub.remember(key)
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
+        self._mount(key)
 
     def _refresh_badges(self):
         """A-004: put the findings bus on the cards it belongs to.
@@ -237,8 +458,14 @@ class ToolsTab(tk.Frame):
     def on_show(self):
         """Refresh the live badges: a tool run while this page was hidden
         changes which cards need a look, and the counts expire with the bus.
+        The hub band refreshes with it — a fixed problem clears its own
+        recommendation instead of waiting for a restart.
         """
         self._refresh_badges()
+        try:
+            self._refresh_hub()
+        except Exception:
+            pass
         return None
 
     def set_run_enabled(self, enabled: bool):
@@ -248,55 +475,25 @@ class ToolsTab(tk.Frame):
     # ------------------------------------------------------------- launch
 
     def _mount(self, key):
-        """A card opens the tool's window. One entry path for every card."""
+        """A card opens the tool's window — through the one routes table.
+
+        U-002: this used to be a 19-branch if/elif that had to agree with
+        app.routes by hand. A card whose key had no branch raised; a route
+        added for recommendations but not here was a silent difference between
+        clicking a card and accepting a recommendation. The table is now the
+        only mapping, and a guard test checks that every card in _CARDS
+        resolves and that its Application method exists.
+        """
         try:
             from app import tool_hub
             tool_hub.remember(key)
         except Exception:
             pass
         try:
-            if key == "storage":
-                self.app._open_storage_insight()
-            elif key == "procman":
-                self.app._open_process_manager()
-            elif key == "dns":
-                self.app._open_dns_tester()
-            elif key == "pilot":
-                self.app._open_pilot_dialog()
-            elif key == "drivetoolkit":
-                self.app._open_drive_toolkit()
-            elif key == "speed":
-                self.app._open_speed_test()
-            elif key == "gameping":
-                self.app._open_game_server_ping()
-            elif key == "specs":
-                self.app._open_pc_specs()
-            elif key == "network_connections":
-                self.app._open_network_connections()
-            elif key == "services":
-                self.app._open_services()
-            elif key == "file_lock":
-                self.app._open_file_lock()
-            elif key == "duplicates":
-                self.app._open_duplicates()
-            elif key == "restore_points":
-                self.app._open_restore_points()
-            elif key == "safety_center":
-                self.app._open_safety_center()
-            elif key == "game_saves":
-                self.app._open_game_saves()
-            elif key == "game_readiness":
-                self.app._open_game_readiness()
-            elif key == "hwmonitor":
-                self.app._open_hw_monitor()
-            elif key == "startup":
-                self.app._open_startup_manager()
-            elif key == "uninstall":
-                self.app._open_uninstall_programs()
-            else:
-                # A card whose key has no entry point is a wiring bug, not a
-                # silent no-op: raise so the handler below logs it.
-                raise LookupError("no tool is wired for %r" % (key,))
+            from app import routes
+            if routes.open_route(self.app, key):
+                return
+            raise LookupError("no route is wired for %r" % (key,))
         except Exception as exc:
             # Never silent: a rename or a broken dialog used to make a click
             # do nothing at all, with no way to tell that from a missed click.

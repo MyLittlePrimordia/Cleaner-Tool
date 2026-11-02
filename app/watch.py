@@ -1,7 +1,7 @@
 """Quiet watch (audit N-006): the app speaks first, once.
 
 A cleaner you have to remember to open is a cleaner that never runs. This
-module is the sentinel behind that idea: three conditions that are worth
+module is the sentinel behind that idea: four conditions that are worth
 interrupting a person for, and the rules that stop it becoming a notification
 machine.
 
@@ -21,7 +21,8 @@ The quiet rules, in the order they save the user:
   seconds later; the episode ends only when the reading recovers past the
   threshold plus `FREE_CLEAR_MARGIN` (hysteresis, so a drive hovering exactly
   on the line cannot chatter). A score drop re-arms only when a NEW checkup
-  produces it, keyed by that checkup's timestamp. A missed schedule re-arms
+  produces it, keyed by that checkup's timestamp. A driver finding re-arms
+  when a checkup grades Drivers A or B again. A missed schedule re-arms
   when Windows reports a different run.
 * A still-true condition may speak again after `REPEAT_AFTER`, so a machine
   left full for a week is mentioned more than once - but at most daily.
@@ -50,7 +51,20 @@ from app.config_schema import WATCH_FREE_RANGE, WATCH_SCORE_RANGE
 #: Episode memory. Its own tiny file rather than a config key: it is
 #: machine-generated, rewritten by a background tick, and losing it costs one
 #: repeated notice - none of which is true of the user's settings.
+#: B-006: bound at import time, this froze the first CONFIG_DIR forever -
+#: a portable install or test that relocated the config dir after import
+#: read/wrote two different watch.json files and repeated every notice.
+#: Resolved lazily via state_file() now; STATE_FILE stays as a compat alias.
 STATE_FILE = CONFIG_DIR / "watch.json"
+
+
+def state_file():
+    """Current episode-memory path, resolved lazily (B-006)."""
+    try:
+        from app.config_paths import get_config_dir
+        return get_config_dir() / "watch.json"
+    except Exception:
+        return STATE_FILE
 
 #: Percent of a drive that counts as nearly full. 10% is the audit's number
 #: (5% is already an emergency), and it is the same threshold the status-row
@@ -140,6 +154,18 @@ def enabled(cfg=None):
 def missed_runs_enabled(cfg=None):
     """Whether a schedule that stopped is worth mentioning."""
     value = (cfg or {}).get("watch_missed_run")
+    return True if value is None else bool(value)
+
+
+def startup_enabled(cfg=None):
+    """Whether a program adding itself to startup is worth mentioning.
+
+    On by default: a new login item is exactly the kind of quiet change a
+    user would otherwise find only after wondering why sign-in got slower.
+    The first reading is a BASELINE and never speaks; only additions after
+    that do.
+    """
+    value = (cfg or {}).get("watch_startup")
     return True if value is None else bool(value)
 
 
@@ -239,6 +265,57 @@ def _score_alert(trend, cfg, now):
     )
 
 
+#: Health grades that mean the Drivers sensor found something worth a
+#: notice. B is one old driver - explicitly not worth interrupting anyone
+#: for - and "?" (not measured) is never stored in a trend point, so it
+#: cannot arrive here at all. The sensor itself grades no worse than D,
+#: but F stays in the tuple so a future harsher grade cannot slip through
+#: silently.
+DRIVER_ALERT_GRADES = ("C", "D", "F")
+
+
+def _drivers_alert(trend, cfg, now):
+    """A checkup that graded Drivers C or worse: missing or stale drivers.
+
+    The fourth quiet-watch condition (N-004). It reads the verdict the
+    Health tab already measured - the latest trend point's "drivers"
+    finding - so the tick costs no probe: no PowerShell, no three-second
+    driver query, just the config the trend already keeps.
+
+    A point that never measured drivers (no key: "?" grades are not
+    stored) says nothing rather than "all clear", matching the module's
+    rule that an unreadable reading is never turned into a claim.
+
+    The episode key is stable ("drivers"), drive-style rather than
+    timestamped: while checkup after checkup keeps grading C/D, nothing
+    new is said, and the episode ends when a checkup grades A or B again.
+    Governed by the master `watch_enabled` switch only - one more
+    condition, not one more setting.
+    """
+    if not isinstance(trend, dict):
+        return None
+    points = trend.get("points") or []
+    if not points or not isinstance(points[-1], dict):
+        return None
+    findings = points[-1].get("f")
+    if not isinstance(findings, dict):
+        return None
+    grade = findings.get("drivers")
+    grade = grade.strip().upper() if isinstance(grade, str) else ""
+    if grade not in DRIVER_ALERT_GRADES:
+        return None
+    return Alert(
+        key="drivers",
+        route="drivers",
+        title="Driver issues found at the last checkup",
+        body=("The last health check graded Drivers %s - a device with no "
+              "driver installed, or drivers over 3 years old. Open the "
+              "Drivers tab to look them up and install newer ones."
+              % grade),
+        short="driver issues found",
+    )
+
+
 def _schedule_alert(schedule, cfg, now):
     """A schedule Windows itself says has gone stale or failed.
 
@@ -256,7 +333,8 @@ def _schedule_alert(schedule, cfg, now):
     if not (stale or failed):
         return None
     kind = str(schedule.get("kind") or "clean")
-    what = "app updates" if kind == "update" else "maintenance"
+    what = {"update": "app updates",
+            "save": "save backup"}.get(kind, "maintenance")
     text = str(schedule.get("text") or "").strip()
     if failed:
         title = "The last scheduled %s run failed" % what
@@ -276,21 +354,116 @@ def _schedule_alert(schedule, cfg, now):
     )
 
 
-def evaluate(*, drives=(), trend=None, schedule=None, cfg=None, now=None):
+def _startup_alerts(startup, cfg, now):
+    """One alert per startup item added since the last baseline.
+
+    `startup` is the LIST OF NEW ITEMS computed by `_startup_new`, not the
+    whole startup list: `evaluate` stays pure and the baseline lives in the
+    episode state. A missing/empty list is no news, never "nothing starts
+    with Windows" (that is a separate fact, and not one worth a toast).
+    """
+    if not startup_enabled(cfg):
+        return []
+    out = []
+    for item in startup or ():
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        item_id = str(item.get("id") or name).strip()
+        if not name or not item_id:
+            continue
+        shown = name if len(name) <= 80 else name[:77] + "\u2026"
+        out.append(Alert(
+            key="startup:%s" % item_id,
+            route="startup",
+            title="\u201c%s\u201d was added to startup" % shown,
+            body=("A program added itself to the startup list, so it may "
+                  "now run whenever you sign in. Open Startup Manager to "
+                  "see it and turn it off if you do not need it."),
+            short="%s added to startup" % shown,
+        ))
+    return out
+
+
+def startup_snapshot():
+    """Enabled startup items as [{id, name}], or None when unreadable.
+
+    Read on the caller's worker thread. Disabled items are excluded because
+    they do not launch; a row Windows has switched off is not new cost at
+    sign-in. `list_startup_items` has its own per-source error handling and
+    returns [] rather than raising, so a broken registry view is an empty
+    reading here too - and an empty reading never establishes a baseline.
+    """
+    try:
+        from app.startup_manager import list_startup_items
+        items = list_startup_items()
+    except Exception:
+        return None
+    out = []
+    for item in items or ():
+        if not isinstance(item, dict) or not item.get("enabled"):
+            continue
+        item_id = str(item.get("id") or "").strip()
+        name = str(item.get("name") or "").strip()
+        if item_id and name:
+            out.append({"id": item_id, "name": name})
+    return out
+
+
+def _startup_new(startup, state):
+    """New enabled items since `state['startup_known']`; updates the memory.
+
+    The first non-empty reading establishes the baseline and returns []. The
+    known list is replaced with the current reading, so a removed item is
+    forgotten and a later re-add is a genuinely new event.
+    """
+    if not startup:
+        return []
+    current = []
+    seen = set()
+    for item in startup:
+        if not isinstance(item, dict):
+            continue
+        item_id = str(item.get("id") or "").strip()
+        name = str(item.get("name") or "").strip()
+        if not item_id or not name or item_id in seen:
+            continue
+        seen.add(item_id)
+        current.append({"id": item_id, "name": name})
+    if not current:
+        return []
+    known = state.get("startup_known")
+    ids = [item["id"] for item in current]
+    if not isinstance(known, list):
+        state["startup_known"] = ids
+        return []
+    known_set = {str(x) for x in known}
+    new = [item for item in current if item["id"] not in known_set]
+    state["startup_known"] = ids
+    return new
+
+
+def evaluate(*, drives=(), trend=None, schedule=None, startup=None,
+             cfg=None, now=None):
     """Every condition currently true, as alerts. Pure; no I/O, no state.
 
     Kept separate from `decide` so the thresholds and the wording can be
     asserted on their own, without an episode history. Order is stable:
-    drives by the caller's own order, then the score, then the schedule.
+    drives by the caller's own order, then the score, drivers, schedule,
+    then startup additions.
     """
     now = time.time() if now is None else float(now)
     alerts = _drive_alerts(drives, cfg, now)
     score = _score_alert(trend, cfg, now)
     if score is not None:
         alerts.append(score)
+    drivers = _drivers_alert(trend, cfg, now)
+    if drivers is not None:
+        alerts.append(drivers)
     sched = _schedule_alert(schedule, cfg, now)
     if sched is not None:
         alerts.append(sched)
+    alerts.extend(_startup_alerts(startup, cfg, now))
     return alerts
 
 
@@ -305,7 +478,7 @@ def load_state():
     repeated notice, which must never be worth an error dialog.
     """
     try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
+        with open(state_file(), "r", encoding="utf-8") as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
     except Exception:
@@ -315,11 +488,12 @@ def load_state():
 def save_state(state):
     """Write the episode memory atomically; best-effort like the read."""
     try:
-        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = STATE_FILE.with_name(STATE_FILE.name + ".tmp")
+        _sf = state_file()
+        _sf.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _sf.with_name(_sf.name + ".tmp")
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(state, f)
-        os.replace(tmp, STATE_FILE)
+        os.replace(tmp, _sf)
     except Exception:
         pass
 
@@ -407,6 +581,11 @@ def _schedule_verdict(cfg, state, now):
         wanted.append(("clean", None))
     if cfg.get("schedule_update_enabled"):
         wanted.append(("update", ["--auto-update"]))
+    # The save-backup schedule is its own task, so its failure is its own
+    # verdict: a week of failed backups must not stay silent just because
+    # Auto Clean happened to run fine.
+    if cfg.get("schedule_saves_enabled"):
+        wanted.append(("save", ["--auto-save-backup"]))
     if not wanted or not missed_runs_enabled(cfg):
         return None
     try:
@@ -444,12 +623,16 @@ def _schedule_verdict(cfg, state, now):
     return None
 
 
-def check(*, drives=(), cfg=None, trend=None, schedule=None, now=None):
+def check(*, drives=(), cfg=None, trend=None, schedule=None, startup=None,
+          now=None):
     """One tick: read, decide, remember, return what is worth saying.
 
     Blocking (it may spawn the scheduler query), so callers run it off the Tk
-    thread. `cfg`, `trend` and `schedule` are injectable for tests; passing
-    `schedule={}` means "there is no verdict", which skips the query.
+    thread. `cfg`, `trend`, `schedule` and `startup` are injectable for tests;
+    passing `schedule={}` means "there is no verdict", which skips the query.
+    Passing `startup=None` means "this caller does not read startup items" -
+    the GUI passes `watch.startup_snapshot()`, so a unit test never alerts on
+    the machine's real login entries.
 
     Returns a list of Alerts - usually empty, which is the point.
     """
@@ -466,14 +649,20 @@ def check(*, drives=(), cfg=None, trend=None, schedule=None, now=None):
         if not enabled(cfg):
             return []
         state = load_state()
+        # `_schedule_verdict` and `_startup_new` mutate `state` in place, so
+        # comparing the post-decide copy to the already-mutated state would
+        # say "unchanged" and never persist a new baseline or the schedule
+        # probe timestamp. Keep the pre-mutation copy for the write test.
+        before = dict(state)
         if trend is None:
             trend = _trend()
         if schedule is None:
             schedule = _schedule_verdict(cfg, state, now)
+        new_startup = _startup_new(startup, state) if startup is not None else []
         alerts = evaluate(drives=drives, trend=trend, schedule=schedule,
-                          cfg=cfg, now=now)
+                          startup=new_startup, cfg=cfg, now=now)
         speak, new_state = decide(alerts, state, now=now)
-        if new_state != state:
+        if new_state != before:
             save_state(new_state)
         return speak
     finally:

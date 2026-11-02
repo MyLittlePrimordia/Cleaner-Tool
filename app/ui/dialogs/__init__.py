@@ -5,7 +5,7 @@ dialog — with two deliberate exceptions that predate this split and are
 called out in the modules themselves:
 
   * PilotDialog opens _CatalogPickerDialog
-  * InstallTab opens InstallProfilesDialog
+  * InstallTab opens InstallProfilesDialog and SetupWizardDialog
 
 Adding a new dialog means adding a module here and re-exporting it from
 app/gui.py, which stays the compatibility facade for the smoke suite.
@@ -31,6 +31,7 @@ from app.ui.dialogs.safety_center_dialog import SafetyCenterDialog
 from app.ui.dialogs.update_picker_dialog import UpdatePickerDialog
 from app.ui.dialogs.scorecard_dialog import ScorecardDialog
 from app.ui.dialogs.services_dialog import ServicesDialog
+from app.ui.dialogs.setup_wizard_dialog import SetupWizardDialog
 from app.ui.dialogs.specs_dialog import SpecsDialog
 from app.ui.dialogs.speed_test_dialog import SpeedTestDialog
 from app.ui.dialogs.startup_manager_dialog import StartupManagerDialog
@@ -45,7 +46,7 @@ __all__ = [
     "InstallProfilesDialog", "NetworkConnectionsDialog",
     "PilotDialog",
     "ProcessManagerDialog", "RestorePointDialog", "SafetyCenterDialog", "UpdatePickerDialog", "ScorecardDialog",
-    "ServicesDialog", "SpecsDialog", "SpeedTestDialog",
+    "ServicesDialog", "SetupWizardDialog", "SpecsDialog", "SpeedTestDialog",
     "StartupManagerDialog", "StorageInsightDialog",
     "UninstallProgramsDialog", "_CatalogPickerDialog",
 ]

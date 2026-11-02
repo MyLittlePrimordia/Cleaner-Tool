@@ -591,11 +591,29 @@ def run_health_scan(ctx, on_card=None, sensors=None):
 
     slow_specs = [s for s in specs if s[3]]
     if slow_specs and not cancelled():
+        # I-002: slow sensors are independent pure functions — run up to 4
+        # concurrently instead of serially (~1s + ~2s + ~3s chained).
+        # Each still reports via run_one/on_card as it lands.
+        from concurrent.futures import ThreadPoolExecutor as _Pool
+
         def slow_worker():
-            for key, title, fn, _slow in slow_specs:
-                if cancelled():
-                    return
-                run_one(key, title, fn)
+            try:
+                with _Pool(max_workers=4) as _pool:
+                    _futs = []
+                    for key, title, fn, _slow in slow_specs:
+                        if cancelled():
+                            break
+                        _futs.append(_pool.submit(run_one, key, title, fn))
+                    for _f in _futs:
+                        try:
+                            _f.result()
+                        except Exception:
+                            pass
+            except Exception:
+                for key, title, fn, _slow in slow_specs:
+                    if cancelled() or key in cards:
+                        continue
+                    run_one(key, title, fn)
 
         th = threading.Thread(target=slow_worker, daemon=True,
                               name="HealthScanSlow")

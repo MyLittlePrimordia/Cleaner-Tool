@@ -25,6 +25,7 @@ import logging.handlers
 import os
 import platform
 import sys
+import tempfile
 import threading
 import traceback
 
@@ -52,6 +53,154 @@ def log_dir() -> str:
 
 def log_path() -> str:
     return os.path.join(log_dir(), "cleaner-tool.log")
+
+
+def startup_log_path() -> str:
+    """The pre-GUI trace written by `app/__main__._early_log`.
+
+    Shared here so the elevation-timeout warning and the entry point cannot
+    disagree about where a startup crash went. `_early_log` keeps its own
+    literal path on purpose: it runs before this module is imported and must
+    not depend on anything that could fail first.
+    """
+    return os.path.join(tempfile.gettempdir(), "cleaner_tool_startup.log")
+
+
+def open_startup_log(parent=None) -> bool:
+    """Open the startup crash trace, or explain why there is none.
+
+    Called by the "Elevated Window Did Not Appear" dialog, where the whole
+    point of the warning is that the elevated copy died before its window
+    appeared. Opening the file is the difference between a dead end and a
+    report the user can act on.
+
+    The Tk import is local: diagnostics is imported by headless runs and must
+    not pull in tkinter. Returns True when the file was handed to the shell,
+    False when it was missing (or the shell refused). Never raises.
+    """
+    path = startup_log_path()
+    exists = os.path.isfile(path)
+    if exists:
+        try:
+            os.startfile(path)  # noqa: S606 - a log file the user owns
+            return True
+        except Exception:
+            pass
+    try:
+        from tkinter import messagebox
+        if exists:
+            detail = ("Could not open the startup log with the default "
+                      "viewer.\n\nThe crash trace is at:\n%s\n\n"
+                      "The app log may also have it:\n%s"
+                      % (path, log_path()))
+        else:
+            detail = ("No startup log was written for this attempt.\n\n"
+                      "Expected at:\n%s\n\n"
+                      "The elevated copy may have stopped before its first "
+                      "log line, or the log was removed. The app log may "
+                      "still have the traceback:\n%s"
+                      % (path, log_path()))
+        messagebox.showinfo("Startup Log", detail, parent=parent)
+    except Exception:
+        pass
+    return False
+
+
+def startup_log_tail(max_lines: int = 6, max_chars: int = 4096) -> list[str]:
+    """The last meaningful lines of the startup trace, newest last.
+
+    Reads only the tail of the file: `_early_log` appends across every launch,
+    so this must not load a log that has grown for months. A partial first
+    line (the read started mid-line) is dropped, control characters are
+    flattened so Tk cannot choke on them, and blank lines are skipped.
+    Returns [] when the file is missing or unreadable. Never raises.
+    """
+    try:
+        path = startup_log_path()
+        if not os.path.isfile(path):
+            return []
+        with open(path, "rb") as fh:
+            size = os.fstat(fh.fileno()).st_size
+            read = min(size, max(1024, int(max_chars)))
+            fh.seek(size - read)
+            data = fh.read()
+        lines = data.decode("utf-8", errors="replace").splitlines()
+        if read < size and lines:
+            # The first line may be the tail of a longer line we did not read.
+            lines = lines[1:]
+        usable = []
+        for raw in lines:
+            line = "".join(ch if ch == "\t" or ch >= " " else " "
+                           for ch in raw).rstrip()
+            if line:
+                usable.append(line)
+        return usable[-max(1, int(max_lines)):]
+    except Exception:
+        return []
+
+
+def startup_log_preview(max_lines: int = 6,
+                        max_line_chars: int = 180) -> str:
+    """Inline preview for the elevation-timeout warning.
+
+    The warning already points at the log; these lines make the failure
+    visible without opening anything. Long traceback lines are clipped so a
+    single pathological line cannot push the dialog's buttons off-screen.
+    """
+    try:
+        path = startup_log_path()
+        lines = startup_log_tail(max_lines=max_lines)
+    except Exception:
+        lines, path = [], ""
+    if not lines:
+        try:
+            if path and not os.path.isfile(path):
+                return "No startup log was written for this attempt."
+        except Exception:
+            pass
+        return "The startup log is empty."
+    shown = []
+    limit = max(40, int(max_line_chars))
+    for line in lines:
+        if len(line) > limit:
+            line = line[:limit].rstrip() + "\u2026"
+        shown.append(line)
+    return "Last startup log lines:\n" + "\n".join(shown)
+
+
+def copy_startup_log_path(parent=None) -> bool:
+    """Put the startup-log path on the clipboard.
+
+    The path is useful even when the file was never written: the user can
+    paste it into a report or open it manually. Uses the widget's own Tk
+    clipboard (the same mechanism the rest of the app uses), so this module
+    still does not import tkinter at import time. Never raises; returns False
+    when the clipboard refused and the path had to be shown instead.
+    """
+    path = startup_log_path()
+    try:
+        if parent is None:
+            raise AttributeError("no clipboard owner")
+        parent.clipboard_clear()
+        parent.clipboard_append(path)
+        try:
+            parent.update_idletasks()
+        except Exception:
+            pass
+        return True
+    except Exception:
+        pass
+    try:
+        from tkinter import messagebox
+        messagebox.showinfo(
+            "Copy Path",
+            "Could not copy the path automatically.\n\n"
+            "The startup log is at:\n%s\n\n"
+            "The app log may also have the traceback:\n%s"
+            % (path, log_path()), parent=parent)
+    except Exception:
+        pass
+    return False
 
 
 def get_logger() -> logging.Logger:
@@ -110,6 +259,17 @@ def _system_lines() -> list[str]:
         from app.compat import windows_build
         build = windows_build()
         lines.append("Windows build: %s" % (build if build else "unknown"))
+    except Exception:
+        pass
+    # LTSC note: support sessions kept guessing the edition from the build
+    # number. The edition probe names it (and flags the S/SN branch), so a
+    # "winget missing" report on IoT LTSC reads as expected, not broken.
+    try:
+        from app.compat import edition_label, is_ltsc_edition
+        _ed = edition_label()
+        if _ed:
+            lines.append("Windows edition: %s%s"
+                         % (_ed, " (LTSC)" if is_ltsc_edition() else ""))
     except Exception:
         pass
     try:

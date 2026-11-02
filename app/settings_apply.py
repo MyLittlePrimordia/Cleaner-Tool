@@ -26,6 +26,7 @@ def apply_settings(values: Dict[str, object],
     values (all optional; a missing key leaves that setting alone):
       clean_schedule  bool   Auto Clean on a schedule
       update_apps     bool   `winget upgrade --all` on the schedule
+      save_backups    bool   game-save backup on the schedule
       frequency       str    daily | weekly | monthly
       time            str    HH:MM (24h)
       auto_elevate    bool   approve admin once, no UAC at launch
@@ -39,6 +40,7 @@ def apply_settings(values: Dict[str, object],
       watch_free      int    percent free that marks a drive
       watch_drop      int    health-score points worth a notice
       watch_missed    bool   mention a schedule that stopped or failed
+      watch_startup   bool   mention a newly added startup item
 
     `results` are short past-tense phrases for a status line; `errors` are
     things the user must be told about (a task that could not be created).
@@ -50,7 +52,8 @@ def apply_settings(values: Dict[str, object],
     v = values
 
     # --- scheduled maintenance ------------------------------------------
-    if "clean_schedule" in v or "update_apps" in v:
+    if ("clean_schedule" in v or "update_apps" in v
+            or "save_backups" in v):
         try:
             from app.scheduler import disable_schedule, enable_schedule
             freq = str(v.get("frequency") or cfg.get("schedule_frequency",
@@ -78,6 +81,18 @@ def apply_settings(values: Dict[str, object],
                     ok, _msg = disable_schedule(["--auto-update"])
                     if ok:
                         results.append("App updates disabled")
+            if "save_backups" in v:
+                if v["save_backups"]:
+                    ok, msg = enable_schedule(
+                        freq, when, extra_args=["--auto-save-backup"])
+                    (results if ok else errors).append(
+                        "Save backups enabled" if ok else
+                        "Could not create the save-backup task: %s" % msg)
+                else:
+                    ok, msg = disable_schedule(["--auto-save-backup"])
+                    (results if ok else errors).append(
+                        "Save backups disabled" if ok else
+                        "Could not remove the save-backup task: %s" % msg)
         except Exception as exc:                      # noqa: BLE001
             errors.append("Scheduling failed: %s" % exc)
 
@@ -104,6 +119,23 @@ def apply_settings(values: Dict[str, object],
                 results.append("Start as admin off")
         except Exception as exc:                      # noqa: BLE001
             results.append("Start as admin saved (%s)" % exc)
+
+    # --- admin prompt on startup (reverse gear for the Gate's ---------
+    # "Don't show this again"). Stored inverted: ask == not remember_limited.
+    # Runs after the auto_elevate block and re-reads its (possibly same-save)
+    # value, so one Save applying both cannot clobber either.
+    if "ask_admin_startup" in v:
+        try:
+            from app import elevated_launch as el
+            want_auto = bool(v.get("auto_elevate",
+                                   cfg.get("auto_elevate", False)))
+            ask = bool(v["ask_admin_startup"])
+            el.save_gate_prefs(want_auto, not ask)
+            results.append("Admin prompt on" if ask else
+                           "Admin prompt off (still shows when admin "
+                           "tasks are selected)")
+        except Exception as exc:                      # noqa: BLE001
+            results.append("Admin prompt saved (%s)" % exc)
 
     # --- start with Windows ---------------------------------------------
     if "start_with_windows" in v:
@@ -151,6 +183,8 @@ def apply_settings(values: Dict[str, object],
         plain["watch_enabled"] = bool(v["watch_enabled"])
     if "watch_missed" in v:
         plain["watch_missed_run"] = bool(v["watch_missed"])
+    if "watch_startup" in v:
+        plain["watch_startup"] = bool(v["watch_startup"])
     if "watch_free" in v:
         from app import watch as _watch
         try:

@@ -93,6 +93,25 @@ STARTUP_COMMAND_MAX = 4096
 GAMEPING_MAX = 64
 #: Game Night / Session Pilot key lists.
 SESSION_KEYS_MAX = 200
+#: Finished Game Mode sessions kept for the recap and the scorecard (A-001).
+#: One row is a start time, a duration, the tweaks it turned on and the counts
+#: the end path could defend - enough for "how long do I usually play", not a
+#: telemetry archive.
+GAME_SESSIONS_MAX = 20
+GAME_SESSION_NOTE_MAX = 120
+#: Latency history (N-004): a bounded series per ping target, enough for a
+#: sparkline and a "has it been bad all week" answer. Targets are the strings
+#: the dialogs already use ("game:cs2", "speed:download", "dns:1.1.1.1").
+LATENCY_TARGETS_MAX = 24
+LATENCY_SAMPLES_MAX = 20
+#: Per-game tweak profiles (N-003): one entry per game, keyed by a short
+#: user-facing name and bound to an exe basename. Bounded because each entry
+#: carries a key list, and a hand-edited file must not grow without limit.
+GAME_PROFILES_MAX = 24
+GAME_PROFILE_KEYS_MAX = 200
+GAME_PROFILE_NAME_MAX = 48
+GAME_PROFILE_KEY_MAX = 120
+GAME_PROFILE_EXE_MAX = 96
 #: Tools hub recency (AUDIT TV-001). Card keys only, newest first; the page
 #: shows at most a handful, the file may keep a few more so a single detour
 #: does not erase the user's real habits.
@@ -476,8 +495,8 @@ def _schedule_time(value, default):
     return out if _TIME_RE.fullmatch(out) else default
 
 
-def _health_last_check(value, default):
-    """Epoch seconds of the last PC Health check; anything else is the default.
+def _epoch_seconds(value, default):
+    """A non-negative epoch-seconds number; anything else is the default.
 
     The check is not decorative. This was a one-line lambda that guarded the
     TYPE and the sign but called float() outside any handler, and json.load()
@@ -495,6 +514,11 @@ def _health_last_check(value, default):
         return float(value)
     except (OverflowError, ValueError):
         return default
+
+
+def _health_last_check(value, default):
+    """Epoch seconds of the last PC Health check; anything else is the default."""
+    return _epoch_seconds(value, default)
 
 
 def _one_run_change(item):
@@ -810,6 +834,118 @@ def _defender_exclusions(value, default):
     return out[:DEFENDER_EXCLUSIONS_MAX]
 
 
+def _latency_history(value, default):
+    """{target: [{t, ms}]} - measured latency, bounded per target (N-004).
+
+    A sample exists only when a probe answered: a refused or timed-out leg
+    records nothing, so the sparkline cannot show a fake zero. Junk rows are
+    dropped, never repaired.
+    """
+    if not isinstance(value, dict):
+        return {}
+    out = {}
+    for target, rows in list(value.items())[:LATENCY_TARGETS_MAX]:
+        if not isinstance(target, str) or not target.strip():
+            continue
+        if not isinstance(rows, list):
+            continue
+        clean = []
+        for row in rows[-LATENCY_SAMPLES_MAX:]:
+            if not isinstance(row, dict):
+                continue
+            try:
+                t = float(row.get("t", 0))
+                ms = float(row.get("ms"))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if t > 0 and ms > 0 and math.isfinite(ms):
+                clean.append({"t": t, "ms": ms})
+        if clean:
+            out[target.strip()[:80]] = clean
+    return out
+
+
+def _game_profiles(value, default):
+    """{name: {"exe": str, "keys": [str]}} — bounded per-game key sets (N-003).
+
+    An entry with no keys is dropped: it could never apply anything, and a
+    profile that silently does nothing is worse than no profile. The exe is
+    a basename, so the match survives the game being moved; keys are deduped
+    in order and capped. Junk rows are dropped, never repaired.
+    """
+    if not isinstance(value, dict):
+        return {}
+    out = {}
+    for name, row in list(value.items())[:GAME_PROFILES_MAX]:
+        if not isinstance(name, str) or not " ".join(name.split()):
+            continue
+        if not isinstance(row, dict):
+            continue
+        exe = row.get("exe")
+        exe = exe.strip()[:GAME_PROFILE_EXE_MAX] if isinstance(exe, str) else ""
+        raw = row.get("keys")
+        if not isinstance(raw, list):
+            continue
+        clean = []
+        for key in raw[:GAME_PROFILE_KEYS_MAX]:
+            if not isinstance(key, str):
+                continue
+            text = key.strip()[:GAME_PROFILE_KEY_MAX]
+            if text and text not in clean:
+                clean.append(text)
+        if not clean:
+            continue
+        label = " ".join(name.split())[:GAME_PROFILE_NAME_MAX]
+        out[label] = {"exe": exe, "keys": clean}
+    return out
+
+
+def _small_int(value):
+    """A non-negative int for a count, else 0. Bools and floats are rejected."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return value if value >= 0 else 0
+
+
+def _game_sessions(value, default):
+    """[{t, d, k, r, f, n}] - finished Game Mode sessions, newest last.
+
+    A-001: the recap used to live only on the dialog, so it vanished with the
+    window. A row is a conclusion this app can defend: when the session
+    started, how long it lasted, and which tweaks it turned on. A row with no
+    real start or no real duration is dropped rather than repaired - an
+    invented duration is exactly the fake recap this ledger exists to stop.
+    """
+    if not isinstance(value, list):
+        return []
+    out = []
+    for entry in value:
+        if not isinstance(entry, dict):
+            continue
+        raw_t = entry.get("t", 0)
+        duration = entry.get("d", 0)
+        if isinstance(raw_t, bool) or not isinstance(raw_t, (int, float)):
+            continue
+        if isinstance(duration, bool) or not isinstance(duration, int):
+            continue
+        try:
+            t = float(raw_t)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not math.isfinite(t) or t <= 0 or duration < 0:
+            continue
+        row = {"t": t, "d": duration,
+               "k": _str_list(entry.get("k"), [], cap=SESSION_KEYS_MAX),
+               "r": _small_int(entry.get("r")),
+               "f": _small_int(entry.get("f"))}
+        note = entry.get("n")
+        if isinstance(note, str) and note.strip():
+            row["n"] = " ".join(note.split())[:GAME_SESSION_NOTE_MAX]
+        out.append(row)
+    out.sort(key=lambda row: row["t"])
+    return out[-GAME_SESSIONS_MAX:]
+
+
 def _game_night_keys(value, default):
     """Tweaks Game Night itself turned on, so End puts back exactly those."""
     return _str_list(value, default, cap=SESSION_KEYS_MAX)
@@ -887,6 +1023,8 @@ SCHEMA = {
     "schedule_enabled": (_bool, "opt-in; written by the scheduler only"),
     "schedule_update_enabled": (_bool,
                                 "separate opt-in for the --auto-update task"),
+    "schedule_saves_enabled": (_bool,
+                               "separate opt-in for the --auto-save-backup task"),
     "schedule_frequency": (_schedule_frequency, "daily | weekly | monthly"),
     "schedule_time": (_schedule_time, "HH:MM 24h"),
     "health_check_mode": (lambda v, d: _str(v, d, choices=("off", "startup", "daily", "weekly"), lower=True),
@@ -912,6 +1050,8 @@ SCHEMA = {
                          "N-006: points a checkup may fall and still be quiet"),
     "watch_missed_run": (_bool,
                          "N-006: mention a schedule that stopped or failed"),
+    "watch_startup": (_bool,
+                      "N: mention a program that adds itself to startup"),
     "insights": (_insights,
                  "[{id, domain, severity, title, at}] findings tools published; "
                  "the Health/hub shared board (AUDIT TX-002)"),
@@ -937,11 +1077,22 @@ SCHEMA = {
     "run_history": (_run_history, "rolling [{t, b}] of finished clean runs"),
     "install_profiles": (_install_profiles, "name -> [package ids]"),
     "game_night_active": (_bool, "a Game Night session is in progress"),
+    "game_night_started_at": (_epoch_seconds,
+                              "epoch seconds when the session started; 0 = none"),
     "game_night_keys": (_game_night_keys, "tweaks Game Night itself turned on"),
     "game_night_close_apps": (_game_night_keys, "optional apps to quiet"),
     "game_night_custom_apps": (_game_night_custom_apps,
                                "apps you added to the close list (exe names only; "
                                "Auto-Pilot closes them by process name, never by path)"),
+    "latency_history": (_latency_history,
+                        "measured latency per ping target; the trend N-004 "
+                        "draws, never a fabricated sample"),
+    "game_sessions": (_game_sessions,
+                      "finished Game Mode sessions: start, duration and tweaks; "
+                      "the surviving recap (A-001)"),
+    "game_profiles": (_game_profiles,
+                      "named tweak sets bound to one exe (N-003); Auto-Pilot "
+                      "applies the match when a Game Session starts"),
     "startup_disabled": (_startup_disabled, "records to restore disabled items"),
     "duplicate_protected_paths": (_protected_paths,
                                   "Duplicates dialog never-delete list"),

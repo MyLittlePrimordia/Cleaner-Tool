@@ -32,7 +32,6 @@ import hashlib
 import json
 import os
 import shutil
-import sys
 import tempfile
 import threading
 import contextlib
@@ -44,14 +43,12 @@ DEFAULT_MAX_BYTES = 2 * 1024 ** 3  # 2 GB
 
 _LOCK = threading.Lock()
 
-# H-024: in-process guard + reentrancy counter for the cross-process lock,
-# mirroring config_persist._config_file_lock. The threading.Lock alone only
-# serialises threads inside ONE process; the GUI and a headless run (or a
-# future path that attaches a bin to headless runs) both append to and rewrite
-# the SAME manifest.jsonl, so two interleaved writers could interleave JSONL
-# lines or truncate mid-rewrite and destroy restore records.
-_manifest_lock_guard = threading.RLock()
-_manifest_lock_depth = 0
+# H-024: the threading.Lock alone only serialises threads inside ONE
+# process; the GUI and a headless run (or a future path that attaches a bin to
+# headless runs) both append to and rewrite the SAME manifest.jsonl, so two
+# interleaved writers could interleave JSONL lines or truncate mid-rewrite and
+# destroy restore records. The cross-process half lives in
+# app.infra.filelock (R-002); only the in-process lock is owned here.
 
 
 @contextlib.contextmanager
@@ -62,46 +59,13 @@ def _manifest_file_lock(root: str):
     moved and each write is small), it only leaves the rare cross-process
     lost-update window unguarded.
     """
-    global _manifest_lock_depth
-    with _manifest_lock_guard:
-        if _manifest_lock_depth > 0:
-            _manifest_lock_depth += 1
-            try:
-                yield
-            finally:
-                _manifest_lock_depth -= 1
-            return
-        handle = None
-        locked = False
-        try:
-            os.makedirs(root, exist_ok=True)
-            lock_path = _manifest_path(root) + ".lock"
-            handle = open(lock_path, "a+")
-            if sys.platform.startswith("win"):
-                import msvcrt
-                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-            locked = True
-        except Exception as exc:
-            from app.utils import log_or_swallow
-            log_or_swallow(None, "quarantine.manifest_lock", exc)
-            locked = False
-        _manifest_lock_depth = 1
-        try:
-            yield
-        finally:
-            _manifest_lock_depth = 0
-            if handle is not None:
-                try:
-                    if locked and sys.platform.startswith("win"):
-                        import msvcrt
-                        handle.seek(0)
-                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-                except Exception:
-                    pass
-                try:
-                    handle.close()
-                except Exception:
-                    pass
+    # R-002: single owner lives in app.infra.filelock; thin wrapper so the
+    # manifest window keeps its fail-open semantics (a lock failure never
+    # blocks the bin, it only leaves the cross-process window unguarded).
+    from app.infra.filelock import locked as _file_locked
+    os.makedirs(root, exist_ok=True)
+    with _file_locked(_manifest_path(root) + ".lock", warn_key="quarantine"):
+        yield
 
 
 def default_root() -> str:
@@ -167,13 +131,25 @@ class Quarantine:
         return _files_dir(self.root)
 
     def stash(self, path: str) -> bool:
+        # B-009: the cap check was check-then-act across processes; two
+        # racers could both pass and overshoot 2 GB. Now checked AND updated
+        # under the in-process lock with a live re-stat, so the window is
+        # one os.replace (documented as bounded overshoot, at most one file).
+        # H-006: manifest append is fail-closed — if the cross-process lock
+        # cannot be taken, fall back to real delete rather than a half-written
+        # manifest that would make the file unrestorable.
         try:
             size = os.path.getsize(path)
         except OSError:
             return False
-        if self.max_bytes and (self._bin_bytes + size) > self.max_bytes:
-            self.refused += 1
-            return False
+        with _LOCK:
+            try:
+                self._bin_bytes = stats(self.root)[1]
+            except Exception:
+                pass
+            if self.max_bytes and (self._bin_bytes + size) > self.max_bytes:
+                self.refused += 1
+                return False
         name = _stored_name(path)
         dest = os.path.join(self.files_dir, name)
         try:
@@ -188,19 +164,23 @@ class Quarantine:
         except Exception:
             return False
         try:
-            with _LOCK:
-                with _manifest_file_lock(self.root):
-                    with open(self.manifest_path, "a", encoding="utf-8") as fh:
-                        fh.write(json.dumps({
-                            "src": os.path.abspath(path),
-                            "dst": name,
-                            "size": size,
-                            "ts": time.time(),
-                        }) + "\n")
+            with _manifest_file_lock(self.root):
+                with open(self.manifest_path, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps({
+                        "src": os.path.abspath(path),
+                        "dst": name,
+                        "size": size,
+                        "ts": time.time(),
+                    }) + "\n")
         except Exception:
-            # the file is safely moved; a lost manifest line only costs a
-            # restore, never data — keep the run going.
-            pass
+            # H-006 fail-closed: manifest unwritable -> undo the move by
+            # deleting the staged file is wrong (data loss); instead roll
+            # the move back so the cleaner can delete normally.
+            try:
+                os.replace(dest, path)
+            except Exception:
+                pass
+            return False
         self.moved_files += 1
         self.moved_bytes += size
         self._bin_bytes += size
@@ -459,6 +439,48 @@ def _entry_is_confined(root: str, entry: dict) -> bool:
     return not _is_protected_root(target)
 
 
+def restore_entry(entry: dict, root: Optional[str] = None
+                  ) -> Tuple[bool, str]:
+    """Move ONE quarantined file back to its original path (U-002).
+
+    The Safety centre lists each quarantined file, so restoring one mistaken
+    clean must not require restoring every other file too. The same
+    confinement rules as `restore_all` apply: a forged manifest row cannot
+    read or write outside the bin, and an existing file at the target is
+    never overwritten. Returns (ok, sentence for the UI). Never raises.
+    """
+    root = root or default_root()
+    if not isinstance(entry, dict):
+        return False, "That record is unreadable."
+    src = entry.get("src")
+    name = _bare_name(entry.get("dst"))
+    if not src or not name:
+        return False, "That record does not name a restorable file."
+    if not _entry_is_confined(root, entry):
+        return False, "That record points outside the quarantine bin."
+    path = os.path.join(_files_dir(root), name)
+    if not os.path.exists(path):
+        return False, "That file is no longer in the quarantine bin."
+    if os.path.exists(src):
+        return False, ("Something already exists at the original location; "
+                       "it was left untouched.")
+    try:
+        parent = os.path.dirname(src)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        try:
+            os.replace(path, src)
+        except OSError:
+            shutil.move(path, src)
+    except Exception as exc:
+        return False, "Could not restore it: %s" % exc
+    remaining = [e for e in list_entries(root)
+                 if not (isinstance(e, dict)
+                         and e.get("src") == src and e.get("dst") == name)]
+    _write_manifest(root, remaining)
+    return True, "Restored to %s." % src
+
+
 def restore_all(root: Optional[str] = None,
                 on_progress: Optional[Callable[[int, int], None]] = None
                 ) -> Tuple[int, int]:
@@ -510,8 +532,15 @@ def empty(root: Optional[str] = None) -> Tuple[int, int]:
     """Permanently delete everything in the bin. Returns (files, bytes) freed."""
     root = root or default_root()
     count, total = stats(root)
+
+    # H-001: report locked or undeletable entries instead of hiding them.
+    def _report(func, path, exc_info):
+        from app.utils import log_or_swallow
+        log_or_swallow(None, "quarantine: could not delete %s" % path, exc_info[1])
+
     try:
-        shutil.rmtree(root, ignore_errors=True)
-    except Exception:
-        pass
+        shutil.rmtree(root, onerror=_report)
+    except Exception as exc:
+        from app.utils import log_or_swallow
+        log_or_swallow(None, "quarantine: could not empty the bin", exc)
     return count, total

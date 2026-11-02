@@ -11,7 +11,7 @@ import tkinter as tk
 
 from app import facts
 from app.ui.dialogs._tool_page import ToolPage
-from app.ui.theme import COLORS, RADIUS_SURFACE, TAB_ACCENTS, TYPE, _hex_lerp, SPACE_2
+from app.ui.theme import COLORS, RADIUS_SURFACE, TAB_ACCENTS, TYPE, _hex_lerp, SPACE_2, CARD_H_HERO
 from app.ui.metrics import CONTROL_GAP, TEXT_NUDGE
 from app.ui.widgets import AnimatedButton, ScrollableRoundedPanel
 from app.ui.widgets.rounded_card import RoundedCard
@@ -52,7 +52,7 @@ class SpecsDialog(ToolPage):
         # gets a tonal pill the way an M3 navigation rail marks the
         # current destination (before this, no row was visibly selected).
         nav = RoundedCard(cols, fill=COLORS["bg_alt"], bg=COLORS["bg"],
-                          radius=RADIUS_SURFACE, min_height=200)
+                          radius=RADIUS_SURFACE, min_height=CARD_H_HERO)
         try:
             nav.configure(width=158)
         except Exception:

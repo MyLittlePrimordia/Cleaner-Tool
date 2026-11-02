@@ -26,6 +26,10 @@ _CatalogPickerDialog, and InstallTab opens InstallProfilesDialog.
 app/gui.py stays as the public facade: app/__main__.py launches through
 `app.gui.launch`, and the re-exports below keep every name the old monolithic
 module exposed reachable from one place after the layers moved out.
+
+I-005: this facade is DEPRECATED for new code — import from `app.ui.*`
+directly. Test-only re-exports (_lerp, _measure_font, CancellationToken)
+remain for one release, then shrink to `launch + Application` only.
 """
 from app.ui.theme import (  # noqa: F401
     COLORS, F, TAB_ACCENTS, _hex_lerp, _lerp, _measure_font, _round_pts,
@@ -55,6 +59,7 @@ from app.ui.dialogs import (  # noqa: F401
     InstallProfilesDialog,
     NetworkConnectionsDialog, PilotDialog, ProcessManagerDialog,
     RestorePointDialog, SafetyCenterDialog, ScorecardDialog, ServicesDialog,
+    SetupWizardDialog,
     SpecsDialog, SpeedTestDialog, StartupManagerDialog,
     StorageInsightDialog, UninstallProgramsDialog, UpdatePickerDialog,
     _CatalogPickerDialog,
@@ -62,7 +67,7 @@ from app.ui.dialogs import (  # noqa: F401
 from app.ui.tabs import (  # noqa: F401
     AdminGateFrame, HealthTab, InstallTab, TaskTab, ToolsTab,
 )
-from app.ui.app import Application, _TAB_STATUS  # noqa: F401
+from app.ui.app import Application  # noqa: F401
 from app.config import (  # noqa: F401
     APP_NAME, FONT_FAMILY, RISK_ADVANCED, RISK_REBOOT, RISK_SAFE,
     WINDOW_MIN_SIZE, WINDOW_SIZE,
@@ -130,6 +135,7 @@ __all__ = [
     "InstallProfilesDialog", "NetworkConnectionsDialog",
     "PilotDialog", "ProcessManagerDialog", "RestorePointDialog",
     "SafetyCenterDialog", "ScorecardDialog", "ServicesDialog",
+    "SetupWizardDialog",
     "SpecsDialog", "SpeedTestDialog",
     "StartupManagerDialog", "StorageInsightDialog", "UninstallProgramsDialog",
     "UpdatePickerDialog", "_CatalogPickerDialog",
@@ -143,5 +149,4 @@ __all__ = [
     "mark_tweak_reverted", "is_admin", "relaunch_as_admin", "show_toast",
     "notify_clean_complete", "check_dangerous_combos",
     "check_info_notices", "CancellationToken", "invoke_task",
-    "_TAB_STATUS",
 ]

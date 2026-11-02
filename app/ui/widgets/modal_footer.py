@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import tkinter as tk
 
-from app.ui.theme import COLORS, DIALOG_PAD_TOP, SPACE_2, TYPE
+from app.ui.theme import COLORS, DIALOG_PAD_TOP, SPACE_2, TYPE, KIND_ROLE
 from app.ui.widgets.button import AnimatedButton
 
 #: The footer adds NO side padding of its own: `ThemedModal.body` already
@@ -54,16 +54,8 @@ MODAL_INSET = 0
 #: the card's bottom margin. Same rhythm as every page footer.
 MODAL_FOOT_PAD = (DIALOG_PAD_TOP, 0)
 
-#: `kind` -> the shared button role. The same vocabulary ToolPage uses, so
-#: a footer button and a page button at the same rung look identical.
-KIND_ROLE = {
-    "primary": "filled",
-    "secondary": "secondary",
-    "danger": "danger",
-    "warn": "warn",
-    "text": "text",
-    "quiet": "secondary",
-}
+#: `kind` -> the shared button role. The table itself lives in theme, so a
+#: footer button and a page button cannot drift apart (C-002).
 
 
 class ModalFooter(tk.Frame):

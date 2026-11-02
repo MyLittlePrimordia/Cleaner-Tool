@@ -43,8 +43,14 @@ def _si_log(msg):
     try:
         from app.logsafe import append_text_no_follow, redact
         text = redact(msg)
-        log_path = os.path.join(tempfile.gettempdir(),
-                                "cleaner_tool_single_instance.log")
+        # H-010: prefer the user-private log dir; %TEMP% inherits world-
+        # readable ACLs. Fall back to %TEMP% only when config dir is unknown.
+        try:
+            from app.config_paths import get_config_dir as _gcd
+            log_path = os.path.join(str(_gcd()), "single_instance.log")
+        except Exception:
+            log_path = os.path.join(tempfile.gettempdir(),
+                                    "cleaner_tool_single_instance.log")
         append_text_no_follow(log_path, f"[{os.getpid()}] {text}\n")
         # I-003: one place for the trail. A startup problem that only reached
         # a %TEMP% file was missing from the crash log a bug report asks for.
@@ -446,13 +452,14 @@ def is_elevation_child(argv=None) -> bool:
 
 def is_headless_run(argv=None) -> bool:
     """True for scheduler/headless invocations that must run concurrently
-    with (or without) the GUI: --auto-clean, --auto-update. Fully exempt
-    from single-instance handling."""
+    with (or without) the GUI: --auto-clean, --auto-update,
+    --auto-save-backup. Fully exempt from single-instance handling."""
     try:
         args = [str(a) for a in (argv if argv is not None else sys.argv)]
     except Exception:
         return False
-    return "--auto-clean" in args or "--auto-update" in args
+    return ("--auto-clean" in args or "--auto-update" in args
+            or "--auto-save-backup" in args)
 
 
 def should_enforce(argv=None) -> bool:

@@ -9,23 +9,13 @@ name: Build Windows Executable
 # in-app "Update Available" flow reads this build.
 #
 # Defender / SmartScreen notes (DEF-001):
-#   - Every build embeds a full VERSIONINFO resource (version_info.txt:
+#   - Every build embeds a full VERSIONINFO resource (.github/version_info.txt:
 #     CompanyName, ProductName, FileVersion, etc.), which removes one of the
 #     heuristic signals behind "Behavior:Win32/Persistence.A!ml".
 #   - Code signing is the single highest-leverage remaining fix, and it is
 #     wired to SSL.com eSigner (cloud HSM) below. It runs only when the four
 #     secrets listed in that step exist; until then the build is unsigned but
 #     already carries proper version metadata.
-#
-#     Why a cloud service and not a .pfx: since the CA/Browser Forum baseline
-#     requirements took effect on 2023-06-01, a publicly trusted OV/EV code
-#     signing private key must be generated, stored and used inside qualifying
-#     hardware. A .pfx pasted into a GitHub secret is no longer how a newly
-#     purchased certificate is delivered, so that flow was retired here rather
-#     than left as a trap. Signing also does not buy instant SmartScreen
-#     trust: publisher reputation still builds over weeks of clean installs.
-#     See the README's "Code signing" section.
-#
 #   - The signing step is gated on push/workflow_dispatch, never on
 #     pull_request: a fork PR gets no secrets anyway, and a same-repo PR should
 #     not spend a signature or hand signing credentials to reviewable code.
@@ -51,9 +41,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          # The token is not needed after checkout; keeping it in the git
-          # config hands every later step (and any dependency's build hook)
-          # a credential that can write to the repo.
           persist-credentials: false
 
       - name: Set up Python
@@ -61,63 +48,46 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Install dependencies
+      - name: Install build dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r .github\requirements.txt
-          pip install -r .github\requirements-dev.txt
+          pip install -r .github/requirements.txt
+          pip install -r .github/requirements-dev.txt
+
       # Static check: the whole `F` (pyflakes) set, not just F821. Every
       # finding here is a real defect class - an undefined or unused name, a
       # redefinition, a wildcard import, a `return` outside a function - and
-      # three undefined names shipped in v1 (all_priority/all_selected) because
-      # the handlers around them swallow exceptions. app/ is at zero now, so
-      # any new finding fails the build. Widen to E9 (syntax errors) and I
-      # (import order) only when the codebase is clean for those too.
+      # three undefined names shipped in v1 because the handlers around them
+      # swallow exceptions. app/ is at zero now, so any new finding fails the
+      # build.
       - name: Static check (pyflakes defects)
         run: python -m ruff check app --select F
 
-      # The design-literal gate (.github/tools/design_literals.py). It runs
-      # `radius=16`, an icon size or a hand-written font tuple gets told which
-      # token to reach for, for every finding at once.
+      # Design-literal gate: a new widget that writes `padx=9`, `radius=16`,
+      # an icon size or a hand-written font tuple gets told which theme token
+      # to reach for, for every finding at once.
       - name: Design-literal gate
-        run: python .github\tools\design_literals.py
+        run: python .github/tools/design_literals.py
 
-      # SEC-001 allowlist drift guard: .github/tools/verify_sec001_task_allowlist.py
-      # recomputes the measured totals from app/tasks/tweak_common.py source.
-      # (was: dev/tools/verify_sec001_task_allowlist.py)
-        run: python .github\tools\verify_sec001_task_allowlist.py
+      # SEC-001 allowlist drift guard: recomputes the measured tweak totals
+      # from the app/tasks/tweak_common.py source on every build.
+      - name: SEC-001 allowlist drift guard
+        run: python .github/tools/verify_sec001_task_allowlist.py
 
-      # R-008: every PowerShell call site goes through app/powershell.py, where
-      # the exe is resolved (System32\WindowsPowerShell\v1.0 first, never a PATH
-      # lookup) and the flags are decided once. Twenty hand-built copies had
-      # drifted before that - most said a bare "powershell", which does not
-      # exist on PATH on every machine, and three pasted the script into a shell
-      # string. The guard walks the AST, so a new list, a new shell string or a
-      # bare exe handed to ShellExecuteW all fail the build.
+      # R-008: every PowerShell call site must go through app/powershell.py.
+      # The guard walks the AST, so a new list, a new shell string or a bare
+      # exe handed to ShellExecuteW all fail the build.
       - name: PowerShell single call-site guard
-        run: python .github\tools\verify_powershell_single_call_site.py
+        run: python .github/tools/verify_powershell_single_call_site.py
 
-      # The dry-run promise. Storage Insight, the Health junk sensor and the
-      # Low-Space nudge estimate sizes by CALLING the real Clean-tab tasks with
-      # dry_run=True (app/storage_scan.SCAN_ALLOWLIST says which). A task that
-      # forgets its `if _dry(ctx)` check then deletes during a read-only scan -
-      # H-001 shipped exactly that. The guard walks what each allowlisted task
-      # can reach and fails on a mutation no dry check dominates, and it
-      # re-proves the dry-aware primitives the allowlist relies on.
+      # Dry-run promise: Storage Insight, the Health junk sensor and the
+      # Low-Space nudge estimate sizes by CALLING the real Clean-tab tasks
+      # with dry_run=True. The guard walks what each allowlisted task can
+      # reach and fails on a mutation no dry check dominates.
       - name: Dry-run scope guard
-        run: python .github\tools\verify_dryrun_scope.py
+        run: python .github/tools/verify_dryrun_scope.py
 
       - name: Build with PyInstaller
-        # --onefile    : single portable .exe
-        # --windowed   : no console window behind the GUI
-        # --name       : Cleaner-Tool -> dist\Cleaner-Tool.exe (matches the
-        #                asset name app/update_checker.py looks for)
-        # --manifest   : embed asInvoker manifest — the app starts unelevated
-        #                and uses its in-app Admin Gate / restart handshake to
-        #                elevate only when needed (cleanups work without admin)
-        # --add-data   : bundle app/assets -> <_MEIPASS>/app/assets, which is
-        #                the first layout app.utils.resolve_asset_path probes
-        # --icon/--version-file : colored 🧼 icon + Win32 VERSIONINFO
         run: >
           pyinstaller --onefile --windowed
           --name "Cleaner-Tool"
@@ -127,34 +97,19 @@ jobs:
           --version-file ".github/version_info.txt"
           app/__main__.py
 
-      # ------------------------------------------------------------------
-      # Authenticode signing via SSL.com eSigner (cloud HSM)
-      # ------------------------------------------------------------------
-      # The private key never leaves SSL.com's FIPS-validated cloud HSM, which
-      # is what the 2023 CA/Browser Forum hardware rule requires and what a
-      # .pfx in a secret cannot satisfy for a newly issued certificate. To
-      # enable, create these four repository secrets (Settings -> Secrets and
-      # variables -> Actions):
-      #
+      # Authenticode signing via SSL.com eSigner (cloud HSM). To enable,
+      # create these four repository secrets
+      # (Settings -> Secrets and variables -> Actions):
       #   ES_USERNAME      SSL.com account username
       #   ES_PASSWORD      SSL.com account password
       #   ES_CREDENTIAL_ID eSigner credential id
-      #                    (CodeSignTool's get_credential_ids prints it)
-      #   ES_TOTP_SECRET   the base32 seed behind the eSigner OTP, which is
-      #                    what makes unattended signing possible
-      #
-      # Nothing is exported or downloaded: the action sends the file's hash,
-      # SSL.com signs it inside the HSM and the signed binary comes back. The
-      # action is pinned to a commit rather than `@develop`, because this step
-      # holds credentials that could sign malware in the project's name.
+      #   ES_TOTP_SECRET   the base32 seed behind the eSigner OTP
       - name: Check for signing credentials
         id: creds
         shell: pwsh
         env:
           ES_USERNAME: ${{ secrets.ES_USERNAME }}
         run: |
-          # Secrets cannot be read from an `if:` expression directly, so the
-          # presence test happens here and the result travels as an output.
           $present = -not [string]::IsNullOrEmpty($env:ES_USERNAME)
           "available=$($present.ToString().ToLower())" >> $env:GITHUB_OUTPUT
           if ($present) { Write-Host "Signing credentials found." }
@@ -173,19 +128,9 @@ jobs:
           credential_id: ${{ secrets.ES_CREDENTIAL_ID }}
           totp_secret: ${{ secrets.ES_TOTP_SECRET }}
           file_path: ${{ github.workspace }}/dist/Cleaner-Tool.exe
-          # Replace dist/Cleaner-Tool.exe in place, so the checksum, the
-          # artifact upload and the release all pick up the SIGNED bytes
-          # without any of them being told the path changed.
           override: true
 
-      # Nothing used to verify the result: the old step could report success
-      # and still leave an unsigned file, for a signature-tooling reason
-      # nobody surfaced. This makes the point of the step checkable and fails
-      # the build rather than publishing bytes it cannot vouch for.
       - name: Verify the signature
-        # Tied to the sign step, not to the credentials: with secrets set, a
-        # same-repo PR skips signing (see the condition above) and must not be
-        # failed by a verifier looking at an intentionally unsigned file.
         if: steps.sign.outcome == 'success'
         shell: pwsh
         run: |
@@ -198,8 +143,6 @@ jobs:
             Write-Host ("Thumbprint  : " + $sig.SignerCertificate.Thumbprint)
           }
           if (-not $sig.TimeStamperCertificate) {
-            # An untimestamped signature stops verifying the day the
-            # certificate expires, for copies already downloaded as well.
             throw "Signature is not timestamped; it must stay verifiable after the certificate expires."
           }
           if ($sig.Status -ne 'Valid') {
@@ -208,17 +151,12 @@ jobs:
           Write-Host "Signature verified against a trusted root."
 
       - name: Note an unsigned build
-        # "Anything but signed" - no credentials, or a PR that is deliberately
-        # not signed - so the log never implies this artifact is verifiable.
         if: steps.sign.outcome != 'success'
         shell: pwsh
         run: |
           Write-Host "::warning title=Unsigned build::This artifact is unsigned: either no SSL.com eSigner secrets are configured, or this event is a pull request (which is never signed). SmartScreen will warn about it."
 
       - name: Compute SHA-256 checksum
-        # Published next to the .exe so a downloader can verify it. The
-        # in-app update checker prefers a .sha256 asset (see update_checker.py,
-        # "prefer publishing a .sha256 asset long-term").
         shell: pwsh
         run: |
           $hash = (Get-FileHash -Algorithm SHA256 "dist\Cleaner-Tool.exe").Hash.ToLower()
@@ -234,11 +172,9 @@ jobs:
             dist/Cleaner-Tool.exe.sha256
           if-no-files-found: error
 
+      # Only on pushes to main - PRs from forks can't write releases, and a
+      # feature branch should not clobber "latest".
       - name: Update rolling latest release (overwrite every build)
-        # Only on pushes to main — PRs from forks can't write releases, and we
-        # don't want feature branches clobbering "latest". Creates/overwrites
-        # the `latest` tag and replaces the attached Cleaner-Tool.exe with the
-        # freshly built one.
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
